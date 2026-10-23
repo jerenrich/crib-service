@@ -118,13 +118,15 @@ import UserNotifications
             return
         }
         refreshing = true
-        session.sendMessage(["command": data], replyHandler: { reply in
+        // WatchConnectivity invokes these callbacks on a background queue. Mark
+        // them Sendable so Swift does not infer the enclosing MainActor isolation.
+        session.sendMessage(["command": data], replyHandler: { @Sendable reply in
             let data = reply["snapshot"] as? Data
             Task { @MainActor in
                 self.refreshing = false
                 if let data, let value = try? JSONDecoder().decode(WatchSnapshot.self, from: data) { self.accept(value) }
             }
-        }, errorHandler: { _ in
+        }, errorHandler: { @Sendable _ in
             Task { @MainActor in self.refreshing = false; self.notice = "iPhone sync unavailable. Open the Parent app and try again." }
         })
     }
