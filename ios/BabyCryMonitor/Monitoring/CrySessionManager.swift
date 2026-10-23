@@ -88,5 +88,11 @@ public struct CrySessionManager: Sendable {
     public mutating func acknowledged(_ id: UUID) {
         snapshot.pending.removeAll { $0.id == id }
     }
+    public mutating func permanentlyFailed(_ id: UUID, at date: Date) {
+        guard let item = snapshot.pending.first(where: { $0.id == id }) else { return }
+        snapshot.failedAlerts.insert(FailedAlert(alert: item.alert, failedAt: date), at: 0)
+        snapshot.failedAlerts = Array(snapshot.failedAlerts.prefix(100))
+        snapshot.pending.removeAll { $0.id == id }
+    }
 }
 private extension PendingAlert { var id: UUID { alert.eventId } }

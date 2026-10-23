@@ -28,12 +28,14 @@ struct DebugView: View {
                 Text("Device: \(model.listenerID)").font(.caption).textSelection(.enabled)
                 Text("Backend: \(model.backendURL.isEmpty ? "Not configured" : model.backendURL)").font(.caption)
                 Text("Pending alerts: \(model.snapshot.pending.count)")
+                Text("Failed alert deliveries: \(model.snapshot.failedAlerts.count)")
             }
             if model.role == .listener {
                 Section("Real push test") {
                     Button(model.sendingTestPush ? "Sending test push…" : "Send test push") {
                         Task { await model.sendTestPush() }
                     }.disabled(!model.paired || model.sendingTestPush)
+                        .accessibilityIdentifier("diagnosticsSendTestPush")
                     Text("Sends a real, silent notification marked as a test to the paired Parent, even while monitoring is stopped.").font(.footnote)
                     if !model.paired { Text("Pair with a Parent first.").font(.footnote) }
                     if let status = model.testPushStatus { Text(status).font(.footnote) }
@@ -47,7 +49,7 @@ struct DebugView: View {
                 Button("Simulate Quiet") { simulation.loud = false; simulation.advance(0.25) }
                 Button("Advance +30 sec") { simulation.advance(30) }
                 Button("Advance +5 min") { simulation.advance(300) }
-                Button("Trigger Threshold") { simulation.trigger() }
+                Button("Trigger Threshold") { simulation.trigger() }.accessibilityIdentifier("simulationTriggerThreshold")
                 Button("Reset Simulation") { simulation = SimulationModel() }
                 Button("Preview silent local notification") {
                     Task {
@@ -64,6 +66,6 @@ struct DebugView: View {
                 ShareLink("Export diagnostic log", item: model.log.export)
                 Text(model.log.export.isEmpty ? "No events yet." : model.log.export).font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
             }
-        }.navigationTitle("Diagnostics")
+        }.accessibilityIdentifier("diagnosticsForm").navigationTitle("Diagnostics")
     }
 }

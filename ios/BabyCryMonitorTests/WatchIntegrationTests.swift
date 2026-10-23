@@ -46,6 +46,7 @@ final class WatchIntegrationTests: XCTestCase {
             let listener = DeviceCredential(deviceId: UUID(), secret: "listener", role: .listener, registered: true)
             let backend = Backend(parent); self.backend = backend
             model = AppModel(defaults: defaults, metadataStore: try MetadataStore(directory: directory),
+                             log: DiagnosticLog(directory: directory),
                              audio: AppModelTests.Audio(), connectivity: AppModelTests.Connectivity(),
                              notifications: AppModelTests.Notifications(),
                              keychain: AppModelTests.Credentials(listener: listener, parent: parent),

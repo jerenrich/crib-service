@@ -67,12 +67,32 @@ public struct PendingAlert: Codable, Sendable {
         nextAttemptAt = now.addingTimeInterval(min(300, pow(2, Double(min(attempts, 9)))))
     }
 }
+public struct FailedAlert: Identifiable, Codable, Sendable {
+    public let alert: CryAlert
+    public let failedAt: Date
+    public var id: UUID { alert.eventId }
+    public init(alert: CryAlert, failedAt: Date) { self.alert = alert; self.failedAt = failedAt }
+}
 public struct SessionSnapshot: Codable, Sendable {
     public var configuration = MonitoringConfiguration()
     public var history: [CryEpisode] = []
     public var current: CryEpisode?
     public var pending: [PendingAlert] = []
+    public var failedAlerts: [FailedAlert] = []
     public var lastObservedAt: Date?
     public var wasMonitoring = false
     public init() {}
+    private enum CodingKeys: String, CodingKey {
+        case configuration, history, current, pending, failedAlerts, lastObservedAt, wasMonitoring
+    }
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        configuration = try values.decode(MonitoringConfiguration.self, forKey: .configuration)
+        history = try values.decode([CryEpisode].self, forKey: .history)
+        current = try values.decodeIfPresent(CryEpisode.self, forKey: .current)
+        pending = try values.decode([PendingAlert].self, forKey: .pending)
+        failedAlerts = try values.decodeIfPresent([FailedAlert].self, forKey: .failedAlerts) ?? []
+        lastObservedAt = try values.decodeIfPresent(Date.self, forKey: .lastObservedAt)
+        wasMonitoring = try values.decode(Bool.self, forKey: .wasMonitoring)
+    }
 }

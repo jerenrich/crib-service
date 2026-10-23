@@ -19,12 +19,18 @@ actor RequestGate {
 
 final class AppModelTests: XCTestCase {
     @MainActor final class Audio: AudioLevelProviding {
-        let levels = AsyncStream<AudioLevelSample> { _ in }
+        let levels: AsyncStream<AudioLevelSample>
+        private let continuation: AsyncStream<AudioLevelSample>.Continuation
         var onStatus: ((AudioCaptureStatus) -> Void)?
         var permissionGranted = true
         var recoveryGate: RequestGate?
         var startFailure: Error?
         private(set) var starts = 0
+        init() {
+            let stream = AsyncStream<AudioLevelSample>.makeStream()
+            levels = stream.stream; continuation = stream.continuation
+        }
+        func emit(_ sample: AudioLevelSample) { continuation.yield(sample) }
         func requestPermission() async -> Bool { permissionGranted }
         func start() async throws {
             starts += 1
@@ -64,15 +70,21 @@ final class AppModelTests: XCTestCase {
         private(set) var beats: [Heartbeat] = []
         private(set) var sent: [CryAlert] = []
         private(set) var settingsCalls = 0
+        private(set) var heartbeatCompletions = 0
         var settingsFail = false
         var settingsGate: RequestGate?
         var heartbeatGate: RequestGate?
+        var sendGate: RequestGate?
+        var heartbeatFail = false
+        var sendFail = false
         var receipt = "sent"
         init(credential: DeviceCredential) { self.credential = credential }
         func configure(settingsFail: Bool = false, settingsGate: RequestGate? = nil,
-                       heartbeatGate: RequestGate? = nil, receipt: String = "sent") {
+                       heartbeatGate: RequestGate? = nil, sendGate: RequestGate? = nil,
+                       heartbeatFail: Bool = false, sendFail: Bool = false, receipt: String = "sent") {
             self.settingsFail = settingsFail; self.settingsGate = settingsGate
             self.heartbeatGate = heartbeatGate; self.receipt = receipt
+            self.sendGate = sendGate; self.heartbeatFail = heartbeatFail; self.sendFail = sendFail
         }
         func register() async throws {}
         func createPairing() async throws -> PairingCode { PairingCode(code: "123456", expiresAt: .distantFuture) }
@@ -81,6 +93,8 @@ final class AppModelTests: XCTestCase {
         func heartbeat(_ value: Heartbeat) async throws -> MonitoringConfiguration {
             beats.append(value)
             await heartbeatGate?.wait()
+            heartbeatCompletions += 1
+            if heartbeatFail { throw URLError(.timedOut) }
             return MonitoringConfiguration()
         }
         func settings(_ configuration: MonitoringConfiguration) async throws {
@@ -89,7 +103,10 @@ final class AppModelTests: XCTestCase {
             if settingsFail { throw URLError(.badServerResponse) }
         }
         func send(_ alert: CryAlert) async throws -> AlertReceipt {
-            sent.append(alert); return AlertReceipt(status: receipt)
+            sent.append(alert)
+            await sendGate?.wait()
+            if sendFail { throw URLError(.notConnectedToInternet) }
+            return AlertReceipt(status: receipt)
         }
         func acknowledge(_ id: UUID) async throws {}
         func pushToken(_ token: String) async throws {}
@@ -105,7 +122,7 @@ final class AppModelTests: XCTestCase {
         let listener: DeviceCredential
         final class Time { var now = Date() }
         let time: Time
-        init(pending: Bool = false, automaticallyStart: Bool = false) throws {
+        init(pending: Bool = false, automaticallyStart: Bool = false, logEvents: [String] = []) throws {
             suite = "AppModelTests.\(UUID())"
             defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
             directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -125,7 +142,9 @@ final class AppModelTests: XCTestCase {
             try store.save(snapshot)
             let backend = Backend(credential: listener); self.backend = backend
             let time = Time(); self.time = time
-            model = AppModel(defaults: defaults, metadataStore: store, audio: audio, connectivity: Connectivity(),
+            let log = DiagnosticLog(directory: directory)
+            for event in logEvents { log.record(event) }
+            model = AppModel(defaults: defaults, metadataStore: store, log: log, audio: audio, connectivity: Connectivity(),
                              notifications: Notifications(), keychain: Credentials(listener: listener, parent: parent),
                              makeClient: { _, _ in backend }, currentTime: { time.now }, automaticallyStart: automaticallyStart)
         }
@@ -301,39 +320,138 @@ final class AppModelTests: XCTestCase {
         fixture.model.stop()
     }
     @MainActor func testAcknowledgedServerReceiptRemovesAlertWithoutClaimingAPNsDelivery() async throws {
-        let fixture = try Fixture(pending: true)
+        let fixture = try Fixture(pending: true, logEvents: ["alert_apns_accepted"])
+        let priorAccepted = fixture.model.log.lines.filter { $0.contains("alert_apns_accepted") }
+        XCTAssertEqual(priorAccepted.count, 1)
         await fixture.backend.configure(receipt: "acknowledged")
         await fixture.model.tick()
         XCTAssertTrue(fixture.model.snapshot.pending.isEmpty)
         XCTAssertEqual(fixture.model.deliveryStatus, "Alert acknowledged on Parent")
-        XCTAssertFalse(fixture.model.log.export.contains("alert_apns_accepted"))
+        XCTAssertEqual(fixture.model.log.lines.filter { $0.contains("alert_apns_accepted") }, priorAccepted)
     }
-
-    // BEGIN temporary fix review probes
-    @MainActor func testReviewPendingAlertDoesNotWaitForHungHeartbeat() async throws {
+    @MainActor func testPendingAlertDoesNotWaitForHungHeartbeatOrQueueDuplicateHeartbeats() async throws {
         let fixture = try Fixture(pending: true)
         let gate = RequestGate()
         await fixture.backend.configure(heartbeatGate: gate)
         await fixture.model.start()
-        let request = Task { await fixture.model.tick() }
+        await fixture.model.tick()
         let started = await eventually { await fixture.backend.beats.count == 1 }
         XCTAssertTrue(started)
-        let sentWhileHeartbeatWaits = await fixture.backend.sent
+        let sent = await fixture.backend.sent
+        XCTAssertEqual(sent.count, 1)
+        XCTAssertTrue(fixture.model.snapshot.pending.isEmpty)
+        // Repeated pulses during the same suspended request must not build a backlog.
+        for _ in 0..<3 { await fixture.model.tick() }
+        let beats = await fixture.backend.beats
+        XCTAssertEqual(beats.count, 1)
         await gate.open()
-        await request.value
-        XCTAssertEqual(sentWhileHeartbeatWaits.count, 1, "A ready alert must not wait for an unrelated heartbeat request")
+        let completed = await eventually { await fixture.backend.heartbeatCompletions == 1 }
+        XCTAssertTrue(completed)
+        fixture.model.stop()
     }
-    @MainActor func testReviewTerminalServerFailureLeavesRetryQueue() async throws {
+    @MainActor func testHeartbeatsContinueWhileAlertDeliveryIsSuspended() async throws {
+        let fixture = try Fixture(pending: true, automaticallyStart: true)
+        let gate = RequestGate()
+        await fixture.backend.configure(sendGate: gate)
+        await fixture.model.start()
+        let sending = await eventually { await fixture.backend.sent.count == 1 }
+        XCTAssertTrue(sending)
+        let connected = await eventually { fixture.model.deliveryStatus == "Connected" }
+        XCTAssertTrue(connected)
+        fixture.time.now = fixture.time.now.addingTimeInterval(61)
+        fixture.audio.emit(AudioLevelSample(timestamp: fixture.time.now, dbFS: -65))
+        let observed = await eventually { fixture.model.snapshot.lastObservedAt == fixture.time.now }
+        XCTAssertTrue(observed)
+        let refreshed = await eventually { await fixture.backend.beats.count == 2 }
+        XCTAssertTrue(refreshed)
+        // The second heartbeat was sent before allowing the alert request to finish.
+        XCTAssertEqual(fixture.model.snapshot.pending.count, 1)
+        await gate.open()
+        let delivered = await eventually { fixture.model.snapshot.pending.isEmpty }
+        XCTAssertTrue(delivered)
+        fixture.model.stop()
+    }
+    @MainActor func testStoppedHeartbeatCompletionCannotSuppressHeartbeatAfterRestart() async throws {
+        let fixture = try Fixture()
+        let gate = RequestGate()
+        await fixture.backend.configure(heartbeatGate: gate)
+        await fixture.model.start()
+        fixture.model.stop()
+        let started = await eventually { await fixture.backend.beats.count == 1 }
+        XCTAssertTrue(started)
+        await fixture.model.start()
+        await gate.open()
+        let completed = await eventually { await fixture.backend.heartbeatCompletions == 1 }
+        XCTAssertTrue(completed)
+        await fixture.model.tick()
+        let refreshed = await eventually { await fixture.backend.beats.count == 2 }
+        XCTAssertTrue(refreshed)
+        let beats = await fixture.backend.beats
+        XCTAssertEqual(beats.map(\.monitoring), [false, true])
+        fixture.model.stop()
+    }
+    @MainActor func testFailedHeartbeatDoesNotPreventAlertDeliveryAndCanRetry() async throws {
         let fixture = try Fixture(pending: true)
+        await fixture.backend.configure(heartbeatFail: true)
+        await fixture.model.start()
+        await fixture.model.tick()
+        let failed = await eventually { fixture.model.deliveryStatus.contains("Alerts may be delayed") }
+        XCTAssertTrue(failed)
+        XCTAssertTrue(fixture.model.snapshot.pending.isEmpty)
+        await fixture.backend.configure()
+        await fixture.model.tick()
+        let reconnected = await eventually { fixture.model.deliveryStatus == "Connected" }
+        XCTAssertTrue(reconnected)
+        let beats = await fixture.backend.beats
+        XCTAssertEqual(beats.count, 2)
+        fixture.model.stop()
+    }
+    @MainActor func testTerminalFailureIsPersistedAndNeverRetried() async throws {
+        let fixture = try Fixture(pending: true)
+        let original = try XCTUnwrap(fixture.model.snapshot.pending.first?.alert)
         await fixture.backend.configure(receipt: "failed")
         await fixture.model.tick()
-        let first = await fixture.backend.sent
-        XCTAssertEqual(first.count, 1)
+        XCTAssertTrue(fixture.model.snapshot.pending.isEmpty)
+        XCTAssertEqual(fixture.model.snapshot.failedAlerts.map(\.alert), [original])
+        XCTAssertEqual(fixture.model.snapshot.failedAlerts.first?.failedAt, fixture.time.now)
+        let restored = try MetadataStore(directory: fixture.directory).load()
+        XCTAssertTrue(restored.pending.isEmpty)
+        XCTAssertEqual(restored.failedAlerts.map(\.alert), [original])
         fixture.time.now = fixture.time.now.addingTimeInterval(301)
         await fixture.model.tick()
-        let retried = await fixture.backend.sent
-        XCTAssertEqual(retried.count, 1, "The server never retries a terminal failure, so retrying this event cannot recover delivery")
+        let requests = await fixture.backend.sent
+        XCTAssertEqual(requests.count, 1)
+        // A new alert can still be delivered without replaying the retired event.
+        await fixture.backend.configure()
+        await fixture.model.sendTestPush()
+        let delivered = await fixture.backend.sent
+        XCTAssertEqual(delivered.count, 2)
+        XCTAssertNotEqual(delivered.last?.eventId, original.eventId)
+        XCTAssertTrue(fixture.model.snapshot.pending.isEmpty)
+        XCTAssertEqual(fixture.model.snapshot.failedAlerts.count, 1)
     }
-    // END temporary fix review probes
+    @MainActor func testRetryableReceiptsAndTransportFailuresRemainQueued() async throws {
+        for status in ["pending", "blocked", "uncertain"] {
+            let fixture = try Fixture(pending: true)
+            await fixture.backend.configure(receipt: status)
+            await fixture.model.tick()
+            XCTAssertEqual(fixture.model.snapshot.pending.count, 1, status)
+            XCTAssertTrue(fixture.model.snapshot.failedAlerts.isEmpty, status)
+        }
+        let fixture = try Fixture(pending: true)
+        await fixture.backend.configure(sendFail: true)
+        await fixture.model.tick()
+        XCTAssertEqual(fixture.model.snapshot.pending.first?.attempts, 1)
+        XCTAssertTrue(fixture.model.snapshot.failedAlerts.isEmpty)
+    }
+    @MainActor func testFixtureLogsAreIsolatedAndExistingHistoryStillLoads() async throws {
+        let first = try Fixture(logEvents: ["alert_apns_accepted"])
+        let second = try Fixture()
+        XCTAssertTrue(second.model.log.lines.isEmpty)
+        second.model.log.record("monitoring_started")
+        XCTAssertFalse(first.model.log.export.contains("monitoring_started"))
+        let restored = DiagnosticLog(directory: first.directory)
+        XCTAssertEqual(restored.lines, first.model.log.lines)
+    }
 }
 #endif

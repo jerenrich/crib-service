@@ -27,7 +27,7 @@ import UIKit
     let connectivity: any ConnectivityProviding
     let notifications: any NotificationProviding
     let watch: PhoneWatchBridge
-    let log = DiagnosticLog()
+    let log: DiagnosticLog
     private var engine = CrySessionManager()
     @ObservationIgnored private var store: MetadataStore?
     @ObservationIgnored private let audio: any AudioLevelProviding
@@ -43,6 +43,8 @@ import UIKit
     @ObservationIgnored private let makeClient: (URL, DeviceCredential) -> any BackendServing
     @ObservationIgnored private let currentTime: () -> Date
     @ObservationIgnored private var settingsGeneration = 0
+    @ObservationIgnored private var monitoringGeneration = 0
+    @ObservationIgnored private var queuedHeartbeatGeneration: Int?
     @ObservationIgnored private var lastSampleAt: Date?
     @ObservationIgnored private var lastSavedAt = Date.distantPast
     @ObservationIgnored private var lastHeartbeatAt = Date.distantPast
@@ -59,13 +61,14 @@ import UIKit
     @ObservationIgnored private var latestTestEventID: UUID?
 
     init(defaults: UserDefaults = .standard, metadataStore: MetadataStore? = nil,
+         log: DiagnosticLog = DiagnosticLog(),
          audio: any AudioLevelProviding = AudioLevelMonitor(),
          connectivity: any ConnectivityProviding = ConnectivityMonitor(),
          notifications: any NotificationProviding = NotificationService(),
          keychain: any CredentialStoring = KeychainStore(),
          makeClient: @escaping (URL, DeviceCredential) -> any BackendServing = { BackendClient(baseURL: $0, credential: $1) },
          currentTime: @escaping () -> Date = Date.init, automaticallyStart: Bool = true) {
-        self.defaults = defaults; self.audio = audio; self.connectivity = connectivity
+        self.defaults = defaults; self.audio = audio; self.connectivity = connectivity; self.log = log
         self.notifications = notifications; self.keychain = keychain; self.makeClient = makeClient
         self.watch = PhoneWatchBridge(enabled: automaticallyStart)
         self.currentTime = currentTime
@@ -260,6 +263,7 @@ import UIKit
         }
     }
     private func audioChanged(_ status: AudioCaptureStatus) {
+        monitoringGeneration += 1; lastHeartbeatAt = .distantPast
         monitoring = false; recoveringAudio = false
         switch status {
         case .active:
@@ -323,6 +327,7 @@ import UIKit
         if monitoring, let lastSampleAt, now.timeIntervalSince(lastSampleAt) > 3 {
             stop(); error = "Monitoring stopped: microphone samples stopped arriving."; needsRestart = true; log.record("audio_stalled")
         }
+        scheduleHeartbeatIfDue()
     }
     func tick() async {
         guard connectivity.available else {
@@ -347,7 +352,7 @@ import UIKit
                 }
                 if now.timeIntervalSince(lastRefreshAt) >= 15 { await refreshParent() }
             } else if role == .listener {
-                if monitoring && currentTime().timeIntervalSince(lastHeartbeatAt) >= 60 { await queueHeartbeat()?.value }
+                scheduleHeartbeatIfDue()
                 guard revision == environmentRevision, role == .listener, storageHealthy else { return }
                 await alerts.deliverReady(snapshot.pending, listenerId: client.credential.deviceId, now: currentTime(), sender: client) { alert, result in
                     switch result {
@@ -357,11 +362,14 @@ import UIKit
                     case .success(let receipt) where receipt.status == "acknowledged":
                         engine.acknowledged(alert.eventId)
                         deliveryStatus = "Alert acknowledged on Parent"
+                    case .success(let receipt) where receipt.status == "failed":
+                        engine.permanentlyFailed(alert.eventId, at: currentTime())
+                        deliveryStatus = "Alert delivery failed. Check Worker/APNs diagnostics."
+                        log.record("alert_delivery_failed")
                     case .success(let receipt):
                         engine.failed(alert.eventId, at: Date())
                         switch receipt.status {
                         case "uncertain": deliveryStatus = "Alert delivery uncertain. Check the Parent iPhone."
-                        case "failed": deliveryStatus = "Alert delivery failed. Check Worker/APNs diagnostics."
                         case "blocked": deliveryStatus = "Alert blocked. Open Parent Mode and enable notifications."
                         default: deliveryStatus = "Alert queued on server (\(receipt.status))."
                         }
@@ -399,6 +407,12 @@ import UIKit
             }
         }
     }
+    private func scheduleHeartbeatIfDue() {
+        guard connectivity.available, monitoring,
+              currentTime().timeIntervalSince(lastHeartbeatAt) >= 60,
+              queuedHeartbeatGeneration != monitoringGeneration else { return }
+        queueHeartbeat()
+    }
     /// Capture the Listener identity and payload synchronously, including before a
     /// role change. Serialize requests so an older active heartbeat cannot win.
     @discardableResult private func queueHeartbeat() -> Task<Void, Never>? {
@@ -410,17 +424,24 @@ import UIKit
                               batteryLevel: batteryLevel, powerConnected: powerConnected, state: state,
                               currentEpisode: snapshot.current.map(remote), episodes: Array(snapshot.history.prefix(100)).map(remote))
         let revision = environmentRevision, generation = settingsGeneration
+        let observation = monitoringGeneration
+        queuedHeartbeatGeneration = observation
         let previous = heartbeatTask
         let task = Task { [weak self] in
+            defer {
+                if self?.queuedHeartbeatGeneration == observation { self?.queuedHeartbeatGeneration = nil }
+            }
             await previous?.value
             guard !Task.isCancelled else { return }
             do {
                 let config = try await client.heartbeat(value)
-                guard let self, revision == self.environmentRevision else { return }
+                guard let self, revision == self.environmentRevision,
+                      observation == self.monitoringGeneration else { return }
                 self.lastHeartbeatAt = self.currentTime(); self.deliveryStatus = "Connected"
                 if !self.settingsDirty, generation == self.settingsGeneration { self.applyRemote(config) }
             } catch {
-                guard let self, revision == self.environmentRevision else { return }
+                guard let self, revision == self.environmentRevision,
+                      observation == self.monitoringGeneration else { return }
                 self.deliveryStatus = "Monitoring locally. Alerts may be delayed: \(error.localizedDescription)"
             }
         }

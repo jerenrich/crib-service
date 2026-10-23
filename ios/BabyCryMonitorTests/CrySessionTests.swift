@@ -185,4 +185,48 @@ final class CrySessionTests: XCTestCase {
         let restored = try JSONDecoder().decode(SessionSnapshot.self, from: encoded)
         XCTAssertNil(restored.pending.first?.alert.isTest)
     }
+    func testPermanentFailureRetiresOnlyMatchingAlertAndSurvivesRelaunch() throws {
+        var s = Simulation(); s.run(306)
+        let alert = try XCTUnwrap(s.emitted.first)
+        let other = s.engine.queueTestAlert(listenerId: s.listener)
+        s.engine.suspend()
+        s.engine.permanentlyFailed(alert.eventId, at: s.time)
+        s.engine.permanentlyFailed(alert.eventId, at: s.time)
+        s.engine.permanentlyFailed(UUID(), at: s.time)
+        XCTAssertEqual(s.engine.snapshot.pending.map { $0.alert.eventId }, [other.eventId])
+        XCTAssertEqual(s.engine.snapshot.failedAlerts.map(\.alert), [alert])
+        XCTAssertNil(s.engine.snapshot.history.first?.alertSentAt)
+        let data = try JSONEncoder().encode(s.engine.snapshot)
+        var restored = CrySessionManager(snapshot: try JSONDecoder().decode(SessionSnapshot.self, from: data))
+        restored.recoverAfterRelaunch()
+        XCTAssertEqual(restored.snapshot.failedAlerts.first?.failedAt, s.time)
+        XCTAssertEqual(restored.snapshot.failedAlerts.map(\.alert), [alert])
+        XCTAssertEqual(restored.snapshot.pending.map { $0.alert.eventId }, [other.eventId])
+    }
+    func testPermanentFailureHistoryIsBoundedAndKeepsNewestFailures() {
+        var engine = CrySessionManager()
+        let listener = UUID()
+        var newest: UUID?
+        for index in 0..<105 {
+            let alert = engine.queueTestAlert(listenerId: listener)
+            engine.permanentlyFailed(alert.eventId, at: Date(timeIntervalSince1970: Double(index)))
+            newest = alert.eventId
+        }
+        XCTAssertTrue(engine.snapshot.pending.isEmpty)
+        XCTAssertEqual(engine.snapshot.failedAlerts.count, 100)
+        XCTAssertEqual(engine.snapshot.failedAlerts.first?.id, newest)
+        XCTAssertEqual(engine.snapshot.failedAlerts.last?.failedAt, Date(timeIntervalSince1970: 5))
+    }
+    func testLegacySnapshotsWithoutFailureHistoryPreservePendingAlerts() throws {
+        var s = Simulation(); s.run(306)
+        let data = try JSONEncoder().encode(s.engine.snapshot)
+        var legacy = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        legacy.removeValue(forKey: "failedAlerts")
+        let restored = try JSONDecoder().decode(SessionSnapshot.self, from: JSONSerialization.data(withJSONObject: legacy))
+        XCTAssertTrue(restored.failedAlerts.isEmpty)
+        XCTAssertEqual(restored.pending.map(\.alert), s.engine.snapshot.pending.map(\.alert))
+        XCTAssertEqual(restored.current?.id, s.engine.snapshot.current?.id)
+        XCTAssertEqual(restored.configuration, s.engine.snapshot.configuration)
+        XCTAssertThrowsError(try JSONDecoder().decode(SessionSnapshot.self, from: Data("{}".utf8)))
+    }
 }

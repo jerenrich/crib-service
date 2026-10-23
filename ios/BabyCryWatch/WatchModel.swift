@@ -91,7 +91,7 @@ import UserNotifications
         guard value.updatedAt >= snapshot.updatedAt || !snapshot.parentMode else { return }
         snapshot = value
         if let data = try? JSONEncoder().encode(value) { UserDefaults.standard.set(data, forKey: "watchSnapshot") }
-        if let message = value.message { notice = message }
+        notice = value.message
         if let incoming = value.alert, !acknowledgedEpisodes.contains(incoming.episodeId) {
             if localAlert == nil || incoming.createdAt >= localAlert!.createdAt { alert = incoming }
         } else if value.statusAvailable && (localAlert == nil || value.updatedAt >= localAlert!.createdAt) {

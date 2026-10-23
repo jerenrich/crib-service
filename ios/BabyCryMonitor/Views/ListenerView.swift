@@ -44,6 +44,9 @@ struct ListenerView: View {
                 Caption(text: "Listener status")
                 Text(model.deliveryStatus).font(.subheadline).foregroundStyle(Palette.muted)
                 if !model.snapshot.pending.isEmpty { Text("\(model.snapshot.pending.count) pending alert(s)").foregroundStyle(Palette.amber) }
+                if let failure = model.snapshot.failedAlerts.first {
+                    Text("Last alert delivery failed \(failure.failedAt.formatted(date: .abbreviated, time: .shortened)).").foregroundStyle(Palette.amber)
+                }
                 HStack { Label(model.powerConnected ? "Connected" : "On battery", systemImage: "powerplug"); Spacer(); Text(model.batteryLevel.map { "\(Int($0 * 100))%" } ?? "Battery unknown") }.font(.subheadline)
                 if !model.powerConnected, let battery = model.batteryLevel, battery < 0.2 { Label("Low battery · Connect power", systemImage: "battery.25percent").foregroundStyle(Palette.amber) }
             }

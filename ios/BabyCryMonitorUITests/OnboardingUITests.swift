@@ -24,13 +24,22 @@ final class OnboardingUITests: XCTestCase {
         if !diagnostics.isHittable { app.swipeUp() }
         XCTAssertTrue(diagnostics.exists); diagnostics.tap()
         XCTAssertTrue(app.navigationBars["Diagnostics"].waitForExistence(timeout: 5))
-        let remoteTest = app.buttons["Send test push"]
-        for _ in 0..<4 { if remoteTest.exists && remoteTest.isHittable { break }; app.swipeUp() }
+        let form = app.descendants(matching: .any)["diagnosticsForm"]
+        XCTAssertTrue(form.waitForExistence(timeout: 5))
+        let remoteTest = app.buttons["diagnosticsSendTestPush"]
+        // Disabled controls need not be hittable. Scope scrolling to the active
+        // form and use identifiers so the underlying Listener cannot match.
+        for _ in 0..<10 { if remoteTest.exists { break }; scrollDown(in: form) }
         XCTAssertTrue(remoteTest.exists)
         XCTAssertFalse(remoteTest.isEnabled)
-        let trigger = app.buttons["Trigger Threshold"]
-        for _ in 0..<4 { if trigger.exists && trigger.isHittable { break }; app.swipeUp() }
-        XCTAssertTrue(trigger.exists); trigger.tap()
+        let trigger = app.buttons["simulationTriggerThreshold"]
+        for _ in 0..<10 { if trigger.exists && trigger.isHittable { break }; scrollDown(in: form) }
+        guard trigger.exists && trigger.isHittable else { XCTFail("Simulation threshold control is not visible"); return }
+        trigger.tap()
         XCTAssertTrue(app.staticTexts["Generated events: 1"].waitForExistence(timeout: 5))
+    }
+    @MainActor private func scrollDown(in element: XCUIElement) {
+        element.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.8))
+            .press(forDuration: 0.05, thenDragTo: element.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)))
     }
 }

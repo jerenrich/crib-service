@@ -46,6 +46,10 @@ The alert clock begins **at confirmation**, rather than at the first loud sample
 
 An initial event UUID and queue timestamp are saved atomically before any request. An episode creates exactly one initial event locally; optional repeat events have their own UUIDs and occur every two or five minutes from the previous queued event. Retries reuse the same UUID with exponential backoff (2 seconds to 5 minutes). Network failures do not reset cry timing. `alertSentAt` means APNs accepted the request, **not** that the Parent or Watch displayed it.
 
+Heartbeats run independently of alert uploads. A suspended heartbeat cannot delay a ready alert, and a suspended alert upload cannot prevent fresh monitoring status. Heartbeat requests remain serialized, with duplicate requests suppressed for the same monitoring state. Responses from before a stop/restart cannot mark the new monitoring session as freshly reported.
+
+A terminal `failed` receipt moves the alert out of the retry queue into persistent local failure history without setting `alertSentAt`. The Listener and diagnostics show these failures; other alerts can still be delivered. Older saved snapshots without failure history remain compatible.
+
 An interruption or sample gap over two seconds ends the observed episode. The app cannot infer crying while the microphone is unavailable. A three-second capture watchdog visibly stops a stalled engine. Calls, route changes, and media-services resets attempt recovery when the audio session permits it. Relaunch ends any saved active episode at its last observed sample, preserves queued alerts/history, and requires monitoring to be restarted. It never assumes the microphone kept running after process termination.
 
 The iPhone and Watch display name is **Crib Service**. Internal Xcode target names, bundle identifiers, Keychain service names, and backend resource names retain their original values so existing installations, pairing, stored data, and push topics continue to work.
@@ -200,6 +204,8 @@ While the Watch alert screen is active, a recent alert repeats a notification ha
 
 Hardware vibration, Focus routing, background push receipt, and overnight wake effectiveness require physical testing; simulator builds cannot validate them.
 
+Validation on 23 October 2026: unsigned watchOS device and combined iPhone/Watch device builds passed. After the delivery fixes, 30 Foundation core tests, 31 Worker tests, 53 iOS unit tests (including four Watch/iPhone integration tests), and the onboarding UI test passed. Coverage includes direct Watch routing, encrypted token registration/removal, invalid-token fallback, ambiguous-delivery duplicate prevention, suspended network requests, restart races, persistent failure history, and old snapshot compatibility. Hardware push delivery, background vibration, and overnight wake effectiveness remain unverified.
+
 Build the companion with:
 
 ```sh
@@ -261,7 +267,7 @@ Unit tests cover brief noise, shorter episodes, confirmation-based timing, exact
 
 Microphone buffers exist only transiently in AVFoundation. dBFS, ambient estimates, and local episode maximum/average levels remain local. HTTPS sends device authentication, push token, pairing code, configuration, timestamps, episode start/end/alert metadata, state, power/battery metadata, and alert events. No audio or acoustic feature vectors are serialized. Device metadata and episodes are sensitive; the Worker/database operator can access them.
 
-Local history holds the last 100 completed episodes; diagnostics hold the last 500 lines. D1 receives at most 100 episode metadata records in the latest heartbeat. Events/deduplication records retain 30 days; events older than 24 hours do not produce a new delayed push. Existing blocked/pending/uncertain events remain visible in status. Registration/pairing records and the last heartbeat remain until administrative deletion; there is no self-service account or deletion screen. The local outbox remains until APNs acceptance; blocked/failed/uncertain entries need deployment/token repair or manual review and are never shown as successful.
+Local history holds the last 100 completed episodes and the last 100 failed alert deliveries; diagnostics hold the last 500 lines. D1 receives at most 100 episode metadata records in the latest heartbeat. Events/deduplication records retain 30 days; events older than 24 hours do not produce a new delayed push. Existing blocked/pending/uncertain events remain visible in status. Registration/pairing records and the last heartbeat remain until administrative deletion; there is no self-service account or deletion screen. The local outbox retains alerts until APNs acceptance, acknowledgement, or a terminal failure. Terminal failures move to local failure history and are not retried. Blocked and uncertain entries require deployment/token repair or manual review and are never shown as successful.
 
 The privacy manifest declares app-functional device identifiers and other metadata, plus the UserDefaults required-reason API. Verify App Store privacy labels and your privacy policy for the actual deployment/retention before distribution.
 
