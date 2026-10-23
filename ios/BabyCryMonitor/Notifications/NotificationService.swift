@@ -38,7 +38,7 @@ extension NotificationProviding { var authorizationAllowed: Bool { false } }
             status = allowed ? "Registering for push notifications…" : "Notifications disabled. Enable them in iPhone Settings."
             log?.record(allowed ? "notification_permission_allowed" : "notification_permission_denied")
             if allowed { UIApplication.shared.registerForRemoteNotifications() }
-        } catch { status = "Could not request notification permission."; log?.record("notification_permission_failed", code: (error as NSError).code) }
+        } catch { status = "Could not request notification permission."; log?.record("notification_permission_failed", error: error) }
     }
     func registered(_ token: Data) {
         status = "Push token registered"
@@ -54,7 +54,7 @@ extension NotificationProviding { var authorizationAllowed: Bool { false } }
         do {
             try await UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: alert.eventId.uuidString, content: content, trigger: nil))
             log?.record("local_notification_scheduled")
-        } catch { log?.record("local_notification_failed", code: (error as NSError).code); throw error }
+        } catch { log?.record("local_notification_failed", error: error); throw error }
     }
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
         await refresh(); return [.banner, .list]
@@ -66,7 +66,7 @@ extension NotificationProviding { var authorizationAllowed: Bool { false } }
     var notifications: (any NotificationProviding)?
     func application(_ application: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) { notifications?.registered(deviceToken) }
     func application(_ application: UIApplication, didFailToRegisterForRemoteNotificationsWithError error: Error) {
-        (notifications as? NotificationService)?.log?.record("push_registration_failed", code: (error as NSError).code)
+        (notifications as? NotificationService)?.log?.record("push_registration_failed", error: error)
         notifications?.failed()
     }
 }

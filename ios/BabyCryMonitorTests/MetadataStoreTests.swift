@@ -27,7 +27,10 @@ final class MetadataStoreTests: XCTestCase {
         let store = try MetadataStore(directory: directory)
         let missing = try store.load(); XCTAssertTrue(missing.pending.isEmpty)
         try Data("invalid metadata".utf8).write(to: directory.appendingPathComponent("listener-metadata.json"))
-        XCTAssertThrowsError(try store.load())
+        XCTAssertThrowsError(try store.load()) { error in
+            XCTAssertEqual((error as? MetadataStoreError)?.operation, .decode)
+            XCTAssertTrue((error as? MetadataStoreError)?.underlyingError is DecodingError)
+        }
     }
 }
 #endif

@@ -312,3 +312,21 @@ Next three highest-value improvements:
 - [Apple: handling audio interruptions](https://developer.apple.com/documentation/avfaudio/handling-audio-interruptions)
 - [Cloudflare: D1 queries](https://developers.cloudflare.com/d1/best-practices/query-d1/)
 - [Cloudflare: Workers Vitest integration](https://developers.cloudflare.com/workers/testing/vitest-integration/)
+
+### Exception diagnostics
+
+The on-device diagnostic export includes redacted exception details for storage, audio, network,
+pairing, credentials, notifications, and Watch sync failures. Entries identify known error domains,
+numeric codes, common file-error categories, and up to three underlying causes. JSON decoding and
+encoding errors include a bounded path made from known schema field names and array indices; unknown
+keys are redacted. Raw exception descriptions, payload values, file paths, URLs, tokens, pairing codes,
+and server response bodies are excluded. Repeated failures are sampled by their exception details so
+a changed cause remains visible. These details apply to new failures after installing this build;
+previous entries cannot be reconstructed.
+
+Metadata failures include the operation (`metadata_directory`, `metadata_read`, `metadata_decode`,
+`metadata_encode`, `metadata_write`, or `metadata_backup_exclusion`). A later blocked Start attempt
+logs the retained exception again as `monitoring_start_blocked_storage`. Safety acceptance has its
+own message and diagnostic event. `persistence=available` describes the diagnostic log file only;
+a failure to save that log adds `diagnostic_storage_error` to the in-memory export. Local monitoring
+data is never deleted or reset as part of logging.

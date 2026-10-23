@@ -134,7 +134,7 @@ final class AppModelTests: XCTestCase {
         let listener: DeviceCredential
         final class Time { var now = Date() }
         let time: Time
-        init(pending: Bool = false, automaticallyStart: Bool = false, logEvents: [String] = [], heartbeatJitter: @escaping () -> Double = { 1 }) throws {
+        init(pending: Bool = false, automaticallyStart: Bool = false, logEvents: [String] = [], snapshotData: Data? = nil, heartbeatJitter: @escaping () -> Double = { 1 }) throws {
             suite = "AppModelTests.\(UUID())"
             defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
             directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -152,6 +152,7 @@ final class AppModelTests: XCTestCase {
                     createdAt: Date().addingTimeInterval(-1), isRepeat: false))]
             }
             try store.save(snapshot)
+            if let snapshotData { try snapshotData.write(to: directory.appendingPathComponent("listener-metadata.json")) }
             let backend = Backend(credential: listener); self.backend = backend
             let time = Time(); self.time = time
             let log = DiagnosticLog(directory: directory)
@@ -174,6 +175,37 @@ final class AppModelTests: XCTestCase {
         return false
     }
 
+    @MainActor func testMetadataDecodeFailureAndBlockedStartRetainTheException() async throws {
+        let fixture = try Fixture(snapshotData: Data("{}".utf8))
+        let model = fixture.model
+        XCTAssertTrue(model.log.export.contains("metadata_load_failed operation=metadata_decode"))
+        XCTAssertTrue(model.log.export.contains("error=decoding_key_not_found path=$.configuration"))
+        model.error = nil
+        await model.start()
+        XCTAssertFalse(model.monitoring)
+        XCTAssertTrue(model.log.export.contains("monitoring_start_blocked_storage operation=metadata_decode"))
+        XCTAssertTrue(model.error?.contains("Local monitoring data is unavailable") == true)
+        // Preserve the original file for investigation; logging must not reset local history or alerts.
+        XCTAssertEqual(try Data(contentsOf: fixture.directory.appendingPathComponent("listener-metadata.json")), Data("{}".utf8))
+    }
+    @MainActor func testMetadataWriteFailureIsRetainedForLaterStartAttempts() async throws {
+        let fixture = try Fixture()
+        let file = fixture.directory.appendingPathComponent("listener-metadata.json")
+        try FileManager.default.removeItem(at: file)
+        try FileManager.default.createDirectory(at: file, withIntermediateDirectories: false)
+        fixture.model.saveSettings(MonitoringConfiguration())
+        XCTAssertTrue(fixture.model.log.export.contains("metadata_write_failed operation=metadata_write"))
+        await fixture.model.start()
+        XCTAssertFalse(fixture.model.monitoring)
+        XCTAssertTrue(fixture.model.log.export.contains("monitoring_start_blocked_storage operation=metadata_write"))
+    }
+    @MainActor func testMissingSafetyAcceptanceHasItsOwnStartDiagnostic() async throws {
+        let fixture = try Fixture()
+        fixture.model.safetyAccepted = false
+        await fixture.model.start()
+        XCTAssertTrue(fixture.model.log.export.contains("monitoring_start_blocked_safety"))
+        XCTAssertFalse(fixture.model.log.export.contains("monitoring_start_blocked_storage"))
+    }
     @MainActor func testCalibrationCannotCreateLiveEpisodesOrAlerts() async throws {
         let fixture = try Fixture()
         await fixture.model.beginCalibration()

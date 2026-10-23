@@ -19,8 +19,9 @@ import UserNotifications
     override private init() {
         super.init()
         log.record("app_launched")
-        if let data = UserDefaults.standard.data(forKey: "watchSnapshot"), let saved = try? JSONDecoder().decode(WatchSnapshot.self, from: data) {
-            snapshot = saved
+        if let data = UserDefaults.standard.data(forKey: "watchSnapshot") {
+            do { snapshot = try JSONDecoder().decode(WatchSnapshot.self, from: data) }
+            catch { log.record("watch_snapshot_failed", error: error) }
         }
         alertState.sendAcknowledgement = { [weak self] command in
             self?.log.record("watch_command_queued")
@@ -63,14 +64,14 @@ import UserNotifications
             } else {
                 alertSetup.updateAuthorization(false, registeredOnPhone: snapshot.watchPushRegistered)
             }
-        } catch { log.record("notification_permission_failed", code: (error as NSError).code) }
+        } catch { log.record("notification_permission_failed", error: error) }
     }
     func registered(_ data: Data) {
         log.record("push_token_received")
         alertSetup.receivedToken(data.map { String(format: "%02x", $0) }.joined())
     }
     func registrationFailed(_ error: Error) {
-        log.record("push_registration_failed", code: (error as NSError).code)
+        log.record("push_registration_failed", error: error)
         alertSetup.fail("Could not register this Watch with Apple. Check its internet connection, then tap Retry setup.")
     }
     func refresh() { send(WatchCommand(kind: .refresh)) }
@@ -100,7 +101,7 @@ import UserNotifications
             try await UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "watch-wrist-test", content: content, trigger: UNTimeIntervalNotificationTrigger(timeInterval: 10, repeats: false)))
             log.record("local_notification_scheduled")
             notice = "Test in 10 seconds. Lower your wrist. Use Silent Mode for vibration only."
-        } catch { notice = "Could not schedule the wrist test. Try again."; log.record("local_notification_failed", code: (error as NSError).code) }
+        } catch { notice = "Could not schedule the wrist test. Try again."; log.record("local_notification_failed", error: error) }
     }
 
     private func accept(_ value: WatchSnapshot) {
@@ -110,13 +111,17 @@ import UserNotifications
         snapshot = value
         alertSetup.accept(value)
         log.record("watch_snapshot_received")
-        if let data = try? JSONEncoder().encode(value) { UserDefaults.standard.set(data, forKey: "watchSnapshot") }
+        do { UserDefaults.standard.set(try JSONEncoder().encode(value), forKey: "watchSnapshot") }
+        catch { log.record("watch_snapshot_failed", error: error) }
         notice = value.message
         alertState.acceptAlert(from: value)
     }
 
     @discardableResult private func send(_ command: WatchCommand, durable: Bool = false) -> Bool {
-        guard WCSession.isSupported(), let data = try? JSONEncoder().encode(command) else { return false }
+        guard WCSession.isSupported() else { return false }
+        let data: Data
+        do { data = try JSONEncoder().encode(command) }
+        catch { log.record("watch_command_failed", error: error); return false }
         let session = WCSession.default
         guard session.activationState == .activated else {
             notice = "Connecting to your iPhone. Keep the Parent app open and try again."
@@ -135,28 +140,32 @@ import UserNotifications
             let data = reply["snapshot"] as? Data
             Task { @MainActor in
                 self.refreshing = false
-                if let data, let value = try? JSONDecoder().decode(WatchSnapshot.self, from: data) { self.accept(value) }
+                if let data { self.receiveSnapshot(data) }
             }
-        }, errorHandler: { @Sendable _ in
-            Task { @MainActor in self.refreshing = false; self.notice = "iPhone sync unavailable. Open the Parent app and try again."; self.log.record("watch_sync_failed") }
+        }, errorHandler: { @Sendable error in
+            Task { @MainActor in self.refreshing = false; self.notice = "iPhone sync unavailable. Open the Parent app and try again."; self.log.record("watch_sync_failed", error: error) }
         })
         return true
     }
 
+    private func receiveSnapshot(_ data: Data) {
+        do { accept(try JSONDecoder().decode(WatchSnapshot.self, from: data)) }
+        catch { log.record("watch_snapshot_failed", error: error) }
+    }
+
     nonisolated func session(_ session: WCSession, activationDidCompleteWith activationState: WCSessionActivationState, error: Error?) {
         let data = session.receivedApplicationContext["snapshot"] as? Data
-        let code = (error as NSError?)?.code
         Task { @MainActor in
-            self.log.record(code == nil ? "watch_activated" : "watch_activation_failed", code: code)
-            if let data, let value = try? JSONDecoder().decode(WatchSnapshot.self, from: data) { self.accept(value) }
+            self.log.record(error == nil ? "watch_activated" : "watch_activation_failed", error: error)
+            if let data { self.receiveSnapshot(data) }
             self.alertState.retryPendingAcknowledgement()
             self.alertSetup.retryRegistration()
             self.refresh()
         }
     }
     nonisolated func session(_ session: WCSession, didReceiveApplicationContext applicationContext: [String: Any]) {
-        guard let data = applicationContext["snapshot"] as? Data, let value = try? JSONDecoder().decode(WatchSnapshot.self, from: data) else { return }
-        Task { @MainActor in self.accept(value) }
+        guard let data = applicationContext["snapshot"] as? Data else { return }
+        Task { @MainActor in self.receiveSnapshot(data) }
     }
     nonisolated func sessionReachabilityDidChange(_ session: WCSession) {
         Task { @MainActor in

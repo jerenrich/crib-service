@@ -43,7 +43,7 @@ enum AudioCaptureStatus {
             onStatus?(.active)
         } catch {
             if generation == expected { wantsMonitoring = false }
-            log?.record("monitoring_start_failed", code: (error as NSError).code)
+            log?.record("monitoring_start_failed", error: error)
             throw error
         }
     }
@@ -86,7 +86,7 @@ enum AudioCaptureStatus {
             onStatus?(.active)
         } catch {
             guard generation == expected, wantsMonitoring else { return }
-            log?.record("audio_interrupted", code: (error as NSError).code)
+            log?.record("audio_interrupted", error: error)
             onStatus?(.failed("Microphone unavailable. Open the app to restart monitoring."))
         }
     }
@@ -134,7 +134,10 @@ private actor AudioCaptureDriver {
         sessionActive = false
     }
 }
-private enum AudioError: LocalizedError {
+private enum AudioError: LocalizedError, CustomNSError {
+    static var errorDomain: String { "CribService.Audio" }
+    var errorCode: Int { 1 }
+    var errorUserInfo: [String: Any] { [NSLocalizedDescriptionKey: errorDescription ?? "Microphone unavailable."] }
     case unavailable
     var errorDescription: String? { "Microphone unavailable. Check the audio input and try again." }
 }

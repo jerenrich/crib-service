@@ -110,20 +110,25 @@ struct BackendClient: BackendServing {
         request.httpMethod = method; request.timeoutInterval = 20
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(credential.deviceId.uuidString.lowercased()).\(credential.secret)", forHTTPHeaderField: "Authorization")
-        let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
-        if let body { request.httpBody = try encoder.encode(body) }
         let operation = ["/v1/device/register": "register", "/v1/pairing/create": "pairing_create", "/v1/pairing/claim": "pairing_claim",
                          "/v1/device/push-token": "push_token", "/v1/device/watch-push-token": "watch_token",
                          "/v1/listener/heartbeat": "heartbeat", "/v1/listener/event": "alert", "/v1/listener/status": "status",
                          "/v1/settings": "settings", "/v1/alert/acknowledge": "acknowledge", "/v1/test-push": "test_push",
                          "/v1/connection-alerts": "connection_preferences", "/v1/pairing/remove": "unpair", "/v1/device/delete": "delete_device"][path] ?? "unknown"
         let started = Date()
+        let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+        do { if let body { request.httpBody = try encoder.encode(body) } }
+        catch {
+            await log?.network(operation: operation, outcome: "encode_error",
+                               elapsedMS: Int(Date().timeIntervalSince(started) * 1000), error: error)
+            throw error
+        }
         let data: Data, rawResponse: URLResponse
         do { (data, rawResponse) = try await session.data(for: request) }
         catch {
             let code = (error as? URLError)?.code.rawValue
             await log?.network(operation: operation, outcome: code == URLError.cancelled.rawValue ? "cancelled" : "transport_error",
-                               status: code, elapsedMS: Int(Date().timeIntervalSince(started) * 1000))
+                               status: code, elapsedMS: Int(Date().timeIntervalSince(started) * 1000), error: error)
             throw error
         }
         guard let response = rawResponse as? HTTPURLResponse else {
@@ -144,7 +149,9 @@ struct BackendClient: BackendServing {
             let formatter = ISO8601DateFormatter(); formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
             if let date = formatter.date(from: value) { return date }
             formatter.formatOptions = [.withInternetDateTime]
-            guard let date = formatter.date(from: value) else { throw BackendError.message("Invalid server timestamp.") }
+            guard let date = formatter.date(from: value) else {
+                throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Invalid server timestamp."))
+            }
             return date
         }
         do {
@@ -154,7 +161,7 @@ struct BackendClient: BackendServing {
             return result
         } catch {
             await log?.network(operation: operation, outcome: "decode_error", status: response.statusCode, requestID: requestID,
-                               elapsedMS: Int(Date().timeIntervalSince(started) * 1000), storageUnavailable: storageUnavailable)
+                               elapsedMS: Int(Date().timeIntervalSince(started) * 1000), storageUnavailable: storageUnavailable, error: error)
             throw error
         }
     }

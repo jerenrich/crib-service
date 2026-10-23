@@ -22,9 +22,12 @@ import Observation
         latest = snapshot
         guard WCSession.isSupported(), WCSession.default.activationState == .activated else { return }
         updateState()
-        guard installed, let data = try? JSONEncoder().encode(snapshot) else { return }
-        do { try WCSession.default.updateApplicationContext(["snapshot": data]) }
-        catch { status = "Watch status sync is temporarily unavailable."; log?.record("watch_snapshot_failed", code: (error as NSError).code) }
+        guard installed else { return }
+        do {
+            let data = try JSONEncoder().encode(snapshot)
+            try WCSession.default.updateApplicationContext(["snapshot": data])
+        }
+        catch { status = "Watch status sync is temporarily unavailable."; log?.record("watch_snapshot_failed", error: error) }
     }
 
     private func updateState() {
@@ -36,8 +39,7 @@ import Observation
     }
 
     nonisolated func session(_ session: WCSession, activationDidCompleteWith activationState: WCSessionActivationState, error: Error?) {
-        let code = (error as NSError?)?.code
-        Task { @MainActor in self.log?.record(code == nil ? "watch_activated" : "watch_activation_failed", code: code); self.publish(self.latest) }
+        Task { @MainActor in self.log?.record(error == nil ? "watch_activated" : "watch_activation_failed", error: error); self.publish(self.latest) }
     }
     nonisolated func sessionReachabilityDidChange(_ session: WCSession) {
         Task { @MainActor in self.updateState(); self.log?.record(self.reachable ? "watch_reachable" : "watch_unreachable") }
@@ -47,18 +49,26 @@ import Observation
     }
     nonisolated func sessionDidBecomeInactive(_ session: WCSession) {}
     nonisolated func sessionDidDeactivate(_ session: WCSession) { session.activate() }
+    private nonisolated func decodeCommand(_ data: Data) -> WatchCommand? {
+        do { return try JSONDecoder().decode(WatchCommand.self, from: data) }
+        catch {
+            Task { @MainActor in self.log?.record("watch_command_failed", error: error) }
+            return nil
+        }
+    }
     nonisolated func session(_ session: WCSession, didReceiveMessage message: [String: Any], replyHandler: @escaping @Sendable ([String: Any]) -> Void) {
-        guard let data = message["command"] as? Data, let command = try? JSONDecoder().decode(WatchCommand.self, from: data) else {
+        guard let data = message["command"] as? Data, let command = decodeCommand(data) else {
             replyHandler([:]); return
         }
         Task { @MainActor in
             let snapshot = await self.onCommand?(command) ?? self.latest
             self.publish(snapshot)
-            replyHandler(["snapshot": (try? JSONEncoder().encode(snapshot)) ?? Data()])
+            do { replyHandler(["snapshot": try JSONEncoder().encode(snapshot)]) }
+            catch { self.log?.record("watch_snapshot_failed", error: error); replyHandler([:]) }
         }
     }
     nonisolated func session(_ session: WCSession, didReceiveUserInfo userInfo: [String: Any]) {
-        guard let data = userInfo["command"] as? Data, let command = try? JSONDecoder().decode(WatchCommand.self, from: data) else { return }
+        guard let data = userInfo["command"] as? Data, let command = decodeCommand(data) else { return }
         Task { @MainActor in
             if let snapshot = await self.onCommand?(command) { self.publish(snapshot) }
         }

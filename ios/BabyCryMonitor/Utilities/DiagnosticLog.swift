@@ -4,6 +4,7 @@ import Observation
 @MainActor @Observable final class DiagnosticLog {
     private(set) var lines: [String] = []
     private(set) var persistenceAvailable = true
+    private(set) var persistenceFailure: String?
     private let url: URL?
     private var recent: [String: Date] = [:]
     private static let events: Set<String> = [
@@ -21,7 +22,10 @@ import Observation
         "notification_permission_allowed", "notification_permission_denied", "notification_permission_failed",
         "push_registration_failed", "local_notification_scheduled", "local_notification_failed", "watch_sync_failed", "watch_token_synced",
         "watch_acknowledged", "watch_activation_failed", "watch_activated", "watch_reachable", "watch_unreachable",
-        "watch_snapshot_failed", "watch_snapshot_received", "watch_command_queued", "watch_push_received"
+        "watch_snapshot_failed", "watch_snapshot_received", "watch_command_queued", "watch_command_failed", "watch_push_received",
+        "monitoring_start_blocked_safety", "monitoring_start_blocked_storage", "test_push_failed",
+        "acknowledgement_failed", "connection_preferences_failed", "device_removal_failed",
+        "calibration_failed", "listener_status_failed"
     ]
     init(directory: URL? = nil) {
         let folder = directory ?? (try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true))
@@ -33,26 +37,29 @@ import Observation
                 let text = try String(contentsOf: url, encoding: .utf8)
                 lines = Array(text.components(separatedBy: "\n").filter { !$0.isEmpty }.suffix(500))
             }
-        } catch { persistenceAvailable = false }
+        } catch { persistenceAvailable = false; persistenceFailure = Self.errorDetails(error) }
     }
-    func record(_ event: String, code: Int? = nil) {
+    func record(_ event: String, code: Int? = nil, error: (any Error)? = nil) {
         // Enforced allowlist: callers cannot accidentally append an exception, token or URL.
         guard Self.events.contains(event) else { return }
         let repetitive: Set<String> = ["alert_retry_scheduled", "alert_uncertain", "alert_blocked", "alert_server_pending",
                                       "heartbeat_retry_scheduled", "settings_sync_failed", "parent_status_failed",
-                                      "backend_unavailable", "watch_sync_failed", "watch_snapshot_failed", "watch_snapshot_received"]
-        let fingerprint = "event_\(event)_\(code ?? 0)"
+                                      "backend_unavailable", "watch_sync_failed", "watch_snapshot_failed", "watch_snapshot_received",
+                                      "listener_status_failed", "monitoring_start_blocked_storage", "monitoring_start_blocked_safety"]
+        let details = error.map { Self.errorDetails($0) } ?? ""
+        let fingerprint = "event_\(event)_\(code ?? 0)_\(details)"
         if repetitive.contains(event), let last = recent[fingerprint], Date().timeIntervalSince(last) < 60 { return }
         recent[fingerprint] = Date()
-        append(event + (code.map { " code=\($0)" } ?? ""))
+        append(event + (code.map { " code=\($0)" } ?? "") + (details.isEmpty ? "" : " " + details))
     }
     func network(operation: String, outcome: String, status: Int? = nil, requestID: UUID? = nil,
-                 elapsedMS: Int, storageUnavailable: Bool = false) {
+                 elapsedMS: Int, storageUnavailable: Bool = false, error: (any Error)? = nil) {
         let operations: Set<String> = ["register", "pairing_create", "pairing_claim", "push_token", "watch_token", "heartbeat", "alert", "status", "settings", "acknowledge", "test_push", "connection_preferences", "unpair", "delete_device"]
-        guard operations.contains(operation), ["ok", "http_error", "transport_error", "decode_error", "cancelled", "invalid_response"].contains(outcome) else { return }
+        guard operations.contains(operation), ["ok", "http_error", "transport_error", "decode_error", "encode_error", "cancelled", "invalid_response"].contains(outcome) else { return }
         // Routine successes are sampled; preserve a failure and its first recovery.
         let failureKey = "failure_\(operation)"
-        let fingerprint = "network_\(operation)_\(outcome)_\(status ?? 0)"
+        let details = error.map { Self.errorDetails($0) } ?? ""
+        let fingerprint = "network_\(operation)_\(outcome)_\(status ?? 0)_\(details)"
         let recovered = outcome == "ok" && recent.removeValue(forKey: failureKey) != nil
         if outcome != "ok" { recent[failureKey] = Date() }
         let routine = ["status", "heartbeat"].contains(operation)
@@ -63,7 +70,79 @@ import Observation
         if let status { entry += " status=\(status)" }
         if let requestID { entry += " request_id=\(requestID.uuidString.lowercased())" }
         if storageUnavailable { entry += " server_diagnostics=unavailable" }
+        if !details.isEmpty { entry += " " + details }
         append(entry)
+    }
+    /// Error descriptions, debug descriptions and userInfo can contain payloads, paths or secrets.
+    /// Export only known categories, numeric codes and allowlisted schema keys, with a bounded cause chain.
+    private static func errorDetails(_ error: any Error, depth: Int = 0) -> String {
+        #if os(iOS)
+        if let failure = error as? MetadataStoreError {
+            return "operation=metadata_\(failure.operation.rawValue) " + errorDetails(failure.underlyingError, depth: depth)
+        }
+        if let failure = error as? KeychainError {
+            return "error=keychain domain=NSOSStatusErrorDomain code=\(failure.status)"
+        }
+        if let failure = error as? BackendError {
+            switch failure {
+            case .message: return "error=backend_configuration_or_response"
+            case .response(let status, _): return "error=backend_http status=\(status)"
+            }
+        }
+        #endif
+        if error is CancellationError { return "error=cancelled" }
+        let nsError = error as NSError
+        let domains: Set<String> = [NSCocoaErrorDomain, NSURLErrorDomain, NSPOSIXErrorDomain, NSOSStatusErrorDomain,
+                                   "AVFoundationErrorDomain", "com.apple.coreaudio.avfaudio", "AVAudioSessionErrorDomain",
+                                   "WCErrorDomain", "UNErrorDomain", "CribService.Audio"]
+        let domain = domains.contains(nsError.domain) ? nsError.domain : "other"
+        var result = "domain=\(domain) code=\(nsError.code)"
+        var context: DecodingError.Context?
+        switch error {
+        case DecodingError.keyNotFound(let key, let value):
+            result += " error=decoding_key_not_found path=\(schemaPath(value.codingPath + [key]))"; context = value
+        case DecodingError.valueNotFound(_, let value):
+            result += " error=decoding_value_not_found path=\(schemaPath(value.codingPath))"; context = value
+        case DecodingError.typeMismatch(_, let value):
+            result += " error=decoding_type_mismatch path=\(schemaPath(value.codingPath))"; context = value
+        case DecodingError.dataCorrupted(let value):
+            result += " error=decoding_data_corrupted path=\(schemaPath(value.codingPath))"; context = value
+        case EncodingError.invalidValue(_, let value):
+            result += " error=encoding_invalid_value path=\(schemaPath(value.codingPath))"
+            if depth < 3, let underlying = value.underlyingError {
+                result += " underlying={\(errorDetails(underlying, depth: depth + 1))}"
+            }
+        default:
+            // Stable descriptions for common failures; no interpolated system exception text.
+            let reasons: [Int: String] = [
+                NSFileNoSuchFileError: "file_not_found", NSFileReadNoPermissionError: "file_read_permission_denied",
+                NSFileReadCorruptFileError: "file_read_corrupt", NSFileReadNoSuchFileError: "file_read_not_found",
+                NSFileWriteNoPermissionError: "file_write_permission_denied", NSFileWriteOutOfSpaceError: "file_write_out_of_space",
+                NSFileWriteVolumeReadOnlyError: "file_write_read_only"
+            ]
+            if nsError.domain == NSCocoaErrorDomain, let reason = reasons[nsError.code] { result += " error=\(reason)" }
+            else if nsError.domain == "CribService.Audio" { result += " error=microphone_input_unavailable" }
+        }
+        if depth < 3, let underlying = context?.underlyingError ?? nsError.userInfo[NSUnderlyingErrorKey] as? any Error {
+            result += " underlying={\(errorDetails(underlying, depth: depth + 1))}"
+        }
+        return result
+    }
+    private static func schemaPath(_ keys: [any CodingKey]) -> String {
+        let allowed: Set<String> = [
+            "configuration", "history", "current", "pending", "failedAlerts", "lastObservedAt", "wasMonitoring",
+            "alertDuration", "quietResetDuration", "sensitivity", "repeatInterval", "absoluteThreshold",
+            "id", "startedAt", "endedAt", "alertQueuedAt", "alertSentAt", "lastAlertQueuedAt", "maximumDBFS", "averageDBFS", "sampleCount",
+            "alert", "attempts", "nextAttemptAt", "failedAt", "eventId", "episodeId", "listenerId", "type", "cryStartedAt",
+            "durationSeconds", "createdAt", "isRepeat", "isTest", "paired", "pairingID", "watchPushRegistered", "phonePushRegistered",
+            "connectionAlertsEnabled", "listenerConfiguration", "lastHeartbeat", "monitoring", "batteryLevel", "powerConnected",
+            "state", "currentEpisode", "episodes", "alerts", "status", "acknowledgedAt", "deliveryTarget", "ok", "expiresAt",
+            "deviceId", "role", "registered", "updatedAt", "parentMode", "message", "acknowledgedEventId", "kind"
+        ]
+        return "$" + keys.prefix(12).map { key in
+            if let index = key.intValue, index >= 0 { return "[\(index)]" }
+            return "." + (allowed.contains(key.stringValue) ? key.stringValue : "<redacted>")
+        }.joined() + (keys.count > 12 ? ".<truncated>" : "")
     }
     private func append(_ event: String) {
         lines.append("\(Date().formatted(.iso8601)) \(event)"); lines = Array(lines.suffix(500))
@@ -78,12 +157,13 @@ import Observation
             var protectedURL = url
             var values = URLResourceValues(); values.isExcludedFromBackup = true
             try protectedURL.setResourceValues(values)
-            persistenceAvailable = true
-        } catch { persistenceAvailable = false }
+            persistenceAvailable = true; persistenceFailure = nil
+        } catch { persistenceAvailable = false; persistenceFailure = Self.errorDetails(error) }
     }
     var export: String {
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
-        return "Crib Service diagnostics · app=\(version) build=\(build) os=\(ProcessInfo.processInfo.operatingSystemVersionString)\npersistence=\(persistenceAvailable ? "available" : "unavailable")\n" + lines.joined(separator: "\n")
+        return "Crib Service diagnostics · app=\(version) build=\(build) os=\(ProcessInfo.processInfo.operatingSystemVersionString)\npersistence=\(persistenceAvailable ? "available" : "unavailable")\n"
+            + (persistenceFailure.map { "diagnostic_storage_error \($0)\n" } ?? "") + lines.joined(separator: "\n")
     }
 }

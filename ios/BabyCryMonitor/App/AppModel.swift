@@ -75,6 +75,7 @@ import UIKit
     @ObservationIgnored private var lastWatchRetryAt = Date.distantPast
     @ObservationIgnored private var watchSyncInFlight = false
     @ObservationIgnored private var storageHealthy = true
+    @ObservationIgnored private var storageFailure: (any Error)?
     @ObservationIgnored private var settingsDirty = false
     @ObservationIgnored private var environmentRevision = 0
     @ObservationIgnored private var latestTestEventID: UUID?
@@ -107,7 +108,7 @@ import UIKit
             engine = CrySessionManager(snapshot: saved); engine.recoverAfterRelaunch()
             configuration = engine.snapshot.configuration
             try store.save(engine.snapshot)
-        } catch { storageHealthy = false; self.error = "Local metadata storage failed: \(error.localizedDescription)"; log.record("metadata_load_failed") }
+        } catch { storageHealthy = false; storageFailure = error; self.error = "Local metadata storage failed: \(error.localizedDescription)"; log.record("metadata_load_failed", error: error) }
         settingsDirty = defaults.bool(forKey: "settingsDirty")
         UIDevice.current.isBatteryMonitoringEnabled = true
         audio.onStatus = { [weak self] status in self?.audioChanged(status) }
@@ -214,7 +215,7 @@ import UIKit
                 let created = try keychain.create(role: role)
                 try keychain.save(created, environment: backendURL); credential = created
             }
-        } catch { self.error = error.localizedDescription; log.record("credential_failed") }
+        } catch { self.error = error.localizedDescription; log.record("credential_failed", error: error) }
     }
     private func client() throws -> any BackendServing {
         #if DEBUG
@@ -244,7 +245,7 @@ import UIKit
             let client = try await registeredClient(); let created = try await client.createPairing()
             guard revision == environmentRevision else { return }; pairingCode = created; error = nil; log.record("pairing_created")
         }
-        catch { self.error = error.localizedDescription; log.record("pairing_failed") }
+        catch { self.error = error.localizedDescription; log.record("pairing_failed", error: error) }
     }
     func claimPairing(_ code: String) async {
         guard code.count == 6, code.allSatisfy(\.isNumber) else { error = "Enter the six-digit code shown on the Parent iPhone."; return }
@@ -255,13 +256,20 @@ import UIKit
             environmentRevision += 1
             paired = true; defaults.set(true, forKey: pairingKey)
             log.record("paired_successfully"); error = nil
-        } catch { self.error = error.localizedDescription; log.record("pairing_failed") }
+        } catch { self.error = error.localizedDescription; log.record("pairing_failed", error: error) }
     }
     func start() async {
         guard !starting, !monitoring, !recoveringAudio, !calibrationActive, !managingDevice, role == .listener else { return }
         let revision = environmentRevision, generation = settingsGeneration
         starting = true; defer { starting = false }
-        guard safetyAccepted, storageHealthy else { error = "Review onboarding and resolve local storage before monitoring."; return }
+        guard safetyAccepted else {
+            log.record("monitoring_start_blocked_safety")
+            error = "Review and accept the safety information before monitoring."; return
+        }
+        guard storageHealthy else {
+            log.record("monitoring_start_blocked_storage", error: storageFailure)
+            error = "Local monitoring data is unavailable. Close and reopen the app, then check Diagnostics if the problem continues."; return
+        }
         guard paired else { error = "Pair this Listener with a Parent before monitoring."; return }
         guard await audio.requestPermission() else { error = "Microphone permission denied. Enable Microphone in iPhone Settings → Crib Service."; log.record("microphone_permission_denied"); return }
         guard revision == environmentRevision, role == .listener else { return }
@@ -289,7 +297,7 @@ import UIKit
             lastSampleAt = currentTime(); needsRestart = false; error = nil
             log.record("monitoring_started")
         } catch is CancellationError { return }
-        catch { self.error = error.localizedDescription; log.record("monitoring_start_failed") }
+        catch { self.error = error.localizedDescription; log.record("monitoring_start_failed", error: error) }
     }
     func stop() {
         let wasActive = monitoring || recoveringAudio
@@ -378,9 +386,9 @@ import UIKit
         guard let store, storageHealthy else { return }
         do { try store.save(engine.snapshot) }
         catch {
-            storageHealthy = false; monitoring = false; audio.stop()
+            storageHealthy = false; storageFailure = error; monitoring = false; audio.stop()
             self.error = "Monitoring stopped: metadata could not be saved. \(error.localizedDescription)"
-            log.record("metadata_write_failed")
+            log.record("metadata_write_failed", error: error)
         }
     }
     func saveSettings(_ config: MonitoringConfiguration) {
@@ -457,7 +465,7 @@ import UIKit
                         }
                     case .failure(let failure):
                         engine.failed(alert.eventId, at: Date()); deliveryStatus = "Alert pending: \(failure.localizedDescription)"
-                        log.record("alert_retry_scheduled")
+                        log.record("alert_retry_scheduled", error: failure)
                     }
                     if alert.eventId == latestTestEventID {
                         if case .success(let receipt) = result, receipt.status == "sent" {
@@ -468,7 +476,7 @@ import UIKit
                     persist()
                 }
             }
-        } catch { deliveryStatus = "Backend unavailable: \(error.localizedDescription)"; log.record("backend_unavailable") }
+        } catch { deliveryStatus = "Backend unavailable: \(error.localizedDescription)"; log.record("backend_unavailable", error: error) }
     }
     private func synchronizeSettings(using client: any BackendServing) {
         guard settingsDirty, paired, settingsTask == nil else { return }
@@ -487,7 +495,7 @@ import UIKit
             } catch {
                 guard let self, revision == self.environmentRevision else { return }
                 self.deliveryStatus = "Settings sync pending: \(error.localizedDescription)"
-                self.log.record("settings_sync_failed")
+                self.log.record("settings_sync_failed", error: error)
             }
         }
     }
@@ -563,7 +571,7 @@ import UIKit
                     let delay = min(30, base * min(1.1, max(0.9, self.heartbeatJitter())))
                     pending.nextAttemptAt = self.currentTime().addingTimeInterval(delay)
                     self.pendingHeartbeats[key] = pending
-                    self.log.record("heartbeat_retry_scheduled")
+                    self.log.record("heartbeat_retry_scheduled", error: error)
                 }
                 if attempt.revision == self.environmentRevision, attempt.observation == self.monitoringGeneration {
                     self.deliveryStatus = "Monitoring status update pending: \(error.localizedDescription)"
@@ -586,7 +594,7 @@ import UIKit
         } catch {
             guard revision == environmentRevision else { return }
             deliveryStatus = "Status unavailable: \(error.localizedDescription)"; parentStatus = nil
-            log.record("parent_status_failed")
+            log.record("parent_status_failed", error: error)
             publishWatch()
         }
     }
@@ -613,12 +621,15 @@ import UIKit
                 let status = try await client.status()
                 guard let self, revision == self.environmentRevision, self.role == .listener else { return }
                 self.observePairing(status)
-            } catch { /* Alert delivery and heartbeats have independent retry paths. */ }
+            } catch {
+                guard let self, revision == self.environmentRevision else { return }
+                self.log.record("listener_status_failed", error: error)
+            }
         }
     }
     func acknowledge(_ id: UUID) async {
         do { let client = try await registeredClient(); try await client.acknowledge(id); await refreshParent() }
-        catch { self.error = error.localizedDescription }
+        catch { self.error = error.localizedDescription; log.record("acknowledgement_failed", error: error) }
     }
     func requestParentTest() async {
         guard role == .parent, paired, !sendingTestPush else { return }
@@ -628,13 +639,13 @@ import UIKit
             let client = try await registeredClient(); try await client.requestTestPush()
             testPushStatus = "Test requested. Lock this iPhone and check your receiving phone or Watch, then confirm receipt below."
             await refreshParent()
-        } catch { testPushStatus = "Test could not be sent: \(error.localizedDescription)" }
+        } catch { testPushStatus = "Test could not be sent: \(error.localizedDescription)"; log.record("test_push_failed", error: error) }
     }
     func setConnectionAlerts(_ enabled: Bool) async {
         guard role == .parent, !changingConnectionAlerts else { return }
         changingConnectionAlerts = true; defer { changingConnectionAlerts = false }
         do { let client = try await registeredClient(); try await client.connectionAlerts(enabled); await refreshParent() }
-        catch { self.error = error.localizedDescription }
+        catch { self.error = error.localizedDescription; log.record("connection_preferences_failed", error: error) }
     }
     func removePairing(deleteDevice: Bool) async {
         guard !managingDevice else { return }
@@ -664,7 +675,7 @@ import UIKit
             if deleteDevice { role = nil; defaults.removeObject(forKey: "role"); uploadedToken = nil }
             deliveryStatus = "Pair a device to reconnect"; error = nil
             publishWatch()
-        } catch { self.error = "Could not finish: \(error.localizedDescription). Monitoring is stopped. Try again." }
+        } catch { self.error = "Could not finish: \(error.localizedDescription). Monitoring is stopped. Try again."; log.record("device_removal_failed", error: error) }
     }
     func beginCalibration() async {
         guard role == .listener, !monitoring, !starting, !recoveringAudio, !calibrationActive else { return }
@@ -675,7 +686,7 @@ import UIKit
         }
         guard calibrationActive, revision == environmentRevision else { return }
         do { try await audio.start() }
-        catch { calibrationPhase = "idle"; audio.stop(); calibrationMessage = error.localizedDescription }
+        catch { calibrationPhase = "idle"; audio.stop(); calibrationMessage = error.localizedDescription; log.record("calibration_failed", error: error) }
     }
     func finishCalibrationBackground() {
         guard calibrationPhase == "background" else { return }
@@ -793,6 +804,6 @@ import UIKit
                 defaults.set(rawID, forKey: confirmedKey)
             }
             return nil
-        } catch { log.record("watch_sync_failed"); return "Watch sync pending. Check the Parent iPhone connection and backend setup." }
+        } catch { log.record("watch_sync_failed", error: error); return "Watch sync pending. Check the Parent iPhone connection and backend setup." }
     }
 }
