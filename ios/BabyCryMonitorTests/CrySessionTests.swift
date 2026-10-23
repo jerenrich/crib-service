@@ -229,4 +229,40 @@ final class CrySessionTests: XCTestCase {
         XCTAssertEqual(restored.configuration, s.engine.snapshot.configuration)
         XCTAssertThrowsError(try JSONDecoder().decode(SessionSnapshot.self, from: Data("{}".utf8)))
     }
+
+    func testEpisodeAlertStatusTracksTerminalFailureAcrossPersistence() throws {
+        var s = Simulation(); s.run(306)
+        let episode = try XCTUnwrap(s.engine.snapshot.current)
+        let alert = try XCTUnwrap(s.emitted.first)
+        XCTAssertEqual(s.engine.snapshot.alertStatus(for: episode), .pending)
+        s.engine.permanentlyFailed(alert.eventId, at: s.time)
+        XCTAssertEqual(s.engine.snapshot.alertStatus(for: episode), .failed)
+        let restored = try JSONDecoder().decode(SessionSnapshot.self, from: JSONEncoder().encode(s.engine.snapshot))
+        XCTAssertEqual(restored.alertStatus(for: episode), .failed)
+        var other = CryEpisode(startedAt: s.time)
+        XCTAssertEqual(restored.alertStatus(for: other), .notQueued)
+        other.alertQueuedAt = s.time
+        XCTAssertEqual(restored.alertStatus(for: other), .acknowledged)
+        other.alertSentAt = s.time
+        XCTAssertEqual(restored.alertStatus(for: other), .sent)
+    }
+    func testFailedRepeatIsVisibleAfterInitialDelivery() throws {
+        var s = Simulation()
+        var config = MonitoringConfiguration(); config.repeatInterval = 120
+        s.engine.configure(config); s.run(306)
+        s.engine.delivered(try XCTUnwrap(s.emitted.first?.eventId), at: s.time)
+        let first = try XCTUnwrap(s.engine.snapshot.current)
+        XCTAssertEqual(s.engine.snapshot.alertStatus(for: first), .sent)
+        s.run(120)
+        let episode = try XCTUnwrap(s.engine.snapshot.current)
+        XCTAssertEqual(s.engine.snapshot.alertStatus(for: episode), .pending)
+        s.engine.permanentlyFailed(try XCTUnwrap(s.emitted.last?.eventId), at: s.time)
+        XCTAssertEqual(s.engine.snapshot.alertStatus(for: episode), .failed)
+        s.run(120)
+        let later = try XCTUnwrap(s.engine.snapshot.current)
+        XCTAssertEqual(s.engine.snapshot.alertStatus(for: later), .pending)
+        s.engine.delivered(try XCTUnwrap(s.emitted.last?.eventId), at: s.time)
+        XCTAssertEqual(s.engine.snapshot.alertStatus(for: later), .sent)
+        XCTAssertEqual(s.engine.snapshot.failedAlerts.count, 1)
+    }
 }

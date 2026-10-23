@@ -8,6 +8,7 @@ import Observation
     private(set) var activated = false
     private(set) var status = "Install the companion from the Watch app."
     var onCommand: ((WatchCommand) async -> WatchSnapshot)?
+    weak var log: DiagnosticLog?
     private var latest = WatchSnapshot()
 
     init(enabled: Bool = true) {
@@ -23,7 +24,7 @@ import Observation
         updateState()
         guard installed, let data = try? JSONEncoder().encode(snapshot) else { return }
         do { try WCSession.default.updateApplicationContext(["snapshot": data]) }
-        catch { status = "Watch status sync is temporarily unavailable." }
+        catch { status = "Watch status sync is temporarily unavailable."; log?.record("watch_snapshot_failed", code: (error as NSError).code) }
     }
 
     private func updateState() {
@@ -35,10 +36,11 @@ import Observation
     }
 
     nonisolated func session(_ session: WCSession, activationDidCompleteWith activationState: WCSessionActivationState, error: Error?) {
-        Task { @MainActor in self.publish(self.latest) }
+        let code = (error as NSError?)?.code
+        Task { @MainActor in self.log?.record(code == nil ? "watch_activated" : "watch_activation_failed", code: code); self.publish(self.latest) }
     }
     nonisolated func sessionReachabilityDidChange(_ session: WCSession) {
-        Task { @MainActor in self.updateState() }
+        Task { @MainActor in self.updateState(); self.log?.record(self.reachable ? "watch_reachable" : "watch_unreachable") }
     }
     nonisolated func sessionWatchStateDidChange(_ session: WCSession) {
         Task { @MainActor in self.updateState() }

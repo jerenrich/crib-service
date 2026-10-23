@@ -12,7 +12,7 @@ struct ListenerView: View {
                 if let episode = model.snapshot.current {
                     Text("\(durationText(episode.duration(at: model.now))) / \(durationText(model.configuration.alertDuration))").font(.system(.title, design: .monospaced)).contentTransition(.numericText())
                     ProgressView(value: min(1, episode.duration(at: model.now) / model.configuration.alertDuration)).tint(Palette.amber)
-                    Text(episode.alertSentAt != nil ? "APNs accepted the alert. Check Parent for delivery." : episode.alertQueuedAt != nil ? "Alert queued · Waiting for delivery confirmation" : "Another \(durationText(max(0, model.configuration.alertDuration - episode.duration(at: model.now)))) before an alert.").font(.subheadline).foregroundStyle(Palette.muted)
+                    Text(Self.alertMessage(for: episode, snapshot: model.snapshot, now: model.now)).font(.subheadline).foregroundStyle(Palette.muted)
                 } else {
                     Text(model.recoveringAudio ? model.audioStatus : model.monitoring ? "Listening for sustained sound" : "Ready when you are").foregroundStyle(Palette.muted)
                 }
@@ -55,8 +55,18 @@ struct ListenerView: View {
     private var stateTitle: String {
         if model.recoveringAudio { return "Paused" }
         if !model.monitoring { return "Stopped" }
+        if let episode = model.snapshot.current, model.snapshot.alertStatus(for: episode) == .failed { return "Alert failed" }
         if model.snapshot.current?.alertSentAt != nil { return "Alert sent" }
         return switch model.state { case .quiet: "Quiet"; case .possibleCry: "Sound detected"; case .crying: "Crying-like sound" }
+    }
+    static func alertMessage(for episode: CryEpisode, snapshot: SessionSnapshot, now: Date) -> String {
+        switch snapshot.alertStatus(for: episode) {
+        case .failed: "Alert delivery failed. This alert will not be retried. Check Worker/APNs diagnostics."
+        case .pending: "Alert queued · Waiting for delivery confirmation"
+        case .sent: "APNs accepted the alert. Check Parent for delivery."
+        case .acknowledged: "Alert acknowledged on Parent."
+        case .notQueued: "Another \(durationText(max(0, snapshot.configuration.alertDuration - episode.duration(at: now)))) before an alert."
+        }
     }
 }
 

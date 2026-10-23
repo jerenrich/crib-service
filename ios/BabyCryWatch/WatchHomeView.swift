@@ -121,6 +121,14 @@ struct WatchSetupView: View {
                 Text("watchOS controls background alerts. Recent alerts repeat vibrations for up to 80 seconds while the alert screen is active. An alert may not wake you.")
                     .font(.caption2).foregroundStyle(.secondary)
                 if let notice = model.notice { Text(notice).font(.caption2).foregroundStyle(.orange) }
+                NavigationLink("Diagnostics") {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 8) {
+                            if !model.log.persistenceAvailable { Text("Log storage unavailable").foregroundStyle(.orange) }
+                            Text(model.log.export).font(.system(.caption2, design: .monospaced))
+                        }
+                    }.navigationTitle("Diagnostics")
+                }
             }
         }.navigationTitle("Wrist alerts").tint(mint)
     }

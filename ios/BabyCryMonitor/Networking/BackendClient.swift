@@ -60,6 +60,8 @@ protocol BackendServing: AlertSending {
 struct BackendClient: BackendServing {
     let baseURL: URL
     let credential: DeviceCredential
+    var log: DiagnosticLog? = nil
+    var session: URLSession = .shared
     func register() async throws {
         struct Registration: Codable { let deviceId: UUID; let role: DeviceRole; let secret: String }
         let _: EmptyResponse = try await request("/v1/device/register", body: Registration(deviceId: credential.deviceId, role: credential.role, secret: credential.secret))
@@ -87,9 +89,28 @@ struct BackendClient: BackendServing {
         request.setValue("Bearer \(credential.deviceId.uuidString.lowercased()).\(credential.secret)", forHTTPHeaderField: "Authorization")
         let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
         if let body { request.httpBody = try encoder.encode(body) }
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let response = response as? HTTPURLResponse else { throw BackendError.message("Invalid server response.") }
+        let operation = ["/v1/device/register": "register", "/v1/pairing/create": "pairing_create", "/v1/pairing/claim": "pairing_claim",
+                         "/v1/device/push-token": "push_token", "/v1/device/watch-push-token": "watch_token",
+                         "/v1/listener/heartbeat": "heartbeat", "/v1/listener/event": "alert", "/v1/listener/status": "status",
+                         "/v1/settings": "settings", "/v1/alert/acknowledge": "acknowledge"][path] ?? "unknown"
+        let started = Date()
+        let data: Data, rawResponse: URLResponse
+        do { (data, rawResponse) = try await session.data(for: request) }
+        catch {
+            let code = (error as? URLError)?.code.rawValue
+            await log?.network(operation: operation, outcome: code == URLError.cancelled.rawValue ? "cancelled" : "transport_error",
+                               status: code, elapsedMS: Int(Date().timeIntervalSince(started) * 1000))
+            throw error
+        }
+        guard let response = rawResponse as? HTTPURLResponse else {
+            await log?.network(operation: operation, outcome: "invalid_response", elapsedMS: Int(Date().timeIntervalSince(started) * 1000))
+            throw BackendError.message("Invalid server response.")
+        }
+        let requestID = response.value(forHTTPHeaderField: "x-request-id").flatMap(UUID.init(uuidString:))
+        let storageUnavailable = response.value(forHTTPHeaderField: "x-diagnostics-status") == "unavailable"
         guard (200..<300).contains(response.statusCode) else {
+            await log?.network(operation: operation, outcome: "http_error", status: response.statusCode, requestID: requestID,
+                               elapsedMS: Int(Date().timeIntervalSince(started) * 1000), storageUnavailable: storageUnavailable)
             let reason = (try? JSONDecoder().decode(ErrorBody.self, from: data).error) ?? "Backend request failed (\(response.statusCode))."
             throw BackendError.response(response.statusCode, reason)
         }
@@ -102,7 +123,16 @@ struct BackendClient: BackendServing {
             guard let date = formatter.date(from: value) else { throw BackendError.message("Invalid server timestamp.") }
             return date
         }
-        return try decoder.decode(R.self, from: data)
+        do {
+            let result = try decoder.decode(R.self, from: data)
+            await log?.network(operation: operation, outcome: "ok", status: response.statusCode, requestID: requestID,
+                               elapsedMS: Int(Date().timeIntervalSince(started) * 1000), storageUnavailable: storageUnavailable)
+            return result
+        } catch {
+            await log?.network(operation: operation, outcome: "decode_error", status: response.statusCode, requestID: requestID,
+                               elapsedMS: Int(Date().timeIntervalSince(started) * 1000), storageUnavailable: storageUnavailable)
+            throw error
+        }
     }
 }
 enum BackendError: LocalizedError {

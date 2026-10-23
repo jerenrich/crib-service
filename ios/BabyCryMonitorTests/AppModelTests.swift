@@ -43,7 +43,7 @@ final class AppModelTests: XCTestCase {
         }
         func stop() { onStatus?(.stopped) }
     }
-    @MainActor struct Connectivity: ConnectivityProviding {
+    @MainActor final class Connectivity: ConnectivityProviding {
         var available = true
         var checked = true
     }
@@ -115,6 +115,7 @@ final class AppModelTests: XCTestCase {
     @MainActor final class Fixture {
         let model: AppModel
         let audio = Audio()
+        let connectivity = Connectivity()
         let backend: Backend
         let defaults: UserDefaults
         let suite: String
@@ -122,7 +123,7 @@ final class AppModelTests: XCTestCase {
         let listener: DeviceCredential
         final class Time { var now = Date() }
         let time: Time
-        init(pending: Bool = false, automaticallyStart: Bool = false, logEvents: [String] = []) throws {
+        init(pending: Bool = false, automaticallyStart: Bool = false, logEvents: [String] = [], heartbeatJitter: @escaping () -> Double = { 1 }) throws {
             suite = "AppModelTests.\(UUID())"
             defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
             directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -144,9 +145,9 @@ final class AppModelTests: XCTestCase {
             let time = Time(); self.time = time
             let log = DiagnosticLog(directory: directory)
             for event in logEvents { log.record(event) }
-            model = AppModel(defaults: defaults, metadataStore: store, log: log, audio: audio, connectivity: Connectivity(),
+            model = AppModel(defaults: defaults, metadataStore: store, log: log, audio: audio, connectivity: connectivity,
                              notifications: Notifications(), keychain: Credentials(listener: listener, parent: parent),
-                             makeClient: { _, _ in backend }, currentTime: { time.now }, automaticallyStart: automaticallyStart)
+                             makeClient: { _, _ in backend }, currentTime: { time.now }, heartbeatJitter: heartbeatJitter, automaticallyStart: automaticallyStart)
         }
         deinit {
             UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite)
@@ -316,6 +317,8 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(uploaded)
         await gate.open()
         await request.value
+        let completed = await eventually { fixture.model.deliveryStatus == "Connected" }
+        XCTAssertTrue(completed)
         XCTAssertEqual(fixture.model.configuration, config)
         fixture.model.stop()
     }
@@ -381,7 +384,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(started)
         await fixture.model.start()
         await gate.open()
-        let completed = await eventually { await fixture.backend.heartbeatCompletions == 1 }
+        let completed = await eventually { await fixture.backend.heartbeatCompletions >= 1 }
         XCTAssertTrue(completed)
         await fixture.model.tick()
         let refreshed = await eventually { await fixture.backend.beats.count == 2 }
@@ -395,10 +398,11 @@ final class AppModelTests: XCTestCase {
         await fixture.backend.configure(heartbeatFail: true)
         await fixture.model.start()
         await fixture.model.tick()
-        let failed = await eventually { fixture.model.deliveryStatus.contains("Alerts may be delayed") }
+        let failed = await eventually { fixture.model.log.lines.contains { $0.contains("heartbeat_retry_scheduled") } }
         XCTAssertTrue(failed)
         XCTAssertTrue(fixture.model.snapshot.pending.isEmpty)
         await fixture.backend.configure()
+        fixture.time.now = fixture.time.now.addingTimeInterval(2)
         await fixture.model.tick()
         let reconnected = await eventually { fixture.model.deliveryStatus == "Connected" }
         XCTAssertTrue(reconnected)
@@ -452,6 +456,230 @@ final class AppModelTests: XCTestCase {
         XCTAssertFalse(first.model.log.export.contains("monitoring_started"))
         let restored = DiagnosticLog(directory: first.directory)
         XCTAssertEqual(restored.lines, first.model.log.lines)
+    }
+
+    @MainActor func testHeartbeatRetryBackoffAndSuccessReset() async throws {
+        let fixture = try Fixture()
+        await fixture.backend.configure(heartbeatFail: true)
+        await fixture.model.start()
+        let first = await eventually { fixture.model.deliveryStatus.contains("status update pending") }
+        XCTAssertTrue(first)
+        var count = 1
+        for delay in [2.0, 4, 8, 16, 30, 30] {
+            // Give each response a distinct status to wait on, ensuring its deadline is installed.
+            fixture.model.deliveryStatus = "Waiting for retry"
+            fixture.time.now = fixture.time.now.addingTimeInterval(delay - 0.01)
+            for _ in 0..<5 { await fixture.model.tick() }
+            let before = await fixture.backend.beats.count
+            XCTAssertEqual(before, count)
+            fixture.time.now = fixture.time.now.addingTimeInterval(0.01)
+            await fixture.model.tick()
+            let failed = await eventually { fixture.model.deliveryStatus.contains("status update pending") }
+            XCTAssertTrue(failed)
+            count += 1
+            let after = await fixture.backend.beats.count
+            XCTAssertEqual(after, count)
+        }
+        await fixture.backend.configure()
+        fixture.time.now = fixture.time.now.addingTimeInterval(30)
+        await fixture.model.tick()
+        let connected = await eventually { fixture.model.deliveryStatus == "Connected" }
+        XCTAssertTrue(connected)
+        count += 1
+        fixture.time.now = fixture.time.now.addingTimeInterval(59.99)
+        await fixture.model.tick()
+        let beforeMinute = await fixture.backend.beats.count
+        XCTAssertEqual(beforeMinute, count)
+        await fixture.backend.configure(heartbeatFail: true)
+        fixture.time.now = fixture.time.now.addingTimeInterval(0.01)
+        await fixture.model.tick()
+        let failed = await eventually { fixture.model.deliveryStatus.contains("status update pending") }
+        XCTAssertTrue(failed)
+        await fixture.backend.configure()
+        fixture.time.now = fixture.time.now.addingTimeInterval(2)
+        await fixture.model.tick()
+        let reset = await eventually { fixture.model.deliveryStatus == "Connected" }
+        XCTAssertTrue(reset)
+        let afterReset = await fixture.backend.beats.count
+        XCTAssertEqual(afterReset, count + 2)
+        fixture.model.stop()
+    }
+
+    @MainActor func testStoppedHeartbeatRetriesAndDoesNotBecomePeriodic() async throws {
+        let fixture = try Fixture()
+        await fixture.model.start()
+        let connected = await eventually { fixture.model.deliveryStatus == "Connected" }
+        XCTAssertTrue(connected)
+        await fixture.backend.configure(heartbeatFail: true)
+        fixture.model.stop()
+        let failed = await eventually { fixture.model.deliveryStatus.contains("status update pending") }
+        XCTAssertTrue(failed)
+        await fixture.backend.configure()
+        fixture.time.now = fixture.time.now.addingTimeInterval(2)
+        await fixture.model.tick()
+        let recovered = await eventually { fixture.model.deliveryStatus == "Connected" }
+        XCTAssertTrue(recovered)
+        fixture.time.now = fixture.time.now.addingTimeInterval(600)
+        await fixture.model.tick()
+        let beats = await fixture.backend.beats
+        XCTAssertEqual(beats.map(\.monitoring), [true, false, false])
+    }
+
+    @MainActor func testConnectivityRecoveryRetriesStoppedHeartbeatImmediately() async throws {
+        let fixture = try Fixture()
+        await fixture.model.start()
+        let connected = await eventually { fixture.model.deliveryStatus == "Connected" }
+        XCTAssertTrue(connected)
+        await fixture.backend.configure(heartbeatFail: true)
+        fixture.model.stop()
+        let failed = await eventually { fixture.model.deliveryStatus.contains("status update pending") }
+        XCTAssertTrue(failed)
+        fixture.connectivity.available = false
+        await fixture.model.tick()
+        await fixture.backend.configure()
+        fixture.connectivity.available = true
+        await fixture.model.tick() // No clock advance: bypass the existing deadline once.
+        let recovered = await eventually { fixture.model.deliveryStatus == "Connected" }
+        XCTAssertTrue(recovered)
+        let beats = await fixture.backend.beats
+        XCTAssertEqual(beats.map(\.monitoring), [true, false, false])
+    }
+
+    @MainActor func testQueuedHeartbeatUsesLatestStateAndNeverOverlaps() async throws {
+        let fixture = try Fixture()
+        let gate = RequestGate()
+        await fixture.backend.configure(heartbeatGate: gate)
+        await fixture.model.start()
+        let sending = await eventually { await fixture.backend.beats.count == 1 }
+        XCTAssertTrue(sending)
+        fixture.model.stop()
+        await fixture.model.start()
+        fixture.model.stop()
+        for _ in 0..<3 { await fixture.model.tick() }
+        let inFlight = await fixture.backend.beats
+        XCTAssertEqual(inFlight.map(\.monitoring), [true])
+        await gate.open()
+        let finished = await eventually { fixture.model.deliveryStatus == "Connected" }
+        XCTAssertTrue(finished)
+        let beats = await fixture.backend.beats
+        XCTAssertEqual(beats.map(\.monitoring), [true, false])
+    }
+
+    @MainActor func testStopAndRestartBypassOldHeartbeatBackoff() async throws {
+        let fixture = try Fixture()
+        await fixture.backend.configure(heartbeatFail: true)
+        await fixture.model.start()
+        let failed = await eventually { fixture.model.deliveryStatus.contains("status update pending") }
+        XCTAssertTrue(failed)
+        fixture.model.deliveryStatus = "Stopping"
+        fixture.model.stop()
+        let stopped = await eventually { fixture.model.deliveryStatus.contains("status update pending") }
+        XCTAssertTrue(stopped)
+        await fixture.backend.configure()
+        await fixture.model.start()
+        let restarted = await eventually { fixture.model.deliveryStatus == "Connected" }
+        XCTAssertTrue(restarted)
+        let beats = await fixture.backend.beats
+        XCTAssertEqual(beats.map(\.monitoring), [true, false, true])
+        fixture.model.stop()
+    }
+
+    @MainActor func testStoppedHeartbeatSurvivesRoleChangeAndOfflinePeriod() async throws {
+        let fixture = try Fixture()
+        await fixture.model.start()
+        let connected = await eventually { fixture.model.deliveryStatus == "Connected" }
+        XCTAssertTrue(connected)
+        fixture.connectivity.available = false
+        fixture.model.selectRole(.parent)
+        await fixture.model.tick()
+        let offline = await fixture.backend.beats
+        XCTAssertEqual(offline.map(\.monitoring), [true])
+        fixture.connectivity.available = true
+        await fixture.model.tick()
+        let sent = await eventually { await fixture.backend.beats.count == 2 }
+        XCTAssertTrue(sent)
+        let beats = await fixture.backend.beats
+        XCTAssertEqual(beats.map(\.monitoring), [true, false])
+        XCTAssertEqual(beats.last?.listenerId, fixture.listener.deviceId)
+    }
+
+    @MainActor func testAlertsSendDuringHeartbeatBackoff() async throws {
+        let fixture = try Fixture()
+        await fixture.backend.configure(heartbeatFail: true)
+        await fixture.model.start()
+        let failed = await eventually { fixture.model.deliveryStatus.contains("status update pending") }
+        XCTAssertTrue(failed)
+        // Advance only enough to make the new test alert due, not the heartbeat.
+        fixture.time.now = fixture.time.now.addingTimeInterval(1)
+        await fixture.model.sendTestPush()
+        let sent = await fixture.backend.sent
+        XCTAssertEqual(sent.count, 1)
+        XCTAssertTrue(fixture.model.snapshot.pending.isEmpty)
+        let beats = await fixture.backend.beats
+        XCTAssertEqual(beats.count, 1)
+        fixture.model.stop()
+    }
+
+    @MainActor func testHeartbeatJitterStaysBounded() async throws {
+        for factor in [0.9, 1.1] {
+            let fixture = try Fixture(heartbeatJitter: { factor })
+            await fixture.backend.configure(heartbeatFail: true)
+            await fixture.model.start()
+            let failed = await eventually { fixture.model.deliveryStatus.contains("status update pending") }
+            XCTAssertTrue(failed)
+            var count = 1
+            for base in [2.0, 4, 8, 16, 30, 30] {
+                fixture.model.deliveryStatus = "Waiting"
+                let due = fixture.time.now.addingTimeInterval(min(30, base * factor))
+                fixture.time.now = due.addingTimeInterval(-0.01)
+                await fixture.model.tick()
+                let before = await fixture.backend.beats.count
+                XCTAssertEqual(before, count)
+                fixture.time.now = due
+                await fixture.model.tick()
+                let retried = await eventually { fixture.model.deliveryStatus.contains("status update pending") }
+                XCTAssertTrue(retried)
+                count += 1
+                let after = await fixture.backend.beats
+                XCTAssertEqual(after.count, count)
+                XCTAssertEqual(after.last?.timestamp, due)
+            }
+            fixture.model.stop()
+        }
+    }
+
+    @MainActor func testFailedEpisodeMessageUsesTerminalOutcome() throws {
+        var simulation = CrySessionTests.Simulation(); simulation.run(306)
+        let alert = try XCTUnwrap(simulation.emitted.first)
+        let episode = try XCTUnwrap(simulation.engine.snapshot.current)
+        XCTAssertTrue(ListenerView.alertMessage(for: episode, snapshot: simulation.engine.snapshot, now: simulation.time).contains("Waiting for delivery"))
+        simulation.engine.permanentlyFailed(alert.eventId, at: simulation.time)
+        let message = ListenerView.alertMessage(for: episode, snapshot: simulation.engine.snapshot, now: simulation.time)
+        XCTAssertTrue(message.contains("Alert delivery failed"))
+        XCTAssertTrue(message.contains("will not be retried"))
+        XCTAssertFalse(message.contains("Waiting"))
+        // Never clear the queue marker: doing so would create another initial event.
+        simulation.run(60)
+        XCTAssertEqual(simulation.emitted.count, 1)
+    }
+
+    @MainActor func testFailedStoppedHeartbeatRetriesWithListenerIdentityAfterRoleChange() async throws {
+        let fixture = try Fixture()
+        await fixture.model.start()
+        let connected = await eventually { fixture.model.deliveryStatus == "Connected" }
+        XCTAssertTrue(connected)
+        await fixture.backend.configure(heartbeatFail: true)
+        fixture.model.selectRole(.parent)
+        let failed = await eventually { fixture.model.log.lines.contains { $0.contains("heartbeat_retry_scheduled") } }
+        XCTAssertTrue(failed)
+        await fixture.backend.configure()
+        fixture.time.now = fixture.time.now.addingTimeInterval(2)
+        await fixture.model.tick()
+        let retried = await eventually { await fixture.backend.heartbeatCompletions == 3 }
+        XCTAssertTrue(retried)
+        let beats = await fixture.backend.beats
+        XCTAssertEqual(beats.map(\.monitoring), [true, false, false])
+        XCTAssertTrue(beats.allSatisfy { $0.listenerId == fixture.listener.deviceId })
     }
 }
 #endif

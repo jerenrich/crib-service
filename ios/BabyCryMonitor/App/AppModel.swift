@@ -44,7 +44,19 @@ import UIKit
     @ObservationIgnored private let currentTime: () -> Date
     @ObservationIgnored private var settingsGeneration = 0
     @ObservationIgnored private var monitoringGeneration = 0
-    @ObservationIgnored private var queuedHeartbeatGeneration: Int?
+    @ObservationIgnored private let heartbeatJitter: () -> Double
+    @ObservationIgnored private var lastConnectivityAvailable: Bool
+    private struct HeartbeatRequest {
+        let id = UUID()
+        let client: any BackendServing
+        var value: Heartbeat
+        let revision: Int
+        var settingsGeneration: Int
+        let observation: Int
+        var failures = 0
+        var nextAttemptAt = Date.distantPast
+    }
+    @ObservationIgnored private var pendingHeartbeats: [String: HeartbeatRequest] = [:]
     @ObservationIgnored private var lastSampleAt: Date?
     @ObservationIgnored private var lastSavedAt = Date.distantPast
     @ObservationIgnored private var lastHeartbeatAt = Date.distantPast
@@ -67,11 +79,13 @@ import UIKit
          notifications: any NotificationProviding = NotificationService(),
          keychain: any CredentialStoring = KeychainStore(),
          makeClient: @escaping (URL, DeviceCredential) -> any BackendServing = { BackendClient(baseURL: $0, credential: $1) },
-         currentTime: @escaping () -> Date = Date.init, automaticallyStart: Bool = true) {
+         currentTime: @escaping () -> Date = Date.init,
+          heartbeatJitter: @escaping () -> Double = { Double.random(in: 0.9...1.1) }, automaticallyStart: Bool = true) {
         self.defaults = defaults; self.audio = audio; self.connectivity = connectivity; self.log = log
         self.notifications = notifications; self.keychain = keychain; self.makeClient = makeClient
         self.watch = PhoneWatchBridge(enabled: automaticallyStart)
-        self.currentTime = currentTime
+        self.currentTime = currentTime; self.heartbeatJitter = heartbeatJitter
+        self.lastConnectivityAvailable = connectivity.available
         #if DEBUG
         if ProcessInfo.processInfo.arguments.contains("--uitesting-reset"), let bundle = Bundle.main.bundleIdentifier {
             defaults.removePersistentDomain(forName: bundle)
@@ -86,12 +100,15 @@ import UIKit
             engine = CrySessionManager(snapshot: saved); engine.recoverAfterRelaunch()
             configuration = engine.snapshot.configuration
             try store.save(engine.snapshot)
-        } catch { storageHealthy = false; self.error = "Local metadata storage failed: \(error.localizedDescription)" }
+        } catch { storageHealthy = false; self.error = "Local metadata storage failed: \(error.localizedDescription)"; log.record("metadata_load_failed") }
         settingsDirty = defaults.bool(forKey: "settingsDirty")
         UIDevice.current.isBatteryMonitoringEnabled = true
         audio.onStatus = { [weak self] status in self?.audioChanged(status) }
-        notifications.onToken = { [weak self] token in self?.pushToken = token; self?.uploadedToken = nil }
-        notifications.onAlert = { [weak self] in Task { await self?.refreshParent() } }
+        (notifications as? NotificationService)?.log = log
+        watch.log = log
+        (audio as? AudioLevelMonitor)?.log = log
+        notifications.onToken = { [weak self] token in self?.pushToken = token; self?.uploadedToken = nil; self?.log.record("push_token_received") }
+        notifications.onAlert = { [weak self] in self?.log.record("push_received"); Task { await self?.refreshParent() } }
         watch.onCommand = { [weak self] command in
             guard let self else { return WatchSnapshot() }
             return await self.handleWatch(command)
@@ -102,6 +119,8 @@ import UIKit
             }
         }
         if automaticallyStart {
+            log.record("app_launched")
+            if needsRestart { log.record("monitoring_recovered_after_relaunch") }
             // Local health and freshness must advance even while a request is suspended.
             loopTask = Task { [weak self] in
                 while !Task.isCancelled {
@@ -167,13 +186,15 @@ import UIKit
                 let created = try keychain.create(role: role)
                 try keychain.save(created, environment: backendURL); credential = created
             }
-        } catch { self.error = error.localizedDescription }
+        } catch { self.error = error.localizedDescription; log.record("credential_failed") }
     }
     private func client() throws -> any BackendServing {
         guard let credential, let url = URL(string: backendURL), !backendURL.isEmpty else {
             throw BackendError.message("The connection service is not configured. Contact the app provider for a configured build.")
         }
-        return makeClient(url, credential)
+        let value = makeClient(url, credential)
+        if var backend = value as? BackendClient { backend.log = log; return backend }
+        return value
     }
     private func registeredClient() async throws -> any BackendServing {
         let client = try client()
@@ -190,9 +211,9 @@ import UIKit
         let revision = environmentRevision
         do {
             let client = try await registeredClient(); let created = try await client.createPairing()
-            guard revision == environmentRevision else { return }; pairingCode = created; error = nil
+            guard revision == environmentRevision else { return }; pairingCode = created; error = nil; log.record("pairing_created")
         }
-        catch { self.error = error.localizedDescription }
+        catch { self.error = error.localizedDescription; log.record("pairing_failed") }
     }
     func claimPairing(_ code: String) async {
         guard code.count == 6, code.allSatisfy(\.isNumber) else { error = "Enter the six-digit code shown on the Parent iPhone."; return }
@@ -202,7 +223,7 @@ import UIKit
             guard revision == environmentRevision else { return }
             paired = true; defaults.set(true, forKey: pairingKey)
             log.record("paired_successfully"); error = nil
-        } catch { self.error = error.localizedDescription }
+        } catch { self.error = error.localizedDescription; log.record("pairing_failed") }
     }
     func start() async {
         guard !starting, !monitoring, !recoveringAudio, role == .listener else { return }
@@ -210,7 +231,7 @@ import UIKit
         starting = true; defer { starting = false }
         guard safetyAccepted, storageHealthy else { error = "Review onboarding and resolve local storage before monitoring."; return }
         guard paired else { error = "Pair this Listener with a Parent before monitoring."; return }
-        guard await audio.requestPermission() else { error = "Microphone permission denied. Enable Microphone in iPhone Settings → Crib Service."; return }
+        guard await audio.requestPermission() else { error = "Microphone permission denied. Enable Microphone in iPhone Settings → Crib Service."; log.record("microphone_permission_denied"); return }
         guard revision == environmentRevision, role == .listener else { return }
         do {
             if connectivity.available {
@@ -233,15 +254,15 @@ import UIKit
             guard revision == environmentRevision, role == .listener, storageHealthy else { return }
             try await audio.start(); engine.markMonitoring(true); persist()
             guard storageHealthy else { return }
-            lastSampleAt = currentTime(); lastHeartbeatAt = .distantPast; needsRestart = false; error = nil
+            lastSampleAt = currentTime(); needsRestart = false; error = nil
             log.record("monitoring_started")
         } catch is CancellationError { return }
-        catch { self.error = error.localizedDescription }
+        catch { self.error = error.localizedDescription; log.record("monitoring_start_failed") }
     }
     func stop() {
         let wasActive = monitoring || recoveringAudio
         audio.stop(); engine.suspend(); persist()
-        if wasActive { log.record("monitoring_stopped"); queueHeartbeat() }
+        if wasActive { log.record("monitoring_stopped") }
     }
     func sendTestPush() async {
         guard !sendingTestPush, role == .listener, paired else { return }
@@ -263,16 +284,20 @@ import UIKit
         }
     }
     private func audioChanged(_ status: AudioCaptureStatus) {
+        let wasActive = monitoring || recoveringAudio
         monitoringGeneration += 1; lastHeartbeatAt = .distantPast
         monitoring = false; recoveringAudio = false
         switch status {
         case .active:
+            log.record("audio_active")
             monitoring = true; audioStatus = "Microphone active"
             engine.markMonitoring(true); lastSampleAt = currentTime(); lastHeartbeatAt = .distantPast
             needsRestart = false; error = nil
+            queueHeartbeat()
         case .stopped:
             audioStatus = "Stopped"
             engine.suspend(); persist()
+            if wasActive { queueHeartbeat() }
         case .recovering(let message):
             // Route changes and resumable interruptions need no user action.
             // Suspend detection so the missing audio never extends an episode.
@@ -330,6 +355,7 @@ import UIKit
         scheduleHeartbeatIfDue()
     }
     func tick() async {
+        scheduleHeartbeatIfDue()
         guard connectivity.available else {
             deliveryStatus = connectivity.checked ? "Internet unavailable. Alerts cannot currently be delivered." : "Checking connectivity…"
             return
@@ -342,7 +368,7 @@ import UIKit
             synchronizeSettings(using: client)
             guard revision == environmentRevision else { return }
             if role == .parent {
-                if let pushToken, pushToken != uploadedToken { try await client.pushToken(pushToken); uploadedToken = pushToken }
+                if let pushToken, pushToken != uploadedToken { try await client.pushToken(pushToken); uploadedToken = pushToken; log.record("push_token_uploaded") }
                 if now.timeIntervalSince(lastWatchRetryAt) >= 15 {
                     lastWatchRetryAt = now
                     if watch.activated, !watch.installed, parentStatus?.watchPushRegistered == true {
@@ -361,6 +387,7 @@ import UIKit
                         deliveryStatus = "Connected · APNs accepted alert"
                     case .success(let receipt) where receipt.status == "acknowledged":
                         engine.acknowledged(alert.eventId)
+                        log.record("alert_acknowledged")
                         deliveryStatus = "Alert acknowledged on Parent"
                     case .success(let receipt) where receipt.status == "failed":
                         engine.permanentlyFailed(alert.eventId, at: currentTime())
@@ -369,9 +396,9 @@ import UIKit
                     case .success(let receipt):
                         engine.failed(alert.eventId, at: Date())
                         switch receipt.status {
-                        case "uncertain": deliveryStatus = "Alert delivery uncertain. Check the Parent iPhone."
-                        case "blocked": deliveryStatus = "Alert blocked. Open Parent Mode and enable notifications."
-                        default: deliveryStatus = "Alert queued on server (\(receipt.status))."
+                        case "uncertain": deliveryStatus = "Alert delivery uncertain. Check the Parent iPhone."; log.record("alert_uncertain")
+                        case "blocked": deliveryStatus = "Alert blocked. Open Parent Mode and enable notifications."; log.record("alert_blocked")
+                        default: deliveryStatus = "Alert queued on server (\(receipt.status))."; log.record("alert_server_pending")
                         }
                     case .failure(let failure):
                         engine.failed(alert.eventId, at: Date()); deliveryStatus = "Alert pending: \(failure.localizedDescription)"
@@ -386,7 +413,7 @@ import UIKit
                     persist()
                 }
             }
-        } catch { deliveryStatus = "Backend unavailable: \(error.localizedDescription)" }
+        } catch { deliveryStatus = "Backend unavailable: \(error.localizedDescription)"; log.record("backend_unavailable") }
     }
     private func synchronizeSettings(using client: any BackendServing) {
         guard settingsDirty, paired, settingsTask == nil else { return }
@@ -399,54 +426,93 @@ import UIKit
                 guard let self, revision == self.environmentRevision,
                       generation == self.settingsGeneration else { return }
                 self.settingsDirty = false; self.defaults.set(false, forKey: "settingsDirty")
+                self.log.record("settings_synced")
                 // Invalidate remote reads begun before this upload finished.
                 self.settingsGeneration += 1
             } catch {
                 guard let self, revision == self.environmentRevision else { return }
                 self.deliveryStatus = "Settings sync pending: \(error.localizedDescription)"
+                self.log.record("settings_sync_failed")
             }
         }
     }
-    private func scheduleHeartbeatIfDue() {
-        guard connectivity.available, monitoring,
-              currentTime().timeIntervalSince(lastHeartbeatAt) >= 60,
-              queuedHeartbeatGeneration != monitoringGeneration else { return }
-        queueHeartbeat()
+    private var heartbeatKey: String? {
+        guard role == .listener, let credential else { return nil }
+        return "\(backendURL)|\(credential.deviceId)"
     }
-    /// Capture the Listener identity and payload synchronously, including before a
-    /// role change. Serialize requests so an older active heartbeat cannot win.
-    @discardableResult private func queueHeartbeat() -> Task<Void, Never>? {
-        guard role == .listener, paired, let client = try? client() else { return nil }
+    private func heartbeatValue(listenerID: UUID) -> Heartbeat {
         func remote(_ episode: CryEpisode) -> RemoteEpisode {
             RemoteEpisode(id: episode.id, startedAt: episode.startedAt, endedAt: episode.endedAt, alertSentAt: episode.alertSentAt)
         }
-        let value = Heartbeat(listenerId: client.credential.deviceId, timestamp: currentTime(), monitoring: monitoring,
-                              batteryLevel: batteryLevel, powerConnected: powerConnected, state: state,
-                              currentEpisode: snapshot.current.map(remote), episodes: Array(snapshot.history.prefix(100)).map(remote))
-        let revision = environmentRevision, generation = settingsGeneration
-        let observation = monitoringGeneration
-        queuedHeartbeatGeneration = observation
-        let previous = heartbeatTask
-        let task = Task { [weak self] in
-            defer {
-                if self?.queuedHeartbeatGeneration == observation { self?.queuedHeartbeatGeneration = nil }
-            }
-            await previous?.value
-            guard !Task.isCancelled else { return }
-            do {
-                let config = try await client.heartbeat(value)
-                guard let self, revision == self.environmentRevision,
-                      observation == self.monitoringGeneration else { return }
-                self.lastHeartbeatAt = self.currentTime(); self.deliveryStatus = "Connected"
-                if !self.settingsDirty, generation == self.settingsGeneration { self.applyRemote(config) }
-            } catch {
-                guard let self, revision == self.environmentRevision,
-                      observation == self.monitoringGeneration else { return }
-                self.deliveryStatus = "Monitoring locally. Alerts may be delayed: \(error.localizedDescription)"
-            }
+        return Heartbeat(listenerId: listenerID, timestamp: currentTime(), monitoring: monitoring,
+                         batteryLevel: batteryLevel, powerConnected: powerConnected, state: state,
+                         currentEpisode: snapshot.current.map(remote), episodes: Array(snapshot.history.prefix(100)).map(remote))
+    }
+    private func scheduleHeartbeatIfDue() {
+        let available = connectivity.available
+        if available != lastConnectivityAvailable { log.record(available ? "network_available" : "network_unavailable") }
+        if available && !lastConnectivityAvailable {
+            // A recovered path gets one immediate attempt, then normal backoff.
+            for key in Array(pendingHeartbeats.keys) { pendingHeartbeats[key]?.nextAttemptAt = currentTime() }
         }
-        heartbeatTask = task
-        return task
+        lastConnectivityAvailable = available
+        if monitoring, let key = heartbeatKey, pendingHeartbeats[key] == nil,
+           currentTime().timeIntervalSince(lastHeartbeatAt) >= 60 {
+            queueHeartbeat()
+        }
+        dispatchHeartbeatIfReady()
+    }
+    /// Capture the Listener identity before a role change. A new state replaces
+    /// obsolete queued work, while an in-flight request finishes before the next.
+    private func queueHeartbeat() {
+        guard paired, let key = heartbeatKey, let client = try? client() else { return }
+        pendingHeartbeats[key] = HeartbeatRequest(client: client, value: heartbeatValue(listenerID: client.credential.deviceId),
+                                                  revision: environmentRevision, settingsGeneration: settingsGeneration,
+                                                  observation: monitoringGeneration)
+        dispatchHeartbeatIfReady()
+    }
+    private func dispatchHeartbeatIfReady() {
+        guard connectivity.available, heartbeatTask == nil,
+              let entry = pendingHeartbeats.filter({ $0.value.nextAttemptAt <= currentTime() })
+                .min(by: { $0.value.nextAttemptAt < $1.value.nextAttemptAt }) else { return }
+        let key = entry.key
+        var request = entry.value
+        if request.revision == environmentRevision, request.observation == monitoringGeneration {
+            // Refresh metadata at dispatch, without resetting a retry's backoff.
+            request.value = heartbeatValue(listenerID: request.client.credential.deviceId)
+            request.settingsGeneration = settingsGeneration
+        }
+        let attempt = request
+        heartbeatTask = Task { [weak self] in
+            guard let self else { return }
+            // A stop/restart may have superseded this task before it even ran.
+            guard self.pendingHeartbeats[key]?.id == attempt.id else {
+                self.heartbeatTask = nil; self.scheduleHeartbeatIfDue(); return
+            }
+            do {
+                let config = try await attempt.client.heartbeat(attempt.value)
+                if attempt.failures > 0 { self.log.record("heartbeat_recovered") }
+                if self.pendingHeartbeats[key]?.id == attempt.id { self.pendingHeartbeats.removeValue(forKey: key) }
+                if attempt.revision == self.environmentRevision, attempt.observation == self.monitoringGeneration {
+                    self.lastHeartbeatAt = self.currentTime(); self.deliveryStatus = "Connected"
+                    if !self.settingsDirty, attempt.settingsGeneration == self.settingsGeneration { self.applyRemote(config) }
+                }
+            } catch {
+                if var pending = self.pendingHeartbeats[key], pending.id == attempt.id {
+                    pending.failures += 1
+                    let base = min(30.0, pow(2, Double(min(pending.failures, 5))))
+                    let delay = min(30, base * min(1.1, max(0.9, self.heartbeatJitter())))
+                    pending.nextAttemptAt = self.currentTime().addingTimeInterval(delay)
+                    self.pendingHeartbeats[key] = pending
+                    self.log.record("heartbeat_retry_scheduled")
+                }
+                if attempt.revision == self.environmentRevision, attempt.observation == self.monitoringGeneration {
+                    self.deliveryStatus = "Monitoring status update pending: \(error.localizedDescription)"
+                }
+            }
+            self.heartbeatTask = nil
+            self.scheduleHeartbeatIfDue()
+        }
     }
     func refreshParent() async {
         guard role == .parent else { return }
@@ -461,6 +527,7 @@ import UIKit
         } catch {
             guard revision == environmentRevision else { return }
             deliveryStatus = "Status unavailable: \(error.localizedDescription)"; parentStatus = nil
+            log.record("parent_status_failed")
             publishWatch()
         }
     }
@@ -469,6 +536,7 @@ import UIKit
         catch { self.error = error.localizedDescription }
     }
     func foreground() async {
+        log.record("foreground")
         if credential == nil { loadCredential() }
         if role == .parent { await notifications.register(); await refreshParent() }
         if role == .listener && needsRestart && !monitoring && !starting && !recoveringAudio { error = "Monitoring needs to be restarted. Check the microphone and tap Start Monitoring." }
@@ -542,6 +610,7 @@ import UIKit
             if hasPendingWatchToken {
                 let token = pendingWatchToken
                 try await client.watchPushToken(token)
+                log.record("watch_token_synced")
                 guard revision == environmentRevision else { return nil }
                 if pendingWatchToken == token {
                     hasPendingWatchToken = false
@@ -552,12 +621,13 @@ import UIKit
             for rawID in queue {
                 guard let id = UUID(uuidString: rawID), revision == environmentRevision else { continue }
                 try await client.acknowledge(id)
+                log.record("watch_acknowledged")
                 var remaining = defaults.stringArray(forKey: queueKey) ?? []
                 remaining.removeAll { $0 == rawID }
                 defaults.set(remaining, forKey: queueKey)
                 defaults.set(rawID, forKey: confirmedKey)
             }
             return nil
-        } catch { return "Watch sync pending. Check the Parent iPhone connection and backend setup." }
+        } catch { log.record("watch_sync_failed"); return "Watch sync pending. Check the Parent iPhone connection and backend setup." }
     }
 }

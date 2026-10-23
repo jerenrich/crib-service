@@ -15,6 +15,7 @@ import Observation
     private(set) var status = "Notifications not enabled"
     var onToken: ((String) -> Void)?
     var onAlert: (() -> Void)?
+    weak var log: DiagnosticLog?
     override init() {
         super.init()
         UNUserNotificationCenter.current().delegate = self
@@ -27,21 +28,25 @@ import Observation
         do {
             let allowed = try await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge])
             status = allowed ? "Registering for push notifications…" : "Notifications disabled. Enable them in iPhone Settings."
+            log?.record(allowed ? "notification_permission_allowed" : "notification_permission_denied")
             if allowed { UIApplication.shared.registerForRemoteNotifications() }
-        } catch { status = "Could not request notification permission." }
+        } catch { status = "Could not request notification permission."; log?.record("notification_permission_failed", code: (error as NSError).code) }
     }
     func registered(_ token: Data) {
         status = "Push token registered"
         onToken?(token.map { String(format: "%02x", $0) }.joined())
     }
-    func failed() { status = "Push registration failed. Check signing and connectivity." }
+    func failed() { status = "Push registration failed. Check signing and connectivity."; log?.record("push_registration_failed") }
     func simulate(_ alert: CryAlert) async throws {
         let content = UNMutableNotificationContent()
         content.title = "Simulation · Baby is still crying"
         content.body = "Synthetic episode reached \(Int(alert.durationSeconds)) seconds."
         content.sound = nil
         content.categoryIdentifier = WatchNotification.category
-        try await UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: alert.eventId.uuidString, content: content, trigger: nil))
+        do {
+            try await UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: alert.eventId.uuidString, content: content, trigger: nil))
+            log?.record("local_notification_scheduled")
+        } catch { log?.record("local_notification_failed", code: (error as NSError).code); throw error }
     }
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
         await refresh(); return [.banner, .list]
@@ -52,5 +57,8 @@ import Observation
 @MainActor final class AppDelegate: NSObject, UIApplicationDelegate {
     var notifications: (any NotificationProviding)?
     func application(_ application: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) { notifications?.registered(deviceToken) }
-    func application(_ application: UIApplication, didFailToRegisterForRemoteNotificationsWithError error: Error) { notifications?.failed() }
+    func application(_ application: UIApplication, didFailToRegisterForRemoteNotificationsWithError error: Error) {
+        (notifications as? NotificationService)?.log?.record("push_registration_failed", code: (error as NSError).code)
+        notifications?.failed()
+    }
 }

@@ -1,7 +1,8 @@
 import {decryptToken} from './security';
 import type {Alert,Env} from './types';
+import {PushPreparationError,type Outcome} from './diagnostics';
 
-export type PushResult = {status:'sent'|'retry'|'blocked'|'uncertain'|'failed';reason?:string};
+export type PushResult = {status:'sent'|'retry'|'blocked'|'uncertain'|'failed';reason?:Outcome;httpStatus?:number};
 let cache: {identity:string;token:string;expires:number}|undefined;
 function base64url(value:Uint8Array):string {return btoa(String.fromCharCode(...value)).replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');}
 function encodedJSON(value:unknown):string {return base64url(new TextEncoder().encode(JSON.stringify(value)));}
@@ -26,17 +27,24 @@ export function payload(alert:Alert,target:'phone'|'watch'='phone') {
 }
 export async function sendPush(env:Env,encryptedToken:string,alert:Alert,target:'phone'|'watch'='phone'):Promise<PushResult> {
  // Errors before fetch are known not to have sent a notification and can safely retry.
- const deviceToken=await decryptToken(env,encryptedToken);const jwt=await apnsToken(env);
- if(!['development','production'].includes(env.APNS_ENVIRONMENT))throw new Error('Invalid APNs environment');
+ let deviceToken:string,jwt:string;
+ try {deviceToken=await decryptToken(env,encryptedToken);}catch{throw new PushPreparationError('token_decryption');}
+ try {jwt=await apnsToken(env);}catch{throw new PushPreparationError('provider_signing');}
+ if(!['development','production'].includes(env.APNS_ENVIRONMENT))throw new PushPreparationError('apns_environment');
  const host=env.APNS_ENVIRONMENT==='production'?'api.push.apple.com':'api.sandbox.push.apple.com';
  let response:Response;
  try {
   response=await fetch(`https://${host}/3/device/${deviceToken}`,{method:'POST',headers:{authorization:`bearer ${jwt}`,'apns-topic':env.APNS_BUNDLE_ID+(target==='watch'?'.watchkitapp':''),'apns-push-type':'alert','apns-priority':'10','apns-id':alert.eventId,'apns-collapse-id':alert.eventId,'apns-expiration':String(Math.floor(Date.now()/1000)+3600),'content-type':'application/json'},body:JSON.stringify(payload(alert,target)),signal:AbortSignal.timeout(10000)});
  }catch{return {status:'uncertain',reason:'transport_unknown'};}
- if(response.status===200)return {status:'sent'};
- if([429,500,503].includes(response.status))return {status:'retry',reason:`apns_${response.status}`};
+ const httpStatus=response.status;
+ if(response.status===200)return {status:'sent',httpStatus};
+ if(response.status===429)return {status:'retry',reason:'apns_429',httpStatus};
+ if(response.status===500)return {status:'retry',reason:'apns_500',httpStatus};
+ if(response.status===503)return {status:'retry',reason:'apns_503',httpStatus};
  let reason='rejected';try{const error=await response.json() as {reason?:string};reason=error.reason??reason;}catch{/* Empty rejection body remains a failure. */}
- if(['BadDeviceToken','DeviceTokenNotForTopic','Unregistered'].includes(reason))return {status:'blocked',reason:'invalid_device_token'};
- if(['ExpiredProviderToken','InvalidProviderToken','Forbidden','TopicDisallowed'].includes(reason))return {status:'retry',reason:'provider_configuration'};
- return {status:'failed',reason:'apns_rejected'};
+ if(['BadDeviceToken','DeviceTokenNotForTopic','Unregistered'].includes(reason))return {status:'blocked',reason:'invalid_device_token',httpStatus};
+ if(['ExpiredProviderToken','InvalidProviderToken','Forbidden','TopicDisallowed'].includes(reason))return {status:'retry',reason:'provider_configuration',httpStatus};
+ const reasons:Record<string,Outcome>={BadTopic:'bad_topic',MissingTopic:'missing_topic',BadPriority:'bad_priority',BadExpirationDate:'bad_expiration',PayloadEmpty:'bad_payload',PayloadTooLarge:'payload_too_large'};
+ const safeReason=Object.hasOwn(reasons,reason)?reasons[reason]:'apns_rejected';
+ return {status:'failed',reason:safeReason,httpStatus};
 }

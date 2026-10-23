@@ -4,39 +4,61 @@ import {authenticate,register,savePushToken,saveWatchPushToken} from './devices'
 import {createPairing,claimPairing} from './pairing';
 import {receiveAlert,acknowledge,flushPending} from './alerts';
 import {saveHeartbeat,listenerStatus,saveSettings} from './status';
+import {operationFor,recordDiagnostic,type Stage} from './diagnostics';
 
 export default {
  async fetch(request:Request,env:Env):Promise<Response> {
+  const requestId=crypto.randomUUID(),started=Date.now();
+  let operation=operationFor('', ''),stage:Stage='validation';
+  const respond=async(result:unknown,status:number,outcome:'ok'|'rejected'|'internal_error')=>{
+   const saved=await recordDiagnostic(env,{requestId,started,operation,stage,outcome,httpStatus:status});
+   return Response.json(result,{status,headers:{'cache-control':'no-store','x-content-type-options':'nosniff',
+    'x-request-id':requestId,'x-diagnostics-status':saved?'recorded':'unavailable'}});
+  };
   try {
    const url=new URL(request.url);
+   operation=operationFor(request.method,url.pathname);
    if(url.protocol!=='https:' && !['localhost','127.0.0.1','[::1]'].includes(url.hostname))throw new APIError(400,'HTTPS required.');
    if(url.search)throw new APIError(400,'Query strings are not accepted.');
    if(!env.PAIRING_PEPPER||env.PAIRING_PEPPER.length<32)throw new Error('Pairing configuration missing');
    const route=`${request.method} ${url.pathname}`;
    const ip=request.headers.get('CF-Connecting-IP')??'local';
+   stage='rate_limit';
    await rateLimit(env,'api',ip,600,600);
    let result:unknown;
-   if(route==='POST /v1/device/register')result=await register(env,await body(request),ip);
+   if(route==='POST /v1/device/register'){stage='handler';result=await register(env,await body(request),ip);}
    else{
+    stage='authentication';
     const device=await authenticate(env,request);
+    stage='handler';
     switch(route){
      case 'POST /v1/pairing/create':result=await createPairing(env,device);break;
      case 'POST /v1/pairing/claim':result=await claimPairing(env,device,await body(request),ip);break;
      case 'POST /v1/device/push-token':result=await savePushToken(env,device,await body(request));break;
      case 'POST /v1/device/watch-push-token':result=await saveWatchPushToken(env,device,await body(request));break;
      case 'POST /v1/listener/heartbeat':result=await saveHeartbeat(env,device,await body(request));break;
-     case 'POST /v1/listener/event':result=await receiveAlert(env,device,await body(request));break;
+     case 'POST /v1/listener/event':result=await receiveAlert(env,device,await body(request),requestId);break;
      case 'GET /v1/listener/status':result=await listenerStatus(env,device);break;
      case 'POST /v1/settings':result=await saveSettings(env,device,await body(request));break;
      case 'POST /v1/alert/acknowledge':result=await acknowledge(env,device,await body(request));break;
      default:throw new APIError(404,'Endpoint not found.');
     }
    }
-   return Response.json(result,{headers:{'cache-control':'no-store','x-content-type-options':'nosniff'}});
+   return await respond(result,200,'ok');
   }catch(error){
    const expected=error instanceof APIError;
-   return Response.json({error:expected?error.message:'Server configuration or storage unavailable.'},{status:expected?error.status:503,headers:{'cache-control':'no-store','x-content-type-options':'nosniff'}});
+   return await respond({error:expected?error.message:'Server configuration or storage unavailable.'},expected?error.status:503,expected?'rejected':'internal_error');
   }
  },
- async scheduled(_controller:ScheduledController,env:Env):Promise<void> {await flushPending(env);}
+ async scheduled(_controller:ScheduledController,env:Env):Promise<void> {
+  const requestId=crypto.randomUUID(),started=Date.now();
+  try {
+   await flushPending(env,requestId);
+   await recordDiagnostic(env,{requestId,started,operation:'maintenance',stage:'cleanup',outcome:'ok'});
+  } catch {
+   await recordDiagnostic(env,{requestId,started,operation:'maintenance',stage:'cleanup',outcome:'internal_error'});
+   // Preserve the failed-invocation metric without leaking a D1 exception/SQL value.
+   throw new Error('Scheduled maintenance failed.');
+  }
+ }
 } satisfies ExportedHandler<Env>;

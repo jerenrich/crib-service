@@ -69,15 +69,17 @@ FAA19EEF38BC7E02F0943DDE = { isa = PBXFileReference; lastKnownFileType = sourcec
 994E6C089F454E666DCF8F7C = { isa = PBXBuildFile; fileRef = FAA19EEF38BC7E02F0943DDE; };
 B28F2106283CFBD7EC0D2821 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "BabyCryMonitorTests/CrySessionTests.swift"; sourceTree = "<group>"; };
 0AB860ECEB11ECC8B0E40BB1 = { isa = PBXBuildFile; fileRef = B28F2106283CFBD7EC0D2821; };
+6D603267A1AE962862DE6189 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "BabyCryMonitorTests/DiagnosticsTests.swift"; sourceTree = "<group>"; };
+16E6E2CA7DBEC199FF4EF764 = { isa = PBXBuildFile; fileRef = 6D603267A1AE962862DE6189; };
 C2EE54DC6A80AB5FD151035A = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "BabyCryMonitorTests/MetadataStoreTests.swift"; sourceTree = "<group>"; };
 2F4525757AC342403808CB15 = { isa = PBXBuildFile; fileRef = C2EE54DC6A80AB5FD151035A; };
 34893FC1743009FA8EF4867E = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "BabyCryMonitorTests/WatchIntegrationTests.swift"; sourceTree = "<group>"; };
 007A444D3D5A3157F08667A1 = { isa = PBXBuildFile; fileRef = 34893FC1743009FA8EF4867E; };
 12C57B9E2D8B9D68E90E25FD = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "BabyCryMonitorTests/WatchMessagesTests.swift"; sourceTree = "<group>"; };
 1CDF6106D663CF01E195DEA3 = { isa = PBXBuildFile; fileRef = 12C57B9E2D8B9D68E90E25FD; };
-F425404A86E525B431714975 = { isa = PBXGroup; name = "BabyCryMonitorTests"; children = (0E6E94943C023FC66825FB0F, FAA19EEF38BC7E02F0943DDE, B28F2106283CFBD7EC0D2821, C2EE54DC6A80AB5FD151035A, 34893FC1743009FA8EF4867E, 12C57B9E2D8B9D68E90E25FD,); sourceTree = "<group>"; };
+F425404A86E525B431714975 = { isa = PBXGroup; name = "BabyCryMonitorTests"; children = (0E6E94943C023FC66825FB0F, FAA19EEF38BC7E02F0943DDE, B28F2106283CFBD7EC0D2821, 6D603267A1AE962862DE6189, C2EE54DC6A80AB5FD151035A, 34893FC1743009FA8EF4867E, 12C57B9E2D8B9D68E90E25FD,); sourceTree = "<group>"; };
 9BCA620710641AE39460FF5B = { isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "BabyCryMonitorTests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
-D0F2ABDE8652A3D5BAAF74A4 = { isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (4F49A6CE5ADC326159D2AF7C, 994E6C089F454E666DCF8F7C, 0AB860ECEB11ECC8B0E40BB1, 2F4525757AC342403808CB15, 007A444D3D5A3157F08667A1, 1CDF6106D663CF01E195DEA3,); runOnlyForDeploymentPostprocessing = 0; };
+D0F2ABDE8652A3D5BAAF74A4 = { isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (4F49A6CE5ADC326159D2AF7C, 994E6C089F454E666DCF8F7C, 0AB860ECEB11ECC8B0E40BB1, 16E6E2CA7DBEC199FF4EF764, 2F4525757AC342403808CB15, 007A444D3D5A3157F08667A1, 1CDF6106D663CF01E195DEA3,); runOnlyForDeploymentPostprocessing = 0; };
 F773D91704D43C90F4A8E059 = { isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 41C88FEF7AB2E917F439585F = { isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 B14D50181820C8D9DF4B549A = { isa = XCBuildConfiguration; baseConfigurationReference = 2E90AAD604339879794A0C39; buildSettings = { PRODUCT_NAME = "$(TARGET_NAME)"; PRODUCT_BUNDLE_IDENTIFIER = "com.jordanerenrich.babycrymonitor.BabyCryMonitorTests"; SWIFT_VERSION = 6.0; IPHONEOS_DEPLOYMENT_TARGET = 17.0; TARGETED_DEVICE_FAMILY = 1; CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; CURRENT_PROJECT_VERSION = 1; MARKETING_VERSION = 1.0; SWIFT_STRICT_CONCURRENCY = complete; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @loader_path/Frameworks"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/BabyCryMonitor.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/BabyCryMonitor"; BUNDLE_LOADER = "$(TEST_HOST)"; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)"; }; name = Debug; };
@@ -105,6 +107,7 @@ A7EC304447531262C8E88529 = { isa = PBXFileReference; lastKnownFileType = sourcec
 34B0E17088ED184DBDD7B7AD = { isa = PBXBuildFile; fileRef = 7862161CD1882B31E3DFF117; };
 F50C63F3354D9960D3990D4A = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "BabyCryWatch/WatchModel.swift"; sourceTree = "<group>"; };
 123D84E04C303C79A750AF3D = { isa = PBXBuildFile; fileRef = F50C63F3354D9960D3990D4A; };
+D423D70D779207AF8AE26FC4 = { isa = PBXBuildFile; fileRef = 930C2DC0F7C4061D58707B0C; };
 1D77C02FC804133FBEDF4095 = { isa = PBXBuildFile; fileRef = AB1846C272AC51796D27EAFB; };
 8CE583730B36AFBC1DE8DE38 = { isa = PBXBuildFile; fileRef = 3E66BDAF28F1B753E0508938; };
 29383A64226DB0E319A95F3C = { isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "BabyCryWatch/Info.plist"; sourceTree = "<group>"; };
@@ -114,7 +117,7 @@ AE30B1B7102031F0C5F56D3B = { isa = PBXBuildFile; fileRef = CADCDB22137D14E6DCC4C
 60E2EDAAEE1A074DBF170B67 = { isa = PBXBuildFile; fileRef = FBD992752F8B428C51DBFA4F; };
 73137C34AE95B9554C5844AF = { isa = PBXGroup; name = BabyCryWatch; children = (A7EC304447531262C8E88529, 7862161CD1882B31E3DFF117, F50C63F3354D9960D3990D4A, 29383A64226DB0E319A95F3C, 9CFE65E3E18CBDBBB345FC97, CADCDB22137D14E6DCC4C448,); sourceTree = "<group>"; };
 B2CB369F58A257CA70823562 = { isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "BabyCryWatch.app"; sourceTree = BUILT_PRODUCTS_DIR; };
-5462B1C56A2BAB29A9957785 = { isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (613C0D592971128325A87AF2, 34B0E17088ED184DBDD7B7AD, 123D84E04C303C79A750AF3D, 1D77C02FC804133FBEDF4095, 8CE583730B36AFBC1DE8DE38,); runOnlyForDeploymentPostprocessing = 0; };
+5462B1C56A2BAB29A9957785 = { isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (613C0D592971128325A87AF2, 34B0E17088ED184DBDD7B7AD, 123D84E04C303C79A750AF3D, D423D70D779207AF8AE26FC4, 1D77C02FC804133FBEDF4095, 8CE583730B36AFBC1DE8DE38,); runOnlyForDeploymentPostprocessing = 0; };
 B712CB65DD62BE7D0BEB6B52 = { isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 224720E095F3EFF84AB74A36 = { isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (AE30B1B7102031F0C5F56D3B, 60E2EDAAEE1A074DBF170B67,); runOnlyForDeploymentPostprocessing = 0; };
 4BF8AD335E03D96FC6632798 = { isa = XCBuildConfiguration; baseConfigurationReference = 2E90AAD604339879794A0C39; buildSettings = { PRODUCT_NAME = "$(TARGET_NAME)"; PRODUCT_BUNDLE_IDENTIFIER = "com.jordanerenrich.babycrymonitor.watchkitapp"; SWIFT_VERSION = 6.0; SWIFT_STRICT_CONCURRENCY = complete; SDKROOT = watchos; SUPPORTED_PLATFORMS = "watchos watchsimulator"; WATCHOS_DEPLOYMENT_TARGET = 10.0; TARGETED_DEVICE_FAMILY = 4; CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = "BabyCryWatch/Info.plist"; CODE_SIGN_ENTITLEMENTS = "BabyCryWatch/BabyCryWatch.entitlements"; CURRENT_PROJECT_VERSION = 1; MARKETING_VERSION = 1.0; SKIP_INSTALL = YES; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)"; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; }; name = Debug; };

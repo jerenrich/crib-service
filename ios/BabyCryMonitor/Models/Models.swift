@@ -73,6 +73,7 @@ public struct FailedAlert: Identifiable, Codable, Sendable {
     public var id: UUID { alert.eventId }
     public init(alert: CryAlert, failedAt: Date) { self.alert = alert; self.failedAt = failedAt }
 }
+public enum EpisodeAlertStatus: Sendable { case notQueued, pending, failed, sent, acknowledged }
 public struct SessionSnapshot: Codable, Sendable {
     public var configuration = MonitoringConfiguration()
     public var history: [CryEpisode] = []
@@ -82,6 +83,13 @@ public struct SessionSnapshot: Codable, Sendable {
     public var lastObservedAt: Date?
     public var wasMonitoring = false
     public init() {}
+    public func alertStatus(for episode: CryEpisode) -> EpisodeAlertStatus {
+        if pending.contains(where: { $0.alert.episodeId == episode.id }) { return .pending }
+        let latestQueuedAt = episode.lastAlertQueuedAt ?? episode.alertQueuedAt
+        if failedAlerts.contains(where: { $0.alert.episodeId == episode.id && $0.alert.createdAt == latestQueuedAt }) { return .failed }
+        if episode.alertSentAt != nil { return .sent }
+        return episode.alertQueuedAt == nil ? .notQueued : .acknowledged
+    }
     private enum CodingKeys: String, CodingKey {
         case configuration, history, current, pending, failedAlerts, lastObservedAt, wasMonitoring
     }

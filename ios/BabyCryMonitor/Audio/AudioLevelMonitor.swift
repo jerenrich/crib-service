@@ -23,6 +23,7 @@ enum AudioCaptureStatus {
     private var wantsMonitoring = false
     private var generation = 0
     var onStatus: ((AudioCaptureStatus) -> Void)?
+    weak var log: DiagnosticLog?
 
     init() {
         let pair = AsyncStream<AudioLevelSample>.makeStream(bufferingPolicy: .bufferingNewest(16))
@@ -42,6 +43,7 @@ enum AudioCaptureStatus {
             onStatus?(.active)
         } catch {
             if generation == expected { wantsMonitoring = false }
+            log?.record("monitoring_start_failed", code: (error as NSError).code)
             throw error
         }
     }
@@ -60,6 +62,10 @@ enum AudioCaptureStatus {
     }
     private func handle(name: Notification.Name, type: UInt?, options: UInt) async {
         guard wantsMonitoring else { return }
+        if name == AVAudioSession.interruptionNotification { log?.record(type == AVAudioSession.InterruptionType.began.rawValue ? "audio_interruption_began" : "audio_interruption_ended") }
+        else if name == AVAudioSession.routeChangeNotification { log?.record("audio_route_changed") }
+        else if name == AVAudioSession.mediaServicesWereResetNotification { log?.record("audio_services_reset") }
+        else if name == .AVAudioEngineConfigurationChange { log?.record("audio_engine_changed") }
         if name == .AVAudioEngineConfigurationChange, await driver.isRunning { return }
         guard wantsMonitoring else { return }
         if name == AVAudioSession.interruptionNotification, type == AVAudioSession.InterruptionType.began.rawValue {
@@ -80,6 +86,7 @@ enum AudioCaptureStatus {
             onStatus?(.active)
         } catch {
             guard generation == expected, wantsMonitoring else { return }
+            log?.record("audio_interrupted", code: (error as NSError).code)
             onStatus?(.failed("Microphone unavailable. Open the app to restart monitoring."))
         }
     }

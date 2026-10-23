@@ -25,6 +25,7 @@ import UserNotifications
         WatchModel.shared.registered(deviceToken)
     }
     func didFailToRegisterForRemoteNotificationsWithError(_ error: Error) {
+        WatchModel.shared.log.record("push_registration_failed", code: (error as NSError).code)
         WatchModel.shared.notice = "Watch push registration failed. Check connectivity and try Enable alerts again."
     }
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {

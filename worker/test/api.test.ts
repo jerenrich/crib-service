@@ -5,6 +5,7 @@ import {defaultConfiguration,type Env,type Alert} from '../src/types';
 import {payload,apnsToken} from '../src/apns';
 import {encryptToken,decryptToken} from '../src/security';
 import {flushPending} from '../src/alerts';
+import {eventReference,recordDiagnostic} from '../src/diagnostics';
 
 let testEnv:Env;
 const secret=btoa('0123456789abcdef0123456789abcdef');
@@ -37,7 +38,7 @@ beforeAll(async()=>{
  testEnv={...env,APNS_KEY_ID:'TESTKEY',APNS_TEAM_ID:'TESTTEAM',APNS_PRIVATE_KEY:`-----BEGIN PRIVATE KEY-----\n${pem}\n-----END PRIVATE KEY-----`,APNS_BUNDLE_ID:'com.example.BabyCryMonitor',APNS_ENVIRONMENT:'development'};
 });
 beforeEach(async()=>{
- await env.DB.batch(['events','heartbeats','pairs','pairing_codes','devices','rate_limits'].map(table=>env.DB.prepare(`DELETE FROM ${table}`)));
+ await env.DB.batch(['diagnostics','events','heartbeats','pairs','pairing_codes','devices','rate_limits'].map(table=>env.DB.prepare(`DELETE FROM ${table}`)));
  pushResponses=[];pushRequests=[];
  vi.stubGlobal('fetch',vi.fn(async(input:string|URL|Request,init?:RequestInit)=>{
   const url=String(input);expect(url).toMatch(/^https:\/\/api\.sandbox\.push\.apple\.com\/3\/device\//);
@@ -336,5 +337,103 @@ describe('APNs and durable idempotent alerts',()=>{
   await flushPending(testEnv);
   expect(await (await call('listener/event',listener,event)).json()).toEqual({status:'acknowledged'});
   expect(pushRequests).toHaveLength(1);
+ });
+});
+
+describe('private operational diagnostics',()=>{
+ it('distinguishes preparation failures and sanitizes arbitrary APNs rejection text',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  const event=alert(listener);
+  const request=()=>new Request('https://monitor.test/v1/listener/event',{
+   method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${listener.deviceId}.${listener.secret}`},body:JSON.stringify(event)
+  });
+  await worker.fetch(request(),{...testEnv,TOKEN_ENCRYPTION_KEY:'invalid-private-key-marker'});
+  expect((await env.DB.prepare("SELECT outcome FROM diagnostics WHERE operation='dispatch'").all()).results).toEqual([{outcome:'token_decryption'}]);
+  await env.DB.prepare('UPDATE events SET next_attempt=0 WHERE event_id=?').bind(event.eventId).run();
+  pushResponses.push(new Response(JSON.stringify({reason:'private-apns-response-marker'}),{status:400}));
+  await worker.fetch(request(),testEnv);
+  const journal=(await env.DB.prepare("SELECT * FROM diagnostics WHERE operation='dispatch' ORDER BY sequence").all()).results;
+  expect(journal[1]).toMatchObject({outcome:'apns_rejected',http_status:400,attempt:2});
+  expect(JSON.stringify(journal)).not.toContain('private-apns-response-marker');
+  expect(JSON.stringify(journal)).not.toContain('invalid-private-key-marker');
+ });
+ it('records interrupted dispatch and never retries uncertain acceptance',async()=>{
+  const {listener}=await paired();const event=alert(listener);await call('listener/event',listener,event);
+  await env.DB.prepare("UPDATE events SET status='sending',lease_until=? WHERE event_id=?").bind(Date.now()-1,event.eventId).run();
+  await worker.scheduled({} as ScheduledController,testEnv);
+  const row=await env.DB.prepare("SELECT outcome,event_ref FROM diagnostics WHERE outcome='dispatch_interrupted'").first();
+  expect(row).toEqual({outcome:'dispatch_interrupted',event_ref:await eventReference(testEnv,event.eventId)});
+  expect(pushRequests).toHaveLength(0);
+ });
+ it('correlates requests and cron retries without persisting private input',async()=>{
+  const {parent,listener,code}=await paired();const token='ab'.repeat(32);
+  await call('device/push-token',parent,{token});
+  const event=alert(listener);mockPush(503);
+  const response=await call('listener/event',listener,event);
+  const requestId=response.headers.get('x-request-id');expect(requestId).toMatch(/^[0-9a-f-]{36}$/);
+  expect(response.headers.get('x-diagnostics-status')).toBe('recorded');
+  const ref=await eventReference(testEnv,event.eventId);
+  const initial=await env.DB.prepare('SELECT * FROM diagnostics WHERE request_id=?').bind(requestId).all();
+  expect(initial.results).toEqual(expect.arrayContaining([
+   expect.objectContaining({operation:'alert',outcome:'ok',http_status:200}),
+   expect.objectContaining({operation:'dispatch',outcome:'apns_503',event_ref:ref,target:'phone',attempt:1})
+  ]));
+  await env.DB.prepare('UPDATE events SET next_attempt=0 WHERE event_id=?').bind(event.eventId).run();mockPush();
+  await worker.scheduled({} as ScheduledController,testEnv);
+  const retries=await env.DB.prepare('SELECT outcome,attempt FROM diagnostics WHERE event_ref=? ORDER BY sequence').bind(ref).all();
+  expect(retries.results).toEqual([{outcome:'apns_503',attempt:1},{outcome:'sent',attempt:2}]);
+  // Deliberately hostile URLs/headers/body, including a spoofed correlation ID.
+  await worker.fetch(new Request('https://monitor.test/private-url-marker?pairing=private-query-marker',{
+   method:'POST',headers:{authorization:'Bearer private-auth-marker','x-request-id':'private-id-marker','CF-Connecting-IP':'192.0.2.42'},body:'private-body-marker'
+  }),testEnv);
+  const journal=JSON.stringify((await env.DB.prepare('SELECT * FROM diagnostics').all()).results);
+  for(const privateValue of [secret,token,parent.deviceId,listener.deviceId,code.code,event.eventId,event.episodeId,event.cryStartedAt,
+   'private-url-marker','private-query-marker','private-auth-marker','private-id-marker','private-body-marker','192.0.2.42']) {
+   expect(journal).not.toContain(privateValue);
+  }
+ });
+ it('keeps diagnostics failures out of API and delivery outcomes',async()=>{
+  const {listener}=await paired();
+  const failingDB=new Proxy(testEnv.DB,{get(target,key){
+   if(key==='prepare')return (sql:string)=>{if(sql.startsWith('INSERT INTO diagnostics')||sql.startsWith('DELETE FROM diagnostics'))throw new Error('private-storage-error');return target.prepare(sql);};
+   const value=Reflect.get(target,key);return typeof value==='function'?value.bind(target):value;
+  }});
+   const response=await worker.fetch(new Request('https://monitor.test/v1/listener/event',{
+    method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${listener.deviceId}.${listener.secret}`},body:JSON.stringify(alert(listener))
+   }),{...testEnv,DB:failingDB});
+   expect(response.status).toBe(200);expect(await response.json()).toEqual({status:'blocked'});
+   expect(response.headers.get('x-diagnostics-status')).toBe('unavailable');
+   expect(response.headers.get('x-request-id')).toMatch(/^[0-9a-f-]{36}$/);
+   // A missing diagnostic table must not prevent scheduled delivery either.
+   await env.DB.prepare("UPDATE events SET status='pending',next_attempt=0").run();
+   const {parent}=await env.DB.prepare('SELECT parent_id AS parent FROM pairs WHERE listener_id=?').bind(listener.deviceId).first<{parent:string}>()??{};
+   await env.DB.prepare('UPDATE devices SET push_token=? WHERE id=?').bind(await encryptToken(testEnv,'ab'.repeat(32)),parent!).run();
+   mockPush();await worker.scheduled({} as ScheduledController,{...testEnv,DB:failingDB});
+   expect(await env.DB.prepare('SELECT status FROM events').first()).toEqual({status:'sent'});
+ });
+ it('records unexpected failures without exception messages or SQL values',async()=>{
+  const failingEnv={...testEnv,PAIRING_PEPPER:''};
+  const response=await worker.fetch(new Request('https://monitor.test/v1/device/register',{method:'POST'}),failingEnv);
+  expect(response.status).toBe(503);
+  const record=await env.DB.prepare('SELECT * FROM diagnostics WHERE request_id=?').bind(response.headers.get('x-request-id')).first();
+  expect(record).toMatchObject({operation:'register',stage:'validation',outcome:'internal_error',http_status:503});
+  expect(JSON.stringify(record)).not.toContain('Pairing configuration missing');
+ });
+ it('expires the journal before dispatch, preserves recent entries, and records cron completion',async()=>{
+  const old=crypto.randomUUID(),recent=crypto.randomUUID();
+  for(const requestId of [old,recent])await recordDiagnostic(testEnv,{requestId,operation:'status',stage:'handler',outcome:'ok',started:Date.now()});
+  await env.DB.prepare('UPDATE diagnostics SET recorded_at=? WHERE request_id=?').bind(Date.now()-8*86400000,old).run();
+  await worker.scheduled({} as ScheduledController,testEnv);
+  const rows=(await env.DB.prepare('SELECT request_id,operation,outcome FROM diagnostics').all()).results;
+  expect(rows).not.toEqual(expect.arrayContaining([expect.objectContaining({request_id:old})]));
+  expect(rows).toEqual(expect.arrayContaining([expect.objectContaining({request_id:recent}),expect.objectContaining({operation:'maintenance',outcome:'ok'})]));
+ });
+ it('enforces the volume bound even when cron is delayed',async()=>{
+  // Advance the sequence to exercise the trigger without 10,000 writes.
+  await recordDiagnostic(testEnv,{requestId:crypto.randomUUID(),operation:'status',stage:'handler',outcome:'ok',started:Date.now()});
+  const first=await env.DB.prepare('SELECT sequence FROM diagnostics').first<{sequence:number}>();
+  await env.DB.prepare("UPDATE sqlite_sequence SET seq=? WHERE name='diagnostics'").bind(first!.sequence+10000).run();
+  await recordDiagnostic(testEnv,{requestId:crypto.randomUUID(),operation:'status',stage:'handler',outcome:'ok',started:Date.now()});
+  expect((await env.DB.prepare('SELECT sequence FROM diagnostics').all()).results).toHaveLength(1);
  });
 });

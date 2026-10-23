@@ -25,7 +25,10 @@ struct RootView: View {
                 .alert("Attention needed", isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) { Button("OK") { model.error = nil } } message: { Text(model.error ?? "") }
         }.tint(Palette.mint).preferredColorScheme(.dark)
             .task { await model.foreground() }
-            .onChange(of: phase) { _, value in if value == .active { Task { await model.foreground() } } }
+            .onChange(of: phase) { _, value in
+                if value == .active { Task { await model.foreground() } }
+                else if value == .background { model.log.record("background") }
+            }
     }
 }
 struct OnboardingView: View {
