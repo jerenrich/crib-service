@@ -38,8 +38,7 @@ import UserNotifications
         let acknowledge = response.actionIdentifier == WatchNotification.acknowledge
         await MainActor.run {
             if let alert {
-                WatchModel.shared.receive(alert)
-                if acknowledge { WatchModel.shared.acknowledge() }
+                WatchModel.shared.handleNotification(alert, acknowledging: acknowledge)
             }
         }
     }

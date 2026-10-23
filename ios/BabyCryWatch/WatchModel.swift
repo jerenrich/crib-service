@@ -8,15 +8,13 @@ import UserNotifications
     static let shared = WatchModel()
     let log = DiagnosticLog()
     private(set) var snapshot = WatchSnapshot()
-    private(set) var alert: WatchCryAlert?
+    var alert: WatchCryAlert? { alertState.alert }
     private(set) var notificationsAllowed = false
     private(set) var refreshing = false
-    private(set) var acknowledgementPending = false
+    var acknowledgementPending: Bool { alertState.acknowledgementPending }
     var notice: String?
     private var token: String?
-    private var localAlert: WatchCryAlert?
-    private var pendingAcknowledgement: UUID?
-    private var acknowledgedEpisodes: Set<UUID> = []
+    private let alertState = WatchAlertState()
 
     override private init() {
         super.init()
@@ -24,9 +22,10 @@ import UserNotifications
         if let data = UserDefaults.standard.data(forKey: "watchSnapshot"), let saved = try? JSONDecoder().decode(WatchSnapshot.self, from: data) {
             snapshot = saved
         }
-        acknowledgedEpisodes = Set((UserDefaults.standard.stringArray(forKey: "acknowledgedEpisodes") ?? []).compactMap(UUID.init(uuidString:)))
-        pendingAcknowledgement = UserDefaults.standard.string(forKey: "pendingAcknowledgement").flatMap(UUID.init(uuidString:))
-        acknowledgementPending = pendingAcknowledgement != nil
+        alertState.sendAcknowledgement = { [weak self] command in
+            self?.log.record("watch_command_queued")
+            self?.send(command, durable: true)
+        }
         if WCSession.isSupported() {
             WCSession.default.delegate = self
             WCSession.default.activate()
@@ -35,6 +34,7 @@ import UserNotifications
 
     func foreground() async {
         log.record("foreground")
+        alertState.retryPendingAcknowledgement()
         let settings = await UNUserNotificationCenter.current().notificationSettings()
         notificationsAllowed = settings.authorizationStatus == .authorized
         if notificationsAllowed { WKApplication.shared().registerForRemoteNotifications() }
@@ -61,23 +61,13 @@ import UserNotifications
 
     func receive(_ value: WatchCryAlert) {
         log.record("watch_push_received")
-        guard !acknowledgedEpisodes.contains(value.episodeId) else { return }
-        localAlert = value
-        alert = value
+        alertState.receive(value)
     }
-    func acknowledge() {
-        guard let alert else { return }
-        // Silence this wrist immediately, but distinguish a queued acknowledgement
-        // from server confirmation. WCSession persists the queued command offline.
-        acknowledgedEpisodes.insert(alert.episodeId)
-        UserDefaults.standard.set(Array(acknowledgedEpisodes.suffix(100)).map(\.uuidString), forKey: "acknowledgedEpisodes")
-        acknowledgementPending = true
-        pendingAcknowledgement = alert.eventId
-        UserDefaults.standard.set(alert.eventId.uuidString, forKey: "pendingAcknowledgement")
-        self.alert = nil; localAlert = nil
-        log.record("watch_command_queued")
-        send(WatchCommand(kind: .acknowledge, eventId: alert.eventId), durable: true)
+    func handleNotification(_ value: WatchCryAlert, acknowledging: Bool) {
+        log.record("watch_push_received")
+        alertState.handleNotification(value, acknowledging: acknowledging)
     }
+    func acknowledge() { alertState.acknowledgeCurrent() }
     func previewHaptic() { WKInterfaceDevice.current().play(.notification) }
 
     func scheduleWristTest() async {
@@ -96,21 +86,14 @@ import UserNotifications
     }
 
     private func accept(_ value: WatchSnapshot) {
+        // Confirmation remains valid even if a newer status snapshot arrived first.
+        alertState.confirmAcknowledgement(value.acknowledgedEventId)
         guard value.updatedAt >= snapshot.updatedAt || !snapshot.parentMode else { return }
         snapshot = value
         log.record("watch_snapshot_received")
         if let data = try? JSONEncoder().encode(value) { UserDefaults.standard.set(data, forKey: "watchSnapshot") }
         notice = value.message
-        if let incoming = value.alert, !acknowledgedEpisodes.contains(incoming.episodeId) {
-            if localAlert == nil || incoming.createdAt >= localAlert!.createdAt { alert = incoming }
-        } else if value.statusAvailable && (localAlert == nil || value.updatedAt >= localAlert!.createdAt) {
-            alert = nil; localAlert = nil
-        }
-        if let pendingAcknowledgement, value.acknowledgedEventId == pendingAcknowledgement {
-            acknowledgementPending = false
-            self.pendingAcknowledgement = nil
-            UserDefaults.standard.removeObject(forKey: "pendingAcknowledgement")
-        }
+        alertState.acceptAlert(from: value)
     }
 
     private func send(_ command: WatchCommand, durable: Bool = false) {
@@ -146,6 +129,7 @@ import UserNotifications
         Task { @MainActor in
             self.log.record(code == nil ? "watch_activated" : "watch_activation_failed", code: code)
             if let data, let value = try? JSONDecoder().decode(WatchSnapshot.self, from: data) { self.accept(value) }
+            self.alertState.retryPendingAcknowledgement()
             self.refresh()
         }
     }
@@ -155,6 +139,7 @@ import UserNotifications
     }
     nonisolated func sessionReachabilityDidChange(_ session: WCSession) {
         Task { @MainActor in
+            self.alertState.retryPendingAcknowledgement()
             if let token = self.token { self.send(WatchCommand(kind: .registerToken, token: token), durable: true) }
             else { self.refresh() }
         }
