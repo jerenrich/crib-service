@@ -6,7 +6,7 @@ workers_dev = true
 
 [vars]
 APNS_ENVIRONMENT = "development"
-APNS_BUNDLE_ID = "com.jordanerenrich.babycrymonitor"
+APNS_BUNDLE_ID = "com.jordanerenrich.cribservice"
 
 [[d1_databases]]
 binding = "DB"
