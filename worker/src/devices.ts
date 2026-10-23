@@ -29,8 +29,25 @@ export async function savePushToken(env:Env,device:Device,value:Record<string,un
  ]);
  return {ok:true};
 }
-export async function pairFor(env:Env,device:Device):Promise<{parent_id:string;listener_id:string}|null> {
+export async function pairFor(env:Env,device:Device):Promise<{parent_id:string;listener_id:string;created_at:number}|null> {
  return env.DB.prepare(`SELECT * FROM pairs WHERE ${device.role==='parent'?'parent_id':'listener_id'}=?`).bind(device.id).first();
+}
+
+// A single D1 transaction cancels queued delivery and revokes the old relationship.
+// The counterpart retains its credential so it can pair with a replacement phone.
+export async function removeDeviceData(env:Env,device:Device,deleteDevice=false) {
+ const pair=await pairFor(env,device);
+ const listener=pair?.listener_id??device.id, parent=pair?.parent_id??device.id;
+ await env.DB.batch([
+  env.DB.prepare('DELETE FROM connection_notices WHERE listener_id=? OR parent_id=?').bind(listener,parent),
+  env.DB.prepare('DELETE FROM connection_states WHERE listener_id=?').bind(listener),
+  env.DB.prepare('DELETE FROM events WHERE listener_id=? OR parent_id=?').bind(listener,parent),
+  env.DB.prepare('DELETE FROM heartbeats WHERE listener_id=?').bind(listener),
+  env.DB.prepare('DELETE FROM pairing_codes WHERE parent_id=? OR claimed_by=?').bind(parent,listener),
+  env.DB.prepare('DELETE FROM pairs WHERE parent_id=? OR listener_id=?').bind(parent,listener),
+  ...(deleteDevice?[env.DB.prepare('DELETE FROM devices WHERE id=?').bind(device.id)]:[])
+ ]);
+ return {ok:true};
 }
 export async function saveWatchPushToken(env:Env,device:Device,value:Record<string,unknown>) {
  requireRole(device,'parent');

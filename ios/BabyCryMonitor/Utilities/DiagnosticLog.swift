@@ -48,7 +48,7 @@ import Observation
     }
     func network(operation: String, outcome: String, status: Int? = nil, requestID: UUID? = nil,
                  elapsedMS: Int, storageUnavailable: Bool = false) {
-        let operations: Set<String> = ["register", "pairing_create", "pairing_claim", "push_token", "watch_token", "heartbeat", "alert", "status", "settings", "acknowledge"]
+        let operations: Set<String> = ["register", "pairing_create", "pairing_claim", "push_token", "watch_token", "heartbeat", "alert", "status", "settings", "acknowledge", "test_push", "connection_preferences", "unpair", "delete_device"]
         guard operations.contains(operation), ["ok", "http_error", "transport_error", "decode_error", "cancelled", "invalid_response"].contains(outcome) else { return }
         // Routine successes are sampled; preserve a failure and its first recovery.
         let failureKey = "failure_\(operation)"

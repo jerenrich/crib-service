@@ -24,6 +24,12 @@ import UIKit
     var powerConnected = false
     var now = Date()
     var needsRestart = false
+    var managingDevice = false
+    var changingConnectionAlerts = false
+    var calibration = SoundCalibration()
+    var calibrationPhase = "idle"
+    var calibrationMessage: String?
+    private var calibrationActive: Bool { ["background", "sample", "waiting"].contains(calibrationPhase) }
     let connectivity: any ConnectivityProviding
     let notifications: any NotificationProviding
     let watch: PhoneWatchBridge
@@ -38,6 +44,7 @@ import UIKit
     @ObservationIgnored private var networkTask: Task<Void, Never>?
     @ObservationIgnored private var settingsTask: Task<Void, Never>?
     @ObservationIgnored private var heartbeatTask: Task<Void, Never>?
+    @ObservationIgnored private var listenerStatusTask: Task<Void, Never>?
     @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private let keychain: any CredentialStoring
     @ObservationIgnored private let makeClient: (URL, DeviceCredential) -> any BackendServing
@@ -140,6 +147,7 @@ import UIKit
     deinit {
         loopTask?.cancel(); networkTask?.cancel(); audioTask?.cancel()
         settingsTask?.cancel(); heartbeatTask?.cancel()
+        listenerStatusTask?.cancel()
     }
     var snapshot: SessionSnapshot { engine.snapshot }
     var state: CryState { engine.detector.state }
@@ -148,7 +156,25 @@ import UIKit
     var listenerID: String { credential?.deviceId.uuidString ?? "Not registered" }
     var parentOnline: Bool {
         guard let status = parentStatus, status.monitoring == true, let last = status.lastHeartbeat else { return false }
-        return now.timeIntervalSince(last) < 150
+        return (-5...150).contains(now.timeIntervalSince(last))
+    }
+    var nurseryConnection: String {
+        guard paired else { return "Not paired" }
+        guard let status = parentStatus, let last = status.lastHeartbeat else { return "Status unavailable" }
+        guard (-5...150).contains(now.timeIntervalSince(last)) else { return "Connection lost" }
+        return status.monitoring == true ? "Monitoring" : "Stopped"
+    }
+    var settingsSyncStatus: String {
+        if !paired { return "Saved on this iPhone · Pair to sync" }
+        if settingsDirty { return "Saving settings…" }
+        if role == .listener { return "Applied on this Listener" }
+        guard let applied = parentStatus?.listenerConfiguration else { return "Waiting for Listener confirmation" }
+        return applied == configuration && parentOnline ? "Applied on Listener" : "Waiting for Listener"
+    }
+    var recentConfirmedTest: RemoteAlert? {
+        parentStatus?.alerts?.first {
+            $0.isTest == true && $0.acknowledgedAt != nil && (-5...1800).contains(now.timeIntervalSince($0.createdAt))
+        }
     }
     var activeAlert: RemoteAlert? {
         let alerts = parentStatus?.alerts?.filter { $0.acknowledgedAt == nil }
@@ -156,6 +182,8 @@ import UIKit
     }
     func acceptSafety() { safetyAccepted = true; defaults.set(true, forKey: "safetyAccepted") }
     func selectRole(_ value: DeviceRole) {
+        guard !managingDevice else { return }
+        cancelCalibration()
         stop(); environmentRevision += 1; role = value; defaults.set(value.rawValue, forKey: "role")
         parentStatus = nil; pairingCode = nil; credential = nil; uploadedToken = nil; loadCredential()
         testPushStatus = nil; latestTestEventID = nil
@@ -189,6 +217,9 @@ import UIKit
         } catch { self.error = error.localizedDescription; log.record("credential_failed") }
     }
     private func client() throws -> any BackendServing {
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--uitesting-offline") { throw URLError(.notConnectedToInternet) }
+        #endif
         guard let credential, let url = URL(string: backendURL), !backendURL.isEmpty else {
             throw BackendError.message("The connection service is not configured. Contact the app provider for a configured build.")
         }
@@ -221,12 +252,13 @@ import UIKit
         do {
             let client = try await registeredClient(); try await client.claim(code)
             guard revision == environmentRevision else { return }
+            environmentRevision += 1
             paired = true; defaults.set(true, forKey: pairingKey)
             log.record("paired_successfully"); error = nil
         } catch { self.error = error.localizedDescription; log.record("pairing_failed") }
     }
     func start() async {
-        guard !starting, !monitoring, !recoveringAudio, role == .listener else { return }
+        guard !starting, !monitoring, !recoveringAudio, !calibrationActive, !managingDevice, role == .listener else { return }
         let revision = environmentRevision, generation = settingsGeneration
         starting = true; defer { starting = false }
         guard safetyAccepted, storageHealthy else { error = "Review onboarding and resolve local storage before monitoring."; return }
@@ -238,8 +270,8 @@ import UIKit
                 do {
                     let client = try await registeredClient(); let status = try await client.status()
                     guard revision == environmentRevision else { return }
+                    observePairing(status)
                     guard status.paired else {
-                        paired = false; defaults.set(false, forKey: pairingKey)
                         throw BackendError.message("Pairing no longer exists. Pair again before monitoring.")
                     }
                     if !settingsDirty, generation == settingsGeneration { applyRemote(status.configuration) }
@@ -284,6 +316,16 @@ import UIKit
         }
     }
     private func audioChanged(_ status: AudioCaptureStatus) {
+        if calibrationActive {
+            switch status {
+            case .active: audioStatus = "Checking sound · Monitoring paused"
+            case .stopped: break
+            case .recovering, .failed:
+                calibrationMessage = "Sound check interrupted. Start again when the microphone is available."
+                calibrationPhase = "idle"; audio.stop()
+            }
+            return
+        }
         let wasActive = monitoring || recoveringAudio
         monitoringGeneration += 1; lastHeartbeatAt = .distantPast
         monitoring = false; recoveringAudio = false
@@ -312,6 +354,12 @@ import UIKit
         }
     }
     private func consume(_ sample: AudioLevelSample) {
+        if calibrationActive {
+            guard sample.dbFS.isFinite else { return }
+            currentDBFS = sample.dbFS
+            if calibrationPhase != "waiting" { calibration.record(sample.dbFS, background: calibrationPhase == "background") }
+            return
+        }
         guard monitoring, let credential, storageHealthy else { return }
         lastSampleAt = sample.timestamp; currentDBFS = sample.dbFS
         meter.append(sample.dbFS); meter = Array(meter.suffix(32))
@@ -355,6 +403,10 @@ import UIKit
         scheduleHeartbeatIfDue()
     }
     func tick() async {
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--uitesting-offline") { return }
+        #endif
+        guard !managingDevice else { return }
         scheduleHeartbeatIfDue()
         guard connectivity.available else {
             deliveryStatus = connectivity.checked ? "Internet unavailable. Alerts cannot currently be delivered." : "Checking connectivity…"
@@ -378,9 +430,12 @@ import UIKit
                 }
                 if now.timeIntervalSince(lastRefreshAt) >= 15 { await refreshParent() }
             } else if role == .listener {
+                refreshListenerPairing(using: client)
+                guard paired else { return }
                 scheduleHeartbeatIfDue()
                 guard revision == environmentRevision, role == .listener, storageHealthy else { return }
                 await alerts.deliverReady(snapshot.pending, listenerId: client.credential.deviceId, now: currentTime(), sender: client) { alert, result in
+                    guard revision == environmentRevision else { return }
                     switch result {
                     case .success(let receipt) where receipt.status == "sent":
                         engine.delivered(alert.eventId, at: Date()); log.record("alert_apns_accepted")
@@ -446,9 +501,10 @@ import UIKit
         }
         return Heartbeat(listenerId: listenerID, timestamp: currentTime(), monitoring: monitoring,
                          batteryLevel: batteryLevel, powerConnected: powerConnected, state: state,
-                         currentEpisode: snapshot.current.map(remote), episodes: Array(snapshot.history.prefix(100)).map(remote))
+                         currentEpisode: snapshot.current.map(remote), episodes: Array(snapshot.history.prefix(100)).map(remote), appliedConfiguration: configuration)
     }
     private func scheduleHeartbeatIfDue() {
+        guard !managingDevice else { return }
         let available = connectivity.available
         if available != lastConnectivityAvailable { log.record(available ? "network_available" : "network_unavailable") }
         if available && !lastConnectivityAvailable {
@@ -495,7 +551,10 @@ import UIKit
                 if self.pendingHeartbeats[key]?.id == attempt.id { self.pendingHeartbeats.removeValue(forKey: key) }
                 if attempt.revision == self.environmentRevision, attempt.observation == self.monitoringGeneration {
                     self.lastHeartbeatAt = self.currentTime(); self.deliveryStatus = "Connected"
-                    if !self.settingsDirty, attempt.settingsGeneration == self.settingsGeneration { self.applyRemote(config) }
+                    if !self.settingsDirty, attempt.settingsGeneration == self.settingsGeneration {
+                        self.applyRemote(config)
+                        if attempt.value.appliedConfiguration != config { self.queueHeartbeat() }
+                    }
                 }
             } catch {
                 if var pending = self.pendingHeartbeats[key], pending.id == attempt.id {
@@ -531,9 +590,115 @@ import UIKit
             publishWatch()
         }
     }
+    private func observePairing(_ status: ParentStatus) {
+        let identityKey = pairingKey + "|identity"
+        let previous = defaults.string(forKey: identityKey)
+        if (!status.paired && paired) || (previous != nil && status.pairingID != nil && previous != status.pairingID) {
+            stop(); pendingHeartbeats.removeAll()
+            engine = CrySessionManager(); configuration = engine.snapshot.configuration; persist()
+            settingsDirty = false; defaults.set(false, forKey: "settingsDirty")
+            needsRestart = false
+        }
+        paired = status.paired; defaults.set(paired, forKey: pairingKey)
+        if let identity = status.pairingID { defaults.set(identity, forKey: identityKey) }
+        else { defaults.removeObject(forKey: identityKey) }
+    }
+    private func refreshListenerPairing(using client: any BackendServing) {
+        guard listenerStatusTask == nil, now.timeIntervalSince(lastRefreshAt) >= 15 else { return }
+        lastRefreshAt = currentTime()
+        let revision = environmentRevision
+        listenerStatusTask = Task { [weak self] in
+            defer { self?.listenerStatusTask = nil }
+            do {
+                let status = try await client.status()
+                guard let self, revision == self.environmentRevision, self.role == .listener else { return }
+                self.observePairing(status)
+            } catch { /* Alert delivery and heartbeats have independent retry paths. */ }
+        }
+    }
     func acknowledge(_ id: UUID) async {
         do { let client = try await registeredClient(); try await client.acknowledge(id); await refreshParent() }
         catch { self.error = error.localizedDescription }
+    }
+    func requestParentTest() async {
+        guard role == .parent, paired, !sendingTestPush else { return }
+        sendingTestPush = true; defer { sendingTestPush = false }
+        testPushStatus = "Sending a real test notification…"
+        do {
+            let client = try await registeredClient(); try await client.requestTestPush()
+            testPushStatus = "Test requested. Lock this iPhone and check your receiving phone or Watch, then confirm receipt below."
+            await refreshParent()
+        } catch { testPushStatus = "Test could not be sent: \(error.localizedDescription)" }
+    }
+    func setConnectionAlerts(_ enabled: Bool) async {
+        guard role == .parent, !changingConnectionAlerts else { return }
+        changingConnectionAlerts = true; defer { changingConnectionAlerts = false }
+        do { let client = try await registeredClient(); try await client.connectionAlerts(enabled); await refreshParent() }
+        catch { self.error = error.localizedDescription }
+    }
+    func removePairing(deleteDevice: Bool) async {
+        guard !managingDevice else { return }
+        managingDevice = true
+        defer { managingDevice = false }
+        cancelCalibration(); stop()
+        environmentRevision += 1
+        pendingHeartbeats.removeAll(); heartbeatTask?.cancel(); settingsTask?.cancel(); listenerStatusTask?.cancel()
+        let old = credential
+        let watchKeys = [watchAcknowledgementsKey, watchConfirmedKey, watchRegistrationKey, watchRegistrationDateKey]
+        do {
+            let client = try await registeredClient()
+            if deleteDevice { try await client.deleteDevice() } else { try await client.unpair() }
+            if deleteDevice, let old {
+                let replacement = try keychain.create(role: old.role)
+                try keychain.save(replacement, environment: backendURL)
+                credential = replacement
+            }
+            for key in watchKeys { defaults.removeObject(forKey: key) }
+            defaults.removeObject(forKey: pairingKey + "|identity")
+            paired = false; defaults.set(false, forKey: pairingKey)
+            parentStatus = nil; pairingCode = nil; needsRestart = false
+            settingsDirty = false; defaults.set(false, forKey: "settingsDirty")
+            engine = CrySessionManager(); configuration = engine.snapshot.configuration; persist()
+            calibration = SoundCalibration(); testPushStatus = nil; latestTestEventID = nil
+            hasPendingWatchToken = false; pendingWatchToken = nil
+            if deleteDevice { role = nil; defaults.removeObject(forKey: "role"); uploadedToken = nil }
+            deliveryStatus = "Pair a device to reconnect"; error = nil
+            publishWatch()
+        } catch { self.error = "Could not finish: \(error.localizedDescription). Monitoring is stopped. Try again." }
+    }
+    func beginCalibration() async {
+        guard role == .listener, !monitoring, !starting, !recoveringAudio, !calibrationActive else { return }
+        calibration = SoundCalibration(); calibrationMessage = nil; calibrationPhase = "background"
+        let revision = environmentRevision
+        guard await audio.requestPermission() else {
+            calibrationPhase = "idle"; calibrationMessage = "Enable Microphone in iPhone Settings to check sound."; return
+        }
+        guard calibrationActive, revision == environmentRevision else { return }
+        do { try await audio.start() }
+        catch { calibrationPhase = "idle"; audio.stop(); calibrationMessage = error.localizedDescription }
+    }
+    func finishCalibrationBackground() {
+        guard calibrationPhase == "background" else { return }
+        guard calibration.background.count >= 20 else {
+            cancelCalibration(); calibrationMessage = "Too few microphone samples. Keep this screen open and try again."; return
+        }
+        calibrationPhase = "waiting"
+    }
+    func beginCalibrationSample() { if calibrationPhase == "waiting" { calibrationPhase = "sample" } }
+    func finishCalibrationSample() {
+        guard calibrationPhase == "sample" else { return }
+        calibrationPhase = "complete"; audio.stop()
+        if let background = calibration.backgroundLevel, background >= -35 {
+            calibrationMessage = "Background noise already crosses the detector's starting threshold. Reduce nearby fan or white-noise volume, or reposition this iPhone, then repeat the check. A sensitivity change alone may not help."
+            return
+        }
+        calibrationMessage = calibration.recommendedSensitivity == nil
+            ? "The sample was too quiet or too similar to background noise. Try moving the Listener closer and repeat the check."
+            : "A threshold can separate this sample from background noise. This check does not prove cry detection or notification delivery."
+    }
+    func cancelCalibration() {
+        guard calibrationActive else { return }
+        calibrationPhase = "idle"; audio.stop()
     }
     func foreground() async {
         log.record("foreground")

@@ -44,10 +44,8 @@ struct WatchHomeView: View {
         .task(id: hapticKey) {
             guard phase == .active, let alert = model.alert, alert.isRecent(at: Date()) else { return }
             // Foreground reminder only. Background delivery belongs to APNs/watchOS.
-            for _ in 0..<20 {
-                guard !Task.isCancelled, model.alert?.eventId == alert.eventId, alert.isRecent(at: Date()) else { return }
-                WKInterfaceDevice.current().play(.notification)
-                try? await Task.sleep(for: .seconds(4))
+            await WatchAlertHaptics.play(for: .seconds(180)) {
+                phase == .active && model.alert?.eventId == alert.eventId && alert.isRecent(at: Date())
             }
         }
         .onChange(of: phase) { _, phase in if phase == .active { Task { await model.foreground() } } }
@@ -106,19 +104,31 @@ struct WatchHomeView: View {
 
 struct WatchSetupView: View {
     @Environment(WatchModel.self) private var model
+    @State private var previewingHaptic = false
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
-                Label("A quiet nudge", systemImage: "applewatch").font(.headline).foregroundStyle(mint)
-                Text(model.notificationsAllowed && model.snapshot.watchPushRegistered ? "Direct Watch alerts registered" : "Finish setting up alerts").font(.footnote)
-                Button("Enable alerts") { Task { await model.enableAlerts() } }
+                Label("Persistent wrist alerts", systemImage: "applewatch").font(.headline).foregroundStyle(mint)
+                HStack {
+                    if model.alertSetup.inProgress { ProgressView().controlSize(.small) }
+                    Text(model.alertSetup.title).font(.footnote)
+                }
+                Button(model.alertSetup.phase == .idle ? "Enable alerts" : "Retry setup") {
+                    Task { await model.enableAlerts() }
+                }
+                .disabled(model.alertSetup.phase == .requestingPermission)
+                Text(model.alertSetup.detail)
+                    .font(.caption2)
+                    .foregroundStyle(model.alertSetup.phase == .blocked ? .orange : .secondary)
                 Text("1. Keep your paired iPhone in Parent mode while enabling alerts.\n\n2. On Watch, turn on Silent Mode and Sounds & Haptics → Haptic Alerts → Prominent.\n\n3. Allow this app in Sleep Focus, including Time Sensitive Notifications. Wear your Watch unlocked with enough battery.")
                     .font(.caption2).foregroundStyle(.secondary)
-                Button("Feel a vibration") { model.previewHaptic() }
+                Button(previewingHaptic ? "Playing alert burst…" : "Feel alert pattern") { previewingHaptic = true }
+                    .disabled(previewingHaptic || model.alert != nil)
                 Button("Test in 10 seconds") { Task { await model.scheduleWristTest() } }
+                    .disabled(model.alertSetup.phase == .requestingPermission)
                 Text("The wrist test checks this Watch only. Send a test push from the nursery Listener to verify the full connection before sleeping.")
                     .font(.caption2).foregroundStyle(.secondary)
-                Text("watchOS controls background alerts. Recent alerts repeat vibrations for up to 80 seconds while the alert screen is active. An alert may not wake you.")
+                Text("While the app is active, recent alerts repeat three-tap bursts for up to 3 minutes. Tap I'm checking to stop. watchOS controls background vibration; use Prominent Haptics for a more noticeable wrist alert.")
                     .font(.caption2).foregroundStyle(.secondary)
                 if let notice = model.notice { Text(notice).font(.caption2).foregroundStyle(.orange) }
                 NavigationLink("Diagnostics") {
@@ -131,5 +141,10 @@ struct WatchSetupView: View {
                 }
             }
         }.navigationTitle("Wrist alerts").tint(mint)
+            .task(id: previewingHaptic) {
+                guard previewingHaptic else { return }
+                defer { previewingHaptic = false }
+                await model.previewHaptic()
+            }
     }
 }

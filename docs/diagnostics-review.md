@@ -2,6 +2,10 @@
 
 Reviewed 23 October 2026. Scope: iPhone capture/detection, persistence, credentials, networking, pairing, heartbeats, outbox, phone notifications, WatchConnectivity, watchOS notifications, Worker API, APNs dispatch/retries, scheduled cleanup and privacy settings. This is a source review with local integration/simulator verification; it does not certify the live deployment or physical-device notification delivery.
 
+Rollout completed later on 23 October 2026: remote migration `0003_diagnostics.sql` applied; revision `be0b1dc` deployed as Worker version `5cb305ca-f99f-4a13-9c5c-ea2c92e862b7`; signed Debug apps installed and launched on J14, J17 and the paired Apple Watch. Live temporary-device API checks and diagnostic response headers passed. Temporary functional metadata was removed afterward. No test push was sent; physical notification delivery remains a separate check.
+
+Post-deployment checks confirmed no pending migrations, 100% traffic on that Worker version, and a successful scheduled-maintenance diagnostic for the same version at `2026-10-23 06:27:27 UTC`. All three device processes were still running after launch. Automatic Worker observability remains disabled.
+
 ## Findings and changes
 
 | Area | Finding | Result |
@@ -67,7 +71,7 @@ Cloudflare documents that automatic invocation logs include request/response met
 ## Remaining limits and operational work
 
 - Deploy migration `0003_diagnostics.sql` before the updated Worker so diagnostic persistence is available. Rebuild/install both phone and Watch apps. These changes alone do not alter the live service.
-- No automatic outage notification or independent synthetic monitoring is configured. Operators need a check for stale cron completion, elevated 503s, blocked/uncertain alerts and diagnostic storage failures. Do not point an unattended monitor at real child data; use a dedicated synthetic pair and define cleanup/notification ownership.
+- No automatic backend/cron outage notification or independent synthetic monitoring is configured. The optional Listener connection notices introduced in `0004_readiness.sql` require the backend and minute cron to remain healthy. Operators need a check for stale cron completion, elevated 503s, blocked/uncertain alerts and diagnostic storage failures. Do not point an unattended monitor at real child data; use a dedicated synthetic pair and define cleanup/notification ownership.
 - The journal shares D1 with the application. A total D1 outage can prevent both application work and server diagnostic persistence. Client exports and Cloudflare aggregate metrics are the fallback. A killed Worker can leave no completion record; lease recovery records the affected dispatch on the next cron run.
 - App logs cannot execute after a crash, force quit, watchdog kill or OS termination. Collect the matching iOS/watchOS crash, hang or jetsam report through Xcode/device diagnostics or Organizer, with user consent. Keep the exact release archive and dSYMs for symbolication. No crash/MetricKit upload SDK is installed by this change.
 - Log sampling/caps intentionally trade exhaustive history for privacy, storage and performance. No source review can guarantee every future issue is diagnosable. Physical locked-screen, interruption, offline/reconnect, Focus/Silent Mode, wrist delivery and overnight checks still matter.

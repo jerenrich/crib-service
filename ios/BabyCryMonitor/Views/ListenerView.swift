@@ -3,6 +3,7 @@ import SwiftUI
 struct ListenerView: View {
     @Environment(AppModel.self) private var model
     @State private var pairing = false
+    @State private var calibration = false
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
             HStack { Caption(text: "Baby monitor"); Spacer(); StatusPill(text: model.monitoring ? "Monitoring" : model.recoveringAudio ? "Recovering" : "Stopped", active: model.monitoring) }
@@ -21,6 +22,8 @@ struct ListenerView: View {
                 Caption(text: "Sound level · Processed on this iPhone")
             }
             HStack { Caption(text: "Alert after"); Spacer(); Text(durationText(model.configuration.alertDuration)).font(.system(.title2, design: .rounded).weight(.medium)) }
+            Text(model.settingsSyncStatus).font(.footnote).foregroundStyle(Palette.muted)
+            if !model.monitoring && !model.recoveringAudio { Button("Check room sound") { calibration = true } }
             if let last = model.snapshot.history.first {
                 Panel { Caption(text: "Last sound episode"); HStack { Text(durationText(last.duration(at: model.now))).font(.title2.monospacedDigit()); Spacer(); if let ended = last.endedAt { Text("Ended \(ended.formatted(date: .omitted, time: .shortened))").font(.subheadline).foregroundStyle(Palette.muted) } } }
             }
@@ -51,6 +54,7 @@ struct ListenerView: View {
                 if !model.powerConnected, let battery = model.batteryLevel, battery < 0.2 { Label("Low battery · Connect power", systemImage: "battery.25percent").foregroundStyle(Palette.amber) }
             }
         }.sheet(isPresented: $pairing) { PairingView() }
+            .sheet(isPresented: $calibration) { CalibrationView() }
     }
     private var stateTitle: String {
         if model.recoveringAudio { return "Paused" }

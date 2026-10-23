@@ -30,9 +30,14 @@ function episode(value:unknown):Episode {
  return result;
 }
 export function heartbeat(value:Record<string,unknown>):Heartbeat {
- onlyKeys(value,['listenerId','timestamp','monitoring','batteryLevel','powerConnected','state','currentEpisode','episodes']);
+ onlyKeys(value,['listenerId','timestamp','monitoring','batteryLevel','powerConnected','state','currentEpisode','episodes','appliedConfiguration']);
  if(typeof value.monitoring!=='boolean'||typeof value.powerConnected!=='boolean'||!['quiet','possibleCry','crying'].includes(String(value.state))||!Array.isArray(value.episodes)||value.episodes.length>100||(value.batteryLevel!=null&&(typeof value.batteryLevel!=='number'||value.batteryLevel<0||value.batteryLevel>1)))throw new APIError(400,'Invalid heartbeat.');
- return {listenerId:uuid(value.listenerId), timestamp:date(value.timestamp),monitoring:value.monitoring,powerConnected:value.powerConnected,batteryLevel:value.batteryLevel as number|null|undefined,state:value.state as Heartbeat['state'],currentEpisode:value.currentEpisode==null?null:episode(value.currentEpisode),episodes:value.episodes.map(episode)};
+ const result:Heartbeat={listenerId:uuid(value.listenerId), timestamp:date(value.timestamp),monitoring:value.monitoring,powerConnected:value.powerConnected,batteryLevel:value.batteryLevel as number|null|undefined,state:value.state as Heartbeat['state'],currentEpisode:value.currentEpisode==null?null:episode(value.currentEpisode),episodes:value.episodes.map(episode)};
+ if(value.appliedConfiguration!=null){
+  if(typeof value.appliedConfiguration!=='object'||Array.isArray(value.appliedConfiguration))throw new APIError(400,'Invalid applied configuration.');
+  result.appliedConfiguration=configuration(value.appliedConfiguration as Record<string,unknown>);
+ }
+ return result;
 }
 export function alert(value:Record<string,unknown>):Alert {
  onlyKeys(value,['eventId','episodeId','listenerId','type','cryStartedAt','durationSeconds','createdAt','isRepeat','isTest']);

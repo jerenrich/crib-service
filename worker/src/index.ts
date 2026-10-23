@@ -1,6 +1,7 @@
 import {APIError,type Env} from './types';
 import {body,rateLimit} from './security';
-import {authenticate,register,savePushToken,saveWatchPushToken} from './devices';
+import {authenticate,register,savePushToken,saveWatchPushToken,removeDeviceData,pairFor} from './devices';
+import {connectionPreferences,flushConnections} from './connections';
 import {createPairing,claimPairing} from './pairing';
 import {receiveAlert,acknowledge,flushPending} from './alerts';
 import {saveHeartbeat,listenerStatus,saveSettings} from './status';
@@ -36,6 +37,19 @@ export default {
      case 'POST /v1/pairing/claim':result=await claimPairing(env,device,await body(request),ip);break;
      case 'POST /v1/device/push-token':result=await savePushToken(env,device,await body(request));break;
      case 'POST /v1/device/watch-push-token':result=await saveWatchPushToken(env,device,await body(request));break;
+     case 'POST /v1/pairing/remove':result=await removeDeviceData(env,device);break;
+     case 'POST /v1/device/delete':result=await removeDeviceData(env,device,true);break;
+     case 'POST /v1/connection-alerts':result=await connectionPreferences(env,device,await body(request));break;
+     case 'POST /v1/test-push':{
+      if(device.role!=='parent')throw new APIError(403,'Only the Parent can request a test.');
+      await rateLimit(env,'test-push',device.id,6,600);
+      const pair=await pairFor(env,device);if(!pair)throw new APIError(409,'Pair a Listener first.');
+      const listener=await env.DB.prepare('SELECT * FROM devices WHERE id=?').bind(pair.listener_id).first<import('./types').Device>();
+      if(!listener)throw new APIError(409,'Listener unavailable.');
+      const config=JSON.parse(device.config),now=new Date();
+      result=await receiveAlert(env,listener,{eventId:crypto.randomUUID(),episodeId:crypto.randomUUID(),listenerId:listener.id,type:'sustained_cry',cryStartedAt:new Date(now.getTime()-config.alertDuration*1000).toISOString(),durationSeconds:config.alertDuration,createdAt:now.toISOString(),isRepeat:false,isTest:true},requestId);
+      break;
+     }
      case 'POST /v1/listener/heartbeat':result=await saveHeartbeat(env,device,await body(request));break;
      case 'POST /v1/listener/event':result=await receiveAlert(env,device,await body(request),requestId);break;
      case 'GET /v1/listener/status':result=await listenerStatus(env,device);break;
@@ -53,7 +67,8 @@ export default {
  async scheduled(_controller:ScheduledController,env:Env):Promise<void> {
   const requestId=crypto.randomUUID(),started=Date.now();
   try {
-   await flushPending(env,requestId);
+   const results=await Promise.allSettled([flushPending(env,requestId),flushConnections(env,requestId)]);
+   if(results.some(result=>result.status==='rejected'))throw new Error('Maintenance failed.');
    await recordDiagnostic(env,{requestId,started,operation:'maintenance',stage:'cleanup',outcome:'ok'});
   } catch {
    await recordDiagnostic(env,{requestId,started,operation:'maintenance',stage:'cleanup',outcome:'internal_error'});

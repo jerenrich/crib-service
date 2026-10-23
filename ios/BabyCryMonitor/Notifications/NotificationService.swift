@@ -4,6 +4,7 @@ import Observation
 
 @MainActor protocol NotificationProviding: AnyObject {
     var status: String { get }
+    var authorizationAllowed: Bool { get }
     var onToken: ((String) -> Void)? { get set }
     var onAlert: (() -> Void)? { get set }
     func register() async
@@ -11,8 +12,10 @@ import Observation
     func failed()
     func simulate(_ alert: CryAlert) async throws
 }
+extension NotificationProviding { var authorizationAllowed: Bool { false } }
 @MainActor @Observable final class NotificationService: NSObject, UNUserNotificationCenterDelegate, NotificationProviding {
     private(set) var status = "Notifications not enabled"
+    private(set) var authorizationAllowed = false
     var onToken: ((String) -> Void)?
     var onAlert: (() -> Void)?
     weak var log: DiagnosticLog?
@@ -25,8 +28,13 @@ import Observation
         ])
     }
     func register() async {
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--uitesting-offline") { return }
+        #endif
         do {
             let allowed = try await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge])
+            let settings = await UNUserNotificationCenter.current().notificationSettings()
+            authorizationAllowed = allowed && settings.alertSetting == .enabled
             status = allowed ? "Registering for push notifications…" : "Notifications disabled. Enable them in iPhone Settings."
             log?.record(allowed ? "notification_permission_allowed" : "notification_permission_denied")
             if allowed { UIApplication.shared.registerForRemoteNotifications() }

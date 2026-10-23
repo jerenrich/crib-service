@@ -78,6 +78,11 @@ final class AppModelTests: XCTestCase {
         var heartbeatFail = false
         var sendFail = false
         var receipt = "sent"
+        private(set) var removedPair = false
+        private(set) var deletedDevice = false
+        private(set) var requestedTest = false
+        var statusValue: ParentStatus?
+        var statusGate: RequestGate?
         init(credential: DeviceCredential) { self.credential = credential }
         func configure(settingsFail: Bool = false, settingsGate: RequestGate? = nil,
                        heartbeatGate: RequestGate? = nil, sendGate: RequestGate? = nil,
@@ -89,7 +94,13 @@ final class AppModelTests: XCTestCase {
         func register() async throws {}
         func createPairing() async throws -> PairingCode { PairingCode(code: "123456", expiresAt: .distantFuture) }
         func claim(_ code: String) async throws {}
-        func status() async throws -> ParentStatus { ParentStatus(paired: true, configuration: MonitoringConfiguration()) }
+        func status() async throws -> ParentStatus { await statusGate?.wait(); return statusValue ?? ParentStatus(paired: true, configuration: MonitoringConfiguration()) }
+        func setStatusGate(_ gate: RequestGate?) { statusGate = gate }
+        func setStatus(_ value: ParentStatus) { statusValue = value }
+        func unpair() async throws { removedPair = true }
+        func deleteDevice() async throws { deletedDevice = true }
+        func requestTestPush() async throws { requestedTest = true }
+        func connectionAlerts(_ enabled: Bool) async throws {}
         func heartbeat(_ value: Heartbeat) async throws -> MonitoringConfiguration {
             beats.append(value)
             await heartbeatGate?.wait()
@@ -161,6 +172,74 @@ final class AppModelTests: XCTestCase {
             try? await Task.sleep(for: .milliseconds(10))
         }
         return false
+    }
+
+    @MainActor func testCalibrationCannotCreateLiveEpisodesOrAlerts() async throws {
+        let fixture = try Fixture()
+        await fixture.model.beginCalibration()
+        XCTAssertFalse(fixture.model.monitoring)
+        XCTAssertEqual(fixture.model.calibrationPhase, "background")
+        for i in 0..<24 { fixture.audio.emit(AudioLevelSample(timestamp: Date().addingTimeInterval(Double(i) / 4), dbFS: -55)) }
+        let measured = await eventually { fixture.model.calibration.background.count == 24 }
+        XCTAssertTrue(measured)
+        fixture.model.finishCalibrationBackground(); fixture.model.beginCalibrationSample()
+        for i in 0..<20 { fixture.audio.emit(AudioLevelSample(timestamp: Date().addingTimeInterval(Double(i) / 4 + 10), dbFS: -10)) }
+        let sampled = await eventually { fixture.model.calibration.sample.count == 20 }
+        XCTAssertTrue(sampled); fixture.model.finishCalibrationSample()
+        XCTAssertNil(fixture.model.snapshot.current); XCTAssertTrue(fixture.model.snapshot.pending.isEmpty)
+        XCTAssertFalse(fixture.model.monitoring); XCTAssertEqual(fixture.model.calibrationPhase, "complete")
+    }
+    @MainActor func testUnpairClearsLocalOutboxAndStopsMonitoring() async throws {
+        let fixture = try Fixture(pending: true)
+        await fixture.model.start(); await fixture.model.removePairing(deleteDevice: false)
+        let removed = await fixture.backend.removedPair
+        XCTAssertTrue(removed); XCTAssertFalse(fixture.model.paired); XCTAssertFalse(fixture.model.monitoring)
+        XCTAssertTrue(fixture.model.snapshot.pending.isEmpty); XCTAssertTrue(fixture.model.snapshot.history.isEmpty)
+        XCTAssertEqual(fixture.model.role, .listener)
+    }
+    @MainActor func testDeletionReturnsToRoleSelection() async throws {
+        let fixture = try Fixture(pending: true)
+        await fixture.model.removePairing(deleteDevice: true)
+        let deleted = await fixture.backend.deletedDevice
+        XCTAssertTrue(deleted); XCTAssertNil(fixture.model.role); XCTAssertFalse(fixture.model.paired)
+        XCTAssertTrue(fixture.model.snapshot.pending.isEmpty)
+    }
+    @MainActor func testRevokedPairingStopsListenerAndClearsQueuedHistory() async throws {
+        let fixture = try Fixture(pending: true)
+        await fixture.model.start()
+        await fixture.backend.setStatus(ParentStatus(paired: false, configuration: MonitoringConfiguration()))
+        await fixture.model.tick()
+        let revoked = await eventually { !fixture.model.paired }
+        XCTAssertTrue(revoked)
+        XCTAssertFalse(fixture.model.monitoring); XCTAssertFalse(fixture.model.paired)
+        XCTAssertTrue(fixture.model.snapshot.pending.isEmpty)
+        var config = fixture.model.configuration; config.alertDuration = 30
+        fixture.model.saveSettings(config)
+        fixture.time.now = fixture.time.now.addingTimeInterval(20)
+        await fixture.model.tick()
+        XCTAssertEqual(fixture.model.configuration.alertDuration, 30)
+    }
+    @MainActor func testSuspendedPairingRefreshDoesNotDelayQueuedAlert() async throws {
+        let fixture = try Fixture(pending: true)
+        let gate = RequestGate(); await fixture.backend.setStatusGate(gate)
+        await fixture.model.tick()
+        let sent = await fixture.backend.sent
+        XCTAssertEqual(sent.count, 1)
+        XCTAssertTrue(fixture.model.snapshot.pending.isEmpty)
+        await gate.open()
+    }
+    @MainActor func testParentDistinguishesConnectionStatesAndSettingsAcknowledgement() async throws {
+        let fixture = try Fixture(); fixture.model.selectRole(.parent)
+        var status = ParentStatus(paired: true, lastHeartbeat: fixture.time.now, monitoring: false, configuration: MonitoringConfiguration())
+        await fixture.backend.setStatus(status); await fixture.model.refreshParent()
+        XCTAssertEqual(fixture.model.nurseryConnection, "Stopped")
+        status.monitoring = true; status.listenerConfiguration = MonitoringConfiguration()
+        await fixture.backend.setStatus(status); await fixture.model.refreshParent()
+        XCTAssertEqual(fixture.model.nurseryConnection, "Monitoring"); XCTAssertEqual(fixture.model.settingsSyncStatus, "Applied on Listener")
+        status.lastHeartbeat = fixture.time.now.addingTimeInterval(-151)
+        await fixture.backend.setStatus(status); await fixture.model.refreshParent()
+        XCTAssertEqual(fixture.model.nurseryConnection, "Connection lost"); XCTAssertFalse(fixture.model.parentOnline)
+        XCTAssertEqual(fixture.model.settingsSyncStatus, "Waiting for Listener")
     }
 
     @MainActor func testStartupRouteRecoveryDoesNotPresentAnError() async throws {

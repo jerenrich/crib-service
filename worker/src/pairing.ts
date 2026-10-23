@@ -25,7 +25,7 @@ export async function claimPairing(env:Env,device:Device,value:Record<string,unk
  try {
   const result=await env.DB.batch([
    env.DB.prepare('UPDATE pairing_codes SET claimed_by=? WHERE code_hash=? AND expires_at>? AND claimed_by IS NULL').bind(device.id,hash,Date.now()),
-   env.DB.prepare('INSERT INTO pairs(parent_id,listener_id) SELECT parent_id,claimed_by FROM pairing_codes WHERE code_hash=? AND claimed_by=?').bind(hash,device.id)
+   env.DB.prepare('INSERT INTO pairs(parent_id,listener_id,created_at) SELECT parent_id,claimed_by,? FROM pairing_codes WHERE code_hash=? AND claimed_by=?').bind(Date.now(),hash,device.id)
   ]);
   if(result[1].meta.changes!==1)throw new APIError(400,'Code expired or already used.');
  }catch(error){if(error instanceof APIError)throw error;throw new APIError(409,'Code unavailable or device already paired.');}

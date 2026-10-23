@@ -26,6 +26,14 @@ export function payload(alert:Alert,target:'phone'|'watch'='phone') {
  return {aps:{alert:{title,body},category:'BABY_CRY_ALERT','thread-id':alert.episodeId,...(target==='watch'?{sound:'default','interruption-level':'time-sensitive'}:{})},eventId:alert.eventId,episodeId:alert.episodeId,cryStartedAt:alert.cryStartedAt,createdAt:alert.createdAt,durationSeconds:alert.durationSeconds,...(alert.isTest?{isTest:true}:{})};
 }
 export async function sendPush(env:Env,encryptedToken:string,alert:Alert,target:'phone'|'watch'='phone'):Promise<PushResult> {
+ return sendNotification(env,encryptedToken,alert.eventId,payload(alert,target),target,3600);
+}
+export async function sendConnectionPush(env:Env,encryptedToken:string,id:string,state:string,target:'phone'|'watch'):Promise<PushResult> {
+ const title=state==='online'?'Monitoring connection restored':state==='stopped'?'Listener monitoring stopped':'Listener connection lost';
+ const body=state==='online'?'The Listener is reporting active monitoring again.':state==='stopped'?'The Listener reports that monitoring has stopped. Check the nursery phone.':'No Listener update for at least 3 minutes. Check power, internet, and monitoring.';
+ return sendNotification(env,encryptedToken,id,{aps:{alert:{title,body},'thread-id':'listener-connection',...(target==='watch'?{sound:'default','interruption-level':'time-sensitive'}:{})},connectionState:state},target,180);
+}
+async function sendNotification(env:Env,encryptedToken:string,id:string,content:unknown,target:'phone'|'watch',expiration:number):Promise<PushResult> {
  // Errors before fetch are known not to have sent a notification and can safely retry.
  let deviceToken:string,jwt:string;
  try {deviceToken=await decryptToken(env,encryptedToken);}catch{throw new PushPreparationError('token_decryption');}
@@ -34,7 +42,7 @@ export async function sendPush(env:Env,encryptedToken:string,alert:Alert,target:
  const host=env.APNS_ENVIRONMENT==='production'?'api.push.apple.com':'api.sandbox.push.apple.com';
  let response:Response;
  try {
-  response=await fetch(`https://${host}/3/device/${deviceToken}`,{method:'POST',headers:{authorization:`bearer ${jwt}`,'apns-topic':env.APNS_BUNDLE_ID+(target==='watch'?'.watchkitapp':''),'apns-push-type':'alert','apns-priority':'10','apns-id':alert.eventId,'apns-collapse-id':alert.eventId,'apns-expiration':String(Math.floor(Date.now()/1000)+3600),'content-type':'application/json'},body:JSON.stringify(payload(alert,target)),signal:AbortSignal.timeout(10000)});
+  response=await fetch(`https://${host}/3/device/${deviceToken}`,{method:'POST',headers:{authorization:`bearer ${jwt}`,'apns-topic':env.APNS_BUNDLE_ID+(target==='watch'?'.watchkitapp':''),'apns-push-type':'alert','apns-priority':'10','apns-id':id,'apns-collapse-id':id,'apns-expiration':String(Math.floor(Date.now()/1000)+expiration),'content-type':'application/json'},body:JSON.stringify(content),signal:AbortSignal.timeout(10000)});
  }catch{return {status:'uncertain',reason:'transport_unknown'};}
  const httpStatus=response.status;
  if(response.status===200)return {status:'sent',httpStatus};

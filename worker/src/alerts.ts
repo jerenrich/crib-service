@@ -7,13 +7,14 @@ export async function receiveAlert(env:Env,device:Device,value:Record<string,unk
  requireRole(device,'listener');const alert=validateAlert(value);
  if(alert.listenerId!==device.id)throw new APIError(403,'Listener identity mismatch.');
  const pair=await pairFor(env,device);if(!pair)throw new APIError(409,'Listener is not paired.');
+ if(Date.parse(alert.createdAt)<pair.created_at-2000)throw new APIError(409,'Alert belongs to an earlier pairing.');
  const previous=await env.DB.prepare('SELECT * FROM events WHERE event_id=?').bind(alert.eventId).first<StoredEvent>();
  if(previous){
   if(previous.listener_id!==device.id||previous.payload!==JSON.stringify(alert))throw new APIError(409,'Event UUID already used for different metadata.');
  }else{
   // Unique index also prevents a buggy client creating another initial UUID for an episode.
-  await env.DB.prepare('INSERT INTO events(event_id,episode_id,listener_id,parent_id,is_repeat,payload,created_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT DO NOTHING')
-   .bind(alert.eventId,alert.episodeId,device.id,pair.parent_id,Number(alert.isRepeat),JSON.stringify(alert),Date.now()).run();
+  await env.DB.prepare('INSERT INTO events(event_id,episode_id,listener_id,parent_id,is_repeat,payload,created_at) SELECT ?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?) ON CONFLICT DO NOTHING')
+   .bind(alert.eventId,alert.episodeId,device.id,pair.parent_id,Number(alert.isRepeat),JSON.stringify(alert),Date.now(),pair.parent_id,pair.listener_id,pair.created_at).run();
  }
  let record=await env.DB.prepare('SELECT * FROM events WHERE event_id=?').bind(alert.eventId).first<StoredEvent>();
  if(record && (record.listener_id!==device.id || record.payload!==JSON.stringify(alert)))throw new APIError(409,'Event UUID already used for different metadata.');

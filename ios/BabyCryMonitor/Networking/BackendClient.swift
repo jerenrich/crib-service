@@ -2,7 +2,11 @@ import Foundation
 
 struct ParentStatus: Codable, Sendable {
     var paired: Bool
+    var pairingID: String?
     var watchPushRegistered: Bool?
+    var phonePushRegistered: Bool?
+    var connectionAlertsEnabled: Bool?
+    var listenerConfiguration: MonitoringConfiguration?
     var listenerId: UUID?
     var lastHeartbeat: Date?
     var monitoring: Bool?
@@ -41,6 +45,7 @@ struct Heartbeat: Codable, Sendable {
     let state: CryState
     let currentEpisode: RemoteEpisode?
     let episodes: [RemoteEpisode]
+    var appliedConfiguration: MonitoringConfiguration? = nil
 }
 struct PairingCode: Codable, Sendable { let code: String; let expiresAt: Date }
 struct PairingResult: Codable, Sendable { let paired: Bool }
@@ -56,6 +61,16 @@ protocol BackendServing: AlertSending {
     func acknowledge(_ id: UUID) async throws
     func pushToken(_ token: String) async throws
     func watchPushToken(_ token: String?) async throws
+    func connectionAlerts(_ enabled: Bool) async throws
+    func requestTestPush() async throws
+    func unpair() async throws
+    func deleteDevice() async throws
+}
+extension BackendServing {
+    func connectionAlerts(_ enabled: Bool) async throws { throw BackendError.message("Connection alerts unavailable.") }
+    func requestTestPush() async throws { throw BackendError.message("Remote test unavailable.") }
+    func unpair() async throws { throw BackendError.message("Unpairing unavailable.") }
+    func deleteDevice() async throws { throw BackendError.message("Deletion unavailable.") }
 }
 struct BackendClient: BackendServing {
     let baseURL: URL
@@ -74,6 +89,14 @@ struct BackendClient: BackendServing {
     func settings(_ configuration: MonitoringConfiguration) async throws { let _: EmptyResponse = try await request("/v1/settings", body: configuration) }
     func acknowledge(_ id: UUID) async throws { let _: EmptyResponse = try await request("/v1/alert/acknowledge", body: ["eventId": id.uuidString]) }
     func pushToken(_ token: String) async throws { let _: EmptyResponse = try await request("/v1/device/push-token", body: ["token": token]) }
+    func connectionAlerts(_ enabled: Bool) async throws { let _: EmptyResponse = try await request("/v1/connection-alerts", body: ["enabled": enabled]) }
+    func requestTestPush() async throws { let _: AlertReceipt = try await request("/v1/test-push", body: [String:String]()) }
+    func unpair() async throws { let _: EmptyResponse = try await request("/v1/pairing/remove", body: [String:String]()) }
+    func deleteDevice() async throws {
+        // A lost success response leaves a revoked credential. Retrying deletion is safe.
+        do { let _: EmptyResponse = try await request("/v1/device/delete", body: [String:String]()) }
+        catch BackendError.response(401, _) { return }
+    }
     func watchPushToken(_ token: String?) async throws {
         struct Token: Encodable { let token: String?; enum CodingKeys: String, CodingKey { case token }
             func encode(to encoder: Encoder) throws { var values = encoder.container(keyedBy: CodingKeys.self); if let token { try values.encode(token, forKey: .token) } else { try values.encodeNil(forKey: .token) } }
@@ -92,7 +115,8 @@ struct BackendClient: BackendServing {
         let operation = ["/v1/device/register": "register", "/v1/pairing/create": "pairing_create", "/v1/pairing/claim": "pairing_claim",
                          "/v1/device/push-token": "push_token", "/v1/device/watch-push-token": "watch_token",
                          "/v1/listener/heartbeat": "heartbeat", "/v1/listener/event": "alert", "/v1/listener/status": "status",
-                         "/v1/settings": "settings", "/v1/alert/acknowledge": "acknowledge"][path] ?? "unknown"
+                         "/v1/settings": "settings", "/v1/alert/acknowledge": "acknowledge", "/v1/test-push": "test_push",
+                         "/v1/connection-alerts": "connection_preferences", "/v1/pairing/remove": "unpair", "/v1/device/delete": "delete_device"][path] ?? "unknown"
         let started = Date()
         let data: Data, rawResponse: URLResponse
         do { (data, rawResponse) = try await session.data(for: request) }

@@ -6,6 +6,7 @@ import {payload,apnsToken} from '../src/apns';
 import {encryptToken,decryptToken} from '../src/security';
 import {flushPending} from '../src/alerts';
 import {eventReference,recordDiagnostic} from '../src/diagnostics';
+import {flushConnections} from '../src/connections';
 
 let testEnv:Env;
 const secret=btoa('0123456789abcdef0123456789abcdef');
@@ -38,7 +39,7 @@ beforeAll(async()=>{
  testEnv={...env,APNS_KEY_ID:'TESTKEY',APNS_TEAM_ID:'TESTTEAM',APNS_PRIVATE_KEY:`-----BEGIN PRIVATE KEY-----\n${pem}\n-----END PRIVATE KEY-----`,APNS_BUNDLE_ID:'com.example.BabyCryMonitor',APNS_ENVIRONMENT:'development'};
 });
 beforeEach(async()=>{
- await env.DB.batch(['diagnostics','events','heartbeats','pairs','pairing_codes','devices','rate_limits'].map(table=>env.DB.prepare(`DELETE FROM ${table}`)));
+ await env.DB.batch(['diagnostics','connection_notices','connection_states','events','heartbeats','pairs','pairing_codes','devices','rate_limits'].map(table=>env.DB.prepare(`DELETE FROM ${table}`)));
  pushResponses=[];pushRequests=[];
  vi.stubGlobal('fetch',vi.fn(async(input:string|URL|Request,init?:RequestInit)=>{
   const url=String(input);expect(url).toMatch(/^https:\/\/api\.sandbox\.push\.apple\.com\/3\/device\//);
@@ -48,6 +49,106 @@ beforeEach(async()=>{
  }));
 });
 afterEach(()=>{expect(pushResponses).toHaveLength(0);vi.unstubAllGlobals();});
+
+describe('connection alerts, readiness and replacement',()=>{
+ const beat=(listener:TestDevice,monitoring=true,appliedConfiguration=defaultConfiguration)=>({listenerId:listener.deviceId,timestamp:new Date().toISOString(),monitoring,powerConnected:true,state:'quiet',episodes:[],appliedConfiguration});
+ async function stale(){await env.DB.prepare('UPDATE heartbeats SET received_at=?').bind(new Date(Date.now()-240000).toISOString()).run();}
+ it('requires parent opt-in and emits one notice per outage plus recovery',async()=>{
+  const {parent,listener}=await paired();
+  await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  expect((await call('connection-alerts',listener,{enabled:true})).status).toBe(403);
+  expect((await call('connection-alerts',parent,{enabled:'yes'})).status).toBe(400);
+  await call('listener/heartbeat',listener,beat(listener));
+  await stale();await flushConnections(testEnv);expect(pushRequests).toHaveLength(0);
+  await call('listener/heartbeat',listener,beat(listener));await flushConnections(testEnv);
+  await call('connection-alerts',parent,{enabled:true});
+  await stale();mockPush();await flushConnections(testEnv);await flushConnections(testEnv);
+  expect(pushRequests).toHaveLength(1);
+  let content=JSON.parse(String(pushRequests[0].init?.body));expect(content.connectionState).toBe('offline');expect(content.eventId).toBeUndefined();
+  await call('listener/heartbeat',listener,beat(listener));mockPush();await flushConnections(testEnv);await flushConnections(testEnv);
+  expect(pushRequests).toHaveLength(2);content=JSON.parse(String(pushRequests[1].init?.body));expect(content.connectionState).toBe('online');
+ });
+ it('reports stopped monitoring but does not warn before first start',async()=>{
+  const {parent,listener}=await paired();await call('connection-alerts',parent,{enabled:true});
+  await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  await call('listener/heartbeat',listener,beat(listener,false));await flushConnections(testEnv);expect(pushRequests).toHaveLength(0);
+  await call('listener/heartbeat',listener,beat(listener));
+  await call('listener/heartbeat',listener,beat(listener,false));mockPush();await flushConnections(testEnv);await flushConnections(testEnv);
+  expect(pushRequests).toHaveLength(1);expect(JSON.parse(String(pushRequests[0].init?.body)).connectionState).toBe('stopped');
+ });
+ it('does not replay ambiguous health delivery and cancels obsolete outages',async()=>{
+  const {parent,listener}=await paired();await call('connection-alerts',parent,{enabled:true});
+  await call('device/push-token',parent,{token:'ab'.repeat(32)});await call('listener/heartbeat',listener,beat(listener));await stale();
+  pushResponses.push(new Error('transport unknown'));await flushConnections(testEnv);await flushConnections(testEnv);
+  expect(pushRequests).toHaveLength(1);
+  const notice=await env.DB.prepare('SELECT status FROM connection_notices').first<{status:string}>();expect(notice?.status).toBe('uncertain');
+  await call('connection-alerts',parent,{enabled:false});await call('listener/heartbeat',listener,beat(listener));await flushConnections(testEnv);
+  expect(pushRequests).toHaveLength(1);
+ });
+ it('cancels an undelivered outage when the Listener recovers',async()=>{
+  const {parent,listener}=await paired();await call('connection-alerts',parent,{enabled:true});
+  await call('listener/heartbeat',listener,beat(listener));await stale();await flushConnections(testEnv);
+  await call('listener/heartbeat',listener,beat(listener));await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  await env.DB.prepare('UPDATE connection_notices SET next_attempt=0').run();mockPush();await flushConnections(testEnv);
+  expect(pushRequests).toHaveLength(1);expect(JSON.parse(String(pushRequests[0].init?.body)).connectionState).toBe('online');
+  const offline=await env.DB.prepare("SELECT status FROM connection_notices WHERE state='offline'").first<{status:string}>();expect(offline?.status).toBe('cancelled');
+ });
+ it('retries explicit rejection once without duplicating concurrent dispatch',async()=>{
+  const {parent,listener}=await paired();await call('connection-alerts',parent,{enabled:true});await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  await call('listener/heartbeat',listener,beat(listener));await stale();mockPush(503);
+  await flushConnections(testEnv);await env.DB.prepare('UPDATE connection_notices SET next_attempt=0').run();mockPush();
+  await Promise.all([flushConnections(testEnv),flushConnections(testEnv)]);expect(pushRequests).toHaveLength(2);
+  expect(pushRequests[0].init?.headers).toEqual(pushRequests[1].init?.headers);
+ });
+ it('falls back after an explicitly invalid Watch token without replaying uncertain sends',async()=>{
+  const {parent,listener}=await paired();await call('connection-alerts',parent,{enabled:true});
+  await call('device/push-token',parent,{token:'ab'.repeat(32)});await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
+  await call('listener/heartbeat',listener,beat(listener));await stale();
+  pushResponses.push(new Response(JSON.stringify({reason:'BadDeviceToken'}),{status:400}));await flushConnections(testEnv);
+  await env.DB.prepare('UPDATE connection_notices SET next_attempt=0').run();mockPush();await flushConnections(testEnv);
+  expect(pushRequests[0].url).toContain('cd'.repeat(32));expect(pushRequests[1].url).toContain('ab'.repeat(32));
+  expect(JSON.parse(String(pushRequests[1].init?.body)).aps.sound).toBeUndefined();
+ });
+ it('keeps desired settings separate from settings reported by the Listener',async()=>{
+  const {parent,listener}=await paired();const desired={...defaultConfiguration,alertDuration:30};
+  await call('settings',parent,desired);await call('listener/heartbeat',listener,beat(listener));
+  let status=await (await call('listener/status',parent,undefined,'GET')).json() as {configuration:unknown;listenerConfiguration:unknown};
+  expect(status.configuration).toEqual(desired);expect(status.listenerConfiguration).toEqual(defaultConfiguration);
+  await call('listener/heartbeat',listener,beat(listener,true,desired));
+  status=await (await call('listener/status',parent,undefined,'GET')).json() as typeof status;
+  expect(status.listenerConfiguration).toEqual(desired);
+  expect((await call('listener/heartbeat',listener,{...beat(listener),appliedConfiguration:{...desired,audio:'forbidden'}})).status).toBe(400);
+ });
+ it('lets only the paired parent request and acknowledge a marked real test',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  expect((await call('test-push',listener)).status).toBe(403);mockPush();expect((await call('test-push',parent)).status).toBe(200);
+  const status=await (await call('listener/status',parent,undefined,'GET')).json() as {alerts:Alert[]};
+  expect(status.alerts[0].isTest).toBe(true);expect(JSON.parse(String(pushRequests[0].init?.body)).isTest).toBe(true);
+  expect((await call('alert/acknowledge',parent,{eventId:status.alerts[0].eventId})).status).toBe(200);
+ });
+ it('unpairs atomically, permits replacement and prevents old history replay',async()=>{
+  const {parent,listener}=await paired();const other=await paired();const old=alert(listener);await call('listener/event',listener,old);
+  await call('listener/heartbeat',listener,beat(listener));await call('listener/heartbeat',other.listener,beat(other.listener));
+  expect((await call('pairing/remove',parent)).status).toBe(200);
+  expect((await call('listener/heartbeat',listener,beat(listener))).status).toBe(409);
+  const status=await (await call('listener/status',listener,undefined,'GET')).json() as {paired:boolean};expect(status.paired).toBe(false);
+  expect((await env.DB.prepare('SELECT * FROM events WHERE event_id=?').bind(old.eventId).all()).results).toHaveLength(0);
+  expect((await env.DB.prepare('SELECT * FROM pairs WHERE parent_id=?').bind(other.parent.deviceId).all()).results).toHaveLength(1);
+  const code=await (await call('pairing/create',parent)).json() as {code:string};await call('pairing/claim',listener,{code:code.code});
+  await env.DB.prepare('UPDATE pairs SET created_at=? WHERE parent_id=?').bind(Date.now()+5000,parent.deviceId).run();
+  expect((await call('listener/event',listener,old)).status).toBe(409);
+  await call('listener/heartbeat',listener,{...beat(listener),episodes:[{id:old.episodeId,startedAt:old.cryStartedAt}]});
+  const fresh=await (await call('listener/status',parent,undefined,'GET')).json() as {episodes:unknown[]};expect(fresh.episodes).toHaveLength(0);
+ });
+ it('deletes only the caller registration and shared pair history',async()=>{
+  const {parent,listener}=await paired();await call('listener/heartbeat',listener,beat(listener));
+  expect((await call('device/delete',listener)).status).toBe(200);
+  expect((await call('listener/status',listener,undefined,'GET')).status).toBe(401);
+  const status=await (await call('listener/status',parent,undefined,'GET')).json() as {paired:boolean};expect(status.paired).toBe(false);
+  expect((await env.DB.prepare('SELECT * FROM heartbeats').all()).results).toHaveLength(0);
+  expect((await call('pairing/create',parent)).status).toBe(200);
+ });
+});
 
 describe('devices and secure pairing',()=>{
  it('requires credentials and rejects wrong roles',async()=>{
