@@ -220,6 +220,13 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(sampled); fixture.model.finishCalibrationSample()
         XCTAssertNil(fixture.model.snapshot.current); XCTAssertTrue(fixture.model.snapshot.pending.isEmpty)
         XCTAssertFalse(fixture.model.monitoring); XCTAssertEqual(fixture.model.calibrationPhase, "complete")
+        XCTAssertEqual(fixture.model.calibration.recommendedThreshold, -15)
+        var config = fixture.model.configuration
+        config.absoluteThreshold = try XCTUnwrap(fixture.model.calibration.recommendedThreshold)
+        fixture.model.saveSettings(config)
+        XCTAssertEqual(fixture.model.threshold, -15)
+        XCTAssertEqual(fixture.model.snapshot.configuration.absoluteThreshold, -15)
+        XCTAssertNil(fixture.model.snapshot.current); XCTAssertTrue(fixture.model.snapshot.pending.isEmpty)
     }
     @MainActor func testUnpairClearsLocalOutboxAndStopsMonitoring() async throws {
         let fixture = try Fixture(pending: true)

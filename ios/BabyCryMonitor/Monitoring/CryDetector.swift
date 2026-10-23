@@ -6,8 +6,6 @@ public protocol CryDetecting {
 /// Energy heuristic, not a classifier. Keeps only a five-second ring of booleans locally.
 public struct CryDetector: CryDetecting, Sendable {
     public private(set) var state: CryState = .quiet
-    public private(set) var ambientDBFS: Double = -60
-    public private(set) var effectiveThreshold: Double = -35
     public private(set) var quietSince: Date?
     private var frames: [(Date, Bool)] = []
     private var firstFrame: Date?
@@ -18,15 +16,9 @@ public struct CryDetector: CryDetecting, Sendable {
     public mutating func consume(_ sample: AudioLevelSample, configuration: MonitoringConfiguration) -> CryState {
         guard sample.dbFS.isFinite else { return state }
         if let lastTimestamp, sample.timestamp <= lastTimestamp { return state }
-        let dt = min(1, max(0.01, sample.timestamp.timeIntervalSince(lastTimestamp ?? sample.timestamp.addingTimeInterval(-0.25))))
         lastTimestamp = sample.timestamp
         if firstFrame == nil { firstFrame = sample.timestamp }
-        effectiveThreshold = max(configuration.absoluteThreshold, ambientDBFS + configuration.sensitivity.margin)
-        let loud = sample.dbFS >= effectiveThreshold
-        // Freeze the baseline during loud frames, possible cries, and confirmed episodes.
-        if state == .quiet && !loud {
-            ambientDBFS += (1 - exp(-dt / 30)) * (max(-100, sample.dbFS) - ambientDBFS)
-        }
+        let loud = sample.dbFS >= configuration.absoluteThreshold
         frames.append((sample.timestamp, loud))
         frames.removeAll { sample.timestamp.timeIntervalSince($0.0) >= 5 }
         let proportion = Double(frames.filter { $0.1 }.count) / Double(max(1, frames.count))

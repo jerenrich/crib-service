@@ -1,20 +1,17 @@
 import Foundation
 
 public enum DeviceRole: String, Codable, CaseIterable, Sendable { case listener, parent }
-public enum Sensitivity: String, Codable, CaseIterable, Sendable {
-    case low, medium, high
-    public var margin: Double { switch self { case .low: 16; case .medium: 12; case .high: 8 } }
-}
 public struct MonitoringConfiguration: Codable, Equatable, Sendable {
+    public static let soundThresholds = Array(stride(from: -60.0, through: -10.0, by: 5.0))
     public var alertDuration: TimeInterval = 300
     public var quietResetDuration: TimeInterval = 20
-    public var sensitivity: Sensitivity = .medium
     public var repeatInterval: TimeInterval? = nil
     public var absoluteThreshold: Double = -35
     public init() {}
     public var isValid: Bool {
         alertDuration.isFinite && (5...3600).contains(alertDuration) && [10.0, 20, 30, 60].contains(quietResetDuration)
-        && (repeatInterval == nil || [120.0, 300].contains(repeatInterval)) && absoluteThreshold == -35
+        && (repeatInterval == nil || [120.0, 300].contains(repeatInterval))
+        && absoluteThreshold.isFinite && (-60 ... -10).contains(absoluteThreshold)
     }
 }
 public protocol ClockProviding: Sendable { var now: Date { get } }

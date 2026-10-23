@@ -13,10 +13,10 @@ final class CrySessionTests: XCTestCase {
         var time = Date(timeIntervalSince1970: 1000)
         let listener = UUID()
         var emitted: [CryAlert] = []
-        mutating func run(_ seconds: Double, loud: Bool = true) {
+        mutating func run(_ seconds: Double, loud: Bool = true, level: Double? = nil) {
             for _ in 0..<Int(seconds * 4) {
                 time = time.addingTimeInterval(0.25)
-                emitted += engine.consume(AudioLevelSample(timestamp: time, dbFS: loud ? -20 : -65), listenerId: listener)
+                emitted += engine.consume(AudioLevelSample(timestamp: time, dbFS: level ?? (loud ? -20 : -65)), listenerId: listener)
             }
         }
     }
@@ -113,13 +113,63 @@ final class CrySessionTests: XCTestCase {
         for i in 0..<1000 { _ = detector.consume(.init(timestamp: start.addingTimeInterval(Double(i) / 4), dbFS: -100), configuration: config) }
         _ = detector.consume(.init(timestamp: start, dbFS: -10), configuration: config)
         _ = detector.consume(.init(timestamp: start.addingTimeInterval(1000), dbFS: .nan), configuration: config)
-        XCTAssertEqual(detector.state, .quiet); XCTAssertTrue(detector.ambientDBFS.isFinite)
+        XCTAssertEqual(detector.state, .quiet)
     }
-    func testAmbientFrozenDuringCryAndSensitivity() {
-        var s = Simulation(); s.run(30, loud: false); let baseline = s.engine.detector.ambientDBFS; s.run(120)
-        XCTAssertEqual(s.engine.detector.ambientDBFS, baseline, accuracy: 0.01)
-        XCTAssertLessThan(Sensitivity.high.margin, Sensitivity.medium.margin)
-        XCTAssertLessThan(Sensitivity.medium.margin, Sensitivity.low.margin)
+    func testAbsoluteThresholdIsIndependentOfPreviousRoomNoise() {
+        for background in [-80.0, -36] {
+            var s = Simulation(); var config = MonitoringConfiguration(); config.alertDuration = 5
+            s.engine.configure(config)
+            s.run(180, level: background)
+            XCTAssertNil(s.engine.snapshot.current)
+            XCTAssertTrue(s.emitted.isEmpty)
+            s.run(10, level: -35)
+            XCTAssertEqual(s.engine.detector.state, .crying)
+            XCTAssertEqual(s.emitted.count, 1, "Expected an alert after background at \(background) dBFS")
+        }
+    }
+    func testSelectedAbsoluteThresholdControlsDetectionAndAlertDelivery() {
+        for threshold in [-60.0, -50, -35, -20, -10] {
+            var s = Simulation(); var config = MonitoringConfiguration()
+            config.absoluteThreshold = threshold; config.alertDuration = 5
+            s.engine.configure(config)
+            s.run(30, level: threshold - 0.01)
+            XCTAssertNil(s.engine.snapshot.current)
+            XCTAssertTrue(s.emitted.isEmpty)
+            s.run(10, level: threshold)
+            XCTAssertEqual(s.emitted.count, 1, "Expected detection at \(threshold) dBFS")
+            XCTAssertEqual(s.emitted.first?.durationSeconds, 5)
+            // A due repeat waits for sound to reach the same absolute threshold again.
+            config.repeatInterval = 120; s.engine.configure(config)
+            s.run(119 - s.time.timeIntervalSince(s.emitted[0].createdAt), level: threshold)
+            s.run(2, level: threshold - 0.01)
+            XCTAssertEqual(s.emitted.count, 1)
+            s.run(0.25, level: threshold)
+            XCTAssertEqual(s.emitted.count, 2)
+        }
+    }
+    func testAbsoluteThresholdValidationAndPersistence() throws {
+        var config = MonitoringConfiguration()
+        for threshold in [-60.0, -47.5, -35, -10] {
+            config.absoluteThreshold = threshold
+            XCTAssertTrue(config.isValid)
+            XCTAssertEqual(try JSONDecoder().decode(MonitoringConfiguration.self, from: JSONEncoder().encode(config)), config)
+        }
+        for threshold in [-60.01, -9.99, .infinity, -.infinity, .nan] {
+            config.absoluteThreshold = threshold
+            XCTAssertFalse(config.isValid)
+            var engine = CrySessionManager(); engine.configure(config)
+            XCTAssertEqual(engine.snapshot.configuration.absoluteThreshold, -35)
+        }
+    }
+    func testLegacySensitivityIsIgnoredWhenRestoringSavedSessions() throws {
+        var s = Simulation(); s.run(306)
+        var saved = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(s.engine.snapshot)) as? [String: Any])
+        var config = try XCTUnwrap(saved["configuration"] as? [String: Any])
+        config["sensitivity"] = "high"; saved["configuration"] = config
+        let restored = try JSONDecoder().decode(SessionSnapshot.self, from: JSONSerialization.data(withJSONObject: saved))
+        XCTAssertEqual(restored.configuration.absoluteThreshold, -35)
+        XCTAssertEqual(restored.pending.map(\.alert), s.engine.snapshot.pending.map(\.alert))
+        XCTAssertFalse(String(decoding: try JSONEncoder().encode(restored), as: UTF8.self).contains("sensitivity"))
     }
     func testHistoryBoundAndConfigValidation() {
         var s = Simulation()

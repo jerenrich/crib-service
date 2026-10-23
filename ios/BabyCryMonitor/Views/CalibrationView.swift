@@ -27,15 +27,14 @@ struct CalibrationView: View {
                 }
                 if model.calibrationPhase == "complete" {
                     Section("Results") {
-                        if let recommendation = model.calibration.recommendedSensitivity,
-                           let threshold = model.calibration.threshold(for: recommendation) {
-                            Text("Try Background + \(Int(recommendation.margin)) dB. In this check the effective threshold would be \(threshold, specifier: "%.0f") dBFS.")
+                        if let threshold = model.calibration.recommendedThreshold {
+                            Text("Try a fixed threshold of \(threshold, specifier: "%.0f") dBFS. In this check it clears background noise by at least 8 dB and stays at least 2 dB below the typical sample.")
                             Button("Use recommended threshold") {
-                                var config = model.configuration; config.sensitivity = recommendation
+                                var config = model.configuration; config.absoluteThreshold = threshold
                                 model.saveSettings(config); dismiss()
                             }
                         }
-                        Text("The live baseline adapts to room noise. Sound must clear both background + margin and the −35 dBFS minimum, then remain active across the confirmation window. Brief or quiet sounds may not qualify.").font(.footnote)
+                        Text("The threshold stays fixed after you apply it. Sound must reach that level across the confirmation window. Brief or quiet sounds may not qualify. Repeat this check if the phone moves or room noise changes.").font(.footnote)
                     }
                 }
                 if let message = model.calibrationMessage { Section { Text(message) } }

@@ -59,12 +59,18 @@ final class OnboardingUITests: XCTestCase {
         XCTAssertTrue(duration.label.contains("30 seconds") || duration.staticTexts["30 seconds"].exists, duration.debugDescription)
         duration.tap()
         app.buttons["5 seconds"].tap()
+        let threshold = app.buttons["soundThresholdPicker"]
+        if !threshold.isHittable { app.swipeUp() }
+        XCTAssertTrue(threshold.waitForExistence(timeout: 5)); threshold.tap()
+        app.buttons["-45 dBFS"].tap()
         // Terminate with Settings still open: saving must happen on selection.
         app.terminate(); app.launch()
         XCTAssertTrue(app.buttons["Settings"].waitForExistence(timeout: 5))
         app.buttons["Settings"].tap()
         XCTAssertTrue(duration.waitForExistence(timeout: 5))
         XCTAssertTrue(duration.label.contains("5 seconds") || duration.staticTexts["5 seconds"].exists, duration.debugDescription)
+        if !threshold.isHittable { app.swipeUp() }
+        XCTAssertTrue(threshold.label.contains("-45 dBFS") || threshold.staticTexts["-45 dBFS"].exists, threshold.debugDescription)
         app.swipeUp()
         let diagnostics = app.buttons["Diagnostics & simulation"]
         if !diagnostics.isHittable { app.swipeUp() }

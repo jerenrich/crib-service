@@ -43,19 +43,24 @@ try {
     const code = await request('pairing/create', parent);
     check(code.status === 200 && /^\d{6}$/.test(code.body.code), 'pairing code created');
     check((await request('pairing/claim', listener, {code: code.body.code})).status === 200, 'secure pairing claim');
-    const config = {alertDuration: 5, quietResetDuration: 20, sensitivity: 'medium', repeatInterval: null, absoluteThreshold: -35};
+    const config = {alertDuration: 5, quietResetDuration: 20, repeatInterval: null, absoluteThreshold: -45};
     check((await request('settings', parent, config)).status === 200, 'five-second shared settings accepted');
     check((await request('settings', parent, {...config, alertDuration: 4})).status === 400, 'durations below five seconds rejected');
+    for (const absoluteThreshold of [-60.01, -9.99]) {
+        check((await request('settings', parent, {...config, absoluteThreshold})).status === 400, `out-of-range sound threshold ${absoluteThreshold} rejected`);
+    }
     const beat = {
         listenerId: listener.deviceId, timestamp: new Date().toISOString(), monitoring: true,
         powerConnected: false, state: 'quiet', episodes: [], appliedConfiguration: config
     };
     const heartbeat = await request('listener/heartbeat', listener, beat);
     check(heartbeat.status === 200 && heartbeat.body.alertDuration === 5, 'listener receives five-second configuration');
+    check(heartbeat.body.absoluteThreshold === -45 && !('sensitivity' in heartbeat.body), 'listener receives fixed -45 dBFS threshold without sensitivity');
     const status = await request('listener/status', parent, null, 'GET');
     check(status.status === 200 && status.body.paired && status.body.listenerId === listener.deviceId && status.body.monitoring === true, 'parent status and listener identity');
     check(status.body.configuration?.alertDuration === 5, 'parent sees the same five-second configuration');
     check(status.body.listenerConfiguration?.alertDuration === 5, 'Listener applied-settings acknowledgement');
+    check(status.body.configuration?.absoluteThreshold === -45 && status.body.listenerConfiguration?.absoluteThreshold === -45, 'Parent sees the selected and applied fixed threshold');
     check(/^[0-9a-f-]{36}$/i.test(status.requestId ?? '') && status.diagnostics === 'recorded', 'live diagnostic request reference recorded');
     check(status.body.connectionAlertsEnabled === false, 'connection alerts default off');
     check((await request('connection-alerts', listener, {enabled: true})).status === 403, 'connection preferences restricted to Parent');

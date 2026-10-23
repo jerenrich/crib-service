@@ -152,8 +152,7 @@ import UIKit
     }
     var snapshot: SessionSnapshot { engine.snapshot }
     var state: CryState { engine.detector.state }
-    var ambient: Double { engine.detector.ambientDBFS }
-    var threshold: Double { engine.detector.effectiveThreshold }
+    var threshold: Double { configuration.absoluteThreshold }
     var listenerID: String { credential?.deviceId.uuidString ?? "Not registered" }
     var parentOnline: Bool {
         guard let status = parentStatus, status.monitoring == true, let last = status.lastHeartbeat else { return false }
@@ -392,7 +391,7 @@ import UIKit
         }
     }
     func saveSettings(_ config: MonitoringConfiguration) {
-        guard config.isValid else { error = "Alert duration must be between 5 seconds and 60 minutes."; return }
+        guard config.isValid else { error = "Check alert timing, quiet reset, repeat interval, and sound threshold (−60 to −10 dBFS)."; return }
         configuration = config; engine.configure(config); persist()
         settingsGeneration += 1
         settingsDirty = true; defaults.set(true, forKey: "settingsDirty")
@@ -699,12 +698,8 @@ import UIKit
     func finishCalibrationSample() {
         guard calibrationPhase == "sample" else { return }
         calibrationPhase = "complete"; audio.stop()
-        if let background = calibration.backgroundLevel, background >= -35 {
-            calibrationMessage = "Background noise already crosses the detector's starting threshold. Reduce nearby fan or white-noise volume, or reposition this iPhone, then repeat the check. A sensitivity change alone may not help."
-            return
-        }
-        calibrationMessage = calibration.recommendedSensitivity == nil
-            ? "The sample was too quiet or too similar to background noise. Try moving the Listener closer and repeat the check."
+        calibrationMessage = calibration.recommendedThreshold == nil
+            ? "No available threshold safely separates this sample from room noise. Reduce nearby fan or white-noise volume, or move the Listener closer to the sound source, then repeat the check."
             : "A threshold can separate this sample from background noise. This check does not prove cry detection or notification delivery."
     }
     func cancelCalibration() {
