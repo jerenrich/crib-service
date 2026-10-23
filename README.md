@@ -22,7 +22,7 @@ flowchart LR
     APNs --> Parent[Parent iPhone fallback]
     APNs --> Watch[Direct Apple Watch alert]
     Parent <-->|Status and acknowledgement| Watch
-    Session --> Heartbeat[60-second metadata heartbeat]
+    Session --> Heartbeat[15-second metadata heartbeat]
     Heartbeat --> Worker
 ```
 
@@ -46,7 +46,7 @@ The alert clock begins **at confirmation**, rather than at the first loud sample
 
 An initial event UUID and queue timestamp are saved atomically before any request. An episode creates exactly one initial event locally; optional repeat events have their own UUIDs and occur every two or five minutes from the previous queued event. Retries reuse the same UUID with exponential backoff (2 seconds to 5 minutes). Network failures do not reset cry timing. `alertSentAt` means APNs accepted the request, **not** that the Parent or Watch displayed it.
 
-Heartbeats run independently of alert uploads. A suspended heartbeat cannot delay a ready alert, and a suspended alert upload cannot prevent fresh monitoring status. Monitoring starts and stops send an immediate heartbeat. Successful active heartbeats repeat every 60 seconds; failures retry after approximately 2, 4, 8, 16, then 30 seconds, with 10% jitter and a hard 30-second cap. Connectivity recovery allows an immediate retry. Failed stopped updates remain queued in memory for retry, including after a role change. Only one heartbeat request runs at a time, and new monitoring states replace obsolete queued updates for that Listener. Responses from before a stop/restart cannot mark the new monitoring session as freshly reported.
+Heartbeats run independently of alert uploads. A suspended heartbeat cannot delay a ready alert, and a suspended alert upload cannot prevent fresh monitoring status. Monitoring starts and stops send an immediate heartbeat. Successful active heartbeats repeat every 15 seconds; failures retry after approximately 2, 4, 8, 16, then 30 seconds, with 10% jitter and a hard 30-second cap. Connectivity recovery allows an immediate retry. Failed stopped updates remain queued in memory for retry, including after a role change. Only one heartbeat request runs at a time, and new monitoring states replace obsolete queued updates for that Listener. Responses from before a stop/restart cannot mark the new monitoring session as freshly reported.
 
 A terminal `failed` receipt moves the alert out of the retry queue into persistent local failure history without setting `alertSentAt`. The Listener episode panel explicitly shows terminal delivery failure instead of waiting for confirmation; diagnostics retain failure history, and other alerts can still be delivered. Older saved snapshots without failure history remain compatible.
 
@@ -139,7 +139,7 @@ All authenticated calls use `Authorization: Bearer <device UUID>.<random secret>
 
 Code reuse by another device is rejected immediately. The original claimant can recover a lost response without making the code usable again. Device/IP registration and claim rate limits reduce guessing; Cloudflare sees the connection IP but only keyed hashes are persisted in rate-limit rows. The backend validates roles, UUIDs, settings, metadata, and event consistency. Heartbeat/event payloads reject additional fields such as audio, RMS, or sound features. Maximum request body size is 64 KiB.
 
-Configuration changed on either phone is persisted locally and sent to the shared Parent configuration row. The Listener picks it up on its next heartbeat, usually within 60 seconds. Locally edited settings remain effective during disconnection and retry before a remote refresh can overwrite them. Last successful write wins if both phones edit settings concurrently.
+Configuration changed on either phone is persisted locally and sent to the shared Parent configuration row. The Listener picks it up on its next heartbeat, usually within 15 seconds. Locally edited settings remain effective during disconnection and retry before a remote refresh can overwrite them. Last successful write wins if both phones edit settings concurrently.
 
 ## Local development and simulation
 
@@ -166,10 +166,10 @@ In Settings → **Diagnostics & simulation**, inspect ambient/threshold/current 
 1. Configure the same deployed backend on both iPhones.
 2. On Parent, enable notifications; choose Pair Listener. A six-digit code appears and expires in ten minutes.
 3. On Listener, choose Pair with Parent and enter that code. It becomes unusable by another device immediately.
-4. Set the desired duration (5/30 sec or 1/2/3/5/10 min), quiet reset, sound threshold above background (8/12/16 dB), and optional repeat alerts (default Off). Changes save automatically as soon as you select an option; tap **Done** to close Settings. Changes made on the Parent reach the Listener on its next update, normally within 60 seconds. Previously saved custom durations remain in effect until you choose a preset. Lower sound thresholds pick up quieter sounds; the fixed -35 dBFS microphone floor still applies. A 5-second alert delay begins after sound is confirmed, rather than after the first noise. The configured backend supports the 5-second minimum; other deployments must include the same validation update.
+4. Set the desired duration (5/30 sec or 1/2/3/5/10 min), quiet reset, sound threshold above background (8/12/16 dB), and optional repeat alerts (default Off). Changes save automatically as soon as you select an option; tap **Done** to close Settings. Changes made on the Parent reach the Listener on its next update, normally within 15 seconds. Previously saved custom durations remain in effect until you choose a preset. Lower sound thresholds pick up quieter sounds; the fixed -35 dBFS microphone floor still applies. A 5-second alert delay begins after sound is confirmed, rather than after the first noise. The configured backend supports the 5-second minimum; other deployments must include the same validation update.
 5. Start monitoring on Listener and grant microphone permission. Pairing is required to avoid an apparently active monitor with no alert recipient.
 6. Keep it charging. Below 20% on battery, a visible warning appears; monitoring does not automatically stop.
-7. Parent status refreshes approximately every 15 seconds while active. Listener heartbeats are approximately every 60 seconds. “Online” requires a fresh heartbeat reporting active monitoring, within 150 seconds. Stale/missing/error status becomes **unknown**, never a reassurance. Foreground network failure clears stale displayed status.
+7. Parent status refreshes approximately every 15 seconds while active. Listener heartbeats are approximately every 15 seconds. “Online” requires a fresh heartbeat reporting active monitoring, within 150 seconds. Stale/missing/error status becomes **unknown**, never a reassurance. Foreground network failure clears stale displayed status.
 8. Temporary loss of internet does not stop local monitoring or its timer. Outbox events survive relaunch. Explicit microphone failure stops monitoring and requires visible recovery; offline pushes are outside this milestone.
 
 Only one Listener and one Parent are supported. Changing role creates/uses a separate credential for that role and backend; it does not unlink the previous pair. Unpair/replacement UI is not in this milestone. To replace phones during development, provision a fresh database/environment, or administratively remove the pair and obsolete device records with care for their event references.

@@ -457,7 +457,7 @@ import UIKit
         }
         lastConnectivityAvailable = available
         if monitoring, let key = heartbeatKey, pendingHeartbeats[key] == nil,
-           currentTime().timeIntervalSince(lastHeartbeatAt) >= 60 {
+           currentTime().timeIntervalSince(lastHeartbeatAt) >= 15 {
             queueHeartbeat()
         }
         dispatchHeartbeatIfReady()

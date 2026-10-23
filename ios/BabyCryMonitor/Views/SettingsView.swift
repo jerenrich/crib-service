@@ -54,7 +54,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Reminders")
                 } footer: {
-                    Text("Send another alert at this interval if the same crying episode continues after the first alert. Changes save automatically. Changes made on the Parent iPhone reach the Listener on its next update, normally within 60 seconds.")
+                    Text("Send another alert at this interval if the same crying episode continues after the first alert. Changes save automatically. Changes made on the Parent iPhone reach the Listener on its next update, normally within 15 seconds.")
                 }
                 Section("This iPhone") {
                     Picker("Mode", selection: Binding(get: { model.role ?? .listener }, set: { model.selectRole($0) })) { Text("Listener").tag(DeviceRole.listener); Text("Parent").tag(DeviceRole.parent) }

@@ -361,7 +361,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(sending)
         let connected = await eventually { fixture.model.deliveryStatus == "Connected" }
         XCTAssertTrue(connected)
-        fixture.time.now = fixture.time.now.addingTimeInterval(61)
+        fixture.time.now = fixture.time.now.addingTimeInterval(16)
         fixture.audio.emit(AudioLevelSample(timestamp: fixture.time.now, dbFS: -65))
         let observed = await eventually { fixture.model.snapshot.lastObservedAt == fixture.time.now }
         XCTAssertTrue(observed)
@@ -486,10 +486,10 @@ final class AppModelTests: XCTestCase {
         let connected = await eventually { fixture.model.deliveryStatus == "Connected" }
         XCTAssertTrue(connected)
         count += 1
-        fixture.time.now = fixture.time.now.addingTimeInterval(59.99)
+        fixture.time.now = fixture.time.now.addingTimeInterval(14.99)
         await fixture.model.tick()
-        let beforeMinute = await fixture.backend.beats.count
-        XCTAssertEqual(beforeMinute, count)
+        let beforeInterval = await fixture.backend.beats.count
+        XCTAssertEqual(beforeInterval, count)
         await fixture.backend.configure(heartbeatFail: true)
         fixture.time.now = fixture.time.now.addingTimeInterval(0.01)
         await fixture.model.tick()
