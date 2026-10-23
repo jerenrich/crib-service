@@ -206,8 +206,37 @@ describe('listener metadata and configuration',()=>{
   const status=await (await call('listener/status',parent,undefined,'GET')).json() as {configuration:typeof config};
   expect(status.configuration).toEqual(config);
  });
+ it('validates absolute sound levels without overwriting saved settings',async()=>{
+  const {parent}=await paired();
+  for(const absoluteThreshold of [-60,-47.5,-35,-10]){
+   expect((await call('settings',parent,{...defaultConfiguration,absoluteThreshold})).status).toBe(200);
+  }
+  for(const absoluteThreshold of [-60.01,-9.99,null,'-35']){
+   expect((await call('settings',parent,{...defaultConfiguration,absoluteThreshold})).status).toBe(400);
+  }
+  const status=await (await call('listener/status',parent,undefined,'GET')).json() as {configuration:typeof defaultConfiguration};
+  expect(status.configuration).toEqual({...defaultConfiguration,absoluteThreshold:-10});
+ });
+ it('discards retired sensitivity in stored configurations and older requests',async()=>{
+  const {parent,listener}=await paired();const legacy={...defaultConfiguration,sensitivity:'high'};
+  const unpaired=device('listener');await register(unpaired);
+  await env.DB.prepare('UPDATE devices SET config=? WHERE id=?').bind(JSON.stringify(legacy),unpaired.deviceId).run();
+  const unpairedStatus=await (await call('listener/status',unpaired,undefined,'GET')).json() as {paired:boolean;configuration:typeof defaultConfiguration};
+  expect(unpairedStatus.paired).toBe(false);expect(unpairedStatus.configuration).toEqual(defaultConfiguration);
+  await env.DB.prepare('UPDATE devices SET config=? WHERE id=?').bind(JSON.stringify(legacy),parent.deviceId).run();
+  const status=await (await call('listener/status',parent,undefined,'GET')).json() as {configuration:typeof defaultConfiguration};
+  expect(status.configuration).toEqual(defaultConfiguration);
+  const beat={listenerId:listener.deviceId,timestamp:new Date().toISOString(),monitoring:true,powerConnected:true,state:'quiet',episodes:[]};
+  expect(await (await call('listener/heartbeat',listener,beat)).json()).toEqual(defaultConfiguration);
+  await env.DB.prepare('UPDATE heartbeats SET metadata=? WHERE listener_id=?').bind(JSON.stringify({...beat,appliedConfiguration:legacy}),listener.deviceId).run();
+  const applied=await (await call('listener/status',parent,undefined,'GET')).json() as {listenerConfiguration:typeof defaultConfiguration};
+  expect(applied.listenerConfiguration).toEqual(defaultConfiguration);
+  expect((await call('settings',parent,legacy)).status).toBe(200);
+  const saved=await env.DB.prepare('SELECT config FROM devices WHERE id=?').bind(parent.deviceId).first<{config:string}>();
+  expect(JSON.parse(saved!.config)).toEqual(defaultConfiguration);
+ });
  it('stores heartbeat with server freshness and shares settings',async()=>{
-  const {parent,listener}=await paired();const config={...defaultConfiguration,alertDuration:60,sensitivity:'high'};
+  const {parent,listener}=await paired();const config={...defaultConfiguration,alertDuration:60,absoluteThreshold:-45};
   expect((await call('settings',parent,config)).status).toBe(200);
   const beat={listenerId:listener.deviceId,timestamp:'2000-01-01T00:00:00Z',monitoring:true,batteryLevel:0.8,powerConnected:true,state:'quiet',episodes:[]};
   const response=await call('listener/heartbeat',listener,beat);expect(response.status).toBe(200);expect(await response.json()).toEqual(config);

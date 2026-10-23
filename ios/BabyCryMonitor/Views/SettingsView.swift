@@ -41,15 +41,19 @@ struct SettingsView: View {
                     Text("After \(Int(model.configuration.quietResetDuration)) seconds below the sound threshold, the crying timer resets. Shorter pauses keep the timer running.")
                 }
                 Section {
-                    Picker("Sound threshold", selection: setting(\.sensitivity)) {
-                        ForEach(Sensitivity.allCases.reversed(), id: \.self) { sensitivity in
-                            Text("Background + \(Int(sensitivity.margin)) dB").tag(sensitivity)
+                    Picker("Sound threshold", selection: setting(\.absoluteThreshold)) {
+                        ForEach(MonitoringConfiguration.soundThresholds, id: \.self) { value in
+                            Text("\(Int(value)) dBFS").tag(value)
+                        }
+                        if !MonitoringConfiguration.soundThresholds.contains(model.configuration.absoluteThreshold) {
+                            Text("\(model.configuration.absoluteThreshold.formatted()) dBFS").tag(model.configuration.absoluteThreshold)
                         }
                     }
+                    .accessibilityIdentifier("soundThresholdPicker")
                 } header: {
                     Text("Sound detection")
                 } footer: {
-                    Text("How far above background noise sound must be: 8 dB detects quieter sounds; 16 dB requires louder sounds. A minimum microphone level also applies, so this may have little effect in a quiet room. Other loud noises can also trigger detection.")
+                    Text("A fixed microphone level. −60 dBFS detects quieter sounds; −10 dBFS requires louder sounds. The threshold stays fixed as room noise changes. dBFS is a microphone reading, not a calibrated room loudness measurement. Other loud noises can also trigger detection.")
                 }
                 if model.role == .listener {
                     Section { Button("Check room sound") { calibration = true } }

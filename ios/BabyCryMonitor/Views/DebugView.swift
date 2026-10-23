@@ -21,7 +21,6 @@ struct DebugView: View {
     var body: some View {
         Form {
             Section("Live diagnostics") {
-                LabeledContent("Ambient", value: String(format: "%.1f dBFS", model.ambient))
                 LabeledContent("Threshold", value: String(format: "%.1f dBFS", model.threshold))
                 LabeledContent("Current", value: String(format: "%.1f dBFS", model.currentDBFS))
                 LabeledContent("Audio", value: model.audioStatus)

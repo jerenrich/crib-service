@@ -18,17 +18,12 @@ public struct SoundCalibration: Sendable {
     }
     public var backgroundLevel: Double? { percentile(background, 0.9) }
     public var sampleLevel: Double? { percentile(sample, 0.5) }
-    public func threshold(for sensitivity: Sensitivity) -> Double? {
-        backgroundLevel.map { max(-35, $0 + sensitivity.margin) }
-    }
-    public var recommendedSensitivity: Sensitivity? {
-        guard background.count >= 20, sample.count >= 12, let sampleLevel, let backgroundLevel,
-              backgroundLevel < -35 else { return nil }
-        // Background above the initial absolute floor freezes the live adaptive
-        // baseline. Do not suggest a margin that the detector cannot learn here.
-        return [Sensitivity.low, .medium, .high].first {
-            let threshold = max(-35, backgroundLevel + $0.margin)
-            return backgroundLevel < threshold && sampleLevel >= threshold + 2
+    public var recommendedThreshold: Double? {
+        guard background.count >= 20, sample.count >= 12, let sampleLevel, let backgroundLevel else { return nil }
+        // Prefer the highest selectable level that clears room noise by at least
+        // 8 dB while leaving the typical sample at least 2 dB above the trigger.
+        return MonitoringConfiguration.soundThresholds.reversed().first {
+            $0 >= backgroundLevel + 8 && sampleLevel >= $0 + 2
         }
     }
 }

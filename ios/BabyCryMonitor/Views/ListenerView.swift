@@ -17,7 +17,7 @@ struct ListenerView: View {
                 } else {
                     Text(model.recoveringAudio ? model.audioStatus : model.monitoring ? "Listening for sustained sound" : "Ready when you are").foregroundStyle(Palette.muted)
                 }
-                SoundLevelChart(levels: model.meter, baseline: model.ambient, trigger: model.threshold,
+                SoundLevelChart(levels: model.meter, trigger: model.threshold,
                                 currentLevel: model.currentDBFS, monitoring: model.monitoring)
                 Caption(text: "Sound level · Processed on this iPhone")
             }
@@ -76,7 +76,6 @@ struct ListenerView: View {
 
 private struct SoundLevelChart: View {
     let levels: [Double]
-    let baseline: Double
     let trigger: Double
     let currentLevel: Double
     let monitoring: Bool
@@ -103,7 +102,6 @@ private struct SoundLevelChart: View {
                                 .frame(height: barHeight)
                         }
                     }
-                    thresholdLine(baseline, color: Palette.muted, dash: [2, 4], size: geometry.size)
                     thresholdLine(trigger, color: Palette.amber, dash: [6, 4], size: geometry.size)
                 }
                 .frame(width: geometry.size.width, height: geometry.size.height, alignment: .bottom)
@@ -111,22 +109,12 @@ private struct SoundLevelChart: View {
             }
             .frame(height: 88)
 
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 16) {
-                    thresholdLabel("Baseline", value: baseline, color: Palette.muted, dash: [2, 4])
-                    Spacer(minLength: 0)
-                    thresholdLabel("Trigger", value: trigger, color: Palette.amber, dash: [6, 4])
-                }
-                VStack(alignment: .leading, spacing: 8) {
-                    thresholdLabel("Baseline", value: baseline, color: Palette.muted, dash: [2, 4])
-                    thresholdLabel("Trigger", value: trigger, color: Palette.amber, dash: [6, 4])
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
+            thresholdLabel("Trigger", value: trigger, color: Palette.amber, dash: [6, 4])
+                .frame(maxWidth: .infinity, alignment: .trailing)
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Live sound level")
-        .accessibilityValue("\(monitoring ? levelText(currentLevel) : "Inactive"). Baseline \(levelText(baseline)). Trigger \(levelText(trigger)).")
+        .accessibilityValue("\(monitoring ? levelText(currentLevel) : "Inactive"). Trigger \(levelText(trigger)).")
     }
 
     // Bars and guides share a bottom-aligned, full microphone scale of -100…0 dBFS.

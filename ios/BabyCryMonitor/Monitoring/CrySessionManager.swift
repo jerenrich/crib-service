@@ -51,7 +51,7 @@ public struct CrySessionManager: Sendable {
         // Once sustained quiet reaches reset, the episode above has already ended.
         // Defer a due alert during a quiet gap until sound resumes. If the gap
         // becomes a full reset, a baby that settled before the threshold sends none.
-        if (initial || repeatDue) && sample.dbFS >= detector.effectiveThreshold {
+        if (initial || repeatDue) && sample.dbFS >= snapshot.configuration.absoluteThreshold {
             let alert = CryAlert(episodeId: episode.id, listenerId: listenerId, cryStartedAt: episode.startedAt,
                                  durationSeconds: episode.duration(at: sample.timestamp), createdAt: sample.timestamp, isRepeat: !initial)
             if initial { episode.alertQueuedAt = sample.timestamp }

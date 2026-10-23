@@ -10,8 +10,8 @@ export interface Env {
  PAIRING_PEPPER: string;
 }
 export interface Device { id: string; role: 'parent' | 'listener'; secret_hash: string; push_token: string | null; config: string }
-export interface Configuration { alertDuration: number; quietResetDuration: number; sensitivity: 'low'|'medium'|'high'; repeatInterval?: number | null; absoluteThreshold: number }
-export const defaultConfiguration: Configuration = {alertDuration:300, quietResetDuration:20, sensitivity:'medium', repeatInterval:null, absoluteThreshold:-35};
+export interface Configuration { alertDuration: number; quietResetDuration: number; repeatInterval?: number | null; absoluteThreshold: number }
+export const defaultConfiguration: Configuration = {alertDuration:300, quietResetDuration:20, repeatInterval:null, absoluteThreshold:-35};
 export interface Episode {id:string; startedAt:string; endedAt?:string|null; alertSentAt?:string|null}
 export interface Heartbeat {listenerId:string; timestamp:string; monitoring:boolean; batteryLevel?:number|null; powerConnected:boolean; state:'quiet'|'possibleCry'|'crying'; currentEpisode?:Episode|null; episodes:Episode[]; appliedConfiguration?:Configuration}
 export interface Alert { eventId:string; episodeId:string; listenerId:string; type:'sustained_cry'; cryStartedAt:string; durationSeconds:number; createdAt:string; isRepeat:boolean; isTest?:boolean }
