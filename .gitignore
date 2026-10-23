@@ -21,3 +21,6 @@ ios/Config/Local.xcconfig
 *.xcarchive/
 *.ipa
 __pycache__/
+
+# Local rollout evidence and signing overrides
+/.local/

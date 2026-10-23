@@ -74,6 +74,27 @@ cp -n ios/Config/Local.xcconfig.example ios/Config/Local.xcconfig
 6. Debug builds use `aps-environment = development`; Release uses `production`. Match the Worker environment to the provisioning profile, rather than to whether the physical phone is used for development. TestFlight/App Store builds use production APNs.
 7. Build and install on both iPhones. Use Listener on the nursery phone and Parent on the other.
 
+If Xcode automatic signing is unavailable, the installed development certificate and the manual profiles **Crib Service Development** (J14/J17) and **Crib Service Watch Development** (Watch) can sign a Debug app build. Keep these local overrides in an ignored file; do not commit profiles or signing credentials:
+
+```xcconfig
+DEVELOPMENT_TEAM = 9PG633BF3R
+BACKEND_URL = https:/$()/baby-cry-monitor.jordan-erenrich.workers.dev
+PROVISIONING_PROFILE_SPECIFIER[sdk=iphoneos*] = Crib Service Development
+PROVISIONING_PROFILE_SPECIFIER[sdk=watchos*] = Crib Service Watch Development
+```
+
+The cleanup retained the working overrides at `.local/cribservice-rollout-2026-10-23/Local.manual-signing.xcconfig` in the main checkout. Use them explicitly when needed, leaving normal automatic signing unchanged:
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild \
+  -project ios/BabyCryMonitor.xcodeproj -scheme BabyCryMonitor \
+  -configuration Debug -destination 'generic/platform=iOS' \
+  -xcconfig .local/cribservice-rollout-2026-10-23/Local.manual-signing.xcconfig \
+  CODE_SIGN_STYLE=Manual build
+```
+
+These explicit profiles sign the iPhone and Watch apps; physical test runners need compatible profiles of their own. The temporary UI automation profile used during setup has been retired. Release/TestFlight needs production provisioning and a matching production APNs backend.
+
 Start in the foreground, leave the Listener plugged in, and lock its screen. Monitoring continues while iOS keeps the valid recording audio session alive. There is no playback or audio streaming. Do not force quit the Listener. Recovery can require reopening the app if iOS does not allow reactivation in the background.
 
 App icon rollout on 23 October 2026: the iPhone and Watch icons now use the original full-body bellhop beside a crib with a smiling baby standing inside. The source artwork and imagegen prompts are in `artwork/`; `swift scripts/draw-icon.swift` exports both opaque 1024×1024 asset-catalog icons. The signed combined iPhone/Watch build and signature verification passed, and the updated apps were installed in place and launched successfully on J14, J17 and Jordan’s Apple Watch. Existing app data and pairing were retained. Restart monitoring on the Listener after updating.
@@ -84,7 +105,11 @@ Crib Service bundle-ID rollout on 23 October 2026: deployed source commit `7f975
 
 Created Apple development profiles **Crib Service Development** (J14 and J17) and **Crib Service Watch Development** (the paired Watch) using the existing development certificate. Signed builds with the new identifiers were installed on both phones and the Watch; the iPhone build contains its Watch companion. New app identities require fresh onboarding, pairing and notification permission/direct Watch registration. Old app installations and data were retained. Critical Alerts approval is still pending; no critical entitlement was added.
 
-Validation: 57 Foundation core tests, 107 iPhone unit tests, 50 Worker tests and TypeScript checks passed, as did the signed combined iPhone/Watch build. Live temporary-device smoke checks passed for fixed thresholds, applied settings, pairing, diagnostics, marked test events without tokens, and deletion/cleanup. Temporary devices were removed. No hardware notification was sent by these checks; actual APNs receipt, wrist haptics and overnight monitoring must be checked after setting up the new installations.
+Validation: 57 Foundation core tests, 107 iPhone unit tests, 50 Worker tests and TypeScript checks passed, as did the signed combined iPhone/Watch build. Live temporary-device smoke checks passed for fixed thresholds, applied settings, pairing, diagnostics, marked test events without tokens, and deletion/cleanup. Temporary devices were removed. Those automated smoke checks did not send hardware notifications. Physical notification validation was subsequently completed as recorded below; overnight monitoring remains a separate acceptance check.
+
+Physical notification validation on 23 October 2026: J14 was confirmed as the actively monitoring Listener and J17 as its paired Parent. The Parent readiness screen reported paired iPhones and enabled iPhone notifications, and direct Watch push registration was active. A real test initiated on J14 was accepted by APNs at 19:10:26 UTC; the Watch recorded `watch_push_received` at 19:10:40 UTC. A second test was accepted at 19:32:32 UTC after the user put the Watch on their wrist and unlocked it; the user confirmed the notification test worked. This verifies real delivery for that test, not Critical Alerts authorization, a particular vibration strength, Sleep Focus behavior, or overnight reliability. Temporary UI automation helper apps were removed afterward.
+
+Critical Alerts request records and selected redacted device-test evidence are retained locally under `.local/cribservice-rollout-2026-10-23/` in the main checkout. Keep the two app development profiles, the working signing certificate and APNs key, both registered app IDs, and the Critical Alerts requests (iPhone `73693T6553`, Watch `HK2ZB58GJZ`). Local build/test output can be regenerated; the working apps and backend do not depend on it.
 
 The fixed sound threshold integration requires an updated Worker and matching app builds on both iPhones. Deploy the Worker before installing these builds: older Workers reject settings without sensitivity and thresholds other than −35 dBFS. Saved settings retain their −35 dBFS threshold; the retired sensitivity field is ignored when loading configurations and applied-settings acknowledgements. Older app versions still use adaptive detection and expect sensitivity in responses, so update both phones together. No database migration is needed for this integration. The bundle-ID rollout below deployed this integration together with the renamed app builds.
 
@@ -98,7 +123,7 @@ On 23 October 2026, version `943e489a-d5c1-4f1e-983d-270d27e066c4` was deployed 
 
 Later on 23 October 2026, version `ff235184-9a60-4d1e-9d21-df11976f264a` was deployed with support for clearly marked real test pushes. The corresponding signed Debug app was installed and launched on J14 and J17. On the paired Listener, use **Send test push** to exercise remote delivery to the Parent; the live temporary-pair check confirmed that test events are accepted and surfaced to the Parent with their test flag. No APNs token was submitted by that check, so real device presentation still needs to be checked on the receiving phone or Watch. The additive `0002_watch.sql` migration present in the shared workspace was also applied for compatibility with concurrent Watch backend changes included in that deployment.
 
-Live checks passed for authentication rejection, device registration, single-use pairing, shared settings, heartbeat, and Parent status. The temporary test devices were removed afterward. The supplied APNs credentials (`APNS_KEY_ID`, `APNS_TEAM_ID`, and `APNS_PRIVATE_KEY`) are now stored as Cloudflare secrets; the key parsed successfully as an EC P-256 private key. Its contents were not copied into this repository. At that earlier deployment, the Worker targeted development APNs and bundle ID `com.jordanerenrich.babycrymonitor`; the current source uses `com.jordanerenrich.cribservice` and matching Debug provisioning. **APNs delivery has not yet been verified with a real device token.** Install the app on your iPhones and run the physical acceptance checklist below. TestFlight/Release needs a separate production APNs backend.
+Live checks passed for authentication rejection, device registration, single-use pairing, shared settings, heartbeat, and Parent status. The temporary test devices were removed afterward. The supplied APNs credentials (`APNS_KEY_ID`, `APNS_TEAM_ID`, and `APNS_PRIVATE_KEY`) are now stored as Cloudflare secrets; the key parsed successfully as an EC P-256 private key. Its contents were not copied into this repository. At that earlier deployment, the Worker targeted development APNs and bundle ID `com.jordanerenrich.babycrymonitor`; the current source uses `com.jordanerenrich.cribservice` and matching Debug provisioning. Real device delivery was subsequently verified on 23 October 2026 as recorded above. Use the physical acceptance checklist below for broader reliability testing. TestFlight/Release needs a separate production APNs backend.
 
 The commands below are for reproducing the deployment. Do not create another database or regenerate existing encryption/pairing secrets when using the configured backend. All five secrets are already configured; proceed with physical device installation and testing.
 
