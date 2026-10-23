@@ -1,15 +1,44 @@
 import AppKit
 import CoreGraphics
+import ImageIO
+
+// Export the checked-in bellhop artwork rather than recreating the retired moon icon.
+// Usage: swift scripts/draw-icon.swift [destination.png]
+// With no destination, refresh both the iPhone and Watch asset catalogs.
+let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+let sourceURL = root.appendingPathComponent("artwork/crib-service-icon.png")
+guard let source = CGImageSourceCreateWithURL(sourceURL as CFURL, nil),
+      let artwork = CGImageSourceCreateImageAtIndex(source, 0, nil),
+      artwork.width == artwork.height else {
+    fatalError("Expected square source artwork at \(sourceURL.path)")
+}
+
 let size = 1024
-if let context = CGContext(data: nil, width: size, height: size, bitsPerComponent: 8, bytesPerRow: size * 4, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) {
-    context.setFillColor(CGColor(red: 0.05, green: 0.09, blue: 0.14, alpha: 1)); context.fill(CGRect(x: 0, y: 0, width: size, height: size))
-    context.setFillColor(CGColor(red: 0.55, green: 0.86, blue: 0.76, alpha: 1)); context.fillEllipse(in: CGRect(x: 208, y: 208, width: 608, height: 608))
-    context.setFillColor(CGColor(red: 0.05, green: 0.09, blue: 0.14, alpha: 1)); context.fillEllipse(in: CGRect(x: 410, y: 365, width: 500, height: 500))
-    context.setFillColor(CGColor(red: 0.55, green: 0.86, blue: 0.76, alpha: 1))
-    for (x, height) in [(540, 100), (615, 180), (690, 260), (765, 140)] {
-        context.addPath(CGPath(roundedRect: CGRect(x: x, y: 300 - height / 2, width: 38, height: height), cornerWidth: 19, cornerHeight: 19, transform: nil)); context.fillPath()
+guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+      let context = CGContext(data: nil, width: size, height: size,
+                              bitsPerComponent: 8, bytesPerRow: size * 4,
+                              space: colorSpace,
+                              bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else {
+    fatalError("Could not create the opaque app icon canvas")
+}
+context.interpolationQuality = .high
+context.draw(artwork, in: CGRect(x: 0, y: 0, width: size, height: size))
+guard let image = context.makeImage(),
+      let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) else {
+    fatalError("Could not encode the app icon")
+}
+
+let destinations: [URL]
+if CommandLine.arguments.count == 2 {
+    destinations = [URL(fileURLWithPath: CommandLine.arguments[1])]
+} else if CommandLine.arguments.count == 1 {
+    destinations = ["BabyCryMonitor", "BabyCryWatch"].map {
+        root.appendingPathComponent("ios/\($0)/Assets.xcassets/AppIcon.appiconset/AppIcon.png")
     }
-    if let image = context.makeImage(), let data = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) {
-        try data.write(to: URL(fileURLWithPath: CommandLine.arguments[1]))
-    }
+} else {
+    fatalError("Usage: swift scripts/draw-icon.swift [destination.png]")
+}
+for destination in destinations {
+    try png.write(to: destination, options: .atomic)
+    print("Exported 1024×1024 opaque icon: \(destination.path)")
 }

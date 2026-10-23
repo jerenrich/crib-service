@@ -76,6 +76,8 @@ cp -n ios/Config/Local.xcconfig.example ios/Config/Local.xcconfig
 
 Start in the foreground, leave the Listener plugged in, and lock its screen. Monitoring continues while iOS keeps the valid recording audio session alive. There is no playback or audio streaming. Do not force quit the Listener. Recovery can require reopening the app if iOS does not allow reactivation in the background.
 
+App icon rollout on 23 October 2026: the iPhone and Watch icons now use the original full-body bellhop beside a crib with a smiling baby standing inside. The source artwork and imagegen prompts are in `artwork/`; `swift scripts/draw-icon.swift` exports both opaque 1024×1024 asset-catalog icons. The signed combined iPhone/Watch build and signature verification passed, and the updated apps were installed in place and launched successfully on J14, J17 and Jordan’s Apple Watch. Existing app data and pairing were retained. Restart monitoring on the Listener after updating.
+
 ## Cloudflare deployment
 
 Crib Service bundle-ID rollout on 23 October 2026: deployed source commit `7f975d5` as Worker version `c2a26aee-0460-437e-af32-bebd9b097d8f` to the existing `baby-cry-monitor` service. The live `APNS_BUNDLE_ID` is `com.jordanerenrich.cribservice`; the shared APNs sender uses that topic for iPhone and appends `.watchkitapp` for Watch, including cry/test pushes and connection notices. Live version inspection confirmed development APNs, the original D1 database, and all five secret bindings; the minute cron and disabled automatic observability were preserved. Backend resource names and URL remain unchanged.

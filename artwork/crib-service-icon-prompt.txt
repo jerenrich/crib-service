@@ -1,0 +1,47 @@
+Generated with the built-in image_gen tool on 23 October 2026.
+Current artwork uses the first full-body bellhop image with a smiling baby added.
+Source: artwork/crib-service-icon.png
+Exports: iPhone and Watch AppIcon.appiconset/AppIcon.png
+Regenerate the 1024 x 1024 opaque exports: swift scripts/draw-icon.swift
+
+Initial generation prompt
+
+Use case: logo-brand
+Asset type: production iPhone and Apple Watch app icon, square 1024 by 1024.
+Primary request: Create a distinctive, beautifully designed icon for Crib Service, a baby sound monitoring app: a friendly adult hotel bellhop standing beside a crib. The visual pun is caring, attentive nursery service.
+Subject and composition: A single cohesive, very simple mascot emblem. A smiling bellhop in a recognizable pillbox bellhop cap and smart dark navy uniform, shown from head to waist just behind and beside a small ivory crib. One relaxed hand rests naturally on the crib's end post. Bellhop is the upper left mass, crib the lower right mass, overlapping into a balanced compact silhouette centered in the square. Crib is unmistakable with a rounded top rail and just three broad vertical slats, minimal perspective. No visible baby, bedding or toys. Adult face is warm and kind, minimal facial details. Cap has a mint crown, dark band, single simple warm brass accent. The crib must be big enough to read at tiny icon scale.
+Style/medium: Premium contemporary flat illustration, confident chunky rounded forms, very restrained subtle dimensional shading, crisp clean edges, highly legible icon design. Sophisticated charming mascot, not a detailed scene or clip art.
+Scene/backdrop: Full bleed solid pale mint background, derived from the existing brand's mint and navy palette. No surrounding room.
+Color palette: Mint, deep navy, warm ivory, warm natural face tone, tiny brass accent.
+Framing: Emblem fills about 76 percent of square with comfortable even safe margins. Render full square artwork edge to edge, no rounded corner mask.
+Constraints: No text, letters, watermark, border, moon, stars, sound waves, microphone, badge, extra people, hotel luggage, furniture beyond the crib, decorative clutter or tiny intricate details. Deliver one finished icon, no mockup, no grid or alternatives. Entire image opaque.
+
+Final refinement prompt
+
+Use case: logo-brand
+Asset type: finished square app icon for iPhone and Apple Watch, opaque.
+Input image: reference and edit target, the newly generated mint-background bellhop and crib illustration.
+Primary request: Refine ONLY the composition into a compact unified app icon. Keep this friendly character, his navy and mint bellhop uniform, warm face, ivory crib, mint backdrop and polished soft illustration style.
+Specific composition change: Show the bellhop HEAD AND SHOULDERS ONLY behind the crib, no legs or lower body visible. The crib spans the lower middle foreground, in a simple three-quarter view so BOTH a long rail with three thick slats AND a short end are visible and it clearly reads as an actual crib, not a gate or chair. A simple flat mattress sits low within the crib. No pillows, toys or loose bedding. One natural hand rests on the crib post. Enlarge the head relative to the uniform for a legible friendly icon. Shift bellhop toward center-left and keep crib centered below and a little to the right, with generous even space around the combined emblem. Eliminate the excessive empty upper-right space by making the composition compact and balanced.
+Critical framing: Every part of the character and crib must fit comfortably INSIDE an imaginary centered circle of diameter 84 percent of the square width, including hat, crib corners and crib feet. This imaginary circle is ONLY a compositional guide and must NOT be drawn. Background remains edge-to-edge mint, no boundary or rounded corners.
+Keep forms simple, bold and readable at 48 pixels. One finished square icon, no grid, no text, no moon, no sound waves, no border, no watermark.
+
+Baby addition prompt (earlier refined version)
+
+Use case: precise-object-edit
+Asset type: square app icon for Crib Service, iPhone and Apple Watch.
+Edit target: the supplied mint-background bellhop beside an ivory crib.
+Primary request: Add one cute, peacefully sleeping baby INSIDE the crib. Keep the existing bellhop's face, cap, uniform, hand position, illustration style, navy/mint/ivory palette, mint background and overall composition unchanged.
+Baby: a small infant with warm natural skin, a round recognizable face, eyes gently closed and a tiny curl of hair, wearing a simple mint footed onesie. Baby is lying naturally on their back on the existing flat mattress, head toward the right end of the crib and feet toward the left. The baby's face and some of the onesie should be clearly visible within the crib from a slightly elevated viewing angle, with correct overlap behind the crib rails. Adjust the crib's viewing angle or rail placement only as little as needed to reveal the resting infant clearly. Baby is supported by the mattress, not floating, not standing, not sitting on or above a rail. Use a simple warm, charming face that remains readable at app icon size.
+Preserve the clean, soft dimensional illustration and square opaque edge-to-edge mint background. Keep the same bellhop identity, crib design and color balance, comfortable outer margins. No pillows, loose blankets, toys, extra people, text, symbols, border, watermark or rounded-corner mask. One finished icon, no mockup or alternatives.
+
+Baby addition to the first original image (current artwork)
+
+Use case: precise-object-edit
+Asset type: finished square app icon for Crib Service.
+Edit target: the provided FIRST original icon: full-body bellhop on the left, ivory crib in the lower right, mint background.
+Primary request: Add one cute smiling baby standing INSIDE this original crib. Preserve this original image's composition and every existing element as closely as possible.
+Baby: a small baby with warm skin, round cheeks, a little curl of hair, open happy eyes and a gentle smile, wearing a plain mint footed onesie. The baby stands on the mattress inside the crib and lightly holds the front top rail with both hands. Baby's head and shoulders appear clearly ABOVE the curved crib rail, centered between the two crib posts, filling some of the empty mint space to the right of the bellhop. The crib rail correctly overlaps the baby's lower torso, and legs are inside the crib, visible only naturally through the slats. Baby must be much smaller than the adult bellhop and match the same charming soft dimensional illustration style.
+Preservation constraints: Keep the full-body bellhop's exact face, pose, scale, uniform, cap, smile, arm and hand on the left crib post unchanged. Keep the original crib's size, original front-facing viewpoint, three vertical slats, rounded rail and posts unchanged. Keep the edge-to-edge mint background, colors, lighting, square framing and margins unchanged. Change only by adding the baby and necessary natural shadows.
+No pillows, toys, loose blankets, extra people, lettering, logos, watermarks, border, rounded-corner mask or mockup. Opaque square image.
+
