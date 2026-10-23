@@ -1,0 +1,3 @@
+APS_ENVIRONMENT = development
+BACKEND_URL =
+#include? "Local.xcconfig"

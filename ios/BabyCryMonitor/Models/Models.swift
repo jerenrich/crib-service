@@ -1,0 +1,78 @@
+import Foundation
+
+public enum DeviceRole: String, Codable, CaseIterable, Sendable { case listener, parent }
+public enum Sensitivity: String, Codable, CaseIterable, Sendable {
+    case low, medium, high
+    public var margin: Double { switch self { case .low: 16; case .medium: 12; case .high: 8 } }
+}
+public struct MonitoringConfiguration: Codable, Equatable, Sendable {
+    public var alertDuration: TimeInterval = 300
+    public var quietResetDuration: TimeInterval = 20
+    public var sensitivity: Sensitivity = .medium
+    public var repeatInterval: TimeInterval? = nil
+    public var absoluteThreshold: Double = -35
+    public init() {}
+    public var isValid: Bool {
+        alertDuration.isFinite && (5...3600).contains(alertDuration) && [10.0, 20, 30, 60].contains(quietResetDuration)
+        && (repeatInterval == nil || [120.0, 300].contains(repeatInterval)) && absoluteThreshold == -35
+    }
+}
+public protocol ClockProviding: Sendable { var now: Date { get } }
+public struct SystemClock: ClockProviding { public init() {}; public var now: Date { Date() } }
+public struct AudioLevelSample: Sendable {
+    public let timestamp: Date
+    public let dbFS: Double
+    public init(timestamp: Date, dbFS: Double) { self.timestamp = timestamp; self.dbFS = dbFS }
+}
+public enum CryState: String, Codable, Sendable { case quiet, possibleCry, crying }
+public struct CryEpisode: Identifiable, Codable, Sendable {
+    public let id: UUID
+    public let startedAt: Date
+    public var endedAt: Date?
+    public var alertQueuedAt: Date?
+    public var alertSentAt: Date?
+    public var lastAlertQueuedAt: Date?
+    public var maximumDBFS: Double?
+    public var averageDBFS: Double?
+    public var sampleCount: Int = 0
+    public init(id: UUID = UUID(), startedAt: Date) { self.id = id; self.startedAt = startedAt }
+    public func duration(at now: Date) -> TimeInterval { max(0, (endedAt ?? now).timeIntervalSince(startedAt)) }
+}
+/// Deliberately excludes sound levels and all audio-derived features.
+public struct CryAlert: Identifiable, Codable, Equatable, Sendable {
+    public let eventId: UUID
+    public let episodeId: UUID
+    public let listenerId: UUID
+    public let type: String
+    public let cryStartedAt: Date
+    public let durationSeconds: Double
+    public let createdAt: Date
+    public let isRepeat: Bool
+    public let isTest: Bool?
+    public var id: UUID { eventId }
+    public init(eventId: UUID = UUID(), episodeId: UUID, listenerId: UUID, cryStartedAt: Date, durationSeconds: Double, createdAt: Date, isRepeat: Bool, isTest: Bool? = nil) {
+        self.eventId = eventId; self.episodeId = episodeId; self.listenerId = listenerId
+        self.type = "sustained_cry"; self.cryStartedAt = cryStartedAt; self.durationSeconds = durationSeconds
+        self.createdAt = createdAt; self.isRepeat = isRepeat
+        self.isTest = isTest
+    }
+}
+public struct PendingAlert: Codable, Sendable {
+    public let alert: CryAlert
+    public var attempts: Int = 0
+    public var nextAttemptAt: Date
+    public init(alert: CryAlert) { self.alert = alert; nextAttemptAt = alert.createdAt }
+    public mutating func failed(at now: Date) {
+        attempts += 1
+        nextAttemptAt = now.addingTimeInterval(min(300, pow(2, Double(min(attempts, 9)))))
+    }
+}
+public struct SessionSnapshot: Codable, Sendable {
+    public var configuration = MonitoringConfiguration()
+    public var history: [CryEpisode] = []
+    public var current: CryEpisode?
+    public var pending: [PendingAlert] = []
+    public var lastObservedAt: Date?
+    public var wasMonitoring = false
+    public init() {}
+}

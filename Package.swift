@@ -1,0 +1,3 @@
+// swift-tools-version: 6.0
+import PackageDescription
+let package = Package(name: "BabyCryMonitorCore", platforms: [.macOS(.v14), .iOS(.v17)], products: [.library(name: "MonitorCore", targets: ["MonitorCore"])], targets: [.target(name: "MonitorCore", path: "ios/BabyCryMonitor", exclude: ["App", "Audio", "Networking", "Notifications", "Pairing", "Persistence", "Views", "Utilities", "Assets.xcassets", "Info.plist", "PrivacyInfo.xcprivacy", "BabyCryMonitor.entitlements"], sources: ["Models", "Monitoring"]), .testTarget(name: "MonitorCoreTests", dependencies: ["MonitorCore"], path: "ios/BabyCryMonitorTests")])

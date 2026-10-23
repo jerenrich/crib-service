@@ -1,0 +1,110 @@
+#if !canImport(MonitorCore)
+import Foundation
+import XCTest
+@testable import BabyCryMonitor
+
+final class WatchIntegrationTests: XCTestCase {
+    actor Backend: BackendServing {
+        nonisolated let credential: DeviceCredential
+        private(set) var tokens: [String?] = []
+        private(set) var acknowledgements: [UUID] = []
+        private var failing = false
+        init(_ credential: DeviceCredential) { self.credential = credential }
+        func fail(_ value: Bool) { failing = value }
+        func register() async throws {}
+        func createPairing() async throws -> PairingCode { PairingCode(code: "123456", expiresAt: .distantFuture) }
+        func claim(_ code: String) async throws {}
+        func status() async throws -> ParentStatus {
+            if failing { throw URLError(.notConnectedToInternet) }
+            return ParentStatus(paired: true, watchPushRegistered: tokens.last.flatMap { $0 } != nil, configuration: MonitoringConfiguration())
+        }
+        func heartbeat(_ value: Heartbeat) async throws -> MonitoringConfiguration { MonitoringConfiguration() }
+        func settings(_ configuration: MonitoringConfiguration) async throws {}
+        func send(_ alert: CryAlert) async throws -> AlertReceipt { AlertReceipt(status: "sent") }
+        func acknowledge(_ id: UUID) async throws {
+            if failing { throw URLError(.notConnectedToInternet) }
+            acknowledgements.append(id)
+        }
+        func pushToken(_ token: String) async throws {}
+        func watchPushToken(_ token: String?) async throws {
+            if failing { throw URLError(.notConnectedToInternet) }
+            tokens.append(token)
+        }
+    }
+
+    @MainActor final class Fixture {
+        let model: AppModel
+        let backend: Backend
+        let defaults: UserDefaults
+        let suite = "WatchIntegrationTests.\(UUID())"
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        init() throws {
+            defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defaults.set("parent", forKey: "role")
+            defaults.set("https://monitor.test", forKey: "backendURL")
+            let parent = DeviceCredential(deviceId: UUID(), secret: "parent", role: .parent, registered: true)
+            let listener = DeviceCredential(deviceId: UUID(), secret: "listener", role: .listener, registered: true)
+            let backend = Backend(parent); self.backend = backend
+            model = AppModel(defaults: defaults, metadataStore: try MetadataStore(directory: directory),
+                             audio: AppModelTests.Audio(), connectivity: AppModelTests.Connectivity(),
+                             notifications: AppModelTests.Notifications(),
+                             keychain: AppModelTests.Credentials(listener: listener, parent: parent),
+                             makeClient: { _, _ in backend }, automaticallyStart: false)
+        }
+        deinit {
+            UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        func command(_ command: WatchCommand) async throws -> WatchSnapshot {
+            let handler = try XCTUnwrap(model.watch.onCommand)
+            return await handler(command)
+        }
+    }
+
+    @MainActor func testOldQueuedTokenCannotUndoNewerRemoval() async throws {
+        let fixture = try Fixture()
+        let date = Date()
+        _ = try await fixture.command(WatchCommand(kind: .registerToken, issuedAt: date, token: "abc"))
+        _ = try await fixture.command(WatchCommand(kind: .registerToken, issuedAt: date.addingTimeInterval(2)))
+        _ = try await fixture.command(WatchCommand(kind: .registerToken, issuedAt: date.addingTimeInterval(1), token: "abc"))
+        let tokens = await fixture.backend.tokens
+        XCTAssertEqual(tokens.count, 2)
+        XCTAssertEqual(tokens.first!, "abc")
+        XCTAssertNil(tokens.last!)
+    }
+    @MainActor func testFailedAcknowledgementRetriesAndConfirmsOnlyAfterSuccess() async throws {
+        let fixture = try Fixture()
+        let id = UUID()
+        await fixture.backend.fail(true)
+        let queued = try await fixture.command(WatchCommand(kind: .acknowledge, eventId: id))
+        XCTAssertNil(queued.acknowledgedEventId)
+        XCTAssertNotNil(queued.message)
+        await fixture.backend.fail(false)
+        let confirmed = try await fixture.command(WatchCommand(kind: .refresh))
+        XCTAssertEqual(confirmed.acknowledgedEventId, id)
+        let acknowledgements = await fixture.backend.acknowledgements
+        XCTAssertEqual(acknowledgements, [id])
+    }
+    @MainActor func testListenerModeDoesNotRegisterWatchOrExposeParentStatus() async throws {
+        let fixture = try Fixture()
+        fixture.model.selectRole(.listener)
+        let result = try await fixture.command(WatchCommand(kind: .registerToken, token: "abc"))
+        XCTAssertFalse(result.parentMode)
+        XCTAssertNil(result.alert)
+        let tokens = await fixture.backend.tokens
+        XCTAssertTrue(tokens.isEmpty)
+    }
+    @MainActor func testWatchRegistrationFailureRemainsPendingUntilBackendRecovers() async throws {
+        let fixture = try Fixture()
+        await fixture.backend.fail(true)
+        let failed = try await fixture.command(WatchCommand(kind: .registerToken, token: "abc"))
+        XCTAssertFalse(failed.watchPushRegistered)
+        XCTAssertNotNil(failed.message)
+        await fixture.backend.fail(false)
+        let recovered = try await fixture.command(WatchCommand(kind: .refresh))
+        XCTAssertTrue(recovered.watchPushRegistered)
+        let tokens = await fixture.backend.tokens
+        XCTAssertEqual(tokens.count, 1)
+    }
+}
+#endif

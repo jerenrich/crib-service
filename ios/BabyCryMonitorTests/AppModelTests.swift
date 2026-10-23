@@ -1,0 +1,339 @@
+#if !canImport(MonitorCore)
+import Foundation
+import XCTest
+@testable import BabyCryMonitor
+
+actor RequestGate {
+    private var opened = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    func wait() async {
+        guard !opened else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+    func open() {
+        opened = true
+        let pending = waiters; waiters.removeAll()
+        for waiter in pending { waiter.resume() }
+    }
+}
+
+final class AppModelTests: XCTestCase {
+    @MainActor final class Audio: AudioLevelProviding {
+        let levels = AsyncStream<AudioLevelSample> { _ in }
+        var onStatus: ((AudioCaptureStatus) -> Void)?
+        var permissionGranted = true
+        var recoveryGate: RequestGate?
+        var startFailure: Error?
+        private(set) var starts = 0
+        func requestPermission() async -> Bool { permissionGranted }
+        func start() async throws {
+            starts += 1
+            if let recoveryGate {
+                onStatus?(.recovering("Audio route changed. Recovering microphone…"))
+                await recoveryGate.wait()
+            }
+            if let startFailure { throw startFailure }
+            onStatus?(.active)
+        }
+        func stop() { onStatus?(.stopped) }
+    }
+    @MainActor struct Connectivity: ConnectivityProviding {
+        var available = true
+        var checked = true
+    }
+    @MainActor final class Notifications: NotificationProviding {
+        var status = "Test notifications"
+        var onToken: ((String) -> Void)?
+        var onAlert: (() -> Void)?
+        func register() async {}
+        func registered(_ token: Data) {}
+        func failed() {}
+        func simulate(_ alert: CryAlert) async throws {}
+    }
+    struct Credentials: CredentialStoring {
+        let listener: DeviceCredential
+        let parent: DeviceCredential
+        func load(role: DeviceRole, environment: String) throws -> DeviceCredential? {
+            role == .listener ? listener : parent
+        }
+        func save(_ credential: DeviceCredential, environment: String) throws {}
+        func create(role: DeviceRole) throws -> DeviceCredential { role == .listener ? listener : parent }
+    }
+    actor Backend: BackendServing {
+        nonisolated let credential: DeviceCredential
+        private(set) var beats: [Heartbeat] = []
+        private(set) var sent: [CryAlert] = []
+        private(set) var settingsCalls = 0
+        var settingsFail = false
+        var settingsGate: RequestGate?
+        var heartbeatGate: RequestGate?
+        var receipt = "sent"
+        init(credential: DeviceCredential) { self.credential = credential }
+        func configure(settingsFail: Bool = false, settingsGate: RequestGate? = nil,
+                       heartbeatGate: RequestGate? = nil, receipt: String = "sent") {
+            self.settingsFail = settingsFail; self.settingsGate = settingsGate
+            self.heartbeatGate = heartbeatGate; self.receipt = receipt
+        }
+        func register() async throws {}
+        func createPairing() async throws -> PairingCode { PairingCode(code: "123456", expiresAt: .distantFuture) }
+        func claim(_ code: String) async throws {}
+        func status() async throws -> ParentStatus { ParentStatus(paired: true, configuration: MonitoringConfiguration()) }
+        func heartbeat(_ value: Heartbeat) async throws -> MonitoringConfiguration {
+            beats.append(value)
+            await heartbeatGate?.wait()
+            return MonitoringConfiguration()
+        }
+        func settings(_ configuration: MonitoringConfiguration) async throws {
+            settingsCalls += 1
+            await settingsGate?.wait()
+            if settingsFail { throw URLError(.badServerResponse) }
+        }
+        func send(_ alert: CryAlert) async throws -> AlertReceipt {
+            sent.append(alert); return AlertReceipt(status: receipt)
+        }
+        func acknowledge(_ id: UUID) async throws {}
+        func pushToken(_ token: String) async throws {}
+        func watchPushToken(_ token: String?) async throws {}
+    }
+    @MainActor final class Fixture {
+        let model: AppModel
+        let audio = Audio()
+        let backend: Backend
+        let defaults: UserDefaults
+        let suite: String
+        let directory: URL
+        let listener: DeviceCredential
+        final class Time { var now = Date() }
+        let time: Time
+        init(pending: Bool = false, automaticallyStart: Bool = false) throws {
+            suite = "AppModelTests.\(UUID())"
+            defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            listener = DeviceCredential(deviceId: UUID(), secret: "test-listener", role: .listener, registered: true)
+            let parent = DeviceCredential(deviceId: UUID(), secret: "test-parent", role: .parent, registered: true)
+            defaults.set("listener", forKey: "role")
+            defaults.set(true, forKey: "safetyAccepted")
+            defaults.set("https://monitor.test", forKey: "backendURL")
+            defaults.set(true, forKey: "paired|https://monitor.test|listener")
+            let store = try MetadataStore(directory: directory)
+            var snapshot = SessionSnapshot()
+            if pending {
+                snapshot.pending = [PendingAlert(alert: CryAlert(episodeId: UUID(), listenerId: listener.deviceId,
+                    cryStartedAt: Date().addingTimeInterval(-301), durationSeconds: 300,
+                    createdAt: Date().addingTimeInterval(-1), isRepeat: false))]
+            }
+            try store.save(snapshot)
+            let backend = Backend(credential: listener); self.backend = backend
+            let time = Time(); self.time = time
+            model = AppModel(defaults: defaults, metadataStore: store, audio: audio, connectivity: Connectivity(),
+                             notifications: Notifications(), keychain: Credentials(listener: listener, parent: parent),
+                             makeClient: { _, _ in backend }, currentTime: { time.now }, automaticallyStart: automaticallyStart)
+        }
+        deinit {
+            UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite)
+            try? FileManager.default.removeItem(at: directory)
+        }
+    }
+    @MainActor private func eventually(timeout: Duration = .seconds(3), _ condition: () async -> Bool) async -> Bool {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while ContinuousClock.now < deadline {
+            if await condition() { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return false
+    }
+
+    @MainActor func testStartupRouteRecoveryDoesNotPresentAnError() async throws {
+        let fixture = try Fixture()
+        let gate = RequestGate()
+        fixture.audio.recoveryGate = gate
+        let start = Task { await fixture.model.start() }
+        let recovering = await eventually { fixture.model.recoveringAudio }
+        XCTAssertTrue(recovering)
+        XCTAssertTrue(fixture.model.starting)
+        XCTAssertFalse(fixture.model.monitoring)
+        XCTAssertFalse(fixture.model.snapshot.wasMonitoring)
+        XCTAssertNil(fixture.model.error)
+        XCTAssertFalse(fixture.model.needsRestart)
+        await fixture.model.foreground()
+        XCTAssertNil(fixture.model.error)
+        await gate.open()
+        await start.value
+        XCTAssertTrue(fixture.model.monitoring)
+        XCTAssertTrue(fixture.model.snapshot.wasMonitoring)
+        XCTAssertFalse(fixture.model.recoveringAudio)
+        XCTAssertNil(fixture.model.error)
+    }
+    @MainActor func testInterruptionRecoveryStaysInlineAndCanBeStopped() async throws {
+        let fixture = try Fixture()
+        await fixture.model.start()
+        fixture.audio.onStatus?(.recovering("Audio interrupted. Waiting for microphone…"))
+        XCTAssertFalse(fixture.model.monitoring)
+        XCTAssertTrue(fixture.model.recoveringAudio)
+        XCTAssertFalse(fixture.model.snapshot.wasMonitoring)
+        XCTAssertNil(fixture.model.error)
+        await fixture.model.foreground()
+        await fixture.model.start()
+        XCTAssertNil(fixture.model.error)
+        XCTAssertEqual(fixture.audio.starts, 1)
+        fixture.model.stop()
+        XCTAssertFalse(fixture.model.recoveringAudio)
+        XCTAssertFalse(fixture.model.monitoring)
+        XCTAssertEqual(fixture.model.audioStatus, "Stopped")
+    }
+    @MainActor func testFailedRecoveryStillRequiresAttention() async throws {
+        let fixture = try Fixture()
+        await fixture.model.start()
+        fixture.audio.onStatus?(.recovering("Recovering microphone…"))
+        let message = "Microphone unavailable. Open the app to restart monitoring."
+        fixture.audio.onStatus?(.failed(message))
+        XCTAssertFalse(fixture.model.monitoring)
+        XCTAssertFalse(fixture.model.recoveringAudio)
+        XCTAssertFalse(fixture.model.snapshot.wasMonitoring)
+        XCTAssertTrue(fixture.model.needsRestart)
+        XCTAssertEqual(fixture.model.error, message)
+        // An explicit retry still recovers from the failure.
+        await fixture.model.start()
+        XCTAssertTrue(fixture.model.monitoring)
+        XCTAssertFalse(fixture.model.needsRestart)
+        XCTAssertNil(fixture.model.error)
+    }
+    @MainActor func testDeniedPermissionAndStartupFailureStillPresentErrors() async throws {
+        let fixture = try Fixture()
+        fixture.audio.permissionGranted = false
+        await fixture.model.start()
+        XCTAssertTrue(fixture.model.error?.contains("Microphone permission denied") == true)
+        XCTAssertFalse(fixture.model.monitoring)
+        XCTAssertEqual(fixture.audio.starts, 0)
+        fixture.audio.permissionGranted = true
+        fixture.audio.startFailure = URLError(.unknown)
+        await fixture.model.start()
+        XCTAssertEqual(fixture.model.error, URLError(.unknown).localizedDescription)
+        XCTAssertFalse(fixture.model.monitoring)
+    }
+
+    @MainActor func testWatchdogStopsCaptureWhileNetworkRequestIsSuspended() async throws {
+        let fixture = try Fixture(automaticallyStart: true)
+        let gate = RequestGate()
+        await fixture.backend.configure(heartbeatGate: gate)
+        await fixture.model.start()
+        XCTAssertTrue(fixture.model.monitoring)
+        let started = await eventually { await fixture.backend.beats.count == 1 }
+        XCTAssertTrue(started)
+        fixture.time.now = fixture.time.now.addingTimeInterval(4)
+        let stopped = await eventually { !fixture.model.monitoring }
+        // The request remains blocked until after these watchdog assertions.
+        XCTAssertTrue(stopped)
+        XCTAssertTrue(fixture.model.needsRestart)
+        XCTAssertTrue(fixture.model.error?.contains("samples stopped arriving") == true)
+        XCTAssertEqual(fixture.model.now, fixture.time.now)
+        await gate.open()
+    }
+    @MainActor func testSettingsFailureDoesNotPreventPendingAlertDeliveryAndRemainsDirty() async throws {
+        let fixture = try Fixture(pending: true)
+        await fixture.backend.configure(settingsFail: true)
+        fixture.model.saveSettings(MonitoringConfiguration())
+        await fixture.model.tick()
+        let attempted = await eventually { await fixture.backend.settingsCalls == 1 }
+        XCTAssertTrue(attempted)
+        XCTAssertTrue(fixture.model.snapshot.pending.isEmpty)
+        XCTAssertTrue(fixture.defaults.bool(forKey: "settingsDirty"))
+        let sent = await fixture.backend.sent
+        XCTAssertEqual(sent.count, 1)
+        // The failed configuration is retried and cleared only after success.
+        await fixture.backend.configure()
+        let synced = await eventually {
+            await fixture.model.tick()
+            return !fixture.defaults.bool(forKey: "settingsDirty")
+        }
+        XCTAssertTrue(synced)
+    }
+    @MainActor func testSuspendedSettingsUploadDoesNotDelayAlertDelivery() async throws {
+        let fixture = try Fixture(pending: true)
+        let gate = RequestGate()
+        await fixture.backend.configure(settingsGate: gate)
+        fixture.model.saveSettings(MonitoringConfiguration())
+        await fixture.model.tick()
+        let attempted = await eventually { await fixture.backend.settingsCalls == 1 }
+        XCTAssertTrue(attempted)
+        XCTAssertTrue(fixture.model.snapshot.pending.isEmpty)
+        XCTAssertTrue(fixture.defaults.bool(forKey: "settingsDirty"))
+        await gate.open()
+        let synced = await eventually { !fixture.defaults.bool(forKey: "settingsDirty") }
+        XCTAssertTrue(synced)
+    }
+    @MainActor func testRoleChangeSendsStoppedListenerHeartbeatAfterInFlightActiveHeartbeat() async throws {
+        let fixture = try Fixture()
+        let gate = RequestGate()
+        await fixture.backend.configure(heartbeatGate: gate)
+        await fixture.model.start()
+        let request = Task { await fixture.model.tick() }
+        let started = await eventually { await fixture.backend.beats.count == 1 }
+        XCTAssertTrue(started)
+        fixture.model.selectRole(.parent)
+        XCTAssertEqual(fixture.model.role, .parent)
+        XCTAssertFalse(fixture.model.monitoring)
+        await gate.open()
+        await request.value
+        let stopped = await eventually { await fixture.backend.beats.count == 2 }
+        XCTAssertTrue(stopped)
+        let beats = await fixture.backend.beats
+        XCTAssertEqual(beats.map(\.monitoring), [true, false])
+        XCTAssertEqual(beats.map(\.listenerId), [fixture.listener.deviceId, fixture.listener.deviceId])
+        XCTAssertEqual(beats.last?.state, .quiet)
+    }
+    @MainActor func testOlderHeartbeatResponseDoesNotUndoSuccessfulSettingsUpload() async throws {
+        let fixture = try Fixture()
+        let gate = RequestGate()
+        await fixture.backend.configure(heartbeatGate: gate)
+        await fixture.model.start()
+        var config = MonitoringConfiguration(); config.alertDuration = 5
+        fixture.model.saveSettings(config)
+        let request = Task { await fixture.model.tick() }
+        let uploaded = await eventually {
+            let beats = await fixture.backend.beats
+            return beats.count == 1 && !fixture.defaults.bool(forKey: "settingsDirty")
+        }
+        XCTAssertTrue(uploaded)
+        await gate.open()
+        await request.value
+        XCTAssertEqual(fixture.model.configuration, config)
+        fixture.model.stop()
+    }
+    @MainActor func testAcknowledgedServerReceiptRemovesAlertWithoutClaimingAPNsDelivery() async throws {
+        let fixture = try Fixture(pending: true)
+        await fixture.backend.configure(receipt: "acknowledged")
+        await fixture.model.tick()
+        XCTAssertTrue(fixture.model.snapshot.pending.isEmpty)
+        XCTAssertEqual(fixture.model.deliveryStatus, "Alert acknowledged on Parent")
+        XCTAssertFalse(fixture.model.log.export.contains("alert_apns_accepted"))
+    }
+
+    // BEGIN temporary fix review probes
+    @MainActor func testReviewPendingAlertDoesNotWaitForHungHeartbeat() async throws {
+        let fixture = try Fixture(pending: true)
+        let gate = RequestGate()
+        await fixture.backend.configure(heartbeatGate: gate)
+        await fixture.model.start()
+        let request = Task { await fixture.model.tick() }
+        let started = await eventually { await fixture.backend.beats.count == 1 }
+        XCTAssertTrue(started)
+        let sentWhileHeartbeatWaits = await fixture.backend.sent
+        await gate.open()
+        await request.value
+        XCTAssertEqual(sentWhileHeartbeatWaits.count, 1, "A ready alert must not wait for an unrelated heartbeat request")
+    }
+    @MainActor func testReviewTerminalServerFailureLeavesRetryQueue() async throws {
+        let fixture = try Fixture(pending: true)
+        await fixture.backend.configure(receipt: "failed")
+        await fixture.model.tick()
+        let first = await fixture.backend.sent
+        XCTAssertEqual(first.count, 1)
+        fixture.time.now = fixture.time.now.addingTimeInterval(301)
+        await fixture.model.tick()
+        let retried = await fixture.backend.sent
+        XCTAssertEqual(retried.count, 1, "The server never retries a terminal failure, so retrying this event cannot recover delivery")
+    }
+    // END temporary fix review probes
+}
+#endif

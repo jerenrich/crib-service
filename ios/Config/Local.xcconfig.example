@@ -1,0 +1,4 @@
+// Copy to Local.xcconfig; this file is ignored by Git.
+DEVELOPMENT_TEAM = YOUR_APPLE_TEAM_ID
+// The slash expansion prevents xcconfig treating // as a comment.
+BACKEND_URL = https:/$()/baby-cry-monitor.YOUR_SUBDOMAIN.workers.dev

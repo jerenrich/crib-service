@@ -1,0 +1,47 @@
+import Foundation
+
+enum WatchNotification {
+    static let category = "BABY_CRY_ALERT"
+    static let acknowledge = "ACKNOWLEDGE_CRY"
+}
+
+/// Only status and alert metadata cross Watch Connectivity. Never audio or credentials.
+struct WatchSnapshot: Codable, Equatable, Sendable {
+    var updatedAt = Date()
+    var parentMode = false
+    var paired = false
+    var statusAvailable = false
+    var lastHeartbeat: Date?
+    var monitoring = false
+    var state: CryState?
+    var alertDuration: Double = 300
+    var watchPushRegistered = false
+    var acknowledgedEventId: UUID?
+    var alert: WatchCryAlert?
+    var message: String?
+
+    func nurseryOnline(at now: Date) -> Bool {
+        guard parentMode, paired, monitoring, let lastHeartbeat else { return false }
+        return (-5...150).contains(now.timeIntervalSince(lastHeartbeat))
+            && (-5...45).contains(now.timeIntervalSince(updatedAt))
+    }
+}
+
+struct WatchCryAlert: Codable, Equatable, Identifiable, Sendable {
+    let eventId: UUID
+    let episodeId: UUID
+    let startedAt: Date
+    let createdAt: Date
+    let duration: Double
+    let isTest: Bool
+    var id: UUID { eventId }
+    func isRecent(at now: Date) -> Bool { (-5...300).contains(now.timeIntervalSince(createdAt)) }
+}
+
+struct WatchCommand: Codable, Sendable {
+    enum Kind: String, Codable, Sendable { case refresh, registerToken, acknowledge }
+    let kind: Kind
+    var issuedAt = Date()
+    var token: String?
+    var eventId: UUID?
+}

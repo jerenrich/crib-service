@@ -1,0 +1,21 @@
+{
+  "name": "baby-cry-monitor-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
+    "test": "vitest run",
+    "db:local": "wrangler d1 migrations apply baby-cry-monitor --local",
+    "db:remote": "wrangler d1 migrations apply baby-cry-monitor --remote"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261002.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.11",
+    "wrangler": "4.146.0",
+    "@cloudflare/vitest-plugin": "1.3.5"
+  }
+}

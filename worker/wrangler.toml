@@ -1,0 +1,21 @@
+name = "baby-cry-monitor"
+account_id = "994f60c144bd9dd9bc2333bd3abba832"
+main = "src/index.ts"
+compatibility_date = "2025-09-17"
+workers_dev = true
+
+[vars]
+APNS_ENVIRONMENT = "development"
+APNS_BUNDLE_ID = "com.jordanerenrich.babycrymonitor"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "baby-cry-monitor"
+database_id = "60674623-4fae-4ee5-84d5-a80a88387662"
+migrations_dir = "migrations"
+
+[triggers]
+crons = ["* * * * *"]
+
+[observability]
+enabled = false
