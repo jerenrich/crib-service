@@ -1,6 +1,6 @@
 import XCTest
 final class OnboardingUITests: XCTestCase {
-    @MainActor func testOnboardingRolePersistenceAndUnpairedStartGuard() {
+    @MainActor func testOnboardingSettingsPersistenceAndUnpairedStartGuard() {
         let app = XCUIApplication(); app.launchArguments = ["--uitesting-reset"]; app.launch()
         let continueButton = app.buttons["I understand · Continue"]
         XCTAssertTrue(continueButton.waitForExistence(timeout: 5))
@@ -19,6 +19,25 @@ final class OnboardingUITests: XCTestCase {
         XCTAssertFalse(app.alerts["Attention needed"].exists)
         app.buttons["Settings"].tap()
         XCTAssertTrue(app.navigationBars["Settings"].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.buttons["Save alert settings"].exists)
+        XCTAssertFalse(app.buttons["Custom alert duration"].exists)
+        let duration = app.buttons["alertDurationPicker"]
+        XCTAssertTrue(duration.waitForExistence(timeout: 5))
+        duration.tap()
+        app.buttons["30 seconds"].tap()
+        XCTAssertTrue(app.navigationBars["Settings"].exists)
+        XCTAssertTrue(duration.label.contains("30 seconds") || duration.staticTexts["30 seconds"].exists, duration.debugDescription)
+        app.buttons["Done"].tap()
+        app.buttons["Settings"].tap()
+        XCTAssertTrue(duration.label.contains("30 seconds") || duration.staticTexts["30 seconds"].exists, duration.debugDescription)
+        duration.tap()
+        app.buttons["5 seconds"].tap()
+        // Terminate with Settings still open: saving must happen on selection.
+        app.terminate(); app.launch()
+        XCTAssertTrue(app.buttons["Settings"].waitForExistence(timeout: 5))
+        app.buttons["Settings"].tap()
+        XCTAssertTrue(duration.waitForExistence(timeout: 5))
+        XCTAssertTrue(duration.label.contains("5 seconds") || duration.staticTexts["5 seconds"].exists, duration.debugDescription)
         app.swipeUp()
         let diagnostics = app.buttons["Diagnostics & simulation"]
         if !diagnostics.isHittable { app.swipeUp() }
