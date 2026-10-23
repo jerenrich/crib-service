@@ -21,7 +21,7 @@ struct ReadinessView: View {
                     Button("Check notifications") { Task { await model.notifications.register(); await model.tick(); await model.refreshParent() } }
                     Link("Open iPhone Settings", destination: URL(string: UIApplication.openSettingsURLString)!)
                     Button("Refresh Listener status") { Task { await model.refreshParent() } }
-                    Text("Start monitoring and connect power on the nursery Listener. Its status normally updates once a minute.").font(.footnote)
+                    Text("Start monitoring and connect power on the nursery Listener. Its status normally updates every 15 seconds.").font(.footnote)
                 }
                 Section("Verify a real notification") {
                     Text("Send a test, lock this iPhone, and check your receiving phone or Watch. With a registered Watch, the test goes directly to the Watch. Confirm only after you see or feel it.")
