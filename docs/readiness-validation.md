@@ -1,14 +1,24 @@
 # Readiness release checks
 
-The new features are implemented locally. Apply `0004_readiness.sql` before releasing the Worker and updated iPhone build. These checks require two physical iPhones and, for wrist delivery, a paired worn/unlocked Apple Watch. Do not mark a check passed from simulator results or an APNs acceptance receipt.
+The readiness release is deployed to the configured backend and installed on both iPhones and the paired Watch; see the rollout record below. For another environment, apply `0004_readiness.sql` before releasing the Worker and updated iPhone build. The physical checks require two iPhones and, for wrist delivery, a paired worn/unlocked Apple Watch. Do not mark a physical check passed from simulator results or an APNs acceptance receipt.
 
 Record device/OS versions, build and Worker revision, timestamps, Focus settings and observed outcomes. Use a dedicated test pair for destructive checks. Never erase the family's active pairing as a test without the user's explicit intent.
 
 ## Automated validation — 23 October 2026
 
-The shared workspace passed 52 Foundation core tests, TypeScript source/test type checks, 48 Worker/D1 integration tests, 95 iOS unit tests and both signed iPhone simulator UI scenarios. The iPhone target with its embedded Watch companion passed an unsigned device build, and Wrangler's deployment dry run produced a local Worker bundle. No live migration or deployment was performed for these changes.
+The shared workspace passed 52 Foundation core tests, TypeScript source/test type checks, 48 Worker/D1 integration tests, 95 iOS unit tests and both signed iPhone simulator UI scenarios. The iPhone target with its embedded Watch companion passed an unsigned device build, and Wrangler's deployment dry run produced a local Worker bundle. After merging the 15-second heartbeat update, all 95 iOS unit tests passed again. Deployment followed as recorded below.
 
 Coverage added here includes outage opt-in/deduplication/recovery, stopped monitoring, explicit APNs rejection and Watch-token fallback, transport uncertainty, obsolete notice cancellation, settings acknowledgement, real test authorization, unpair/replacement/deletion isolation, non-blocking pairing refresh, calibration isolation and loud-room rejection. UI checks cover settings persistence, calibration navigation, the unpaired readiness flow and cancelling device deletion. UI launches use a Debug-only offline flag to prevent external API calls or notification registration.
+
+## Live rollout — 23 October 2026
+
+- Source: `f489402`, merged and pushed to `main`.
+- Applied only the pending additive migration `0004_readiness.sql` to the existing `baby-cry-monitor` D1 database.
+- Published Worker version `a9d78941-56ce-414c-bb26-5acd5308dc9a` at the configured workers.dev origin. Existing database binding, secrets, development APNs environment, disabled automatic observability and minute cron were preserved. Previous Worker version: `0e2a1f08-666e-4dd7-98f1-3bd5626e0ef6`.
+- Live smoke checks passed for authentication, temporary registration/pairing, five-second settings and bounds, applied-configuration acknowledgement, diagnostic request references, connection preference default/role/opt-in/out, marked tokenless test events, unpair/replacement, old-history removal and device deletion/revoked credentials. Temporary devices and metadata were deleted through the API. No real push token was submitted and no push was sent.
+- Three consecutive successful maintenance records from the new Worker version confirmed that scheduled work runs after deployment.
+- Signed Debug app and companion built for the configured Apple team with development APNs and the live backend URL. Installed in place and launched successfully on J14 (iPhone 14 Pro), J17 (iPhone 17 Pro) and Jordan’s Apple Watch. No app-data reset or unpairing was performed on these devices.
+- Monitoring must be restarted on the Listener after installation. Parent → Ready for tonight? provides the live checklist and real test request. Connection alerts remain opt-in. Presentation, wrist haptics, room calibration and overnight behavior require the physical checks below.
 
 ## Physical validation
 
