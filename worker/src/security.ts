@@ -14,7 +14,7 @@ export async function body(request:Request):Promise<Record<string,unknown>> {
  try { const parsed:unknown=JSON.parse(new TextDecoder().decode(bytes)); if(!parsed||typeof parsed!=='object'||Array.isArray(parsed))throw new Error(); return parsed as Record<string,unknown>; }
  catch { throw new APIError(400,'Invalid JSON object.'); }
 }
-function onlyKeys(value:Record<string,unknown>, keys:string[]) {if(Object.keys(value).some(key=>!keys.includes(key))) throw new APIError(400,'Unexpected metadata field. Audio and features are not accepted.');}
+export function onlyKeys(value:Record<string,unknown>, keys:string[]) {if(Object.keys(value).some(key=>!keys.includes(key))) throw new APIError(400,'Unexpected metadata field. Audio and features are not accepted.');}
 export function date(value:unknown):string {if(typeof value!=='string'||!/^\d{4}-\d{2}-\d{2}T/.test(value)||!Number.isFinite(Date.parse(value)))throw new APIError(400,'Invalid timestamp.');return new Date(value).toISOString();}
 export function configuration(value:Record<string,unknown>):Configuration {
  // Accept and discard the retired field in saved settings and older requests.

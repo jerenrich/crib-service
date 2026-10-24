@@ -1,3 +1,4 @@
+import {latestMonitoringCommand} from './monitoring';
 import {heartbeatTimeline} from './timeline';
 import {scheduleReminders} from './reminders';
 import {APIError,defaultConfiguration,requireRole,type Device,type Env,type Heartbeat} from './types';
@@ -25,17 +26,18 @@ export async function saveHeartbeat(env:Env,device:Device,value:Record<string,un
 export async function listenerStatus(env:Env,device:Device) {
  const pair=await pairFor(env,device);
  if(!pair)return {paired:false,watchPushRegistered:false,serverTime:new Date().toISOString(),nextHeartbeatExpectedAt:null,configuration:configuration(JSON.parse(device.config))};
- const [last,parent,events]=await Promise.all([
+ const [last,parent,events,monitoringCommand]=await Promise.all([
   env.DB.prepare('SELECT * FROM heartbeats WHERE listener_id=?').bind(pair.listener_id).first<{received_at:string;metadata:string}>(),
   env.DB.prepare('SELECT config,push_token,watch_push_token,connection_alerts,alerts_muted_until FROM devices WHERE id=?').bind(pair.parent_id).first<{config:string;push_token:string|null;watch_push_token:string|null;connection_alerts:number;alerts_muted_until:number}>(),
-  env.DB.prepare('SELECT payload,status,sent_at,acknowledged_at,push_target FROM events WHERE parent_id=? ORDER BY created_at DESC LIMIT 100').bind(pair.parent_id).all<{payload:string;status:string;sent_at:string|null;acknowledged_at:string|null;push_target:string|null}>()
+  env.DB.prepare('SELECT payload,status,sent_at,acknowledged_at,push_target FROM events WHERE parent_id=? ORDER BY created_at DESC LIMIT 100').bind(pair.parent_id).all<{payload:string;status:string;sent_at:string|null;acknowledged_at:string|null;push_target:string|null}>(),
+  latestMonitoringCommand(env,pair)
  ]);
  const metadata=last?JSON.parse(last.metadata) as Heartbeat:null;
  // An estimate, not a deadline: the Listener waits 15 seconds after its response.
  // Keep this anchored to the stored heartbeat so repeated reads cannot postpone it.
  const nextHeartbeatExpectedAt=last&&metadata?.monitoring?new Date(Date.parse(last.received_at)+15000).toISOString():null;
  return {paired:true,pairingID:`${pair.parent_id}|${pair.listener_id}|${pair.created_at}`,listenerId:pair.listener_id,lastHeartbeat:last?.received_at??null,monitoring:metadata?.monitoring??false,batteryLevel:metadata?.batteryLevel??null,powerConnected:metadata?.powerConnected??false,state:metadata?.state??null,currentEpisode:metadata?.currentEpisode??null,episodes:metadata?.episodes??[],configuration:parent?configuration(JSON.parse(parent.config)):defaultConfiguration,
- serverTime:new Date().toISOString(),nextHeartbeatExpectedAt,
+ serverTime:new Date().toISOString(),nextHeartbeatExpectedAt,monitoringCommand,
  watchPushRegistered:parent?.watch_push_token!=null,phonePushRegistered:parent?.push_token!=null,
  alertsMutedUntil:parent?.alerts_muted_until?new Date(parent.alerts_muted_until).toISOString():null,
  connectionAlertsEnabled:parent?.connection_alerts===1,listenerConfiguration:metadata?.appliedConfiguration?configuration({...metadata.appliedConfiguration}):null,

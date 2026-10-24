@@ -5,6 +5,7 @@ const routes = {
  'POST /v1/device/watch-push-token':'watch_token', 'POST /v1/pairing/create':'pairing_create',
  'POST /v1/pairing/claim':'pairing_claim', 'POST /v1/listener/heartbeat':'heartbeat',
  'POST /v1/listener/event':'alert', 'GET /v1/listener/status':'status', 'GET /v1/timeline':'timeline',
+ 'POST /v1/monitoring':'monitoring', 'POST /v1/monitoring/complete':'monitoring_complete',
  'POST /v1/settings':'settings', 'POST /v1/alert/acknowledge':'acknowledge',
  'POST /v1/pairing/remove':'unpair','POST /v1/device/delete':'delete_device',
  'POST /v1/connection-alerts':'connection_preferences','POST /v1/test-push':'test_push'

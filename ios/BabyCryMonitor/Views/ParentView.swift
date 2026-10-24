@@ -5,10 +5,31 @@ struct ParentView: View {
     @State private var pairing = false
     @State private var readiness = false
     @State private var overnightSetup = false
+    @State private var showMonitoringError = false
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
             HStack { Caption(text: "Parent Mode"); Spacer(); StatusPill(text: model.nurseryConnection, active: model.parentOnline) }
             PrimaryButton(title: "Ready for tonight?") { readiness = true }
+            if model.paired {
+                Panel {
+                    Caption(text: "Nursery monitoring")
+                    Text(model.nurseryConnection).font(.title2.weight(.semibold))
+                    HStack {
+                        PrimaryButton(title: "Start Monitoring") { Task { await model.requestMonitoring(true) } }
+                        PrimaryButton(title: "Stop Monitoring", destructive: true) { Task { await model.requestMonitoring(false) } }
+                    }.disabled(model.requestingMonitoring || model.managingDevice)
+                    if let message = model.monitoringControlMessage {
+                        Text(message).font(.subheadline).foregroundStyle(Palette.muted)
+                    }
+                    if let failure = model.monitoringControlError {
+                        Label("Monitoring not confirmed", systemImage: "exclamationmark.triangle.fill")
+                            .font(.headline).foregroundStyle(.red)
+                        Text(failure).font(.subheadline).foregroundStyle(.red)
+                    }
+                    Text("Stop cancels repeating crying alerts. Remote start needs the nursery app to be running. If iOS has suspended it, reopen it on that phone. Always wait for monitoring confirmation.")
+                        .font(.footnote).foregroundStyle(Palette.muted)
+                }
+            }
             if let alert = model.activeAlert {
                 Panel {
                     Label(alert.isTest == true ? "Test notification" : "Crying alert", systemImage: "bell.badge").font(.title2.weight(.semibold)).foregroundStyle(Palette.amber)
@@ -65,7 +86,14 @@ struct ParentView: View {
                 Text("Use Ready for tonight? → Guided overnight setup to check Sleep Focus and test a wrist alert before sleeping.").font(.footnote).foregroundStyle(Palette.muted)
             }
             Panel { Caption(text: "Connection"); Text(model.deliveryStatus).font(.subheadline).foregroundStyle(Palette.muted); Text(model.notifications.status).font(.subheadline).foregroundStyle(Palette.muted) }
-        }.sheet(isPresented: $pairing) { PairingView() }
+        }.onAppear { showMonitoringError = model.monitoringControlError != nil }
+            .onChange(of: model.monitoringControlError) { _, failure in
+            if failure != nil { showMonitoringError = true }
+        }
+            .alert("Monitoring not confirmed", isPresented: $showMonitoringError) {
+                Button("OK", role: .cancel) { }
+            } message: { Text(model.monitoringControlError ?? "Check the nursery phone before relying on monitoring.") }
+            .sheet(isPresented: $pairing) { PairingView() }
             .sheet(isPresented: $readiness) { ReadinessView() }
             .sheet(isPresented: $overnightSetup) {
                 NavigationStack {

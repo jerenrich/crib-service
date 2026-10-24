@@ -1,3 +1,4 @@
+import {latestMonitoringCommand} from './monitoring';
 import type {Alert,Env,Heartbeat,StoredEvent} from './types';
 import {configuration} from './security';
 import {dispatchEvent} from './alerts';
@@ -46,9 +47,11 @@ export class AlertReminders implements DurableObject {
 
 export async function runReminder(env:Env,parentId:string):Promise<boolean> {
  const now=Date.now();
- const pair=await env.DB.prepare('SELECT p.listener_id,d.alerts_muted_until,d.config FROM pairs p JOIN devices d ON d.id=p.parent_id WHERE p.parent_id=?')
-  .bind(parentId).first<{listener_id:string;alerts_muted_until:number;config:string}>();
+ const pair=await env.DB.prepare('SELECT p.listener_id,p.created_at,d.alerts_muted_until,d.config FROM pairs p JOIN devices d ON d.id=p.parent_id WHERE p.parent_id=?')
+  .bind(parentId).first<{listener_id:string;created_at:number;alerts_muted_until:number;config:string}>();
  if(!pair)return false;
+ const control=await latestMonitoringCommand(env,{parent_id:parentId,listener_id:pair.listener_id,created_at:pair.created_at});
+ if(control&&!control.enabled&&['pending','applied'].includes(control.status))return false;
  if(pair.alerts_muted_until>now)return true;
  // An expired upload may have arrived after a live alert. Skip that row rather
  // than letting it shut down reminders for every other outstanding episode.
