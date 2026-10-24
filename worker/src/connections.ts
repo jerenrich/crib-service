@@ -34,11 +34,13 @@ export async function flushConnections(env:Env,requestId=crypto.randomUUID()) {
    env.DB.prepare(`INSERT INTO connection_notices(id,listener_id,parent_id,state,observed_at,created_at)
     SELECT ?,?,?,?, ?,? FROM devices d JOIN pairs p ON p.parent_id=d.id
     JOIN connection_states s ON s.listener_id=p.listener_id JOIN heartbeats h ON h.listener_id=p.listener_id
-    WHERE p.listener_id=? AND d.id=? AND d.connection_alerts=1 AND s.state=? AND h.received_at=? ON CONFLICT DO NOTHING`)
-    .bind(crypto.randomUUID(),row.listener_id,row.parent_id,state,row.received_at,now,row.listener_id,row.parent_id,row.state,row.received_at),
+    WHERE p.listener_id=? AND d.id=? AND d.connection_alerts=1 AND s.state=? AND h.received_at=? AND ?<>'online' ON CONFLICT DO NOTHING`)
+    .bind(crypto.randomUUID(),row.listener_id,row.parent_id,state,row.received_at,now,row.listener_id,row.parent_id,row.state,row.received_at,state),
    env.DB.prepare('UPDATE connection_states SET state=?,changed_at=? WHERE listener_id=? AND state=? AND EXISTS(SELECT 1 FROM heartbeats h WHERE h.listener_id=connection_states.listener_id AND h.received_at=?)').bind(state,row.received_at,row.listener_id,row.state,row.received_at)
   ]);
  }
+ // Recovery updates status/history quietly, including notices queued by older versions.
+ await env.DB.prepare("UPDATE connection_notices SET status='cancelled',lease_until=NULL WHERE state='online' AND status IN ('pending','blocked')").run();
  await env.DB.prepare("UPDATE connection_notices SET status='uncertain',lease_until=NULL WHERE status='sending' AND lease_until<?").bind(now).run();
  const pending=await env.DB.prepare(`SELECT n.id FROM connection_notices n WHERE n.status IN ('pending','blocked') AND n.next_attempt<=? ORDER BY n.created_at LIMIT 25`).bind(now).all<{id:string}>();
  for(const {id} of pending.results){
@@ -50,7 +52,7 @@ export async function flushConnections(env:Env,requestId=crypto.randomUUID()) {
    WHERE p.parent_id=? AND p.listener_id=?`).bind(notice.parent_id,notice.listener_id)
    .first<{push_token:string|null;watch_push_token:string|null;connection_alerts:number;received_at:string;metadata:string}>();
   const current=context?(JSON.parse(context.metadata).monitoring===true?(now-Date.parse(context.received_at)>180000?'offline':'online'):'stopped'):null;
-  if(!context?.connection_alerts||current!==notice.state||now-notice.created_at>600000){
+  if((notice.state!=='offline'&&notice.state!=='stopped')||!context?.connection_alerts||current!==notice.state||now-notice.created_at>600000){
    await env.DB.prepare("UPDATE connection_notices SET status='cancelled',lease_until=NULL WHERE id=?").bind(id).run();continue;
   }
   const target=context.watch_push_token?'watch':'phone', token=context.watch_push_token??context.push_token;
