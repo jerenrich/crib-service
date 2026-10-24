@@ -8,9 +8,9 @@ final class OnboardingUITests: XCTestCase {
         XCTAssertTrue(timeline.waitForExistence(timeout: 5)); timeline.tap()
         XCTAssertTrue(app.navigationBars["Timeline"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.staticTexts["Last 12 hours"].exists)
-        XCTAssertTrue(app.staticTexts["No history recorded"].exists)
-        XCTAssertTrue(app.staticTexts["Listener updates missing"].exists)
-        XCTAssertTrue(app.staticTexts["Status unavailable"].exists)
+        XCTAssertTrue(app.buttons["timelineLegend_noHistory"].exists)
+        XCTAssertTrue(app.buttons["timelineLegend_updatesMissing"].exists)
+        XCTAssertTrue(app.buttons["timelineLegend_unavailable"].exists)
         let overview = XCTAttachment(screenshot: app.screenshot())
         overview.name = "Timeline coverage distinctions"; overview.lifetime = .keepAlways; add(overview)
         let gap = app.buttons.matching(identifier: "timelineCoverage_updatesMissing").firstMatch

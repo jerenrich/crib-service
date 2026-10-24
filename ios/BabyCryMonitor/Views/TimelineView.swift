@@ -27,6 +27,13 @@ struct TimelineView: View {
     }
     private var filtered: [TimelineEvent] { visibleEvents.filter { filter == .all || $0.category == filter } }
     private var displayed: [TimelineEvent] { showEarlier ? filtered : Array(filtered.prefix(8)) }
+    private var emptyEventsText: String {
+        if model.loadingTimeline { return "Loading events…" }
+        if sharedStatusUnavailable {
+            return model.timeline == nil ? "Event history is unavailable. Retry to load it." : "No matching events in the last fetched history."
+        }
+        return filter == .all ? "No events recorded in the last 12 hours." : "No \(filter.rawValue.lowercased()) events in this window."
+    }
     private var sharedStatusUnavailable: Bool {
         model.role == .parent && (model.timelineError != nil || model.timeline == nil || end.timeIntervalSince(model.timeline?.serverTime ?? end) > 180)
     }
@@ -97,7 +104,7 @@ struct TimelineView: View {
                         }.accessibilityIdentifier("timelineFilter")
                     }
                     if displayed.isEmpty {
-                        Text(model.loadingTimeline ? "Loading events…" : filter == .all ? "No events recorded in the last 12 hours." : "No \(filter.rawValue.lowercased()) events in this window.")
+                        Text(emptyEventsText)
                             .font(.subheadline).foregroundStyle(Palette.muted).padding(.vertical, 12)
                     } else {
                         LazyVStack(alignment: .leading, spacing: 0) {
@@ -211,6 +218,7 @@ struct TimelineView: View {
                     } label: {
                         legend(state.title, color: coverageColor(state))
                     }.buttonStyle(.plain).disabled(!coverage.contains { $0.state == state })
+                        .accessibilityLabel(state.title).accessibilityIdentifier("timelineLegend_\(state.rawValue)")
                 }
             }
             Text("Tap a status interval for details.").font(.caption2).foregroundStyle(Palette.muted)
