@@ -15,7 +15,8 @@ final class WatchAlertStateTests: XCTestCase {
         state.handleNotification(current, acknowledging: true)
         state = fixture.makeState()
         fixture.activated = true
-        state.resolveAcknowledgements(from: WatchSnapshot(discardedAcknowledgementEventId: deleted.eventId))
+        let encoded = try JSONEncoder().encode(WatchSnapshot(discardedAcknowledgementEventId: deleted.eventId))
+        state.resolveAcknowledgements(from: try JSONDecoder().decode(WatchSnapshot.self, from: encoded))
         XCTAssertTrue(state.acknowledgementPending)
         XCTAssertEqual(fixture.commands.last?.eventId, current.eventId)
         state.resolveAcknowledgements(from: WatchSnapshot(acknowledgedEventId: current.eventId))

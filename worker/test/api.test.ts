@@ -834,6 +834,23 @@ it('accepts offline cry journal entries without relying on the latest 100 episod
  expect((await call('listener/heartbeat',listener,{...value,timelineEvents:[{...timelineEvents[1],audioFeatures:[1]}]})).status).toBe(400);
 });
 
+// Hold an acknowledgement after its reads, immediately before the atomic write.
+// This reproduces interleavings without sleeps or concurrent test timing guesses.
+async function pausedAcknowledgement(parent:TestDevice,eventId:string) {
+ const {acknowledge}=await import('../src/alerts');
+ const registered=await env.DB.prepare('SELECT * FROM devices WHERE id=?').bind(parent.deviceId).first<import('../src/types').Device>();
+ let release!:()=>void,ready!:()=>void;
+ const gate=new Promise<void>(resolve=>{release=resolve;});
+ const entered=new Promise<void>(resolve=>{ready=resolve;});
+ const delayedDB=new Proxy(testEnv.DB,{get(target,prop){
+  if(prop==='batch')return async(statements:D1PreparedStatement[])=>{ready();await gate;return target.batch(statements);};
+  const member=Reflect.get(target,prop);return typeof member==='function'?member.bind(target):member;
+ }});
+ const pending=acknowledge({...testEnv,DB:delayedDB},registered!,{eventId});
+ await entered;
+ return async()=>{release();await pending;};
+}
+
 describe('alert delivery regressions',()=>{
  it('keeps reminders alive for a current alert when an expired outbox event arrives later',async()=>{
   const {parent,listener}=await paired();
@@ -849,7 +866,7 @@ describe('alert delivery regressions',()=>{
   expect(pushRequests).toHaveLength(2);
   expect(JSON.parse(String(pushRequests[1].init?.body)).episodeId).toBe(current.episodeId);
  });
- it('does not replay an offline alert from an earlier snooze after a second snooze',async()=>{
+ it('suppresses earlier snoozes but still delivers alerts created between snoozes',async()=>{
   const {parent,listener}=await paired();
   await env.DB.prepare('UPDATE pairs SET created_at=?').bind(Date.now()-3600000).run();
   await call('device/push-token',parent,{token:'ab'.repeat(32)});
@@ -862,61 +879,93 @@ describe('alert delivery regressions',()=>{
   mockPush();await call('listener/event',listener,second);
   await call('alert/acknowledge',parent,{eventId:second.eventId});
   vi.spyOn(Date,'now').mockReturnValue(now+130000);
-  const result=await (await call('listener/event',listener,delayed)).json();
-  expect(result).toEqual({status:'acknowledged'});
+  expect(await (await call('listener/event',listener,delayed)).json()).toEqual({status:'acknowledged'});
   expect(pushRequests).toHaveLength(2);
+  const between={...alert(listener),createdAt:new Date(now+62000).toISOString(),cryStartedAt:new Date(now-238000).toISOString()};
+  mockPush();expect(await (await call('listener/event',listener,between)).json()).toEqual({status:'sent'});
  });
  it('does not let a concurrent duplicate acknowledgement acknowledge a later alert',async()=>{
   const {parent,listener}=await paired();
   await call('device/push-token',parent,{token:'ab'.repeat(32)});
   const first=alert(listener);mockPush();await call('listener/event',listener,first);
-  const {acknowledge}=await import('../src/alerts');
-  const device=await env.DB.prepare('SELECT * FROM devices WHERE id=?').bind(parent.deviceId).first<import('../src/types').Device>();
-  let release!:()=>void;
-  const gate=new Promise<void>(resolve=>{release=resolve;});
-  let ready!:()=>void;
-  const entered=new Promise<void>(resolve=>{ready=resolve;});
-  const delayedDB=new Proxy(testEnv.DB,{get(target,prop){
-   if(prop==='batch')return async(statements: D1PreparedStatement[])=>{ready();await gate;return target.batch(statements);};
-   const member=Reflect.get(target,prop);return typeof member==='function'?member.bind(target):member;
-  }});
-  const delayedAck=acknowledge({...testEnv,DB:delayedDB},device!,{eventId:first.eventId});
-  await entered;
-  await call('alert/acknowledge',parent,{eventId:first.eventId});
-  const time=Date.now()+65000;vi.spyOn(Date,'now').mockReturnValue(time);
-  const later={...alert(listener),createdAt:new Date(time).toISOString(),cryStartedAt:new Date(time-300000).toISOString()};
-  mockPush();await call('listener/event',listener,later);
-  release();await delayedAck;
+  const finish=await pausedAcknowledgement(parent,first.eventId);
+  let later:Alert;
+  try {
+   await call('alert/acknowledge',parent,{eventId:first.eventId});
+   const time=Date.now()+65000;vi.spyOn(Date,'now').mockReturnValue(time);
+   later={...alert(listener),createdAt:new Date(time).toISOString(),cryStartedAt:new Date(time-300000).toISOString()};
+   mockPush();await call('listener/event',listener,later);
+  }finally{await finish();}
   const row=await env.DB.prepare('SELECT acknowledged_at FROM events WHERE event_id=?').bind(later.eventId).first<{acknowledged_at:string|null}>();
   expect(row?.acknowledged_at).toBeNull();
   const muted=await env.DB.prepare('SELECT alerts_muted_until FROM devices WHERE id=?').bind(parent.deviceId).first<{alerts_muted_until:number}>();
   expect(muted!.alerts_muted_until).toBeLessThanOrEqual(Date.now());
+  expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM alert_snoozes').first()).toEqual({n:1});
+  expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM timeline_events WHERE kind='alert_acknowledged'").first()).toEqual({n:1});
+ });
+ it('does not apply an old in-flight acknowledgement to a replacement pairing',async()=>{
+  const {parent,listener}=await paired();
+  await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  const first=alert(listener);mockPush();await call('listener/event',listener,first);
+  const finish=await pausedAcknowledgement(parent,first.eventId);
+  let later:Alert;
+  try {
+   expect((await call('pairing/remove',parent)).status).toBe(200);
+   const code=await (await call('pairing/create',parent)).json() as {code:string};
+   const replacement=device('listener');await register(replacement);
+   expect((await call('pairing/claim',replacement,{code:code.code})).status).toBe(200);
+   later=alert(replacement);mockPush();await call('listener/event',replacement,later);
+  }finally{await finish();}
+  const row=await env.DB.prepare('SELECT acknowledged_at FROM events WHERE event_id=?').bind(later.eventId).first<{acknowledged_at:string|null}>();
+  expect(row?.acknowledged_at).toBeNull();
+  const muted=await env.DB.prepare('SELECT alerts_muted_until FROM devices WHERE id=?').bind(parent.deviceId).first<{alerts_muted_until:number}>();
+  expect(muted!.alerts_muted_until).toBe(0);
+  expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM alert_snoozes').first()).toEqual({n:0});
+  expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM timeline_events WHERE kind='alert_acknowledged'").first()).toEqual({n:0});
+ });
+ it('retains snoozes by their end time through cleanup and expires them afterward',async()=>{
+  const {parent,listener}=await paired();
+  const now=Date.now(),start=now-86400000-600000,until=start+900000;
+  await env.DB.prepare('UPDATE pairs SET created_at=?').bind(start-3600000).run();
+  await call('settings',parent,{...defaultConfiguration,snoozeDuration:900});
+  await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  vi.spyOn(Date,'now').mockReturnValue(start);
+  const first={...alert(listener),createdAt:new Date(start).toISOString(),cryStartedAt:new Date(start-300000).toISOString()};
+  mockPush();await call('listener/event',listener,first);
+  await call('alert/acknowledge',parent,{eventId:first.eventId});
+  vi.spyOn(Date,'now').mockReturnValue(now);
+  // Isolate historical suppression from the compatibility/current-mute fields.
+  await env.DB.prepare('UPDATE devices SET alerts_muted_at=0,alerts_muted_until=0 WHERE id=?').bind(parent.deviceId).run();
+  await flushPending(testEnv);
+  expect(await env.DB.prepare('SELECT until_at FROM alert_snoozes').first()).toEqual({until_at:until});
+  const created=now-86400000+60000;
+  const delayed={...alert(listener),createdAt:new Date(created).toISOString(),cryStartedAt:new Date(created-300000).toISOString()};
+  expect(await (await call('listener/event',listener,delayed)).json()).toEqual({status:'acknowledged'});
+  expect(pushRequests).toHaveLength(1);
+  vi.spyOn(Date,'now').mockReturnValue(until+86400001);
+  await flushPending(testEnv);
+  expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM alert_snoozes').first()).toEqual({n:0});
+ });
+ it.each(['pairing/remove','device/delete'])('clears snooze history on %s',async(path)=>{
+  const {parent,listener}=await paired();
+  const event=alert(listener);await call('listener/event',listener,event);
+  await call('alert/acknowledge',parent,{eventId:event.eventId});
+  expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM alert_snoozes').first()).toEqual({n:1});
+  expect((await call(path,parent)).status).toBe(200);
+  expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM alert_snoozes').first()).toEqual({n:0});
+ });
+ it('migrates the last existing snooze before a later acknowledgement replaces it',async()=>{
+  const {parent,listener}=await paired();
+  const start=Date.now()-120000,until=start+60000;
+  await env.DB.prepare('UPDATE pairs SET created_at=?').bind(start-60000).run();
+  await env.DB.prepare('UPDATE devices SET alerts_muted_at=?,alerts_muted_until=? WHERE id=?').bind(start,until,parent.deviceId).run();
+  const migration=env.TEST_MIGRATIONS.find(m=>m.name.includes('0008_alert_snoozes'))!;
+  await env.DB.prepare('DROP TABLE alert_snoozes').run();
+  await env.DB.batch(migration.queries.map(query=>env.DB.prepare(query)));
+  await env.DB.prepare('UPDATE devices SET alerts_muted_at=0,alerts_muted_until=0 WHERE id=?').bind(parent.deviceId).run();
+  const created=start+30000;
+  const delayed={...alert(listener),createdAt:new Date(created).toISOString(),cryStartedAt:new Date(created-300000).toISOString()};
+  expect(await (await call('listener/event',listener,delayed)).json()).toEqual({status:'acknowledged'});
+  expect(pushRequests).toHaveLength(0);
  });
 });
-
-it('does not apply an old in-flight acknowledgement to a replacement pairing',async()=>{
- const {parent,listener}=await paired();
- await call('device/push-token',parent,{token:'ab'.repeat(32)});
- const first=alert(listener);mockPush();await call('listener/event',listener,first);
- const {acknowledge}=await import('../src/alerts');
- const device=await env.DB.prepare('SELECT * FROM devices WHERE id=?').bind(parent.deviceId).first<import('../src/types').Device>();
- let release!:()=>void,ready!:()=>void;
- const gate=new Promise<void>(resolve=>{release=resolve;});
- const entered=new Promise<void>(resolve=>{ready=resolve;});
- const delayedDB=new Proxy(testEnv.DB,{get(target,prop){
-  if(prop==='batch')return async(statements: D1PreparedStatement[])=>{ready();await gate;return target.batch(statements);};
-  const member=Reflect.get(target,prop);return typeof member==='function'?member.bind(target):member;
- }});
- const delayedAck=acknowledge({...testEnv,DB:delayedDB},device!,{eventId:first.eventId});await entered;
- expect((await call('pairing/remove',parent)).status).toBe(200);
- const code=await (await call('pairing/create',parent)).json() as {code:string};
- const replacement=deviceForReplacement();await register(replacement);
- expect((await call('pairing/claim',replacement,{code:code.code})).status).toBe(200);
- const later=alert(replacement);mockPush();await call('listener/event',replacement,later);
- release();await delayedAck;
- const row=await env.DB.prepare('SELECT acknowledged_at FROM events WHERE event_id=?').bind(later.eventId).first<{acknowledged_at:string|null}>();
- expect(row?.acknowledged_at).toBeNull();
-  const muted=await env.DB.prepare('SELECT alerts_muted_until FROM devices WHERE id=?').bind(parent.deviceId).first<{alerts_muted_until:number}>();
-  expect(muted!.alerts_muted_until).toBeLessThanOrEqual(Date.now());
-});
-function deviceForReplacement(){return device('listener');}
