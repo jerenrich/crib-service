@@ -113,7 +113,7 @@ final class WatchAlertSetupTests: XCTestCase {
         setup.receivedToken("abc")
         setup.accept(WatchSnapshot())
         XCTAssertEqual(setup.phase, .blocked)
-        XCTAssertTrue(setup.detail.contains("Choose Parent Alerts"))
+        XCTAssertTrue(setup.detail.contains("Choose Parent Mode"))
         setup.retryRegistration()
         setup.accept(WatchSnapshot(parentMode: true, watchPushRegistered: true))
         XCTAssertEqual(setup.phase, .registered)

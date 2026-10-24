@@ -45,13 +45,11 @@ public struct CrySessionManager: Sendable {
         episode.averageDBFS = (episode.averageDBFS ?? sample.dbFS) + (sample.dbFS - (episode.averageDBFS ?? sample.dbFS)) / Double(episode.sampleCount)
         var alerts: [CryAlert] = []
         let initial = episode.alertQueuedAt == nil && episode.duration(at: sample.timestamp) >= snapshot.configuration.alertDuration
-        let repeatDue = episode.alertQueuedAt != nil && snapshot.configuration.repeatInterval.map {
-            sample.timestamp.timeIntervalSince(episode.lastAlertQueuedAt ?? sample.timestamp) >= $0
-        } == true
         // Once sustained quiet reaches reset, the episode above has already ended.
         // Defer a due alert during a quiet gap until sound resumes. If the gap
         // becomes a full reset, a baby that settled before the threshold sends none.
-        if (initial || repeatDue) && sample.dbFS >= snapshot.configuration.absoluteThreshold {
+        // The server repeats until acknowledgement, independently of later sound.
+        if initial && sample.dbFS >= snapshot.configuration.absoluteThreshold {
             let alert = CryAlert(episodeId: episode.id, listenerId: listenerId, cryStartedAt: episode.startedAt,
                                  durationSeconds: episode.duration(at: sample.timestamp), createdAt: sample.timestamp, isRepeat: !initial)
             if initial { episode.alertQueuedAt = sample.timestamp }

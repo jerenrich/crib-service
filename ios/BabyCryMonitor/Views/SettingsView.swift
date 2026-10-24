@@ -4,7 +4,6 @@ struct SettingsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     @State private var pairing = false
-    @State private var calibration = false
     @State private var readiness = false
     @State private var removal = Removal.unpair
     @State private var confirmRemoval = false
@@ -55,19 +54,18 @@ struct SettingsView: View {
                 } footer: {
                     Text("A fixed microphone level. −60 dBFS detects quieter sounds; −10 dBFS requires louder sounds. The threshold stays fixed as room noise changes. dBFS is a microphone reading, not a calibrated room loudness measurement. Other loud noises can also trigger detection.")
                 }
-                if model.role == .listener {
-                    Section { Button("Check room sound") { calibration = true } }
-                }
                 Section {
-                    Picker("Repeat alerts", selection: setting(\.repeatInterval)) {
-                        Text("Off").tag(Optional<Double>.none)
-                        Text("Every 2 minutes").tag(Optional(120.0))
-                        Text("Every 5 minutes").tag(Optional(300.0))
+                    LabeledContent("Repeat alerts", value: "Every 5 seconds")
+                    Picker("Snooze after acknowledgement", selection: setting(\.snoozeDuration)) {
+                        ForEach(MonitoringConfiguration.snoozeDurations, id: \.self) { value in
+                            Text(alertDurationText(value)).tag(value)
+                        }
                     }
+                    .accessibilityIdentifier("snoozeDurationPicker")
                 } header: {
                     Text("Reminders")
                 } footer: {
-                    Text("Send another alert at this interval if the same crying episode continues after the first alert. Changes save automatically. Changes made on the Parent iPhone reach the Listener on its next update, normally within 15 seconds.")
+                    Text("Crying alerts repeat every 5 seconds until you acknowledge one on your iPhone or Watch, even if the sound stops. Acknowledging snoozes crying alerts for \(alertDurationText(model.configuration.snoozeDuration)). Connection-loss alerts stay on. Notification delivery depends on connectivity and your device settings.")
                 }
                 Section("This iPhone") {
                     Picker("Mode", selection: Binding(get: { model.role ?? .listener }, set: { model.selectRole($0) })) { Text("Listener").tag(DeviceRole.listener); Text("Parent").tag(DeviceRole.parent) }
@@ -80,7 +78,7 @@ struct SettingsView: View {
                         Toggle("Connection-loss alerts", isOn: Binding(get: { model.parentStatus?.connectionAlertsEnabled == true }, set: { value in Task { await model.setConnectionAlerts(value) } }))
                             .disabled(model.changingConnectionAlerts || model.parentStatus == nil || !model.paired)
                     } header: { Text("Monitoring connection") } footer: {
-                        Text("When enabled, the server sends one notice after at least 3 minutes without an active Listener update, plus a recovery notice. It also reports a Listener that stops monitoring. The minute check can add up to a minute. Delivery requires the receiving device to have internet and allow notifications.")
+                        Text("When enabled, the server reports a stopped Listener or missing updates after 3–4 minutes. During monitoring, Parent and Watch also arm a local warning for 3 minutes without a verified Parent server check. That warning needs no internet once armed. Keep Parent Mode open: locking or leaving the app may pause checks and trigger it. Notification, Focus and haptic settings still apply.")
                     }
                 }
                 Section {
@@ -97,7 +95,6 @@ struct SettingsView: View {
             }.navigationTitle("Settings")
                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
                 .sheet(isPresented: $pairing) { PairingView() }
-                .sheet(isPresented: $calibration) { CalibrationView() }
                 .sheet(isPresented: $readiness) { ReadinessView() }
                 .alert(removal == .delete ? "Delete device and shared history?" : "Unpair these phones?", isPresented: $confirmRemoval) {
                     Button(removal == .delete ? "Delete device & shared history" : "Unpair and clear shared history", role: .destructive) {

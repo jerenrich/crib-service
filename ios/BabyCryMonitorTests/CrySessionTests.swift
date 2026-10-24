@@ -9,7 +9,11 @@ import XCTest
 final class CrySessionTests: XCTestCase {
     struct FixedClock: ClockProviding { let now: Date }
     struct Simulation {
-        var engine = CrySessionManager(clock: FixedClock(now: Date(timeIntervalSince1970: 1000)))
+        var engine: CrySessionManager = {
+            var snapshot = SessionSnapshot()
+            snapshot.configuration.alertDuration = 300
+            return CrySessionManager(snapshot: snapshot, clock: FixedClock(now: Date(timeIntervalSince1970: 1000)))
+        }()
         var time = Date(timeIntervalSince1970: 1000)
         let listener = UUID()
         var emitted: [CryAlert] = []
@@ -98,11 +102,26 @@ final class CrySessionTests: XCTestCase {
         recovered.delivered(id, at: s.time); recovered.delivered(id, at: s.time)
         XCTAssertTrue(recovered.snapshot.pending.isEmpty); XCTAssertNotNil(recovered.snapshot.history[0].alertSentAt)
     }
-    func testRepeatsAndReset() {
-        var s = Simulation(); var config = MonitoringConfiguration(); config.alertDuration = 30; config.repeatInterval = 120
+    func testListenerQueuesOnlyInitialAlertsAndServerOwnsRepeats() {
+        var s = Simulation(); var config = MonitoringConfiguration(); config.alertDuration = 30
         s.engine.configure(config); s.run(280)
-        XCTAssertEqual(s.emitted.count, 3); XCTAssertFalse(s.emitted[0].isRepeat); XCTAssertTrue(s.emitted[1].isRepeat)
-        s.run(30, loud: false); s.run(40); XCTAssertEqual(s.emitted.count, 4); XCTAssertFalse(s.emitted[3].isRepeat)
+        XCTAssertEqual(s.emitted.count, 1); XCTAssertFalse(s.emitted[0].isRepeat)
+        s.run(30, loud: false); s.run(40)
+        XCTAssertEqual(s.emitted.count, 2); XCTAssertFalse(s.emitted[1].isRepeat)
+    }
+    func testNewInstallDefaultsAndLegacyReminderMigration() throws {
+        let fresh = MonitoringConfiguration()
+        XCTAssertEqual(fresh.alertDuration, 5)
+        XCTAssertEqual(fresh.repeatInterval, 5)
+        XCTAssertEqual(fresh.snoozeDuration, 60)
+        for legacy in ["null", "15", "120", "300"] {
+            let data = Data("{\"alertDuration\":300,\"quietResetDuration\":20,\"repeatInterval\":\(legacy),\"absoluteThreshold\":-35}".utf8)
+            let restored = try JSONDecoder().decode(MonitoringConfiguration.self, from: data)
+            XCTAssertEqual(restored.alertDuration, 300)
+            XCTAssertEqual(restored.repeatInterval, 5)
+            XCTAssertEqual(restored.snoozeDuration, 60)
+            XCTAssertTrue(restored.isValid)
+        }
     }
     func testMissingSamplesDoNotCountAsCrying() {
         var s = Simulation(); s.run(60); s.time = s.time.addingTimeInterval(300); s.run(1)
@@ -138,13 +157,13 @@ final class CrySessionTests: XCTestCase {
             s.run(10, level: threshold)
             XCTAssertEqual(s.emitted.count, 1, "Expected detection at \(threshold) dBFS")
             XCTAssertEqual(s.emitted.first?.durationSeconds, 5)
-            // A due repeat waits for sound to reach the same absolute threshold again.
-            config.repeatInterval = 120; s.engine.configure(config)
+            // Continued sound never creates a competing Listener reminder.
+            s.engine.configure(config)
             s.run(119 - s.time.timeIntervalSince(s.emitted[0].createdAt), level: threshold)
             s.run(2, level: threshold - 0.01)
             XCTAssertEqual(s.emitted.count, 1)
             s.run(0.25, level: threshold)
-            XCTAssertEqual(s.emitted.count, 2)
+            XCTAssertEqual(s.emitted.count, 1)
         }
     }
     func testAbsoluteThresholdValidationAndPersistence() throws {
@@ -201,8 +220,8 @@ final class CrySessionTests: XCTestCase {
         let second = engine.queueTestAlert(listenerId: listener)
         XCTAssertEqual(first.isTest, true)
         XCTAssertEqual(first.listenerId, listener)
-        XCTAssertEqual(first.durationSeconds, 300)
-        XCTAssertEqual(first.createdAt.timeIntervalSince(first.cryStartedAt), 300)
+        XCTAssertEqual(first.durationSeconds, 5)
+        XCTAssertEqual(first.createdAt.timeIntervalSince(first.cryStartedAt), 5)
         XCTAssertNotEqual(first.eventId, second.eventId)
         XCTAssertNotEqual(first.episodeId, second.episodeId)
         XCTAssertFalse(engine.snapshot.wasMonitoring)
@@ -296,23 +315,24 @@ final class CrySessionTests: XCTestCase {
         other.alertSentAt = s.time
         XCTAssertEqual(restored.alertStatus(for: other), .sent)
     }
-    func testFailedRepeatIsVisibleAfterInitialDelivery() throws {
-        var s = Simulation()
-        var config = MonitoringConfiguration(); config.repeatInterval = 120
-        s.engine.configure(config); s.run(306)
+    func testDeliveryDoesNotCreateListenerRepeats() throws {
+        var s = Simulation(); s.run(306)
         s.engine.delivered(try XCTUnwrap(s.emitted.first?.eventId), at: s.time)
-        let first = try XCTUnwrap(s.engine.snapshot.current)
-        XCTAssertEqual(s.engine.snapshot.alertStatus(for: first), .sent)
-        s.run(120)
-        let episode = try XCTUnwrap(s.engine.snapshot.current)
-        XCTAssertEqual(s.engine.snapshot.alertStatus(for: episode), .pending)
-        s.engine.permanentlyFailed(try XCTUnwrap(s.emitted.last?.eventId), at: s.time)
-        XCTAssertEqual(s.engine.snapshot.alertStatus(for: episode), .failed)
-        s.run(120)
-        let later = try XCTUnwrap(s.engine.snapshot.current)
-        XCTAssertEqual(s.engine.snapshot.alertStatus(for: later), .pending)
-        s.engine.delivered(try XCTUnwrap(s.emitted.last?.eventId), at: s.time)
-        XCTAssertEqual(s.engine.snapshot.alertStatus(for: later), .sent)
-        XCTAssertEqual(s.engine.snapshot.failedAlerts.count, 1)
+        s.run(600)
+        XCTAssertEqual(s.emitted.count, 1)
+        XCTAssertTrue(s.engine.snapshot.pending.isEmpty)
+        XCTAssertEqual(s.engine.snapshot.alertStatus(for: try XCTUnwrap(s.engine.snapshot.current)), .sent)
     }
+    func testSnoozeSelectionValidationAndPersistence() throws {
+        for duration in MonitoringConfiguration.snoozeDurations {
+            var config = MonitoringConfiguration(); config.snoozeDuration = duration
+            XCTAssertTrue(config.isValid)
+            XCTAssertEqual(try JSONDecoder().decode(MonitoringConfiguration.self, from: JSONEncoder().encode(config)).snoozeDuration, duration)
+        }
+        for duration in [0.0, 30, 61, .infinity, .nan] {
+            var config = MonitoringConfiguration(); config.snoozeDuration = duration
+            XCTAssertFalse(config.isValid)
+        }
+    }
+
 }

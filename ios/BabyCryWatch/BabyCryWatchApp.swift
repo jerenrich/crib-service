@@ -29,7 +29,11 @@ import UserNotifications
     }
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
         let alert = WatchCryAlert.notification(notification.request.content)
-        await MainActor.run { if let alert { WatchModel.shared.receive(alert) } }
+        let hasSound = notification.request.content.sound != nil
+        await MainActor.run {
+            WatchModel.shared.log.record("watch_foreground_notification", code: hasSound ? 1 : 0)
+            if let alert { WatchModel.shared.receive(alert) }
+        }
         return [.banner, .list, .sound]
     }
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {

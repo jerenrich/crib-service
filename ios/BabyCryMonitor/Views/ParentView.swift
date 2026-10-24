@@ -4,17 +4,40 @@ struct ParentView: View {
     @Environment(AppModel.self) private var model
     @State private var pairing = false
     @State private var readiness = false
+    @State private var overnightSetup = false
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
-            HStack { Caption(text: "Nursery"); Spacer(); StatusPill(text: model.nurseryConnection, active: model.parentOnline) }
+            HStack { Caption(text: "Parent Mode"); Spacer(); StatusPill(text: model.nurseryConnection, active: model.parentOnline) }
             PrimaryButton(title: "Ready for tonight?") { readiness = true }
+            if model.paired {
+                Panel {
+                    Label("Local connection warning", systemImage: "wifi.exclamationmark").font(.headline)
+                    if let failure = model.parentConnectionWarningError {
+                        Text("Warning unavailable: \(failure)").foregroundStyle(Palette.amber)
+                    } else if let deadline = model.parentConnectionDeadline {
+                        Text(model.now >= deadline ? "Server check overdue. Check both phones and your internet connection." : "Armed · Warns after 3 minutes without a successful server check.")
+                            .foregroundStyle(model.now >= deadline ? Palette.amber : Palette.mint)
+                    } else {
+                        Text("Starts when monitoring is active and connection-loss alerts are enabled.").foregroundStyle(Palette.muted)
+                    }
+                    Text("Once armed, this iPhone can warn without internet. Keep Parent Mode open for ongoing checks. Locking the phone or leaving the app may pause checks and also trigger the warning. iPhone Silent Mode and Focus can silence it.")
+                        .font(.footnote).foregroundStyle(Palette.muted)
+                }
+            }
             if let alert = model.activeAlert {
                 Panel {
                     Label(alert.isTest == true ? "Test notification" : "Crying alert", systemImage: "bell.badge").font(.title2.weight(.semibold)).foregroundStyle(Palette.amber)
-                    Text(alert.isTest == true ? "The Listener simulated the \(durationText(alert.durationSeconds)) alert threshold." : "Sound has continued for \(durationText(alert.durationSeconds)).").font(.title3)
+                    Text(alert.isTest == true ? "The Listener simulated the \(durationText(alert.durationSeconds)) alert threshold." : "Crying-like sound was detected. Check on baby and acknowledge this alert.").font(.title3)
                     Text(alert.isTest == true ? "Sent \(alert.createdAt.formatted(date: .omitted, time: .shortened))" : "Started \(alert.cryStartedAt.formatted(date: .omitted, time: .shortened))").foregroundStyle(Palette.muted)
                     Text("Delivery: \(alert.status)").font(.caption).foregroundStyle(Palette.muted)
+                    if alert.isTest != true { Text("Acknowledge to snooze crying alerts for \(durationText(model.configuration.snoozeDuration)).").font(.footnote).foregroundStyle(Palette.muted) }
                     PrimaryButton(title: "Acknowledge") { Task { await model.acknowledge(alert.eventId) } }
+                }
+            }
+            if let until = model.parentStatus?.alertsMutedUntil, until > model.now {
+                Panel {
+                    Label("Crying alerts snoozed", systemImage: "bell.slash").font(.headline)
+                    Text("Alerts resume at \(until.formatted(date: .omitted, time: .shortened)). Connection-loss alerts stay on.").font(.footnote).foregroundStyle(Palette.muted)
                 }
             }
             Panel {
@@ -53,11 +76,18 @@ struct ParentView: View {
                 Label("Apple Watch", systemImage: "applewatch").font(.headline)
                 Text(model.watch.status).font(.subheadline).foregroundStyle(Palette.muted)
                 Text("Open Crib Service on your Watch and enable alerts. Turn on Watch Silent Mode and Prominent Haptic Alerts for a vibration-only nudge.").font(.footnote).foregroundStyle(Palette.muted)
-                Text("Send a test push from the nursery Listener before sleeping. Delivery depends on connectivity, Focus, and Watch settings; an alert may not wake you.").font(.footnote).foregroundStyle(Palette.muted)
+                Button("Guided overnight setup & watch test") { overnightSetup = true }
+                Text("Use Ready for tonight? → Guided overnight setup to check Sleep Focus and test a wrist alert before sleeping.").font(.footnote).foregroundStyle(Palette.muted)
             }
             Panel { Caption(text: "Connection"); Text(model.deliveryStatus).font(.subheadline).foregroundStyle(Palette.muted); Text(model.notifications.status).font(.subheadline).foregroundStyle(Palette.muted) }
         }.sheet(isPresented: $pairing) { PairingView() }
             .sheet(isPresented: $readiness) { ReadinessView() }
+            .sheet(isPresented: $overnightSetup) {
+                NavigationStack {
+                    OvernightSetupView()
+                        .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { overnightSetup = false } } }
+                }.tint(Palette.mint)
+            }
     }
     private var babyState: String {
         guard model.parentOnline else { return model.nurseryConnection }

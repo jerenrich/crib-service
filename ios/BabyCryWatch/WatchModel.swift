@@ -14,6 +14,15 @@ import UserNotifications
     private(set) var refreshing = false
     var acknowledgementPending: Bool { alertState.acknowledgementPending }
     var notice: String?
+    private(set) var notificationAlerts = "Checking…"
+    private(set) var notificationSounds = "Checking…"
+    private(set) var notificationTimeSensitive = "Checking…"
+    private(set) var notificationWarning: String?
+    private(set) var connectionWarningDeadline: Date?
+    private(set) var connectionWarningError: String?
+    @ObservationIgnored private var connectionWarningTask: Task<Void, Never>?
+    @ObservationIgnored private var connectionWarningUpdatePending = false
+    private static let scheduledWarningKey = "scheduledConnectionWarningDeadline"
     private let alertState = WatchAlertState()
 
     override private init() {
@@ -34,13 +43,20 @@ import UserNotifications
             WCSession.default.delegate = self
             WCSession.default.activate()
         }
+        // The pending OS notification survives suspension/relaunch. Do not
+        // reschedule a previously delivered deadline merely by opening the app.
+        let deadline = snapshot.localConnectionDeadline
+        connectionWarningDeadline = deadline
+        if deadline == nil || UserDefaults.standard.object(forKey: Self.scheduledWarningKey) as? Date != deadline {
+            updateConnectionWarning(deadline, force: true)
+        }
     }
 
     func foreground() async {
         log.record("foreground")
         alertState.retryPendingAcknowledgement()
         if alertSetup.phase != .requestingPermission {
-            let settings = await UNUserNotificationCenter.current().notificationSettings()
+            let settings = await inspectNotificationSettings()
             alertSetup.updateAuthorization(settings.authorizationStatus == .authorized,
                                            denied: settings.authorizationStatus == .denied,
                                            registeredOnPhone: snapshot.watchPushRegistered)
@@ -51,6 +67,29 @@ import UserNotifications
             alertSetup.retryRegistration()
         }
         refresh()
+        if connectionWarningError != nil { updateConnectionWarning(connectionWarningDeadline, force: true) }
+    }
+    @discardableResult private func inspectNotificationSettings() async -> UNNotificationSettings {
+        let settings = await UNUserNotificationCenter.current().notificationSettings()
+        func label(_ value: UNNotificationSetting) -> String {
+            switch value {
+            case .enabled: "Enabled"
+            case .disabled: "Disabled"
+            case .notSupported: "Not supported"
+            @unknown default: "Unknown"
+            }
+        }
+        notificationAlerts = label(settings.alertSetting)
+        notificationSounds = label(settings.soundSetting)
+        notificationTimeSensitive = label(settings.timeSensitiveSetting)
+        log.record("watch_notification_authorization", code: settings.authorizationStatus.rawValue)
+        log.record("watch_alert_permission", code: settings.alertSetting.rawValue)
+        log.record("watch_sound_permission", code: settings.soundSetting.rawValue)
+        log.record("watch_time_sensitive_permission", code: settings.timeSensitiveSetting.rawValue)
+        notificationWarning = settings.alertSetting == .disabled || settings.soundSetting == .disabled
+            ? "Check Crib Service in your iPhone's Watch → Notifications settings. Allow notifications and check its sound/haptic options. Global Prominent Haptics does not change this app's notification permissions."
+            : nil
+        return settings
     }
     func enableAlerts() async {
         guard alertSetup.phase != .requestingPermission else { return }
@@ -84,12 +123,13 @@ import UserNotifications
         log.record("watch_push_received")
         alertState.handleNotification(value, acknowledging: acknowledging)
     }
-    func acknowledge() { alertState.acknowledgeCurrent() }
+    func acknowledge() { log.record("watch_acknowledgement_requested"); alertState.acknowledgeCurrent() }
     func previewHaptic() async {
-        await WatchAlertHaptics.play(for: .seconds(4.5)) { self.alert == nil }
+        await WatchAlertHaptics.play(for: .seconds(4.5), log: log) { self.alert == nil }
     }
 
     func scheduleWristTest() async {
+        await inspectNotificationSettings()
         if !notificationsAllowed { await enableAlerts() }
         guard notificationsAllowed else { return }
         let content = UNMutableNotificationContent()
@@ -98,7 +138,7 @@ import UserNotifications
         content.sound = .default
         content.interruptionLevel = .timeSensitive
         do {
-            try await UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "watch-wrist-test", content: content, trigger: UNTimeIntervalNotificationTrigger(timeInterval: 10, repeats: false)))
+            try await UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "watch-wrist-test-\(UUID().uuidString)", content: content, trigger: UNTimeIntervalNotificationTrigger(timeInterval: 10, repeats: false)))
             log.record("local_notification_scheduled")
             notice = "Test in 10 seconds. Lower your wrist. Use Silent Mode for vibration only."
         } catch { notice = "Could not schedule the wrist test. Try again."; log.record("local_notification_failed", error: error) }
@@ -109,12 +149,38 @@ import UserNotifications
         alertState.confirmAcknowledgement(value.acknowledgedEventId)
         guard value.updatedAt >= snapshot.updatedAt || !snapshot.parentMode else { return }
         snapshot = value
+        updateConnectionWarning(value.localConnectionDeadline)
         alertSetup.accept(value)
         log.record("watch_snapshot_received")
         do { UserDefaults.standard.set(try JSONEncoder().encode(value), forKey: "watchSnapshot") }
         catch { log.record("watch_snapshot_failed", error: error) }
         notice = value.message
         alertState.acceptAlert(from: value)
+    }
+
+    private func updateConnectionWarning(_ deadline: Date?, force: Bool = false) {
+        guard force || deadline != connectionWarningDeadline else { return }
+        connectionWarningDeadline = deadline
+        connectionWarningUpdatePending = true
+        guard connectionWarningTask == nil else { return }
+        connectionWarningTask = Task { [weak self] in
+            guard let self else { return }
+            while self.connectionWarningUpdatePending {
+                let requested = self.connectionWarningDeadline
+                self.connectionWarningUpdatePending = false
+                do {
+                    try await ConnectionWarningNotification.apply(deadline: requested, watch: true)
+                    if let requested { UserDefaults.standard.set(requested, forKey: Self.scheduledWarningKey) }
+                    else { UserDefaults.standard.removeObject(forKey: Self.scheduledWarningKey) }
+                    if !self.connectionWarningUpdatePending { self.connectionWarningError = nil }
+                    self.log.record(requested == nil ? "parent_connection_warning_cancelled" : "parent_connection_warning_armed")
+                } catch {
+                    if !self.connectionWarningUpdatePending { self.connectionWarningError = error.localizedDescription }
+                    self.log.record("parent_connection_warning_failed", error: error)
+                }
+            }
+            self.connectionWarningTask = nil
+        }
     }
 
     @discardableResult private func send(_ command: WatchCommand, durable: Bool = false) -> Bool {
@@ -129,7 +195,7 @@ import UserNotifications
         }
         if durable { session.transferUserInfo(["command": data]) }
         guard session.isReachable else {
-            if command.kind == .refresh { notice = "Open Parent mode on the paired iPhone to refresh. Registered push alerts use the Watch's internet connection." }
+            if command.kind == .refresh { notice = "Open Parent Mode on the paired iPhone to refresh. Registered push alerts use the Watch's internet connection." }
             else { notice = "Queued for your iPhone. Open the Parent app to finish syncing." }
             return durable
         }
@@ -179,21 +245,28 @@ import UserNotifications
 @MainActor enum WatchAlertHaptics {
     /// Three distinct notification haptics, then a pause before the next burst.
     /// Leave time for each system haptic to finish; rapid calls cut it short.
-    static func play(for duration: Duration, while shouldContinue: () -> Bool) async {
+    static func play(for duration: Duration, log: DiagnosticLog? = nil, while shouldContinue: () -> Bool) async {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: duration)
         let spacing: [Duration] = [.seconds(1.5), .seconds(1.5), .seconds(2.5)]
+        var requested = false
+        log?.record("watch_haptic_started")
         do {
             while clock.now < deadline {
                 for delay in spacing {
-                    guard !Task.isCancelled, clock.now < deadline,
-                          WKApplication.shared().applicationState == .active,
-                          shouldContinue() else { return }
+                    guard !Task.isCancelled, clock.now < deadline, shouldContinue() else {
+                        log?.record("watch_haptic_stopped"); return
+                    }
+                    guard WKApplication.shared().applicationState == .active else {
+                        log?.record("watch_haptic_inactive"); return
+                    }
                     WKInterfaceDevice.current().play(.notification)
+                    if !requested { log?.record("watch_haptic_requested"); requested = true }
                     try await clock.sleep(until: min(clock.now.advanced(by: delay), deadline))
                 }
             }
         } catch {
+            log?.record("watch_haptic_stopped")
             // SwiftUI cancels the task on acknowledgement, navigation, or inactivity.
         }
     }

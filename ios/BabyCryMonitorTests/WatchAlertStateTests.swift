@@ -172,4 +172,38 @@ final class WatchAlertStateTests: XCTestCase {
         state.acceptAlert(from: WatchSnapshot(alert: alert))
         XCTAssertNil(state.alert)
     }
+    @MainActor func testSameEpisodeCanAlertAgainAfterFiveMinuteMute() throws {
+        let fixture = try Fixture()
+        let now = Date(timeIntervalSince1970: 1000)
+        let state = WatchAlertState(defaults: fixture.defaults, currentTime: { now })
+        let initial = WatchCryAlert(eventId: UUID(), episodeId: UUID(), startedAt: now,
+                                    createdAt: now, duration: 5, isTest: false)
+        state.acceptAlert(from: WatchSnapshot(snoozeDuration: 300))
+        state.receive(initial); state.acknowledgeCurrent()
+        state.confirmAcknowledgement(initial.eventId)
+        let before = WatchCryAlert(eventId: UUID(), episodeId: initial.episodeId, startedAt: now,
+                                   createdAt: now.addingTimeInterval(299), duration: 5, isTest: false)
+        state.receive(before); XCTAssertNil(state.alert)
+        let after = WatchCryAlert(eventId: UUID(), episodeId: initial.episodeId, startedAt: now,
+                                  createdAt: now.addingTimeInterval(300), duration: 5, isTest: false)
+        state.receive(after); XCTAssertEqual(state.alert, after)
+        // Retained pre-mute notifications never restart the old alert.
+        state.receive(initial); XCTAssertEqual(state.alert, after)
+    }
+
+    @MainActor func testDefaultSnoozeIsOneMinuteAndNewSettingsDoNotChangeExistingSnooze() throws {
+        let fixture = try Fixture()
+        let now = Date(timeIntervalSince1970: 1000)
+        let state = WatchAlertState(defaults: fixture.defaults, currentTime: { now })
+        let initial = WatchCryAlert(eventId: UUID(), episodeId: UUID(), startedAt: now, createdAt: now, duration: 5, isTest: false)
+        state.receive(initial); state.acknowledgeCurrent(); state.confirmAcknowledgement(initial.eventId)
+        state.acceptAlert(from: WatchSnapshot(snoozeDuration: 300))
+        let before = WatchCryAlert(eventId: UUID(), episodeId: initial.episodeId, startedAt: now,
+                                   createdAt: now.addingTimeInterval(59), duration: 5, isTest: false)
+        state.receive(before); XCTAssertNil(state.alert)
+        let after = WatchCryAlert(eventId: UUID(), episodeId: initial.episodeId, startedAt: now,
+                                  createdAt: now.addingTimeInterval(60), duration: 5, isTest: false)
+        state.receive(after); XCTAssertEqual(state.alert, after)
+    }
+
 }

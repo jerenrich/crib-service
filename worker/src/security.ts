@@ -17,10 +17,12 @@ function onlyKeys(value:Record<string,unknown>, keys:string[]) {if(Object.keys(v
 export function date(value:unknown):string {if(typeof value!=='string'||!/^\d{4}-\d{2}-\d{2}T/.test(value)||!Number.isFinite(Date.parse(value)))throw new APIError(400,'Invalid timestamp.');return new Date(value).toISOString();}
 export function configuration(value:Record<string,unknown>):Configuration {
  // Accept and discard the retired field in saved settings and older requests.
- onlyKeys(value,['alertDuration','quietResetDuration','sensitivity','repeatInterval','absoluteThreshold']);
+ onlyKeys(value,['alertDuration','quietResetDuration','sensitivity','repeatInterval','absoluteThreshold','snoozeDuration']);
  const {alertDuration,quietResetDuration,repeatInterval,absoluteThreshold}=value;
- if(typeof alertDuration!=='number'||!Number.isFinite(alertDuration)||alertDuration<5||alertDuration>3600||typeof quietResetDuration!=='number'||![10,20,30,60].includes(quietResetDuration)||(repeatInterval!=null&&!([120,300] as unknown[]).includes(repeatInterval))||typeof absoluteThreshold!=='number'||!Number.isFinite(absoluteThreshold)||absoluteThreshold < -60||absoluteThreshold > -10)throw new APIError(400,'Invalid monitoring configuration.');
- return {alertDuration,quietResetDuration,repeatInterval:repeatInterval as number|null|undefined,absoluteThreshold};
+ const snoozeDuration=value.snoozeDuration??60;
+ if(!([60,120,300,600,900] as unknown[]).includes(snoozeDuration))throw new APIError(400,'Invalid snooze duration.');
+ if(typeof alertDuration!=='number'||!Number.isFinite(alertDuration)||alertDuration<5||alertDuration>3600||typeof quietResetDuration!=='number'||![10,20,30,60].includes(quietResetDuration)||(repeatInterval!=null&&!([5,15,120,300] as unknown[]).includes(repeatInterval))||typeof absoluteThreshold!=='number'||!Number.isFinite(absoluteThreshold)||absoluteThreshold < -60||absoluteThreshold > -10)throw new APIError(400,'Invalid monitoring configuration.');
+ return {alertDuration,quietResetDuration,repeatInterval:5,absoluteThreshold,snoozeDuration:snoozeDuration as number};
 }
 function episode(value:unknown):Episode {
  if(!value||typeof value!=='object'||Array.isArray(value))throw new APIError(400,'Invalid episode.');

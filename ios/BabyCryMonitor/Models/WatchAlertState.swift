@@ -9,10 +9,23 @@ import Observation
     @ObservationIgnored private let defaults: UserDefaults
     private var localAlert: WatchCryAlert?
     private var acknowledgedEpisodes: [UUID]
+    private var acknowledgedUntil: [String: Double]
+    private let currentTime: () -> Date
+    private var snoozeDuration: TimeInterval
+    private var mutedUntil: Date?
     private var pendingAcknowledgements: [UUID]
 
-    init(defaults: UserDefaults = .standard) {
+    init(defaults: UserDefaults = .standard, currentTime: @escaping () -> Date = Date.init) {
         self.defaults = defaults
+        self.currentTime = currentTime
+        snoozeDuration = defaults.object(forKey: "snoozeDuration") as? Double ?? 60
+        mutedUntil = defaults.object(forKey: "cryAlertsMutedUntil") as? Date
+        if let saved = defaults.dictionary(forKey: "episodeMutedUntil") as? [String: Double] {
+            acknowledgedUntil = saved
+        } else {
+            let legacy = defaults.dictionary(forKey: "episodeAcknowledgedAt") as? [String: Double] ?? [:]
+            acknowledgedUntil = legacy.mapValues { $0 + 300 }
+        }
         acknowledgedEpisodes = (defaults.stringArray(forKey: "acknowledgedEpisodes") ?? []).compactMap(UUID.init(uuidString:))
         if let saved = defaults.stringArray(forKey: "pendingAcknowledgements") {
             pendingAcknowledgements = saved.compactMap(UUID.init(uuidString:))
@@ -24,7 +37,7 @@ import Observation
     }
 
     func receive(_ value: WatchCryAlert) {
-        guard !acknowledgedEpisodes.contains(value.episodeId) else { return }
+        guard !isSuppressed(value) else { return }
         localAlert = value
         alert = value
     }
@@ -40,7 +53,9 @@ import Observation
     }
 
     private func acknowledge(_ value: WatchCryAlert) {
-        guard !acknowledgedEpisodes.contains(value.episodeId) else { return }
+        guard !isSuppressed(value) else { return }
+        acknowledgedUntil[value.episodeId.uuidString] = currentTime().timeIntervalSince1970 + snoozeDuration
+        acknowledgedEpisodes.removeAll { $0 == value.episodeId }
         acknowledgedEpisodes.append(value.episodeId)
         acknowledgedEpisodes = Array(acknowledgedEpisodes.suffix(100))
         pendingAcknowledgements.append(value.eventId)
@@ -52,7 +67,15 @@ import Observation
     }
 
     func acceptAlert(from value: WatchSnapshot) {
-        if let incoming = value.alert, !acknowledgedEpisodes.contains(incoming.episodeId) {
+        snoozeDuration = value.snoozeDuration ?? 60
+        if value.statusAvailable {
+            mutedUntil = value.alertsMutedUntil
+            if let until = mutedUntil, until > currentTime() {
+                for id in acknowledgedEpisodes { acknowledgedUntil[id.uuidString] = until.timeIntervalSince1970 }
+            }
+        }
+        persist()
+        if let incoming = value.alert, !isSuppressed(incoming) {
             if localAlert == nil || incoming.createdAt >= localAlert!.createdAt { alert = incoming }
         } else if value.statusAvailable && (localAlert == nil || value.updatedAt >= localAlert!.createdAt) {
             alert = nil; localAlert = nil
@@ -73,7 +96,19 @@ import Observation
         sendAcknowledgement?(WatchCommand(kind: .acknowledge, eventId: eventID))
     }
 
+    private func isSuppressed(_ value: WatchCryAlert) -> Bool {
+        if !value.isTest, let mutedUntil, value.createdAt < mutedUntil { return true }
+        guard acknowledgedEpisodes.contains(value.episodeId) else { return false }
+        guard let time = acknowledgedUntil[value.episodeId.uuidString] else { return true }
+        // Old notifications stay dismissed; a new alert after the mute may wake again.
+        return value.createdAt.timeIntervalSince1970 < time
+    }
+
     private func persist() {
+        acknowledgedUntil = acknowledgedUntil.filter { acknowledgedEpisodes.map(\.uuidString).contains($0.key) }
+        defaults.set(acknowledgedUntil, forKey: "episodeMutedUntil")
+        defaults.set(snoozeDuration, forKey: "snoozeDuration")
+        defaults.set(mutedUntil, forKey: "cryAlertsMutedUntil")
         defaults.set(acknowledgedEpisodes.map(\.uuidString), forKey: "acknowledgedEpisodes")
         defaults.set(pendingAcknowledgements.map(\.uuidString), forKey: "pendingAcknowledgements")
         defaults.removeObject(forKey: "pendingAcknowledgement")

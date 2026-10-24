@@ -48,7 +48,7 @@ for name, folder, kind in [('BabyCryMonitor', 'BabyCryMonitor', 'application'), 
     targets.append(obj('target'+name, fields(isa='PBXNativeTarget', buildConfigurationList=configList, buildPhases=array(phases), buildRules='()', dependencies=array(dependencies) if dependencies else '()', name=name, productName=name, productReference=product, productType=q('com.apple.product-type.'+kind))))
 # Modern, single-target watchOS companion; shared messages stay Foundation-only.
 watchName = 'BabyCryWatch'
-watchFiles = sorted((ios/watchName).rglob('*.swift')) + [ios/'BabyCryMonitor/Utilities/DiagnosticLog.swift', ios/'BabyCryMonitor/Models/Models.swift', ios/'BabyCryMonitor/Models/WatchMessages.swift', ios/'BabyCryMonitor/Models/WatchAlertState.swift', ios/'BabyCryMonitor/Models/WatchAlertSetup.swift', ios/watchName/'Info.plist', ios/watchName/'BabyCryWatch.entitlements', ios/watchName/'Assets.xcassets', ios/'BabyCryMonitor/PrivacyInfo.xcprivacy']
+watchFiles = sorted((ios/watchName).rglob('*.swift')) + [ios/'BabyCryMonitor/Utilities/DiagnosticLog.swift', ios/'BabyCryMonitor/Utilities/ConnectionWarningNotification.swift', ios/'BabyCryMonitor/Models/Models.swift', ios/'BabyCryMonitor/Models/WatchMessages.swift', ios/'BabyCryMonitor/Models/WatchAlertState.swift', ios/'BabyCryMonitor/Models/WatchAlertSetup.swift', ios/watchName/'Info.plist', ios/watchName/'BabyCryWatch.entitlements', ios/watchName/'Assets.xcassets', ios/'BabyCryMonitor/PrivacyInfo.xcprivacy']
 watchRefs = []; watchSources = []; watchResources = []
 for path in watchFiles:
     rel = path.relative_to(ios).as_posix()

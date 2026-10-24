@@ -26,6 +26,8 @@ import UIKit
     var needsRestart = false
     var managingDevice = false
     var changingConnectionAlerts = false
+    private(set) var parentConnectionDeadline: Date?
+    private(set) var parentConnectionWarningError: String?
     var calibration = SoundCalibration()
     var calibrationPhase = "idle"
     var calibrationMessage: String?
@@ -68,6 +70,8 @@ import UIKit
     @ObservationIgnored private var lastSavedAt = Date.distantPast
     @ObservationIgnored private var lastHeartbeatAt = Date.distantPast
     @ObservationIgnored private var lastRefreshAt = Date.distantPast
+    @ObservationIgnored private var nextParentRefreshAt = Date.distantPast
+    @ObservationIgnored private var parentRefreshTask: Task<Void, Never>?
     @ObservationIgnored private var uploadedToken: String?
     @ObservationIgnored private var pushToken: String?
     @ObservationIgnored private var pendingWatchToken: String?
@@ -79,6 +83,11 @@ import UIKit
     @ObservationIgnored private var settingsDirty = false
     @ObservationIgnored private var environmentRevision = 0
     @ObservationIgnored private var latestTestEventID: UUID?
+    @ObservationIgnored private var parentWarningTask: Task<Void, Never>?
+    @ObservationIgnored private var parentWarningUpdatePending = false
+    @ObservationIgnored private var parentWarningRetryAt: Date?
+    private static let parentWarningDeadlineKey = "parentConnectionWarningDeadline"
+    private static let parentWarningScopeKey = "parentConnectionWarningScope"
 
     init(defaults: UserDefaults = .standard, metadataStore: MetadataStore? = nil,
          log: DiagnosticLog = DiagnosticLog(),
@@ -104,6 +113,12 @@ import UIKit
         backendURL = defaults.string(forKey: "backendURL") ?? (Bundle.main.object(forInfoDictionaryKey: "BackendURL") as? String ?? "")
         do {
             let store = try metadataStore ?? MetadataStore(); self.store = store
+            #if DEBUG
+            if ProcessInfo.processInfo.arguments.contains("--uitesting-reset"),
+               ProcessInfo.processInfo.arguments.contains("--uitesting-offline") {
+                try store.save(SessionSnapshot())
+            }
+            #endif
             let saved = try store.load(); needsRestart = saved.wasMonitoring
             engine = CrySessionManager(snapshot: saved); engine.recoverAfterRelaunch()
             configuration = engine.snapshot.configuration
@@ -117,6 +132,7 @@ import UIKit
         (audio as? AudioLevelMonitor)?.log = log
         notifications.onToken = { [weak self] token in self?.pushToken = token; self?.uploadedToken = nil; self?.log.record("push_token_received") }
         notifications.onAlert = { [weak self] in self?.log.record("push_received"); Task { await self?.refreshParent() } }
+        notifications.onAcknowledge = { [weak self] id in await self?.acknowledge(id) }
         watch.onCommand = { [weak self] command in
             guard let self else { return WatchSnapshot() }
             return await self.handleWatch(command)
@@ -144,11 +160,20 @@ import UIKit
             }
         }
         loadCredential()
+        // Keep an already scheduled warning across relaunch; never postpone it just
+        // because the app starts or a network path becomes available.
+        if role == .parent, paired,
+           defaults.string(forKey: Self.parentWarningScopeKey) == parentWarningScope,
+           let deadline = defaults.object(forKey: Self.parentWarningDeadlineKey) as? Date {
+            parentConnectionDeadline = deadline
+        } else {
+            setParentConnectionDeadline(nil, force: true)
+        }
     }
     deinit {
         loopTask?.cancel(); networkTask?.cancel(); audioTask?.cancel()
         settingsTask?.cancel(); heartbeatTask?.cancel()
-        listenerStatusTask?.cancel()
+        listenerStatusTask?.cancel(); parentRefreshTask?.cancel()
     }
     var snapshot: SessionSnapshot { engine.snapshot }
     var state: CryState { engine.detector.state }
@@ -183,9 +208,11 @@ import UIKit
     func acceptSafety() { safetyAccepted = true; defaults.set(true, forKey: "safetyAccepted") }
     func selectRole(_ value: DeviceRole) {
         guard !managingDevice else { return }
+        setParentConnectionDeadline(nil)
         cancelCalibration()
         stop(); environmentRevision += 1; role = value; defaults.set(value.rawValue, forKey: "role")
         parentStatus = nil; pairingCode = nil; credential = nil; uploadedToken = nil; loadCredential()
+        nextParentRefreshAt = .distantPast
         testPushStatus = nil; latestTestEventID = nil
         hasPendingWatchToken = false; pendingWatchToken = nil
         publishWatch()
@@ -196,9 +223,11 @@ import UIKit
         guard let url = URL(string: value.trimmingCharacters(in: .whitespacesAndNewlines)), url.scheme == "https",
               url.host != nil, url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
               url.path.isEmpty || url.path == "/" else { error = "Enter the HTTPS origin of your deployed Worker."; return }
+        setParentConnectionDeadline(nil)
         environmentRevision += 1; backendURL = url.absoluteString
         defaults.set(backendURL, forKey: "backendURL")
         credential = nil; parentStatus = nil; pairingCode = nil; uploadedToken = nil
+        nextParentRefreshAt = .distantPast
         testPushStatus = nil; latestTestEventID = nil
         hasPendingWatchToken = false; pendingWatchToken = nil
         loadCredential()
@@ -408,6 +437,49 @@ import UIKit
             stop(); error = "Monitoring stopped: microphone samples stopped arriving."; needsRestart = true; log.record("audio_stalled")
         }
         scheduleHeartbeatIfDue()
+        if let retry = parentWarningRetryAt, now >= retry, parentWarningTask == nil {
+            parentWarningUpdatePending = true
+            dispatchParentConnectionWarning()
+        }
+    }
+    private var parentWarningScope: String { "\(backendURL)|\(credential?.deviceId.uuidString ?? "none")" }
+    private func setParentConnectionDeadline(_ deadline: Date?, force: Bool = false) {
+        guard force || deadline != parentConnectionDeadline else { return }
+        parentConnectionDeadline = deadline
+        if let deadline {
+            defaults.set(deadline, forKey: Self.parentWarningDeadlineKey)
+            defaults.set(parentWarningScope, forKey: Self.parentWarningScopeKey)
+        } else {
+            defaults.removeObject(forKey: Self.parentWarningDeadlineKey)
+            defaults.removeObject(forKey: Self.parentWarningScopeKey)
+        }
+        parentWarningUpdatePending = true
+        parentWarningRetryAt = nil
+        dispatchParentConnectionWarning()
+    }
+    private func dispatchParentConnectionWarning() {
+        guard parentWarningTask == nil else { return }
+        parentWarningTask = Task { [weak self] in
+            guard let self else { return }
+            while self.parentWarningUpdatePending {
+                let deadline = self.parentConnectionDeadline
+                self.parentWarningUpdatePending = false
+                do {
+                    try await self.notifications.setParentConnectionDeadline(deadline)
+                    if !self.parentWarningUpdatePending {
+                        self.parentConnectionWarningError = nil; self.parentWarningRetryAt = nil
+                    }
+                    self.log.record(deadline == nil ? "parent_connection_warning_cancelled" : "parent_connection_warning_armed")
+                } catch {
+                    if !self.parentWarningUpdatePending {
+                        self.parentConnectionWarningError = error.localizedDescription
+                        self.parentWarningRetryAt = self.currentTime().addingTimeInterval(15)
+                    }
+                    self.log.record("parent_connection_warning_failed", error: error)
+                }
+            }
+            self.parentWarningTask = nil
+        }
     }
     func tick() async {
         #if DEBUG
@@ -435,7 +507,7 @@ import UIKit
                     }
                     await syncWatchCommands()
                 }
-                if now.timeIntervalSince(lastRefreshAt) >= 15 { await refreshParent() }
+                if currentTime() >= nextParentRefreshAt { await refreshParent() }
             } else if role == .listener {
                 refreshListenerPairing(using: client)
                 guard paired else { return }
@@ -582,17 +654,33 @@ import UIKit
     }
     func refreshParent() async {
         guard role == .parent else { return }
+        if let task = parentRefreshTask { await task.value; return }
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.fetchParentStatus()
+        }
+        parentRefreshTask = task
+        await task.value
+        parentRefreshTask = nil
+    }
+    private func fetchParentStatus() async {
         let revision = environmentRevision, generation = settingsGeneration
         do {
             let client = try await registeredClient(); let status = try await client.status()
             guard revision == environmentRevision, role == .parent else { return }
             parentStatus = status; paired = status.paired; defaults.set(paired, forKey: pairingKey)
+            // Only a successful server response renews the local warning. A failed
+            // or suspended request leaves the previous OS notification untouched.
+            let warn = status.paired && status.monitoring == true && status.connectionAlertsEnabled != false
+            setParentConnectionDeadline(warn ? currentTime().addingTimeInterval(ConnectionWarningNotification.timeout) : nil)
             if !settingsDirty, generation == settingsGeneration { applyRemote(status.configuration) }
-            lastRefreshAt = Date(); deliveryStatus = "Connected"; error = nil
+            nextParentRefreshAt = currentTime().addingTimeInterval(status.refreshDelay())
+            deliveryStatus = "Connected"; error = nil
             publishWatch()
         } catch {
-            guard revision == environmentRevision else { return }
+            guard revision == environmentRevision, role == .parent else { return }
             deliveryStatus = "Status unavailable: \(error.localizedDescription)"; parentStatus = nil
+            nextParentRefreshAt = currentTime().addingTimeInterval(15)
             log.record("parent_status_failed", error: error)
             publishWatch()
         }
@@ -630,20 +718,48 @@ import UIKit
         do { let client = try await registeredClient(); try await client.acknowledge(id); await refreshParent() }
         catch { self.error = error.localizedDescription; log.record("acknowledgement_failed", error: error) }
     }
-    func requestParentTest() async {
-        guard role == .parent, paired, !sendingTestPush else { return }
+    var canTestWatchAlert: Bool {
+        role == .parent && paired && parentStatus?.watchPushRegistered == true && !sendingTestPush && !managingDevice
+    }
+    @discardableResult func requestParentTest(requiresWatch: Bool = false) async -> Bool {
+        guard role == .parent, paired, !sendingTestPush, !managingDevice else { return false }
         sendingTestPush = true; defer { sendingTestPush = false }
+        let revision = environmentRevision
+        if requiresWatch {
+            await refreshParent()
+            guard revision == environmentRevision, role == .parent, paired else { return false }
+            guard parentStatus?.watchPushRegistered == true else {
+                testPushStatus = "Open Crib Service on your Watch and enable alerts, then refresh Watch registration here."
+                return false
+            }
+        }
         testPushStatus = "Sending a real test notification…"
         do {
-            let client = try await registeredClient(); try await client.requestTestPush()
-            testPushStatus = "Test requested. Lock this iPhone and check your receiving phone or Watch, then confirm receipt below."
+            let client = try await registeredClient()
+            guard revision == environmentRevision else { return false }
+            try await client.requestTestPush()
+            guard revision == environmentRevision else { return false }
+            testPushStatus = requiresWatch
+                ? "Test requested. Lock this iPhone and wait for a test notification and wrist tap on your Watch. Confirm only if you feel it."
+                : "Test requested. Lock this iPhone and check your receiving phone or Watch, then confirm receipt below."
             await refreshParent()
-        } catch { testPushStatus = "Test could not be sent: \(error.localizedDescription)"; log.record("test_push_failed", error: error) }
+            return revision == environmentRevision && role == .parent && paired
+        } catch {
+            guard revision == environmentRevision else { return false }
+            testPushStatus = "Test could not be sent: \(error.localizedDescription)"; log.record("test_push_failed", error: error)
+            return false
+        }
     }
     func setConnectionAlerts(_ enabled: Bool) async {
         guard role == .parent, !changingConnectionAlerts else { return }
         changingConnectionAlerts = true; defer { changingConnectionAlerts = false }
-        do { let client = try await registeredClient(); try await client.connectionAlerts(enabled); await refreshParent() }
+        let revision = environmentRevision
+        do {
+            let client = try await registeredClient(); try await client.connectionAlerts(enabled)
+            guard revision == environmentRevision, role == .parent else { return }
+            if !enabled { setParentConnectionDeadline(nil) }
+            await refreshParent()
+        }
         catch { self.error = error.localizedDescription; log.record("connection_preferences_failed", error: error) }
     }
     func removePairing(deleteDevice: Bool) async {
@@ -666,6 +782,7 @@ import UIKit
             for key in watchKeys { defaults.removeObject(forKey: key) }
             defaults.removeObject(forKey: pairingKey + "|identity")
             paired = false; defaults.set(false, forKey: pairingKey)
+            setParentConnectionDeadline(nil)
             parentStatus = nil; pairingCode = nil; needsRestart = false
             settingsDirty = false; defaults.set(false, forKey: "settingsDirty")
             engine = CrySessionManager(); configuration = engine.snapshot.configuration; persist()
@@ -726,9 +843,13 @@ import UIKit
         value.statusAvailable = value.parentMode && parentStatus != nil
         value.lastHeartbeat = value.parentMode ? parentStatus?.lastHeartbeat : nil
         value.monitoring = value.parentMode && parentStatus?.monitoring == true
+        value.connectionWarningSupported = true
+        value.connectionWarningDeadline = value.parentMode && paired ? parentConnectionDeadline : nil
         value.state = value.parentMode ? parentStatus?.state : nil
         value.alertDuration = configuration.alertDuration
+        value.snoozeDuration = configuration.snoozeDuration
         value.watchPushRegistered = value.parentMode && parentStatus?.watchPushRegistered == true
+        value.alertsMutedUntil = value.parentMode ? parentStatus?.alertsMutedUntil : nil
         value.acknowledgedEventId = defaults.string(forKey: watchConfirmedKey).flatMap(UUID.init(uuidString:))
         if value.parentMode, let alert = activeAlert {
             value.alert = WatchCryAlert(eventId: alert.eventId, episodeId: alert.episodeId, startedAt: alert.cryStartedAt,
@@ -740,7 +861,7 @@ import UIKit
     private func publishWatch() { watch.publish(watchSnapshot()) }
 
     private func handleWatch(_ command: WatchCommand) async -> WatchSnapshot {
-        guard role == .parent else { return watchSnapshot(message: "Choose Parent Alerts on your paired iPhone.") }
+        guard role == .parent else { return watchSnapshot(message: "Choose Parent Mode on your paired iPhone.") }
         switch command.kind {
         case .refresh: break
         case .registerToken:

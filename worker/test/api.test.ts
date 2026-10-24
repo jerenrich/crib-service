@@ -1,4 +1,5 @@
-import {env,applyD1Migrations} from 'cloudflare:test';
+import {runReminder} from '../src/reminders';
+import {env,applyD1Migrations,runInDurableObject,runDurableObjectAlarm} from 'cloudflare:test';
 import {beforeAll,afterEach,beforeEach,describe,it,expect,vi} from 'vitest';
 import worker from '../src/index';
 import {defaultConfiguration,type Env,type Alert} from '../src/types';
@@ -48,16 +49,19 @@ beforeEach(async()=>{
   if(response instanceof Error)throw response;return response;
  }));
 });
-afterEach(()=>{expect(pushResponses).toHaveLength(0);vi.unstubAllGlobals();});
+afterEach(()=>{try{expect(pushResponses).toHaveLength(0);}finally{vi.unstubAllGlobals();vi.restoreAllMocks();}});
 
 describe('connection alerts, readiness and replacement',()=>{
  const beat=(listener:TestDevice,monitoring=true,appliedConfiguration=defaultConfiguration)=>({listenerId:listener.deviceId,timestamp:new Date().toISOString(),monitoring,powerConnected:true,state:'quiet',episodes:[],appliedConfiguration});
  async function stale(){await env.DB.prepare('UPDATE heartbeats SET received_at=?').bind(new Date(Date.now()-240000).toISOString()).run();}
- it('requires parent opt-in and emits one notice per outage plus recovery',async()=>{
+ it('defaults connection alerts on, respects opt-out and emits one notice per outage plus recovery',async()=>{
   const {parent,listener}=await paired();
   await call('device/push-token',parent,{token:'ab'.repeat(32)});
   expect((await call('connection-alerts',listener,{enabled:true})).status).toBe(403);
   expect((await call('connection-alerts',parent,{enabled:'yes'})).status).toBe(400);
+  const initial=await (await call('listener/status',parent,undefined,'GET')).json() as {connectionAlertsEnabled:boolean};
+  expect(initial.connectionAlertsEnabled).toBe(true);
+  await call('connection-alerts',parent,{enabled:false});
   await call('listener/heartbeat',listener,beat(listener));
   await stale();await flushConnections(testEnv);expect(pushRequests).toHaveLength(0);
   await call('listener/heartbeat',listener,beat(listener));await flushConnections(testEnv);
@@ -68,13 +72,32 @@ describe('connection alerts, readiness and replacement',()=>{
   await call('listener/heartbeat',listener,beat(listener));mockPush();await flushConnections(testEnv);await flushConnections(testEnv);
   expect(pushRequests).toHaveLength(2);content=JSON.parse(String(pushRequests[1].init?.body));expect(content.connectionState).toBe('online');
  });
- it('reports stopped monitoring but does not warn before first start',async()=>{
-  const {parent,listener}=await paired();await call('connection-alerts',parent,{enabled:true});
+ it('defaults stopped-monitor warnings on but does not warn before first start',async()=>{
+  const {parent,listener}=await paired();
   await call('device/push-token',parent,{token:'ab'.repeat(32)});
   await call('listener/heartbeat',listener,beat(listener,false));await flushConnections(testEnv);expect(pushRequests).toHaveLength(0);
   await call('listener/heartbeat',listener,beat(listener));
   await call('listener/heartbeat',listener,beat(listener,false));mockPush();await flushConnections(testEnv);await flushConnections(testEnv);
   expect(pushRequests).toHaveLength(1);expect(JSON.parse(String(pushRequests[0].init?.body)).connectionState).toBe('stopped');
+ });
+ it('uses scheduled checks to warn the Watch after three minutes without a heartbeat, even during snooze',async()=>{
+  const {parent,listener}=await paired();
+  await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
+  await call('listener/heartbeat',listener,beat(listener));
+  await env.DB.prepare('UPDATE devices SET alerts_muted_until=? WHERE id=?').bind(Date.now()+60000,parent.deviceId).run();
+  const check=()=>worker.scheduled({} as ScheduledController,testEnv);
+  await env.DB.prepare('UPDATE heartbeats SET received_at=?').bind(new Date(Date.now()-179000).toISOString()).run();
+  await check();expect(pushRequests).toHaveLength(0);
+  await env.DB.prepare('UPDATE heartbeats SET received_at=?').bind(new Date(Date.now()-181000).toISOString()).run();
+  mockPush();await check();await check();
+  expect(pushRequests).toHaveLength(1);expect(pushRequests[0].url).toContain('cd'.repeat(32));
+  const content=JSON.parse(String(pushRequests[0].init?.body));
+  expect(content.connectionState).toBe('offline');
+  expect(content.aps.alert.title).toBe('Listener connection lost');
+  expect(content.aps.sound).toBe('default');
+  expect(content.aps['interruption-level']).toBe('time-sensitive');
+  expect((await env.DB.prepare('SELECT status FROM connection_notices').first<{status:string}>())?.status).toBe('sent');
  });
  it('does not replay ambiguous health delivery and cancels obsolete outages',async()=>{
   const {parent,listener}=await paired();await call('connection-alerts',parent,{enabled:true});
@@ -240,8 +263,23 @@ describe('listener metadata and configuration',()=>{
   expect((await call('settings',parent,config)).status).toBe(200);
   const beat={listenerId:listener.deviceId,timestamp:'2000-01-01T00:00:00Z',monitoring:true,batteryLevel:0.8,powerConnected:true,state:'quiet',episodes:[]};
   const response=await call('listener/heartbeat',listener,beat);expect(response.status).toBe(200);expect(await response.json()).toEqual(config);
-  const status=await (await call('listener/status',parent,undefined,'GET')).json() as {lastHeartbeat:string;monitoring:boolean};
+  const status=await (await call('listener/status',parent,undefined,'GET')).json() as {lastHeartbeat:string;monitoring:boolean;serverTime:string;nextHeartbeatExpectedAt:string};
   expect(Date.parse(status.lastHeartbeat)).toBeGreaterThan(Date.now()-5000);expect(status.monitoring).toBe(true);
+  expect(Date.parse(status.nextHeartbeatExpectedAt)-Date.parse(status.lastHeartbeat)).toBe(15000);
+  expect(Date.parse(status.serverTime)).toBeGreaterThanOrEqual(Date.parse(status.lastHeartbeat));
+  const again=await (await call('listener/status',parent,undefined,'GET')).json() as typeof status;
+  expect(again.nextHeartbeatExpectedAt).toBe(status.nextHeartbeatExpectedAt);
+ });
+ it('only predicts the next heartbeat for an actively monitoring Listener',async()=>{
+  const {parent,listener}=await paired();
+  const status=async()=>await (await call('listener/status',parent,undefined,'GET')).json() as {nextHeartbeatExpectedAt:string|null;serverTime:string};
+  expect((await status()).nextHeartbeatExpectedAt).toBeNull();
+  await call('listener/heartbeat',listener,{listenerId:listener.deviceId,timestamp:new Date().toISOString(),monitoring:false,powerConnected:true,state:'quiet',episodes:[]});
+  expect((await status()).nextHeartbeatExpectedAt).toBeNull();
+  await call('pairing/remove',parent);
+  const unpaired=await status();
+  expect(unpaired.nextHeartbeatExpectedAt).toBeNull();
+  expect(Number.isFinite(Date.parse(unpaired.serverTime))).toBe(true);
  });
  it('rejects audio fields, identities and invalid settings',async()=>{
   const {parent,listener}=await paired();const beat={listenerId:listener.deviceId,timestamp:new Date().toISOString(),monitoring:true,powerConnected:true,state:'quiet',episodes:[]};
@@ -363,7 +401,7 @@ describe('APNs and durable idempotent alerts',()=>{
  });
  it('omits audible sound and signs an ES256 provider JWT',async()=>{
   const notification=payload(alert(device('listener')));expect(notification.aps).not.toHaveProperty('sound');
-  expect(notification.aps.alert.title).toBe('Baby is still crying');
+  expect(notification.aps.alert.title).toBe('Baby is crying');
   expect(notification).not.toHaveProperty('isTest');
   const token=await apnsToken(testEnv);expect(token.split('.')).toHaveLength(3);
   const header=JSON.parse(atob(token.split('.')[0]));expect(header.alg).toBe('ES256');
@@ -453,10 +491,9 @@ describe('APNs and durable idempotent alerts',()=>{
   await flushPending(testEnv);
   expect(await (await call('listener/event',listener,event)).json()).toEqual({status:'acknowledged'});
   expect(pushRequests).toHaveLength(0);
-  // Acknowledging existing events must not suppress a later enabled reminder.
-  mockPush();
-  expect(await (await call('listener/event',listener,{...event,eventId:crypto.randomUUID(),isRepeat:true})).json()).toEqual({status:'sent'});
-  expect(pushRequests).toHaveLength(1);
+  // Late reminders from older clients are silenced during the five-minute mute.
+  expect(await (await call('listener/event',listener,{...event,eventId:crypto.randomUUID(),isRepeat:true})).json()).toEqual({status:'acknowledged'});
+  expect(pushRequests).toHaveLength(0);
  });
  it('does not retry a pending APNs rejection once the Parent acknowledges it',async()=>{
   const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
@@ -566,4 +603,164 @@ describe('private operational diagnostics',()=>{
   await recordDiagnostic(testEnv,{requestId:crypto.randomUUID(),operation:'status',stage:'handler',outcome:'ok',started:Date.now()});
   expect((await env.DB.prepare('SELECT sequence FROM diagnostics').all()).results).toHaveLength(1);
  });
+});
+
+describe('5-second reminders and acknowledgement mute',()=>{
+ async function ready() {
+  const pair=await paired();await call('device/push-token',pair.parent,{token:'ab'.repeat(32)});
+  // The simulated episode began five minutes ago, after this seeded pairing.
+  await env.DB.prepare('UPDATE pairs SET created_at=created_at-600000 WHERE parent_id=?').bind(pair.parent.deviceId).run();
+  const event=alert(pair.listener);mockPush();
+  expect((await call('listener/event',pair.listener,event)).status).toBe(200);
+  return {...pair,event};
+ }
+ function advance(seconds:number) {
+  const time=Date.now()+seconds*1000;vi.spyOn(Date,'now').mockReturnValue(time);return time;
+ }
+ async function heartbeat(listener:TestDevice,event:Alert,state='crying') {
+  await call('listener/heartbeat',listener,{listenerId:listener.deviceId,timestamp:new Date(Date.now()).toISOString(),monitoring:true,powerConnected:true,state,
+   episodes:[],currentEpisode:state==='crying'?{id:event.episodeId,startedAt:event.cryStartedAt}:null});
+  await env.DB.prepare('UPDATE heartbeats SET received_at=? WHERE listener_id=?').bind(new Date(Date.now()).toISOString(),listener.deviceId).run();
+ }
+ it('uses five seconds for new devices and migrates retired reminder choices',async()=>{
+  const {parent}=await paired();
+  const status=await (await call('listener/status',parent,undefined,'GET')).json() as {configuration:typeof defaultConfiguration};
+  expect(status.configuration).toEqual({...defaultConfiguration,alertDuration:5,repeatInterval:5});
+  for(const repeatInterval of [null,15,120,300]) {
+   await call('settings',parent,{...defaultConfiguration,alertDuration:60,repeatInterval});
+   const saved=await (await call('listener/status',parent,undefined,'GET')).json() as typeof status;
+   expect(saved.configuration).toEqual({...defaultConfiguration,alertDuration:60,repeatInterval:5});
+  }
+ });
+ it('persists a timer and duplicate uploads do not postpone it',async()=>{
+  const {parent,listener,event}=await ready();
+  const stub=testEnv.ALERT_REMINDERS.getByName(parent.deviceId);
+  const first=await runInDurableObject(stub,async(_instance,state)=>state.storage.getAlarm());
+  expect(first).toBeGreaterThan(Date.now());expect(first).toBeLessThanOrEqual(Date.now()+5000);
+  await call('listener/event',listener,event);
+  expect(await runInDurableObject(stub,async(_instance,state)=>state.storage.getAlarm())).toBe(first);
+ });
+ it('advances a persisted 15-second timer to the new five-second cadence',async()=>{
+  const {parent,listener,event}=await ready();
+  const stub=testEnv.ALERT_REMINDERS.getByName(parent.deviceId);
+  await runInDurableObject(stub,async(_instance,state)=>state.storage.setAlarm(Date.now()+15000));
+  await call('listener/event',listener,event);
+  const next=await runInDurableObject(stub,async(_instance,state)=>state.storage.getAlarm());
+  expect(next).toBeGreaterThan(Date.now());expect(next).toBeLessThanOrEqual(Date.now()+5000);
+ });
+ it('sends nothing before 5 seconds, then repeats even when the Listener is quiet',async()=>{
+  const {parent,listener,event}=await ready();await heartbeat(listener,event,'quiet');
+  advance(4);await runReminder(testEnv,parent.deviceId);expect(pushRequests).toHaveLength(1);
+  advance(1);mockPush();await runReminder(testEnv,parent.deviceId);expect(pushRequests).toHaveLength(2);
+  const reminder=JSON.parse(String(pushRequests[1].init?.body));
+  expect(reminder.eventId).not.toBe(event.eventId);expect(reminder.episodeId).toBe(event.episodeId);
+  expect(reminder.aps.alert.title).toContain('Reminder');expect(reminder.aps.alert.body).toContain('Settings');
+  const headers=pushRequests[1].init?.headers as Record<string,string>;
+  expect(Number(headers['apns-expiration'])).toBe(Math.floor(Date.now()/1000)+5);
+  expect(headers['apns-collapse-id']).toBe(event.episodeId);
+  advance(5);mockPush();await runReminder(testEnv,parent.deviceId);expect(pushRequests).toHaveLength(3);
+ });
+ it('creates only one reminder for a source event under concurrent work',async()=>{
+  const {parent}=await ready();advance(5);mockPush();
+  await Promise.all([runReminder(testEnv,parent.deviceId),runReminder(testEnv,parent.deviceId)]);
+  expect(pushRequests).toHaveLength(2);
+ });
+ it('acknowledges all crying alerts and idempotent retries do not extend the one-minute default',async()=>{
+  const {parent,listener,event}=await ready();
+  expect((await call('alert/acknowledge',parent,{eventId:event.eventId})).status).toBe(200);
+  const mute=await env.DB.prepare('SELECT alerts_muted_until FROM devices WHERE id=?').bind(parent.deviceId).first<{alerts_muted_until:number}>();
+  expect(mute!.alerts_muted_until-Date.now()).toBeGreaterThan(59000);
+  advance(15);await runReminder(testEnv,parent.deviceId);
+  const later={...alert(listener),cryStartedAt:new Date(Date.now()-300000).toISOString(),createdAt:new Date(Date.now()).toISOString()};
+  expect(await (await call('listener/event',listener,later)).json()).toEqual({status:'acknowledged'});
+  await call('alert/acknowledge',parent,{eventId:event.eventId});
+  const status=await (await call('listener/status',parent,undefined,'GET')).json() as {alertsMutedUntil:string};
+  expect(Date.parse(status.alertsMutedUntil)).toBe(mute!.alerts_muted_until);
+  expect(pushRequests).toHaveLength(1);
+ });
+ it('does not replay delayed offline alerts created during the mute after it expires',async()=>{
+  const {parent,listener,event}=await ready();await call('alert/acknowledge',parent,{eventId:event.eventId});
+  const created=Date.now()+30000;
+  const queued={...alert(listener),createdAt:new Date(created).toISOString(),cryStartedAt:new Date(created-300000).toISOString()};
+  advance(61);
+  expect(await (await call('listener/event',listener,queued)).json()).toEqual({status:'acknowledged'});
+  expect(pushRequests).toHaveLength(1);
+ });
+ it('resumes an ongoing crying episode after the one-minute default and permits another acknowledgement',async()=>{
+  const {parent,listener,event}=await ready();await call('alert/acknowledge',parent,{eventId:event.eventId});
+  advance(59);await heartbeat(listener,event);await runReminder(testEnv,parent.deviceId);expect(pushRequests).toHaveLength(1);
+  advance(2);await heartbeat(listener,event);mockPush();await runReminder(testEnv,parent.deviceId);
+  expect(pushRequests).toHaveLength(2);
+  const reminder=JSON.parse(String(pushRequests[1].init?.body));
+  expect((await call('alert/acknowledge',parent,{eventId:reminder.eventId})).status).toBe(200);
+  advance(15);await runReminder(testEnv,parent.deviceId);expect(pushRequests).toHaveLength(2);
+ });
+ it('stops after the mute if quiet, stale, or unpaired',async()=>{
+  const {parent,listener,event}=await ready();await call('alert/acknowledge',parent,{eventId:event.eventId});
+  advance(61);expect(await runReminder(testEnv,parent.deviceId)).toBe(false);
+  await heartbeat(listener,event,'quiet');expect(await runReminder(testEnv,parent.deviceId)).toBe(false);
+  await call('pairing/remove',parent);expect(await runReminder(testEnv,parent.deviceId)).toBe(false);
+  expect(pushRequests).toHaveLength(1);
+ });
+ it('does not repeat test notifications or let their acknowledgement mute real alerts',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  const test={...alert(listener),isTest:true};mockPush();await call('listener/event',listener,test);
+  await call('alert/acknowledge',parent,{eventId:test.eventId});advance(15);
+  expect(await runReminder(testEnv,parent.deviceId)).toBe(false);
+  const mute=await env.DB.prepare('SELECT alerts_muted_until FROM devices WHERE id=?').bind(parent.deviceId).first<{alerts_muted_until:number}>();
+  expect(mute?.alerts_muted_until).toBe(0);expect(pushRequests).toHaveLength(1);
+ });
+ it('clears the durable timer after unpairing and resets the mute for replacement',async()=>{
+  const {parent,event}=await ready();await call('alert/acknowledge',parent,{eventId:event.eventId});
+  const stub=testEnv.ALERT_REMINDERS.getByName(parent.deviceId);
+  const mute=await env.DB.prepare('SELECT alerts_muted_until FROM devices WHERE id=?').bind(parent.deviceId).first<{alerts_muted_until:number}>();
+  expect(await runInDurableObject(stub,async(_instance,state)=>state.storage.getAlarm())).toBe(mute!.alerts_muted_until);
+  await call('pairing/remove',parent);
+  expect(await runDurableObjectAlarm(stub)).toBe(true);
+  expect(await runInDurableObject(stub,async(_instance,state)=>state.storage.getAlarm())).toBeNull();
+  expect((await env.DB.prepare('SELECT alerts_muted_until FROM devices WHERE id=?').bind(parent.deviceId).first<{alerts_muted_until:number}>())?.alerts_muted_until).toBe(0);
+ });
+ it('does not acknowledge new alerts when retrying an old acknowledgement',async()=>{
+  const {parent,listener,event}=await ready();await call('alert/acknowledge',parent,{eventId:event.eventId});
+  advance(61);const createdAt=new Date(Date.now()).toISOString();
+  const later={...alert(listener),createdAt,cryStartedAt:createdAt,durationSeconds:0};mockPush();await call('listener/event',listener,later);
+  await call('alert/acknowledge',parent,{eventId:event.eventId});
+  const saved=await env.DB.prepare('SELECT acknowledged_at FROM events WHERE event_id=?').bind(later.eventId).first<{acknowledged_at:string|null}>();
+  expect(saved?.acknowledged_at).toBeNull();
+ });
+ it('re-arms on a fresh heartbeat after a stale mute-expiry check',async()=>{
+  const {parent,listener,event}=await ready();await call('alert/acknowledge',parent,{eventId:event.eventId});
+  advance(61);expect(await runReminder(testEnv,parent.deviceId)).toBe(false);
+  await heartbeat(listener,event);mockPush();expect(await runReminder(testEnv,parent.deviceId)).toBe(true);
+  expect(pushRequests).toHaveLength(2);
+ });
+ it('keeps connection alerts active during the crying-alert mute',async()=>{
+  const {parent,listener,event}=await ready();await heartbeat(listener,event);
+  await call('alert/acknowledge',parent,{eventId:event.eventId});
+  await call('listener/heartbeat',listener,{listenerId:listener.deviceId,timestamp:new Date().toISOString(),monitoring:false,powerConnected:true,state:'quiet',episodes:[]});
+  mockPush();await flushConnections(testEnv);expect(pushRequests).toHaveLength(2);
+  expect(JSON.parse(String(pushRequests[1].init?.body)).connectionState).toBe('stopped');
+ });
+
+ it('does not turn an expired initial offline event into a fresh reminder',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  await env.DB.prepare('UPDATE pairs SET created_at=created_at-172800000 WHERE parent_id=?').bind(parent.deviceId).run();
+  const created=Date.now()-90000000;
+  const old={...alert(listener),createdAt:new Date(created).toISOString(),cryStartedAt:new Date(created-300000).toISOString()};
+  expect(await (await call('listener/event',listener,old)).json()).toEqual({status:'failed'});
+  expect(await runReminder(testEnv,parent.deviceId)).toBe(false);expect(pushRequests).toHaveLength(0);
+ });
+
+ it('uses the selected snooze without changing a snooze already in progress',async()=>{
+  const {parent,event}=await ready();
+  await call('settings',parent,{...defaultConfiguration,snoozeDuration:300});
+  await call('alert/acknowledge',parent,{eventId:event.eventId});
+  const first=await env.DB.prepare('SELECT alerts_muted_until,alerts_muted_at FROM devices WHERE id=?').bind(parent.deviceId).first<{alerts_muted_until:number;alerts_muted_at:number}>();
+  expect(first!.alerts_muted_until-first!.alerts_muted_at).toBe(300000);
+  await call('settings',parent,{...defaultConfiguration,snoozeDuration:60});
+  const current=await env.DB.prepare('SELECT alerts_muted_until FROM devices WHERE id=?').bind(parent.deviceId).first<{alerts_muted_until:number}>();
+  expect(current!.alerts_muted_until).toBe(first!.alerts_muted_until);
+  for(const snoozeDuration of [0,30,61,3600,'60'])expect((await call('settings',parent,{...defaultConfiguration,snoozeDuration})).status).toBe(400);
+ });
+
 });

@@ -15,11 +15,20 @@ struct WatchHomeView: View {
                         if let alert = model.alert { alertCard(alert, now: context.date) }
                         else { nurseryCard(now: context.date) }
                         if model.acknowledgementPending {
-                            Text("Wrist silenced. Acknowledgement queued for iPhone.").font(.caption2).foregroundStyle(.orange)
+                            Text("Acknowledgement queued for iPhone. The snooze starts when it syncs.").font(.caption2).foregroundStyle(.orange)
+                        }
+                        if let until = model.snapshot.alertsMutedUntil, until > context.date {
+                            Text("Crying alerts snoozed. Resume at \(until.formatted(date: .omitted, time: .shortened)).").font(.caption2).foregroundStyle(.secondary)
                         }
                         NavigationLink { WatchSetupView() } label: {
                             Label("Wrist alerts", systemImage: "applewatch.radiowaves.left.and.right")
                         }.font(.footnote)
+                        if let failure = model.connectionWarningError {
+                            Text("Local connection warning unavailable: \(failure)").font(.caption2).foregroundStyle(.orange)
+                        } else if let deadline = model.connectionWarningDeadline {
+                            Text(context.date >= deadline ? "Connection check overdue · Check both phones" : "Offline warning armed · 3 minute timeout")
+                                .font(.caption2).foregroundStyle(context.date >= deadline ? .orange : mint)
+                        }
                         if let notice = model.notice {
                             Text(notice).font(.caption2).foregroundStyle(.secondary).multilineTextAlignment(.center)
                         }
@@ -51,7 +60,7 @@ struct WatchHomeView: View {
         .task(id: hapticKey) {
             guard phase == .active, let alert = model.alert, alert.isRecent(at: Date()) else { return }
             // Foreground reminder only. Background delivery belongs to APNs/watchOS.
-            await WatchAlertHaptics.play(for: .seconds(180)) {
+            await WatchAlertHaptics.play(for: .seconds(180), log: model.log) {
                 phase == .active && model.alert?.eventId == alert.eventId && alert.isRecent(at: Date())
             }
         }
@@ -80,7 +89,7 @@ struct WatchHomeView: View {
                     Text("Heartbeat \(last.formatted(.relative(presentation: .numeric)))").font(.caption2).foregroundStyle(.secondary)
                 }
             } else {
-                Text(model.snapshot.parentMode ? "Pair a nursery Listener on your iPhone." : "Choose Parent Alerts on your paired iPhone.")
+                Text(model.snapshot.parentMode ? "Pair a nursery Listener on your iPhone." : "Choose Parent Mode on your paired iPhone.")
                     .font(.caption2).foregroundStyle(.secondary).multilineTextAlignment(.center)
             }
         }
@@ -92,6 +101,7 @@ struct WatchHomeView: View {
             Text(alert.isTest ? "A test from your Listener." : "Crying-like sound continued for \(duration(alert.duration)).").font(.footnote).multilineTextAlignment(.center)
             Text("Sent \(alert.createdAt.formatted(date: .omitted, time: .shortened))").font(.caption2).foregroundStyle(.secondary)
             if !alert.isRecent(at: now) { Text("Earlier alert · Check current nursery status.").font(.caption2).foregroundStyle(.orange) }
+            if !alert.isTest { Text("Acknowledge to snooze crying alerts for \(duration(model.snapshot.snoozeDuration ?? 60)).").font(.caption2).foregroundStyle(.secondary) }
         }.padding(.vertical, 8)
     }
     private func stateTitle(online: Bool) -> String {
@@ -126,13 +136,24 @@ struct WatchSetupView: View {
                 Text(model.alertSetup.detail)
                     .font(.caption2)
                     .foregroundStyle(model.alertSetup.phase == .blocked ? .orange : .secondary)
-                Text("1. Keep your paired iPhone in Parent mode while enabling alerts.\n\n2. On Watch, turn on Silent Mode and Sounds & Haptics → Haptic Alerts → Prominent.\n\n3. Allow this app in Sleep Focus, including Time Sensitive Notifications. Wear your Watch unlocked with enough battery.")
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Notification permissions").font(.footnote.weight(.semibold))
+                    LabeledContent("Alerts", value: model.notificationAlerts)
+                    LabeledContent("Sounds", value: model.notificationSounds)
+                    LabeledContent("Time Sensitive", value: model.notificationTimeSensitive)
+                }.font(.caption2)
+                if let warning = model.notificationWarning {
+                    Text(warning).font(.caption2).foregroundStyle(.orange)
+                }
+                Text("1. Keep your paired iPhone in Parent Mode while enabling alerts.\n\n2. On Watch, turn on Silent Mode and Sounds & Haptics → Haptic Alerts → Prominent.\n\n3. Allow this app in Sleep Focus, including Time Sensitive Notifications. Wear your Watch unlocked with enough battery.")
                     .font(.caption2).foregroundStyle(.secondary)
                 Button(previewingHaptic ? "Playing alert burst…" : "Feel alert pattern") { previewingHaptic = true }
                     .disabled(previewingHaptic || model.alert != nil)
                 Button("Test in 10 seconds") { Task { await model.scheduleWristTest() } }
                     .disabled(model.alertSetup.phase == .requestingPermission)
                 Text("The wrist test checks this Watch only. Send a test push from the nursery Listener to verify the full connection before sleeping.")
+                    .font(.caption2).foregroundStyle(.secondary)
+                Text("The local connection warning works without internet once armed. It warns 3 minutes after the last verified Parent server check. Keep Parent Mode open: iOS may pause checks when the phone is locked or backgrounded, which also triggers this warning. Watch notification, Focus and haptic settings still apply.")
                     .font(.caption2).foregroundStyle(.secondary)
                 Text("While the app is active, recent alerts repeat three-tap bursts for up to 3 minutes. Tap Acknowledge to stop. watchOS controls background vibration; use Prominent Haptics for a more noticeable wrist alert.")
                     .font(.caption2).foregroundStyle(.secondary)

@@ -3,14 +3,28 @@ import Foundation
 public enum DeviceRole: String, Codable, CaseIterable, Sendable { case listener, parent }
 public struct MonitoringConfiguration: Codable, Equatable, Sendable {
     public static let soundThresholds = Array(stride(from: -60.0, through: -10.0, by: 5.0))
-    public var alertDuration: TimeInterval = 300
+    public var alertDuration: TimeInterval = 5
+    public static let snoozeDurations: [TimeInterval] = [60, 120, 300, 600, 900]
+    public var snoozeDuration: TimeInterval = 60
     public var quietResetDuration: TimeInterval = 20
-    public var repeatInterval: TimeInterval? = nil
+    public var repeatInterval: TimeInterval? = 5
     public var absoluteThreshold: Double = -35
     public init() {}
+    private enum CodingKeys: String, CodingKey {
+        case alertDuration, quietResetDuration, repeatInterval, absoluteThreshold, snoozeDuration
+    }
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        alertDuration = try values.decode(TimeInterval.self, forKey: .alertDuration)
+        quietResetDuration = try values.decode(TimeInterval.self, forKey: .quietResetDuration)
+        absoluteThreshold = try values.decode(Double.self, forKey: .absoluteThreshold)
+        snoozeDuration = try values.decodeIfPresent(TimeInterval.self, forKey: .snoozeDuration) ?? 60
+        // The server now owns reminders. Migrate the retired Off/15-second/2/5-minute choices.
+        repeatInterval = 5
+    }
     public var isValid: Bool {
         alertDuration.isFinite && (5...3600).contains(alertDuration) && [10.0, 20, 30, 60].contains(quietResetDuration)
-        && (repeatInterval == nil || [120.0, 300].contains(repeatInterval))
+        && repeatInterval == 5 && Self.snoozeDurations.contains(snoozeDuration)
         && absoluteThreshold.isFinite && (-60 ... -10).contains(absoluteThreshold)
     }
 }

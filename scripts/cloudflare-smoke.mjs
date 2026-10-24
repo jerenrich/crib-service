@@ -43,7 +43,9 @@ try {
     const code = await request('pairing/create', parent);
     check(code.status === 200 && /^\d{6}$/.test(code.body.code), 'pairing code created');
     check((await request('pairing/claim', listener, {code: code.body.code})).status === 200, 'secure pairing claim');
-    const config = {alertDuration: 5, quietResetDuration: 20, repeatInterval: null, absoluteThreshold: -45};
+    const defaults = await request('listener/status', parent, null, 'GET');
+    check(defaults.body.configuration?.alertDuration === 5 && defaults.body.configuration?.snoozeDuration === 60, 'new-device five-second threshold and one-minute snooze');
+    const config = {alertDuration: 5, quietResetDuration: 20, repeatInterval: 5, absoluteThreshold: -45, snoozeDuration: 120};
     check((await request('settings', parent, config)).status === 200, 'five-second shared settings accepted');
     check((await request('settings', parent, {...config, alertDuration: 4})).status === 400, 'durations below five seconds rejected');
     for (const absoluteThreshold of [-60.01, -9.99]) {
@@ -55,14 +57,20 @@ try {
     };
     const heartbeat = await request('listener/heartbeat', listener, beat);
     check(heartbeat.status === 200 && heartbeat.body.alertDuration === 5, 'listener receives five-second configuration');
+    check(heartbeat.body.repeatInterval === 5, 'listener receives five-second repeat schedule');
     check(heartbeat.body.absoluteThreshold === -45 && !('sensitivity' in heartbeat.body), 'listener receives fixed -45 dBFS threshold without sensitivity');
     const status = await request('listener/status', parent, null, 'GET');
     check(status.status === 200 && status.body.paired && status.body.listenerId === listener.deviceId && status.body.monitoring === true, 'parent status and listener identity');
+    check(Date.parse(status.body.nextHeartbeatExpectedAt) - Date.parse(status.body.lastHeartbeat) === 15000, 'next heartbeat estimate is anchored 15 seconds after server receipt');
+    check(Date.parse(status.body.serverTime) >= Date.parse(status.body.lastHeartbeat), 'server clock supplied for adaptive polling');
+    const repeatedStatus = await request('listener/status', parent, null, 'GET');
+    check(repeatedStatus.body.nextHeartbeatExpectedAt === status.body.nextHeartbeatExpectedAt, 'repeated polling does not postpone the expected heartbeat');
     check(status.body.configuration?.alertDuration === 5, 'parent sees the same five-second configuration');
     check(status.body.listenerConfiguration?.alertDuration === 5, 'Listener applied-settings acknowledgement');
     check(status.body.configuration?.absoluteThreshold === -45 && status.body.listenerConfiguration?.absoluteThreshold === -45, 'Parent sees the selected and applied fixed threshold');
     check(/^[0-9a-f-]{36}$/i.test(status.requestId ?? '') && status.diagnostics === 'recorded', 'live diagnostic request reference recorded');
-    check(status.body.connectionAlertsEnabled === false, 'connection alerts default off');
+    check(status.body.connectionAlertsEnabled === true, 'connection alerts default on');
+    check(status.body.configuration?.snoozeDuration === 120 && status.body.listenerConfiguration?.snoozeDuration === 120, 'configurable snooze syncs to Listener and Parent');
     check((await request('connection-alerts', listener, {enabled: true})).status === 403, 'connection preferences restricted to Parent');
     check((await request('connection-alerts', parent, {enabled: true})).status === 200, 'connection alert opt-in');
     check((await request('listener/status', parent, null, 'GET')).body.connectionAlertsEnabled === true, 'connection alert preference persisted');
@@ -71,6 +79,18 @@ try {
     check(test.status === 200 && test.body.status === 'blocked', 'marked real-test route blocked safely without push tokens');
     const testStatus = await request('listener/status', parent, null, 'GET');
     check(testStatus.body.alerts?.length === 1 && testStatus.body.alerts[0].isTest === true, 'test event clearly marked in Parent status');
+    const createdAt = new Date();
+    const realAlert = {eventId: randomUUID(), episodeId: randomUUID(), listenerId: listener.deviceId, type: 'sustained_cry',
+        cryStartedAt: new Date(createdAt.getTime() - 5000).toISOString(), durationSeconds: 5, createdAt: createdAt.toISOString(), isRepeat: false};
+    const real = await request('listener/event', listener, realAlert);
+    check(real.status === 200 && real.body.status === 'blocked', 'real alert schedules durable reminders without sending a push');
+    check((await request('alert/acknowledge', parent, {eventId: realAlert.eventId})).status === 200, 'real alert acknowledgement starts configured snooze');
+    const snoozed = await request('listener/status', parent, null, 'GET');
+    const remaining = Date.parse(snoozed.body.alertsMutedUntil) - Date.now();
+    check(remaining > 110000 && remaining <= 120000, 'selected two-minute snooze is active on the live backend');
+    check((await request('alert/acknowledge', parent, {eventId: testStatus.body.alerts[0].eventId})).status === 200, 'test acknowledgement accepted');
+    const afterTest = await request('listener/status', parent, null, 'GET');
+    check(afterTest.body.alertsMutedUntil === snoozed.body.alertsMutedUntil, 'test acknowledgement does not extend the real snooze');
     check((await request('pairing/remove', parent)).status === 200, 'authenticated unpair and shared-history cleanup');
     check((await request('listener/status', listener, null, 'GET')).body.paired === false, 'counterpart observes revoked pairing');
     check((await request('listener/heartbeat', listener, beat)).status === 409, 'revoked Listener cannot update old pair');
