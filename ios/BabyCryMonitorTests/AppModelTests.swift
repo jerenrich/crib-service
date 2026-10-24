@@ -28,6 +28,7 @@ final class AppModelTests: XCTestCase {
         var startFailure: Error?
         var recoveringOnStartFailure = false
         private(set) var starts = 0
+        private(set) var stops = 0
         init() {
             let stream = AsyncStream<AudioLevelSample>.makeStream()
             levels = stream.stream; continuation = stream.continuation
@@ -46,7 +47,7 @@ final class AppModelTests: XCTestCase {
             }
             onStatus?(.active)
         }
-        func stop() { onStatus?(.stopped) }
+        func stop() { stops += 1; onStatus?(.stopped) }
     }
     @MainActor final class Connectivity: ConnectivityProviding {
         var available = true
@@ -324,7 +325,7 @@ final class AppModelTests: XCTestCase {
         await fixture.model.requestMonitoring(false)
         XCTAssertNil(fixture.model.monitoringControlError, "A lost POST response does not prove the request failed")
         fixture.time.now = fixture.time.now.addingTimeInterval(31); await fixture.model.tick()
-        XCTAssertTrue(fixture.model.monitoringControlError?.contains("Monitoring stop could not be verified") == true)
+        XCTAssertTrue(fixture.model.monitoringControlError?.contains("Monitoring pause could not be verified") == true)
     }
     @MainActor func testFreshMicrophoneHeartbeatOverridesFailedOrPendingStartupReceipt() async throws {
         for receipt in ["failed", "pending", "expired"] {
@@ -381,7 +382,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(confirmed); XCTAssertEqual(fixture.audio.starts, 1)
         fixture.model.stop()
     }
-    @MainActor func testRemoteStopStopsAudioAndPublishesStoppedHeartbeat() async throws {
+    @MainActor func testRemotePauseKeepsAudioAndPublishesStandbyHeartbeat() async throws {
         let fixture = try Fixture(); await fixture.model.start()
         let command = MonitoringCommand(id: UUID(), enabled: false, status: "pending", createdAt: fixture.time.now, expiresAt: fixture.time.now.addingTimeInterval(30))
         await fixture.backend.setStatus(ParentStatus(paired: true, serverTime: fixture.time.now, monitoringCommand: command, configuration: MonitoringConfiguration()))
@@ -393,6 +394,113 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(stopped)
         let reported = await eventually { await fixture.backend.beats.last?.monitoring == false }
         XCTAssertTrue(reported)
+    }
+    @MainActor private func remoteCommand(_ enabled: Bool, fixture: Fixture) async throws {
+        fixture.time.now = fixture.time.now.addingTimeInterval(3)
+        let command = MonitoringCommand(id: UUID(), enabled: enabled, status: "pending",
+            createdAt: fixture.time.now, expiresAt: fixture.time.now.addingTimeInterval(30))
+        await fixture.backend.setStatus(ParentStatus(paired: true, serverTime: fixture.time.now,
+            monitoringCommand: command, configuration: MonitoringConfiguration()))
+        await fixture.model.tick()
+        let applied = await eventually { (await fixture.backend.monitoringResults).contains { $0.0 == command.id && $0.1 } }
+        XCTAssertTrue(applied)
+    }
+    @MainActor func testStandbyDiscardsSoundAndRemoteResumeReusesCaptureWithFreshDetection() async throws {
+        let fixture = try Fixture(); await fixture.model.start()
+        for _ in 0..<24 {
+            fixture.time.now = fixture.time.now.addingTimeInterval(0.25)
+            fixture.audio.emit(AudioLevelSample(timestamp: fixture.time.now, dbFS: -10))
+        }
+        let crying = await eventually { fixture.model.snapshot.current != nil }
+        XCTAssertTrue(crying)
+        try await remoteCommand(false, fixture: fixture)
+        XCTAssertTrue(fixture.model.standby); XCTAssertFalse(fixture.model.monitoring)
+        XCTAssertTrue(fixture.model.microphoneActive); XCTAssertEqual(fixture.audio.stops, 0)
+        XCTAssertEqual(fixture.model.state, .quiet); XCTAssertNil(fixture.model.snapshot.current)
+        XCTAssertNil(fixture.liveSound.connectedDevice)
+        let history = fixture.model.snapshot.history.count
+        let frames = fixture.liveSound.frames.count
+        let pending = fixture.model.snapshot.pending.count
+        for _ in 0..<160 {
+            fixture.time.now = fixture.time.now.addingTimeInterval(0.25)
+            fixture.audio.emit(AudioLevelSample(timestamp: fixture.time.now, dbFS: -10))
+        }
+        for _ in 0..<100 { await Task.yield() }
+        XCTAssertEqual(fixture.model.snapshot.history.count, history)
+        XCTAssertEqual(fixture.model.snapshot.pending.count, pending)
+        XCTAssertNil(fixture.model.snapshot.current)
+        XCTAssertEqual(fixture.liveSound.frames.count, frames)
+        XCTAssertEqual(fixture.model.currentDBFS, -100)
+        let pausedSampleTime = fixture.time.now
+        fixture.model.setAppActive(false)
+        try await remoteCommand(true, fixture: fixture)
+        XCTAssertTrue(fixture.model.monitoring); XCTAssertFalse(fixture.model.standby)
+        XCTAssertEqual(fixture.audio.starts, 1, "Resume must not reactivate a background audio session")
+        XCTAssertEqual(fixture.model.state, .quiet)
+        fixture.audio.emit(AudioLevelSample(timestamp: pausedSampleTime, dbFS: -10))
+        for _ in 0..<100 { await Task.yield() }
+        XCTAssertEqual(fixture.model.currentDBFS, -100, "Queued standby audio must be discarded after resume")
+        fixture.time.now = fixture.time.now.addingTimeInterval(0.25)
+        fixture.audio.emit(AudioLevelSample(timestamp: fixture.time.now, dbFS: -10))
+        let live = await eventually { fixture.liveSound.frames.count > frames }
+        XCTAssertTrue(live)
+        XCTAssertNil(fixture.model.snapshot.current, "Resume starts a fresh confirmation window")
+        fixture.model.stop()
+        XCTAssertFalse(fixture.model.microphoneActive); XCTAssertEqual(fixture.audio.stops, 1)
+    }
+    @MainActor func testStandbyKeepsSendingHeartbeatsAndLocalStopReleasesMicrophone() async throws {
+        let fixture = try Fixture(); await fixture.model.start()
+        try await remoteCommand(false, fixture: fixture)
+        let settled = await eventually { await fixture.backend.beats.last?.microphoneActive == true && fixture.model.deliveryStatus == "Connected" }
+        XCTAssertTrue(settled)
+        await fixture.backend.setStatus(ParentStatus(paired: true, configuration: MonitoringConfiguration()))
+        let count = await fixture.backend.beats.count
+        fixture.time.now = fixture.time.now.addingTimeInterval(16)
+        await fixture.model.tick()
+        let periodic = await eventually { await fixture.backend.beats.count > count }
+        XCTAssertTrue(periodic)
+        let beats = await fixture.backend.beats
+        let beat = try XCTUnwrap(beats.last)
+        XCTAssertFalse(beat.monitoring); XCTAssertEqual(beat.microphoneActive, true)
+        fixture.model.stop()
+        XCTAssertFalse(fixture.model.standby); XCTAssertFalse(fixture.model.microphoneActive)
+        let off = await eventually { await fixture.backend.beats.last?.microphoneActive == false }
+        XCTAssertTrue(off)
+    }
+    @MainActor func testStandbyRecoveryNeverEnablesDetectionAndCalibrationCannotTakeCapture() async throws {
+        let fixture = try Fixture(); await fixture.model.start()
+        try await remoteCommand(false, fixture: fixture)
+        await fixture.model.beginCalibration()
+        XCTAssertEqual(fixture.model.calibrationPhase, "idle")
+        XCTAssertEqual(fixture.audio.starts, 1)
+        fixture.audio.onStatus?(.recovering("Audio interrupted"))
+        XCTAssertFalse(fixture.model.microphoneActive); XCTAssertTrue(fixture.model.recoveringAudio)
+        fixture.audio.onStatus?(.active)
+        XCTAssertTrue(fixture.model.standby); XCTAssertFalse(fixture.model.monitoring)
+        fixture.audio.onStatus?(.failed("Microphone unavailable"))
+        XCTAssertFalse(fixture.model.standby); XCTAssertFalse(fixture.model.microphoneActive)
+        XCTAssertTrue(fixture.model.needsRestart)
+        fixture.model.stop()
+    }
+    @MainActor func testPausingAnOffListenerDoesNotStartItsMicrophone() async throws {
+        let fixture = try Fixture()
+        try await remoteCommand(false, fixture: fixture)
+        XCTAssertFalse(fixture.model.microphoneActive); XCTAssertFalse(fixture.model.standby)
+        XCTAssertEqual(fixture.audio.starts, 0)
+    }
+    @MainActor func testParentDistinguishesStandbyOffAndStaleListener() async throws {
+        let fixture = try Fixture(); fixture.model.selectRole(.parent)
+        var status = ParentStatus(paired: true, lastHeartbeat: fixture.time.now,
+            serverTime: fixture.time.now, monitoring: false, configuration: MonitoringConfiguration(), microphoneActive: true)
+        await fixture.backend.setStatus(status); await fixture.model.refreshParent()
+        XCTAssertEqual(fixture.model.nurseryConnection, "Standby")
+        XCTAssertEqual(fixture.model.nightstandDevices.first?.status, "Standby")
+        status.microphoneActive = false
+        await fixture.backend.setStatus(status); await fixture.model.refreshParent()
+        XCTAssertEqual(fixture.model.nurseryConnection, "Stopped")
+        status.microphoneActive = true; status.lastHeartbeat = fixture.time.now.addingTimeInterval(-180)
+        await fixture.backend.setStatus(status); await fixture.model.refreshParent()
+        XCTAssertEqual(fixture.model.nurseryConnection, "Connection lost")
     }
     @MainActor func testRemoteStartActivatesMicrophoneAndReportsSuccess() async throws {
         let fixture = try Fixture()

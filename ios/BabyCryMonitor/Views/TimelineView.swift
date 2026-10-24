@@ -232,6 +232,7 @@ struct TimelineView: View {
     private func coverageColor(_ state: TimelineCoverage.State) -> Color {
         switch state {
         case .monitoring: Palette.mint.opacity(0.7)
+        case .standby: Palette.lavender.opacity(0.5)
         case .stopped: Palette.muted.opacity(0.5)
         case .noHistory: Color.gray.opacity(0.25)
         case .updatesMissing: Palette.amber
@@ -242,6 +243,7 @@ struct TimelineView: View {
     private func coverageIcon(_ state: TimelineCoverage.State) -> String {
         switch state {
         case .monitoring: "mic"
+        case .standby: "pause.circle"
         case .stopped: "stop.circle"
         case .noHistory: "clock.badge.questionmark"
         case .updatesMissing: "wifi.slash"
@@ -256,6 +258,7 @@ struct TimelineView: View {
     private func coverageDetail(_ segment: TimelineCoverage) -> String {
         switch segment.state {
         case .monitoring: "The Listener reported active monitoring during this interval."
+        case .standby: "The microphone remained active for remote resume. Sound samples were discarded without detection or sharing."
         case .stopped: "The Listener reported stopped or interrupted sound detection during this interval."
         case .noHistory:
             model.timeline?.truncated == true
@@ -333,6 +336,8 @@ private extension TimelineEvent {
     var timelineTitle: String {
         switch kind {
         case "monitoring_observed": "Monitoring reported active"
+        case "standby_observed": "Standby reported"
+        case "monitoring_paused": "Monitoring paused · Microphone active"
         case "stopped_observed": "Monitoring reported stopped"
         case "monitoring_started": "Monitoring started"
         case "monitoring_stopped": "Monitoring stopped"
@@ -364,7 +369,7 @@ private extension TimelineEvent {
     }
     var timelineSubtitle: String {
         switch kind {
-        case "monitoring_observed", "stopped_observed": "Backend observation · Exact transition time unknown"
+        case "monitoring_observed", "stopped_observed", "standby_observed": "Backend observation · Exact transition time unknown"
         case "cry_ended": endAt.map { "Episode lasted \(durationText(occurredAt.timeIntervalSince($0)))" } ?? "Quiet period confirmed"
         case "alert", "test_alert": "\(count ?? 1) \((count ?? 1) == 1 ? "alert" : "alerts, including reminders") · \(destination)"
         case "connection_alert": "Connection notice · \(status ?? "pending")"
@@ -384,13 +389,14 @@ private extension TimelineEvent {
             if status == "sent" { return "Apple accepted this notification for delivery. Acceptance does not confirm receipt or a wrist tap. Repeated notifications with the same episode, destination and status are grouped. Tests are labelled separately." }
             return "Current delivery status: \(status ?? "pending"). The timestamp is when the alert was created; it is not a confirmed delivery time. A queued, blocked, failed or uncertain notification is not shown as sent."
         case "alert_acknowledged": return "The backend recorded an explicit parent acknowledgement. Outstanding crying alerts were acknowledged. \(endAt.map { "Crying alerts were snoozed until \($0.formatted(date: .omitted, time: .standard))." } ?? "") Connection-loss alerts remain independent."
-        case "monitoring_observed", "stopped_observed": return "The backend received this monitoring state at the displayed time. It does not establish the exact time the Listener started or stopped."
+        case "monitoring_observed", "stopped_observed", "standby_observed": return "The backend received this monitoring state at the displayed time. It does not establish the exact time the Listener started or stopped."
         case "test_acknowledged": return "A parent acknowledged this test notification. It did not snooze real crying alerts."
         case "heartbeat_missing": return "No heartbeat arrived for more than three minutes. \(endAt.map { "Last update: \($0.formatted(date: .omitted, time: .standard))." } ?? "") Monitoring may have continued locally, but its status could not be verified. The overview marks the interval since that last update as Listener updates missing."
         case "connection_restored": return "Fresh Listener updates resumed. \(endAt.map { "The previous update was at \($0.formatted(date: .omitted, time: .standard))." } ?? "") This records when the backend observed recovery."
         case "cry_started": return "Sustained sound was confirmed on the Listener. This records crying-like sound activity; it does not identify every cry or distinguish all other room sounds. Audio remains on the Listener."
         case "cry_ended": return "The recorded sound episode ended after quiet was confirmed or capture stopped. This is sound activity, not a sleep state."
         case "monitoring_unverified": return "The app relaunched after an active session. Its last sample marks the start of an unverified interval. Monitoring needs to be restarted; no unobserved time is counted as sound detection."
+        case "monitoring_paused": return "Detection was paused while the microphone remained active for remote resume. Sound samples were discarded without storage or transmission."
         case "monitoring_stopped", "audio_interrupted": return "Sound detection was inactive from this recorded transition until monitoring or microphone capture resumed."
         case "network_lost", "network_restored": return "The Listener recorded an internet-path change. This describes its connection, independently of whether its microphone kept monitoring. Events recorded offline sync when connectivity returns."
         case "battery_low": return "The Listener reported less than 20% battery while disconnected from power."
@@ -400,6 +406,7 @@ private extension TimelineEvent {
     var timelineIcon: String {
         switch kind {
         case "monitoring_started", "audio_resumed": "play"
+        case "monitoring_paused", "standby_observed": "pause"
         case "monitoring_stopped": "stop"
         case "audio_interrupted", "monitoring_unverified": "mic.slash"
         case "cry_started", "cry_ended": "waveform"

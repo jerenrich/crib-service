@@ -11,7 +11,7 @@ struct CalibrationView: View {
                     Text("Place the Listener where you intend to use it. Leave normal fans or white noise on. Keep the room otherwise quiet for 10 seconds.")
                     Text("Monitoring stays stopped during this local sound check. No episodes or notifications are created.").font(.footnote)
                     Button("Measure background") { Task { await model.beginCalibration() } }
-                        .disabled(model.monitoring || model.starting || model.recoveringAudio || ["background", "sample", "waiting"].contains(model.calibrationPhase))
+                        .disabled(model.microphoneActive || model.monitoring || model.starting || model.recoveringAudio || ["background", "sample", "waiting"].contains(model.calibrationPhase))
                     if let background = model.calibration.backgroundLevel {
                         Text("Background: \(background, specifier: "%.0f") dBFS")
                     }
@@ -38,7 +38,7 @@ struct CalibrationView: View {
                     }
                 }
                 if let message = model.calibrationMessage { Section { Text(message) } }
-                if model.monitoring { Section { Text("Stop monitoring on the Listener before running this check.") } }
+                if model.microphoneActive || model.monitoring { Section { Text("Stop the microphone on the Listener before running this check.") } }
             }.navigationTitle("Check room sound")
                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
                 .task(id: model.calibrationPhase) {

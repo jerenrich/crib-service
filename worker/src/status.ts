@@ -35,8 +35,8 @@ export async function listenerStatus(env:Env,device:Device) {
  const metadata=last?JSON.parse(last.metadata) as Heartbeat:null;
  // An estimate, not a deadline: the Listener waits 15 seconds after its response.
  // Keep this anchored to the stored heartbeat so repeated reads cannot postpone it.
- const nextHeartbeatExpectedAt=last&&metadata?.monitoring?new Date(Date.parse(last.received_at)+15000).toISOString():null;
- return {paired:true,pairingID:`${pair.parent_id}|${pair.listener_id}|${pair.created_at}`,listenerId:pair.listener_id,lastHeartbeat:last?.received_at??null,monitoring:metadata?.monitoring??false,batteryLevel:metadata?.batteryLevel??null,powerConnected:metadata?.powerConnected??false,state:metadata?.state??null,currentEpisode:metadata?.currentEpisode??null,episodes:metadata?.episodes??[],configuration:parent?configuration(JSON.parse(parent.config)):defaultConfiguration,
+ const nextHeartbeatExpectedAt=last&&(metadata?.monitoring||metadata?.microphoneActive)?new Date(Date.parse(last.received_at)+15000).toISOString():null;
+ return {paired:true,pairingID:`${pair.parent_id}|${pair.listener_id}|${pair.created_at}`,listenerId:pair.listener_id,lastHeartbeat:last?.received_at??null,monitoring:metadata?.monitoring??false,microphoneActive:metadata?.microphoneActive??metadata?.monitoring??false,batteryLevel:metadata?.batteryLevel??null,powerConnected:metadata?.powerConnected??false,state:metadata?.state??null,currentEpisode:metadata?.currentEpisode??null,episodes:metadata?.episodes??[],configuration:parent?configuration(JSON.parse(parent.config)):defaultConfiguration,
  serverTime:new Date().toISOString(),nextHeartbeatExpectedAt,monitoringCommand,
  watchPushRegistered:parent?.watch_push_token!=null,phonePushRegistered:parent?.push_token!=null,
  alertsMutedUntil:parent?.alerts_muted_until?new Date(parent.alerts_muted_until).toISOString():null,
