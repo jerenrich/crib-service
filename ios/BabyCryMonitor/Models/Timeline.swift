@@ -28,7 +28,8 @@ public struct TimelineEvent: Codable, Identifiable, Equatable, Sendable {
         switch kind {
         case "monitoring_started", "audio_resumed", "monitoring_observed", "coverage_active": .monitoring
         case "monitoring_stopped", "audio_interrupted", "stopped_observed", "coverage_stopped": .stopped
-        case "heartbeat_missing", "monitoring_unverified": .unknown
+        case "heartbeat_missing": .updatesMissing
+        case "monitoring_unverified": .unverified
         // Only the fresh monitoring observation establishes active capture on reconnect.
         default: nil
         }
@@ -46,33 +47,69 @@ public struct TimelineResponse: Codable, Sendable {
     public var lastHeartbeat: Date? = nil
 }
 public struct TimelineCoverage: Identifiable, Equatable, Sendable {
-    public enum State: Sendable { case monitoring, stopped, unknown }
+    public enum State: String, CaseIterable, Sendable {
+        case monitoring, stopped, noHistory, updatesMissing, unavailable, unverified
+
+        public var title: String {
+            switch self {
+            case .monitoring: "Monitoring reported"
+            case .stopped: "Stopped"
+            case .noHistory: "No history recorded"
+            case .updatesMissing: "Listener updates missing"
+            case .unavailable: "Status unavailable"
+            case .unverified: "Monitoring unverified"
+            }
+        }
+    }
     public var id: Date { start }
     public let start: Date
     public let end: Date
     public let state: State
 
-    /// Unknown intervals begin at the last heartbeat, not the later outage-detection
-    /// time. Missing history is never painted as quiet or active monitoring.
-    public static func segments(events: [TimelineEvent], from start: Date, to end: Date, availableSince: Date) -> [Self] {
+    /// A backend outage cannot establish a Listener disconnection. Preserve the
+    /// fetched history and mark only time since that fetch as unavailable.
+    public static func segments(events: [TimelineEvent], from start: Date, to end: Date, availableSince: Date,
+                                statusUnavailableSince: Date? = nil, historyTruncated: Bool = false) -> [Self] {
         guard end > start else { return [] }
-        var transitions = events.compactMap { e -> (Date, State, String)? in
+        var transitions = historyTruncated ? [] : events.compactMap { e -> (Date, State, String)? in
             guard let state = e.coverageState else { return nil }
-            return (e.kind == "heartbeat_missing" ? e.endAt ?? e.occurredAt : e.occurredAt, state, e.id)
-        }.sorted {
+            let date = e.kind == "heartbeat_missing" ? e.endAt ?? e.occurredAt : e.occurredAt
+            guard date >= availableSince else { return nil }
+            return (date, state, e.id)
+        }
+        // Keep the history boundary explicit, even if the first known state
+        // arrives later. Events before logging began cannot fill that history.
+        transitions.append((availableSince, .noHistory, "history-boundary"))
+        transitions.sort {
             if $0.0 != $1.0 { return $0.0 < $1.0 }
-            func priority(_ state: State) -> Int { switch state { case .monitoring: 0; case .stopped: 1; case .unknown: 2 } }
+            func priority(_ state: State) -> Int {
+                switch state {
+                case .noHistory: 0
+                case .monitoring: 1
+                case .stopped: 2
+                case .unverified: 3
+                case .updatesMissing: 4
+                case .unavailable: 5
+                }
+            }
             if $0.1 != $1.1 { return priority($0.1) < priority($1.1) }
             return $0.2 < $1.2
         }
-        transitions.append((end, .unknown, "end"))
-        var result: [Self] = [], cursor = start, state: State = .unknown
+        if let unavailable = statusUnavailableSince {
+            transitions.removeAll { $0.0 >= unavailable }
+            transitions.append((unavailable, .unavailable, "refresh-unavailable"))
+        }
+        transitions.append((end, .noHistory, "end"))
+        var result: [Self] = [], cursor = start, state: State = .noHistory
         for (date, next, _) in transitions {
-            if date < availableSince { continue }
             if date <= start { state = next; continue }
-            let boundary = min(end, max(start, date))
+            let boundary = min(end, date)
             if boundary > cursor {
-                result.append(Self(start: cursor, end: boundary, state: cursor < availableSince ? .unknown : state))
+                if let previous = result.last, previous.state == state {
+                    result[result.count - 1] = Self(start: previous.start, end: boundary, state: state)
+                } else {
+                    result.append(Self(start: cursor, end: boundary, state: state))
+                }
                 cursor = boundary
             }
             state = next
