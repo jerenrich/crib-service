@@ -104,6 +104,20 @@ try {
     check((await request('alert/acknowledge', parent, {eventId: testStatus.body.alerts[0].eventId})).status === 200, 'test acknowledgement accepted');
     const afterTest = await request('listener/status', parent, null, 'GET');
     check(afterTest.body.alertsMutedUntil === snoozed.body.alertsMutedUntil, 'test acknowledgement does not extend the real snooze');
+    const expectedUntil = Date.parse(snoozed.body.alertsMutedUntil);
+    check((await request('alert/resume', listener, {expectedUntil})).status === 403, 'early resume restricted to Parent');
+    check((await request('alert/resume', parent, {expectedUntil})).status === 200, 'Parent can end the observed snooze early');
+    const resumed = await request('listener/status', parent, null, 'GET');
+    check(Date.parse(resumed.body.alertsMutedUntil) <= Date.now() && Date.parse(resumed.body.alertsMutedUntil) < expectedUntil, 'early resume is confirmed by authoritative status');
+    const nextCreatedAt = new Date();
+    const nextAlert = {...realAlert, eventId: randomUUID(), episodeId: randomUUID(),
+        cryStartedAt: new Date(nextCreatedAt.getTime() - 5000).toISOString(), createdAt: nextCreatedAt.toISOString()};
+    check((await request('listener/event', listener, nextAlert)).status === 200, 'subsequent cry accepted');
+    check((await request('alert/acknowledge', parent, {eventId: nextAlert.eventId})).status === 200, 'subsequent acknowledgement creates a new snooze');
+    const nextSnooze = await request('listener/status', parent, null, 'GET');
+    check(Date.parse(nextSnooze.body.alertsMutedUntil) > expectedUntil, 'new snooze has a later deadline');
+    check((await request('alert/resume', parent, {expectedUntil})).status === 200, 'stale resume is accepted idempotently');
+    check((await request('listener/status', parent, null, 'GET')).body.alertsMutedUntil === nextSnooze.body.alertsMutedUntil, 'stale resume cannot cancel a newer snooze');
     const startID = randomUUID();
     const startRequest = await request('monitoring', parent, {id: startID, enabled: true});
     check(startRequest.status === 200 && startRequest.body.status === 'pending', 'remote Start waits for Listener confirmation');
@@ -117,6 +131,9 @@ try {
     check((await request('listener/heartbeat', listener, {...beat, monitoring: false})).status === 200, 'Listener reports stopped microphone');
     const stopped = await request('listener/status', parent, null, 'GET');
     check(stopped.body.monitoring === false && stopped.body.monitoringCommand?.status === 'applied', 'Parent sees confirmed Stop and truthful microphone state');
+    check((await request('listener/heartbeat', listener, {...beat, monitoring: false, microphoneActive: true})).status === 200, 'Listener reports standby with active microphone');
+    const standby = await request('listener/status', parent, null, 'GET');
+    check(standby.body.monitoring === false && standby.body.microphoneActive === true, 'Parent sees standby capture separately from detection');
     const localStartID = randomUUID();
     check((await request('monitoring', listener, {id: localStartID, enabled: true})).body.status === 'applied', 'local Listener controls remain supported');
     await request('monitoring', parent, {id: stopID, enabled: false});

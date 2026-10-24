@@ -21,10 +21,11 @@ struct ParentStatus: Codable, Sendable {
     var episodes: [RemoteEpisode]?
     var alerts: [RemoteAlert]?
     var configuration: MonitoringConfiguration
+    var microphoneActive: Bool? = nil
 
     /// Compare two server timestamps so the Parent's clock cannot shift polling.
     func refreshDelay() -> TimeInterval {
-        guard paired, monitoring == true, let serverTime, let nextHeartbeatExpectedAt else { return 15 }
+        guard paired, monitoring == true || microphoneActive == true, let serverTime, let nextHeartbeatExpectedAt else { return 15 }
         let remaining = nextHeartbeatExpectedAt.timeIntervalSince(serverTime)
         // Stop the one-second burst after 15 seconds of lateness. A new heartbeat
         // restores the schedule; a stopped/missing Listener uses ordinary polling.
@@ -68,6 +69,7 @@ struct Heartbeat: Codable, Sendable {
     let episodes: [RemoteEpisode]
     var appliedConfiguration: MonitoringConfiguration? = nil
     var timelineEvents: [TimelineEvent]? = nil
+    var microphoneActive: Bool? = nil
 }
 struct PairingCode: Codable, Sendable { let code: String; let expiresAt: Date }
 struct PairingResult: Codable, Sendable { let paired: Bool }

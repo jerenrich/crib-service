@@ -8,6 +8,10 @@ import UIKit
     var configuration = MonitoringConfiguration()
     var backendURL: String
     var monitoring = false
+    private(set) var microphoneActive = false
+    private var detectionPaused = false
+    @ObservationIgnored private var detectionStartedAt: Date?
+    var standby: Bool { microphoneActive && detectionPaused }
     var starting = false
     var recoveringAudio = false
     var paired = false
@@ -231,10 +235,13 @@ import UIKit
             configuration.absoluteThreshold = -45
             meter = (0..<SoundLevelFrame.barCount).map { -80 + Double(($0 * 17) % 65) }
             currentDBFS = meter.last ?? -100
-            monitoring = role == .listener
+            let paused = ProcessInfo.processInfo.arguments.contains("--uitesting-standby")
+            microphoneActive = role == .listener
+            detectionPaused = paused && role == .listener
+            monitoring = role == .listener && !paused
             let status = ParentStatus(paired: true, pairingID: "ui-test-pair", watchPushRegistered: true, phonePushRegistered: true,
-                lastHeartbeat: now, monitoring: true, batteryLevel: 1, powerConnected: true,
-                state: .quiet, configuration: configuration)
+                lastHeartbeat: now, monitoring: !paused, batteryLevel: 1, powerConnected: true,
+                state: .quiet, configuration: configuration, microphoneActive: true)
             if role == .parent { parentStatus = status }
             else { listenerPairStatus = status; listenerPairStatusReceivedAt = now }
             seedLiveSoundFrameForUITest()
@@ -278,11 +285,11 @@ import UIKit
     }
     var nurseryConnection: String {
         guard paired else { return "Not paired" }
-        if let command = pendingMonitoringCommand { return command.enabled ? "Starting…" : "Stopping…" }
+        if let command = pendingMonitoringCommand { return command.enabled ? "Starting…" : "Pausing…" }
         if monitoringControlError != nil { return "Monitoring unverified" }
         guard let status = parentStatus, let last = status.lastHeartbeat else { return "Status unavailable" }
         guard (-5...150).contains(now.timeIntervalSince(last)) else { return "Connection lost" }
-        return status.monitoring == true ? "Monitoring" : "Stopped"
+        return status.monitoring == true ? "Monitoring" : status.microphoneActive == true ? "Standby" : "Stopped"
     }
     var settingsSyncStatus: String {
         if !paired { return "Saved on this iPhone · Pair to sync" }
@@ -358,7 +365,7 @@ import UIKit
         if value == .parent { Task { await notifications.register(); await refreshParent() } }
     }
     func setBackend(_ value: String) {
-        guard !monitoring, !starting, !recoveringAudio, snapshot.pending.isEmpty else { error = "Stop monitoring and deliver pending alerts before changing the backend."; return }
+        guard !microphoneActive, !monitoring, !starting, !recoveringAudio, snapshot.pending.isEmpty else { error = "Stop the microphone and deliver pending alerts before changing the backend."; return }
         guard let url = URL(string: value.trimmingCharacters(in: .whitespacesAndNewlines)), url.scheme == "https",
               url.host != nil, url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
               url.path.isEmpty || url.path == "/" else { error = "Enter the HTTPS origin of your deployed Worker."; return }
@@ -455,7 +462,9 @@ import UIKit
             error = "Local monitoring data is unavailable. Close and reopen the app, then check Diagnostics if the problem continues."; return
         }
         guard paired else { error = "Pair this Listener with a Parent before monitoring."; return }
-        guard await audio.requestPermission() else { error = "Microphone permission denied. Enable Microphone in iPhone Settings → Crib Service."; log.record("microphone_permission_denied"); return }
+        if !microphoneActive {
+            guard await audio.requestPermission() else { error = "Microphone permission denied. Enable Microphone in iPhone Settings → Crib Service."; log.record("microphone_permission_denied"); return }
+        }
         guard revision == environmentRevision, control == controlGeneration, role == .listener else { return }
         do {
             if connectivity.available {
@@ -478,7 +487,11 @@ import UIKit
             }
             guard revision == environmentRevision, control == controlGeneration, role == .listener, storageHealthy else { return }
             guard deadline.map({ currentTime() < $0 }) ?? true else { return }
-            try await audio.start()
+            // Standby already owns a live audio session. Reopening it here would
+            // lose the ability to resume while the nursery phone is locked.
+            detectionPaused = false
+            if microphoneActive { audioChanged(.active) }
+            else { try await audio.start() }
             guard revision == environmentRevision, control == controlGeneration,
                   deadline.map({ currentTime() < $0 }) ?? true else { audio.stop(); return }
             engine.markMonitoring(true); persist()
@@ -494,10 +507,25 @@ import UIKit
         if !remote, role == .listener, paired { queueLocalMonitoringReport(false) }
         haltMonitoring()
     }
+    /// Parent Pause leaves capture running, but no sample reaches detection or
+    /// live sound. A local Stop always releases the microphone.
+    private func pauseMonitoring() {
+        let wasMonitoring = monitoring
+        detectionPaused = microphoneActive || recoveringAudio
+        monitoring = false; detectionStartedAt = nil
+        monitoringGeneration += 1; lastHeartbeatAt = .distantPast
+        engine.suspend()
+        if wasMonitoring { engine.recordTimeline("monitoring_paused", at: currentTime()) }
+        meter = Array(repeating: -100, count: SoundLevelFrame.barCount); currentDBFS = -100
+        if standby { audioStatus = "Standby · Microphone active" }
+        persist(); synchronizeLiveSound(); queueHeartbeat(); recordBatterySample()
+        log.record("monitoring_paused")
+    }
     /// Ends capture without reporting a Stop. Only a person's Stop may retire
     /// crying alerts; a stall or lost pairing must leave reminders running.
     private func haltMonitoring() {
-        let wasActive = monitoring || recoveringAudio
+        let wasActive = monitoring || recoveringAudio || microphoneActive
+        detectionPaused = false; detectionStartedAt = nil
         audio.stop(); engine.suspend(); persist()
         if wasActive { log.record("monitoring_stopped") }
         recordBatterySample()
@@ -550,7 +578,7 @@ import UIKit
         monitoringControlDeadline = currentTime().addingTimeInterval(30)
         monitoringControlError = nil
         persistMonitoringControl()
-        monitoringControlMessage = enabled ? "Start requested · Waiting for the nursery microphone…" : "Stop requested · Waiting for nursery confirmation…"
+        monitoringControlMessage = enabled ? "Start requested · Waiting for the nursery microphone…" : "Pause requested · Waiting for nursery confirmation…"
         do {
             let client = try await registeredClient()
             let command = try await client.setMonitoring(enabled, id: id)
@@ -576,7 +604,7 @@ import UIKit
         guard let command = pendingMonitoringCommand, let deadline = monitoringControlDeadline, currentTime() >= deadline else { return }
         monitoringControlError = command.enabled
             ? "Monitoring could not be started or verified. Open Crib Service on the nursery phone, check microphone permission and internet access, then try again. Do not rely on alerts until Monitoring is confirmed."
-            : "Monitoring stop could not be verified. Check the nursery phone. It may still be listening; repeating crying alerts were cancelled if the service received your request."
+            : "Monitoring pause could not be verified. Check the nursery phone. Detection may still be active; repeating crying alerts were cancelled if the service received your request."
         monitoringControlMessage = nil; pendingMonitoringCommand = nil; monitoringControlDeadline = nil
         persistMonitoringControl()
     }
@@ -607,7 +635,7 @@ import UIKit
         guard status.paired, status.monitoring == command.enabled,
               let heartbeat = status.lastHeartbeat, let serverTime = status.serverTime,
               heartbeat >= command.createdAt, (0...30).contains(serverTime.timeIntervalSince(heartbeat)) else { return false }
-        monitoringControlMessage = command.enabled ? "Monitoring confirmed on nursery phone" : "Monitoring stopped on nursery phone"
+        monitoringControlMessage = command.enabled ? "Monitoring confirmed on nursery phone" : status.microphoneActive == true ? "Standby confirmed · Nursery microphone remains active" : "Monitoring stopped on nursery phone"
         monitoringControlError = nil; pendingMonitoringCommand = nil; monitoringControlDeadline = nil
         persistMonitoringControl()
         return true
@@ -623,13 +651,13 @@ import UIKit
         if defaults.string(forKey: handledKey) != command.id.uuidString {
             defaults.set(command.id.uuidString, forKey: handledKey)
             if command.enabled { await start(remote: true, deadline: deadline, commandID: command.id) }
-            else { stop(remote: true) }
+            else { pauseMonitoring() }
         }
         guard revision == environmentRevision, control == controlGeneration, role == .listener else { return }
         // A route change can cancel the original audio.start() while recovery
         // continues. Leave this command pending and confirm on the next poll.
         guard !recoveringAudio else { return }
-        let succeeded = command.enabled ? monitoring : !monitoring && !recoveringAudio
+        let succeeded = command.enabled ? monitoring : !monitoring
         do {
             try await client.completeMonitoring(command.id, succeeded: succeeded)
             guard revision == environmentRevision, control == controlGeneration else { return }
@@ -666,20 +694,26 @@ import UIKit
             }
             return
         }
-        let wasActive = monitoring || recoveringAudio
+        let wasActive = monitoring || recoveringAudio || microphoneActive
         let wasRecovering = recoveringAudio
+        let wasMonitoring = monitoring
         monitoringGeneration += 1; lastHeartbeatAt = .distantPast
-        monitoring = false; recoveringAudio = false
+        monitoring = false; recoveringAudio = false; microphoneActive = false; detectionStartedAt = nil
         switch status {
         case .active:
             log.record("audio_active")
             meter = Array(repeating: -100, count: SoundLevelFrame.barCount); currentDBFS = -100
-            monitoring = true; audioStatus = "Microphone active"
-            engine.markMonitoring(true); lastSampleAt = currentTime(); lastHeartbeatAt = .distantPast
+            microphoneActive = true; monitoring = !detectionPaused
+            detectionStartedAt = monitoring ? currentTime() : nil
+            audioStatus = standby ? "Standby · Microphone active" : "Microphone active"
+            engine.markMonitoring(monitoring); lastSampleAt = currentTime(); lastHeartbeatAt = .distantPast
             needsRestart = false; error = nil
-            if !wasActive || wasRecovering { engine.recordTimeline(wasRecovering ? "audio_resumed" : "monitoring_started", at: currentTime()); persist() }
+            if !wasActive || wasRecovering || monitoring != wasMonitoring {
+                engine.recordTimeline(standby ? "monitoring_paused" : wasRecovering ? "audio_resumed" : "monitoring_started", at: currentTime()); persist()
+            }
             queueHeartbeat()
         case .stopped:
+            detectionPaused = false
             audioStatus = "Stopped"
             if wasActive { engine.recordTimeline("monitoring_stopped", at: currentTime()) }
             engine.suspend(); persist()
@@ -707,10 +741,14 @@ import UIKit
             if calibrationPhase != "waiting" { calibration.record(sample.dbFS, background: calibrationPhase == "background") }
             return
         }
+        // Standby samples only prove capture is healthy. Never retain, detect,
+        // or publish their levels, including samples queued before a resume.
+        if microphoneActive, sample.dbFS.isFinite { lastSampleAt = currentTime() }
+        guard detectionStartedAt.map({ sample.timestamp >= $0 }) ?? false else { return }
         guard monitoring, let credential, storageHealthy, sample.dbFS.isFinite else { return }
         // Full-scale clipping is the loudest sound, not an invalid reading.
         let sample = AudioLevelSample(timestamp: sample.timestamp, dbFS: min(0, max(-100, sample.dbFS)))
-        lastSampleAt = sample.timestamp; currentDBFS = sample.dbFS
+        currentDBFS = sample.dbFS
         meter.append(sample.dbFS); meter = Array(meter.suffix(SoundLevelFrame.barCount))
         let before = state; let quietBefore = engine.detector.quietSince
         let events = engine.consume(sample, listenerId: credential.deviceId)
@@ -782,7 +820,7 @@ import UIKit
             engine.recordTimeline(powered ? "power_connected" : "power_disconnected", at: now); persist()
         }
         powerConnected = powered
-        if monitoring, let lastSampleAt, now.timeIntervalSince(lastSampleAt) > 3 {
+        if microphoneActive, let lastSampleAt, now.timeIntervalSince(lastSampleAt) > 3 {
             haltMonitoring(); error = "Monitoring stopped: microphone samples stopped arriving."; needsRestart = true; log.record("audio_stalled")
         }
         synchronizeLiveSound()
@@ -807,7 +845,7 @@ import UIKit
         let device = UIDevice.current
         log.battery(batteryLevel: device.batteryLevel >= 0 ? Double(device.batteryLevel) : nil,
                     powerConnected: device.batteryState == .unknown ? nil : device.batteryState == .charging || device.batteryState == .full,
-                    monitoring: monitoring || recoveringAudio, audioActive: monitoring && !recoveringAudio,
+                    monitoring: monitoring || (recoveringAudio && !detectionPaused), audioActive: microphoneActive,
                     lowPowerMode: ProcessInfo.processInfo.isLowPowerModeEnabled,
                     appActive: UIApplication.shared.applicationState == .active, at: currentTime())
     }
@@ -955,7 +993,8 @@ import UIKit
         return Heartbeat(listenerId: listenerID, timestamp: currentTime(), monitoring: monitoring,
                          batteryLevel: batteryLevel, powerConnected: powerConnected, state: state,
                          currentEpisode: snapshot.current.map(remote), episodes: Array(snapshot.history.prefix(100)).map(remote), appliedConfiguration: configuration,
-                         timelineEvents: Array(snapshot.timelineEvents.filter { snapshot.pendingTimelineIDs.contains($0.id) }.prefix(100)))
+                         timelineEvents: Array(snapshot.timelineEvents.filter { snapshot.pendingTimelineIDs.contains($0.id) }.prefix(100)),
+                         microphoneActive: microphoneActive)
     }
     private func scheduleHeartbeatIfDue() {
         guard !managingDevice else { return }
@@ -971,7 +1010,7 @@ import UIKit
             for key in Array(pendingHeartbeats.keys) { pendingHeartbeats[key]?.nextAttemptAt = currentTime() }
         }
         lastConnectivityAvailable = available
-        if (monitoring || !snapshot.pendingTimelineIDs.isEmpty), let key = heartbeatKey, pendingHeartbeats[key] == nil,
+        if (microphoneActive || monitoring || !snapshot.pendingTimelineIDs.isEmpty), let key = heartbeatKey, pendingHeartbeats[key] == nil,
            currentTime().timeIntervalSince(lastHeartbeatAt) >= 15 {
             queueHeartbeat()
         }
@@ -1266,7 +1305,9 @@ import UIKit
         } catch { self.error = "Could not finish: \(error.localizedDescription). Monitoring is stopped. Try again."; log.record("device_removal_failed", error: error) }
     }
     func beginCalibration() async {
-        guard role == .listener, !monitoring, !starting, !recoveringAudio, !calibrationActive else { return }
+        guard role == .listener, !microphoneActive, !monitoring, !starting, !recoveringAudio, !calibrationActive else {
+            calibrationMessage = "Stop the microphone before checking sound."; return
+        }
         calibration = SoundCalibration(); calibrationMessage = nil; calibrationPhase = "background"
         let revision = environmentRevision
         guard await audio.requestPermission() else {

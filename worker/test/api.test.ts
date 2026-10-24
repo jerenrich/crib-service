@@ -306,6 +306,39 @@ describe('listener metadata and configuration',()=>{
   const again=await (await call('listener/status',parent,undefined,'GET')).json() as typeof status;
   expect(again.nextHeartbeatExpectedAt).toBe(status.nextHeartbeatExpectedAt);
  });
+ it('reports standby separately from off, schedules standby heartbeats, and accepts older listeners',async()=>{
+  const {parent,listener}=await paired();
+  const beat={listenerId:listener.deviceId,timestamp:new Date().toISOString(),monitoring:false,microphoneActive:true,powerConnected:true,state:'quiet',episodes:[]};
+  expect((await call('listener/heartbeat',listener,beat)).status).toBe(200);
+  const status=async()=>await (await call('listener/status',parent,undefined,'GET')).json() as {monitoring:boolean;microphoneActive:boolean;lastHeartbeat:string;nextHeartbeatExpectedAt:string|null};
+  const standby=await status();expect(standby.monitoring).toBe(false);expect(standby.microphoneActive).toBe(true);
+  expect(Date.parse(standby.nextHeartbeatExpectedAt!)-Date.parse(standby.lastHeartbeat)).toBe(15000);
+  const stored=await env.DB.prepare('SELECT metadata FROM heartbeats WHERE listener_id=?').bind(listener.deviceId).first<{metadata:string}>();
+  expect(JSON.parse(stored!.metadata).microphoneActive).toBe(true);
+  expect((await call('listener/heartbeat',listener,{...beat,microphoneActive:false})).status).toBe(200);
+  expect((await status()).microphoneActive).toBe(false);expect((await status()).nextHeartbeatExpectedAt).toBeNull();
+  const {microphoneActive,...legacy}=beat;
+  expect((await call('listener/heartbeat',listener,{...legacy,monitoring:true})).status).toBe(200);
+  expect((await status()).microphoneActive).toBe(true);
+ });
+ it('rejects inconsistent or invalid microphone and standby detection states',async()=>{
+  const {listener}=await paired();
+  const beat={listenerId:listener.deviceId,timestamp:new Date().toISOString(),monitoring:false,microphoneActive:true,powerConnected:true,state:'quiet',episodes:[]};
+  for(const invalid of [{microphoneActive:'true'},{monitoring:true,microphoneActive:false},{state:'crying'},{currentEpisode:{id:crypto.randomUUID(),startedAt:new Date().toISOString()}}]){
+   expect((await call('listener/heartbeat',listener,{...beat,...invalid})).status).toBe(400);
+  }
+ });
+ it('preserves standby transitions and marks stale standby coverage as missing',async()=>{
+  const {parent,listener}=await paired();
+  const paused={id:crypto.randomUUID(),kind:'monitoring_paused',occurredAt:new Date().toISOString()};
+  const beat={listenerId:listener.deviceId,timestamp:new Date().toISOString(),monitoring:false,microphoneActive:true,powerConnected:true,state:'quiet',episodes:[],timelineEvents:[paused]};
+  expect((await call('listener/heartbeat',listener,beat)).status).toBe(200);
+  const history=async()=>await (await call('timeline',parent,undefined,'GET')).json() as {events:{kind:string}[]};
+  const kinds=(await history()).events.map(e=>e.kind);
+  expect(kinds).toContain('monitoring_paused');expect(kinds).toContain('standby_observed');expect(kinds).toContain('coverage_standby');
+  await env.DB.prepare('UPDATE heartbeats SET received_at=? WHERE listener_id=?').bind(new Date(Date.now()-240000).toISOString(),listener.deviceId).run();
+  expect((await history()).events.some(e=>e.kind==='heartbeat_missing')).toBe(true);
+ });
  it('only predicts the next heartbeat for an actively monitoring Listener',async()=>{
   const {parent,listener}=await paired();
   const status=async()=>await (await call('listener/status',parent,undefined,'GET')).json() as {nextHeartbeatExpectedAt:string|null;serverTime:string};

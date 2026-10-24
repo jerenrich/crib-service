@@ -34,10 +34,13 @@ function episode(value:unknown):Episode {
  return result;
 }
 export function heartbeat(value:Record<string,unknown>):Heartbeat {
- onlyKeys(value,['listenerId','timestamp','monitoring','batteryLevel','powerConnected','state','currentEpisode','episodes','appliedConfiguration','timelineEvents']);
+ onlyKeys(value,['listenerId','timestamp','monitoring','microphoneActive','batteryLevel','powerConnected','state','currentEpisode','episodes','appliedConfiguration','timelineEvents']);
  if(typeof value.monitoring!=='boolean'||typeof value.powerConnected!=='boolean'||!['quiet','possibleCry','crying'].includes(String(value.state))||!Array.isArray(value.episodes)||value.episodes.length>100||(value.batteryLevel!=null&&(typeof value.batteryLevel!=='number'||value.batteryLevel<0||value.batteryLevel>1)))throw new APIError(400,'Invalid heartbeat.');
+ if(value.microphoneActive!==undefined&&(typeof value.microphoneActive!=='boolean'||value.monitoring===true&&value.microphoneActive===false))throw new APIError(400,'Invalid microphone state.');
+ if(value.microphoneActive===true&&value.monitoring===false&&(value.state!=='quiet'||value.currentEpisode!=null))throw new APIError(400,'Standby cannot report active detection.');
  const timelineEvents=value.timelineEvents===undefined?undefined:validateTimelineEvents(value.timelineEvents);
  const result:Heartbeat={listenerId:uuid(value.listenerId), timestamp:date(value.timestamp),monitoring:value.monitoring,powerConnected:value.powerConnected,batteryLevel:value.batteryLevel as number|null|undefined,state:value.state as Heartbeat['state'],currentEpisode:value.currentEpisode==null?null:episode(value.currentEpisode),episodes:value.episodes.map(episode)};
+ if(value.microphoneActive!==undefined)result.microphoneActive=value.microphoneActive as boolean;
  if(timelineEvents)result.timelineEvents=timelineEvents;
  if(value.appliedConfiguration!=null){
   if(typeof value.appliedConfiguration!=='object'||Array.isArray(value.appliedConfiguration))throw new APIError(400,'Invalid applied configuration.');

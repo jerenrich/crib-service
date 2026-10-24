@@ -9,6 +9,17 @@ import XCTest
 final class TimelineTests: XCTestCase {
     private let zero = Date(timeIntervalSince1970: 1_700_000_000)
     private func at(_ seconds: Double) -> Date { zero.addingTimeInterval(seconds) }
+    func testStandbyCoverageSeparatesDiscardedCaptureFromMonitoringAndOff() {
+        let events = [TimelineEvent(kind: "monitoring_started", occurredAt: at(0)),
+                      TimelineEvent(kind: "monitoring_paused", occurredAt: at(100)),
+                      TimelineEvent(kind: "standby_observed", occurredAt: at(110)),
+                      TimelineEvent(kind: "monitoring_started", occurredAt: at(200)),
+                      TimelineEvent(kind: "monitoring_stopped", occurredAt: at(300))]
+        let segments = TimelineCoverage.segments(events: events, from: at(0), to: at(400), availableSince: at(0))
+        XCTAssertEqual(segments.map(\.state), [.monitoring, .standby, .monitoring, .stopped])
+        XCTAssertEqual(segments[1].start, at(100)); XCTAssertEqual(segments[1].end, at(200))
+        XCTAssertTrue(TimelineEvent(kind: "coverage_standby", occurredAt: at(110)).isObservation)
+    }
     func testMissingHeartbeatBackdatesMissingUpdatesAndFreshObservationEndsIt() {
         let events = [TimelineEvent(kind: "monitoring_started", occurredAt: at(0)),
                       TimelineEvent(kind: "heartbeat_missing", occurredAt: at(480), endAt: at(300)),

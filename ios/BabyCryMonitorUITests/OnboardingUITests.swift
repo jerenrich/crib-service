@@ -19,7 +19,9 @@ final class OnboardingUITests: XCTestCase {
         app.launch()
         XCTAssertTrue(app.buttons["resumeAlerts"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.buttons["resumeAlerts"].isHittable)
-        XCTAssertTrue(app.buttons["retryConnection"].isHittable, app.debugDescription)
+        let retry = app.buttons["retryConnection"]
+        for _ in 0..<6 { if retry.isHittable { break }; app.scrollViews.firstMatch.swipeUp() }
+        XCTAssertTrue(retry.isHittable, app.debugDescription)
         XCTAssertTrue(app.staticTexts["Live chart paused"].firstMatch.exists)
         let shot = XCTAttachment(screenshot: app.screenshot()); shot.name = "Snooze and connection recovery"; shot.lifetime = .keepAlways; add(shot)
     }
@@ -38,7 +40,7 @@ final class OnboardingUITests: XCTestCase {
         XCTAssertTrue(NSPredicate(format: "label CONTAINS %@", "00:30").evaluate(with: timing) || app.staticTexts["Requested 30 sec · Waiting for nursery confirmation"].exists)
         XCTAssertFalse(app.descendants(matching: .any)["pairedDevice_listener"].exists)
         let summary = app.buttons["deviceSummary"]
-        for _ in 0..<4 { if summary.exists && summary.isHittable && summary.frame.maxY < app.frame.maxY - 150 { break }; app.swipeUp() }
+        for _ in 0..<4 { if summary.exists && summary.isHittable && summary.frame.maxY < timing.frame.minY { break }; app.scrollViews.firstMatch.swipeUp() }
         XCTAssertTrue(summary.exists)
         summary.tap()
         XCTAssertTrue(app.navigationBars["Devices"].waitForExistence(timeout: 5))
@@ -83,6 +85,34 @@ final class OnboardingUITests: XCTestCase {
         let shot = XCTAttachment(screenshot: app.screenshot()); shot.name = "Short nightly check"; shot.lifetime = .keepAlways; add(shot)
     }
 
+    @MainActor func testStandbyShowsActiveMicrophoneAndOffersResumeInBothModes() {
+        let app = XCUIApplication()
+        for listener in [false, true] {
+            app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", "--uitesting-standby"]
+            if listener { app.launchArguments.append("--uitesting-listener") }
+            app.launch()
+            let state = app.staticTexts["nightstandState"]
+            XCTAssertTrue(state.waitForExistence(timeout: 5))
+            XCTAssertEqual(state.label, "Standby")
+            XCTAssertTrue(app.staticTexts["Microphone active · Detection paused"].exists)
+            let chart = app.descendants(matching: .any)["soundLevelChart"].firstMatch
+            XCTAssertTrue((chart.value as? String)?.contains("Inactive") == true)
+            let resume = app.buttons["Resume monitoring"]
+            for _ in 0..<3 { if resume.isHittable { break }; app.swipeUp() }
+            XCTAssertTrue(resume.isEnabled)
+            if listener {
+                let stop = app.buttons["nightstandStopMicrophone"]
+                XCTAssertTrue(stop.exists)
+                for _ in 0..<3 { if stop.isHittable { break }; app.swipeUp() }
+                stop.tap()
+                XCTAssertEqual(state.label, "Stopped")
+            }
+            let shot = XCTAttachment(screenshot: app.screenshot())
+            shot.name = listener ? "Listener microphone stopped" : "Parent standby"
+            shot.lifetime = .keepAlways; add(shot)
+            app.terminate()
+        }
+    }
     @MainActor func testBothModesUseSameLiveSoundChart() {
         let app = XCUIApplication()
         var parentValue: String?
@@ -165,6 +195,10 @@ final class OnboardingUITests: XCTestCase {
         app.launch()
         let start = app.buttons["Start Monitoring"]
         XCTAssertTrue(start.waitForExistence(timeout: 5))
+        let chart = app.descendants(matching: .any)["soundLevelChart"].firstMatch
+        let initialChartFrame = chart.frame
+        let initialControlFrame = start.frame
+        let initialTabFrame = app.tabBars.firstMatch.frame
         start.tap()
         let warning = app.alerts["Monitoring not confirmed"]
         XCTAssertTrue(warning.waitForExistence(timeout: 5))
@@ -173,7 +207,45 @@ final class OnboardingUITests: XCTestCase {
         screenshot.name = "Parent monitoring failure"; screenshot.lifetime = .keepAlways; add(screenshot)
         warning.buttons["OK"].tap()
         XCTAssertTrue(app.staticTexts["Monitoring not confirmed"].exists)
-        XCTAssertTrue(app.buttons["Stop Monitoring"].isEnabled)
+        XCTAssertTrue(app.buttons["Pause monitoring"].isEnabled)
+        XCTAssertEqual(chart.frame.minY, initialChartFrame.minY, accuracy: 1)
+        XCTAssertEqual(chart.frame.height, initialChartFrame.height, accuracy: 1)
+        XCTAssertEqual(start.frame.minY, initialControlFrame.minY, accuracy: 1)
+        XCTAssertEqual(app.tabBars.firstMatch.frame.minY, initialTabFrame.minY, accuracy: 1)
+        let details = app.buttons["nightstandDetails"]
+        for _ in 0..<4 {
+            if details.isHittable && details.frame.maxY < start.frame.minY { break }
+            app.scrollViews.firstMatch.swipeUp()
+        }
+        XCTAssertTrue(details.isHittable)
+        XCTAssertLessThan(details.frame.maxY, start.frame.minY)
+        details.tap()
+        XCTAssertTrue(app.navigationBars["Monitoring details"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "could not be started or verified")).firstMatch.exists)
+        app.buttons["Done"].tap()
+        XCTAssertTrue(app.buttons["Pause monitoring"].isEnabled)
+        let stableScreen = XCTAttachment(screenshot: app.screenshot())
+        stableScreen.name = "Compact monitoring warning"; stableScreen.lifetime = .keepAlways; add(stableScreen)
+    }
+    @MainActor func testMonitorSupportsAccessibilityTextAndScrollableDetails() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound",
+            "-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"]
+        app.launch()
+        XCTAssertTrue(app.staticTexts["nightstandState"].waitForExistence(timeout: 5))
+        let control = app.buttons["nightstandMonitoringControl"]
+        let details = app.buttons["nightstandDetails"]
+        for _ in 0..<12 { if details.isHittable { break }; app.scrollViews.firstMatch.swipeUp() }
+        XCTAssertTrue(details.isHittable)
+        details.tap()
+        XCTAssertTrue(app.navigationBars["Monitoring details"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["Done"].isHittable)
+        app.buttons["Done"].tap()
+        for _ in 0..<12 { if control.isHittable { break }; app.scrollViews.firstMatch.swipeUp() }
+        XCTAssertTrue(control.isHittable)
+        XCTAssertLessThanOrEqual(control.frame.maxY, app.tabBars.firstMatch.frame.minY)
+        let largeText = XCTAttachment(screenshot: app.screenshot())
+        largeText.name = "Compact monitor with accessibility text"; largeText.lifetime = .keepAlways; add(largeText)
     }
     @MainActor func testTimelineOverviewFilteringAndDetails() {
         let app = XCUIApplication()
