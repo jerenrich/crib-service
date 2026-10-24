@@ -36,6 +36,8 @@ Coverage added here includes outage opt-in/deduplication/recovery, stopped monit
 | Settings | Change alert duration on Parent while Listener is online | Saving → waiting → applied; actual Listener duration changes | Not run |
 | Offline settings | Disconnect Listener, change duration, reconnect | Parent does not claim applied until Listener reports the new configuration | Not run |
 | Connection loss | Opt in, start Listener, then disconnect only Listener internet for at least four minutes | One connection-loss notice; Parent shows lost connection when opened | Not run |
+| Local offline warning | First confirm the local warning is armed on Parent and Watch, then remove their internet/phone connectivity on test devices | Each device's OS presents its already scheduled warning three minutes after the last verified Parent check; Watch notification haptic is felt under intended Focus/wrist settings | Native scheduling accepted on J17 and Watch, 24 October 2026; disconnected delivery/wrist tap not yet observed |
+| Parent checks suspended | Arm local warnings, then lock/background Parent without interrupting the network | An overdue-check warning can still fire after three minutes because iOS paused verification; it must not claim a proven router outage | Not run |
 | Recovery | Restore Listener internet after outage | One recovery notice and fresh active monitoring status | Not run |
 | Stop/interruption | Stop Listener; separately exercise call, audio-route change and capture recovery | Stopped status/notice, or truthful recovery status; missing audio never counts toward cry duration | Not run |
 | Opt out | Disable connection alerts, then repeat a fresh outage/recovery | No new connection notices | Not run |

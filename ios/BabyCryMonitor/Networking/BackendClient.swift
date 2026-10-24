@@ -59,6 +59,7 @@ struct Heartbeat: Codable, Sendable {
     let currentEpisode: RemoteEpisode?
     let episodes: [RemoteEpisode]
     var appliedConfiguration: MonitoringConfiguration? = nil
+    var timelineEvents: [TimelineEvent]? = nil
 }
 struct PairingCode: Codable, Sendable { let code: String; let expiresAt: Date }
 struct PairingResult: Codable, Sendable { let paired: Bool }
@@ -69,6 +70,7 @@ protocol BackendServing: AlertSending {
     func createPairing() async throws -> PairingCode
     func claim(_ code: String) async throws
     func status() async throws -> ParentStatus
+    func timeline() async throws -> TimelineResponse
     func heartbeat(_ value: Heartbeat) async throws -> MonitoringConfiguration
     func settings(_ configuration: MonitoringConfiguration) async throws
     func acknowledge(_ id: UUID) async throws
@@ -80,6 +82,7 @@ protocol BackendServing: AlertSending {
     func deleteDevice() async throws
 }
 extension BackendServing {
+    func timeline() async throws -> TimelineResponse { throw BackendError.message("Timeline requires an updated connection service.") }
     func connectionAlerts(_ enabled: Bool) async throws { throw BackendError.message("Connection alerts unavailable.") }
     func requestTestPush() async throws { throw BackendError.message("Remote test unavailable.") }
     func unpair() async throws { throw BackendError.message("Unpairing unavailable.") }
@@ -97,6 +100,7 @@ struct BackendClient: BackendServing {
     func createPairing() async throws -> PairingCode { try await request("/v1/pairing/create", body: [String: String]()) }
     func claim(_ code: String) async throws { let _: PairingResult = try await request("/v1/pairing/claim", body: ["code": code]) }
     func status() async throws -> ParentStatus { try await request("/v1/listener/status", method: "GET", body: Optional<String>.none) }
+    func timeline() async throws -> TimelineResponse { try await request("/v1/timeline", method: "GET", body: Optional<String>.none) }
     func heartbeat(_ value: Heartbeat) async throws -> MonitoringConfiguration { try await request("/v1/listener/heartbeat", body: value) }
     func send(_ alert: CryAlert) async throws -> AlertReceipt { try await request("/v1/listener/event", body: alert) }
     func settings(_ configuration: MonitoringConfiguration) async throws { let _: EmptyResponse = try await request("/v1/settings", body: configuration) }
@@ -126,7 +130,7 @@ struct BackendClient: BackendServing {
         let operation = ["/v1/device/register": "register", "/v1/pairing/create": "pairing_create", "/v1/pairing/claim": "pairing_claim",
                          "/v1/device/push-token": "push_token", "/v1/device/watch-push-token": "watch_token",
                          "/v1/listener/heartbeat": "heartbeat", "/v1/listener/event": "alert", "/v1/listener/status": "status",
-                         "/v1/settings": "settings", "/v1/alert/acknowledge": "acknowledge", "/v1/test-push": "test_push",
+                         "/v1/timeline": "timeline", "/v1/settings": "settings", "/v1/alert/acknowledge": "acknowledge", "/v1/test-push": "test_push",
                          "/v1/connection-alerts": "connection_preferences", "/v1/pairing/remove": "unpair", "/v1/device/delete": "delete_device"][path] ?? "unknown"
         let started = Date()
         let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601

@@ -441,6 +441,8 @@ final class AppModelTests: XCTestCase {
         await fixture.backend.setStatus(ParentStatus(paired: true, monitoring: true, configuration: MonitoringConfiguration()))
         fixture.model.selectRole(.parent); await fixture.model.refreshParent()
         let deadline = try XCTUnwrap(fixture.model.parentConnectionDeadline)
+        let scheduled = await eventually { fixture.notifications.scheduledConnectionDeadline == deadline }
+        XCTAssertTrue(scheduled)
         fixture.time.now = deadline.addingTimeInterval(1)
         let restoredNotifications = Notifications()
         let restored = AppModel(defaults: fixture.defaults, metadataStore: try MetadataStore(directory: fixture.directory),

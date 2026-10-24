@@ -1,5 +1,24 @@
 import XCTest
 final class OnboardingUITests: XCTestCase {
+    @MainActor func testTimelineOverviewFilteringAndDetails() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-timeline"]
+        app.launch()
+        let timeline = app.buttons["Timeline"]
+        XCTAssertTrue(timeline.waitForExistence(timeout: 5)); timeline.tap()
+        XCTAssertTrue(app.navigationBars["Timeline"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["Last 12 hours"].exists)
+        let filter = app.buttons["timelineFilter"]
+        for _ in 0..<4 { if filter.isHittable { break }; app.swipeUp() }
+        XCTAssertTrue(filter.isHittable); filter.tap()
+        app.buttons["Connection"].tap()
+        let missing = app.descendants(matching: .any)["timelineEvent_heartbeat_missing"]
+        for _ in 0..<4 { if missing.isHittable { break }; app.swipeUp() }
+        XCTAssertTrue(missing.exists); missing.tap()
+        XCTAssertTrue(app.staticTexts.containing(NSPredicate(format: "label BEGINSWITH %@", "No heartbeat arrived")).firstMatch.waitForExistence(timeout: 3))
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "Timeline connection event detail"; screenshot.lifetime = .keepAlways; add(screenshot)
+    }
     @MainActor func testParentReadinessAndDeletionConfirmation() {
         let app = XCUIApplication(); app.launchArguments = ["--uitesting-reset", "--uitesting-offline"]; app.launch()
         let proceed = app.buttons["I understand · Continue"]

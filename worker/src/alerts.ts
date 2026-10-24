@@ -41,6 +41,9 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  AND COALESCE(json_extract(payload,'$.isTest'),0)=0 AND (
  EXISTS(SELECT 1 FROM devices d WHERE d.id=events.parent_id AND d.alerts_muted_until>0
  AND (d.alerts_muted_until>? OR CAST((julianday(json_extract(events.payload,'$.createdAt'))-2440587.5)*86400000 AS INTEGER) BETWEEN d.alerts_muted_at AND d.alerts_muted_until))
+ OR EXISTS(SELECT 1 FROM alert_snoozes s JOIN pairs p ON p.parent_id=s.parent_id AND p.listener_id=s.listener_id AND p.created_at=s.pair_created_at
+ WHERE s.parent_id=events.parent_id AND s.listener_id=events.listener_id
+ AND CAST(ROUND((julianday(json_extract(events.payload,'$.createdAt'))-2440587.5)*86400000) AS INTEGER) BETWEEN s.started_at AND s.until_at)
  OR (is_repeat=1 AND EXISTS(SELECT 1 FROM events prior WHERE prior.parent_id=events.parent_id AND prior.episode_id=events.episode_id AND prior.acknowledged_at IS NOT NULL AND prior.created_at>=events.created_at))
  )`).bind(new Date(now).toISOString(),eventId,now).run();
  const event=await env.DB.prepare("UPDATE events SET status='sending',lease_until=?,attempts=attempts+1,push_target=COALESCE(push_target,CASE WHEN (SELECT watch_push_token FROM devices WHERE id=events.parent_id) IS NOT NULL THEN 'watch' ELSE 'phone' END) WHERE event_id=? AND status='pending' AND acknowledged_at IS NULL AND next_attempt<=? RETURNING *").bind(now+30000,eventId,now).first<StoredEvent>();
@@ -89,13 +92,34 @@ export async function acknowledge(env:Env,device:Device,value:Record<string,unkn
   return {ok:true};
  }
  const now=Date.now(),timestamp=new Date(now).toISOString();
- if((JSON.parse(event.payload) as Alert).isTest) {
-  await env.DB.prepare('UPDATE events SET acknowledged_at=COALESCE(acknowledged_at,?) WHERE episode_id=? AND parent_id=?').bind(timestamp,event.episode_id,device.id).run();
+ const pair=await pairFor(env,device);if(!pair||pair.listener_id!==event.listener_id)throw new APIError(409,'Pairing changed.');
+ const isTest=(JSON.parse(event.payload) as Alert).isTest===true;
+ const until=now+configuration(JSON.parse(device.config)).snoozeDuration*1000;
+ const journalEvent={id:`ack:${id}`,kind:isTest?'test_acknowledged':'alert_acknowledged',occurredAt:timestamp,episodeID:event.episode_id,
+  ...(isTest?{}:{endAt:new Date(until).toISOString()})};
+ const journal=env.DB.prepare(`INSERT INTO timeline_events(id,parent_id,listener_id,pair_created_at,kind,occurred_at,payload)
+  SELECT ?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?)
+  AND EXISTS(SELECT 1 FROM events WHERE event_id=? AND acknowledged_at IS NULL) ON CONFLICT DO NOTHING`)
+  .bind(journalEvent.id,pair.parent_id,pair.listener_id,pair.created_at,journalEvent.kind,now,JSON.stringify(journalEvent),pair.parent_id,pair.listener_id,pair.created_at,id);
+ if(isTest) {
+  await env.DB.batch([journal,env.DB.prepare(`UPDATE events SET acknowledged_at=COALESCE(acknowledged_at,?) WHERE event_id=? AND parent_id=?
+   AND EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?)`)
+   .bind(timestamp,id,device.id,pair.parent_id,pair.listener_id,pair.created_at)]);
  }else{
+  const claim=crypto.randomUUID();
+  // A unique request claim gates every side effect in the same D1 transaction.
+  // A duplicate or a request overtaken by unpairing cannot affect newer alerts.
   await env.DB.batch([
-   // Retrying the same acknowledgement must not extend the mute.
-   env.DB.prepare('UPDATE devices SET alerts_muted_until=?,alerts_muted_at=? WHERE id=? AND (SELECT acknowledged_at FROM events WHERE event_id=?) IS NULL').bind(now+configuration(JSON.parse(device.config)).snoozeDuration*1000,now,device.id,id),
-   env.DB.prepare("UPDATE events SET acknowledged_at=COALESCE(acknowledged_at,?) WHERE parent_id=? AND COALESCE(json_extract(payload,'$.isTest'),0)=0").bind(timestamp,device.id)
+   env.DB.prepare(`INSERT INTO alert_snoozes(event_id,claim_id,parent_id,listener_id,pair_created_at,started_at,until_at)
+    SELECT ?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?)
+    AND EXISTS(SELECT 1 FROM events WHERE event_id=? AND parent_id=? AND listener_id=? AND acknowledged_at IS NULL)
+    ON CONFLICT DO NOTHING`).bind(id,claim,device.id,pair.listener_id,pair.created_at,now,until,pair.parent_id,pair.listener_id,pair.created_at,id,device.id,pair.listener_id),
+   env.DB.prepare(`UPDATE devices SET alerts_muted_until=?,alerts_muted_at=? WHERE id=?
+    AND EXISTS(SELECT 1 FROM alert_snoozes WHERE event_id=? AND claim_id=?)`).bind(until,now,device.id,id,claim),
+   journal,
+   env.DB.prepare(`UPDATE events SET acknowledged_at=COALESCE(acknowledged_at,?) WHERE parent_id=? AND listener_id=?
+    AND COALESCE(json_extract(payload,'$.isTest'),0)=0
+    AND EXISTS(SELECT 1 FROM alert_snoozes WHERE event_id=? AND claim_id=?)`).bind(timestamp,device.id,pair.listener_id,id,claim)
   ]);
   await scheduleReminders(env,device.id);
  }
@@ -116,6 +140,8 @@ export async function flushPending(env:Env,requestId=crypto.randomUUID()) {
  // Keep deduplication tombstones for 30 days. Codes are short-lived; claimed codes retain
  // enough time to recover a lost claim response. Status metadata retains max 100 episodes.
  await env.DB.batch([
+  env.DB.prepare('DELETE FROM alert_snoozes WHERE until_at<?').bind(Date.now()-86400000),
+  env.DB.prepare(`DELETE FROM timeline_events WHERE occurred_at<? AND id NOT IN (SELECT id FROM timeline_events t2 WHERE t2.parent_id=timeline_events.parent_id AND t2.listener_id=timeline_events.listener_id AND t2.pair_created_at=timeline_events.pair_created_at AND t2.kind IN ('coverage_active','coverage_stopped') ORDER BY occurred_at DESC LIMIT 1)`).bind(Date.now()-24*3600000),
   env.DB.prepare('DELETE FROM events WHERE created_at<?').bind(Date.now()-30*86400000),
   env.DB.prepare('DELETE FROM pairing_codes WHERE expires_at<?').bind(Date.now()-86400000),
   env.DB.prepare('DELETE FROM rate_limits WHERE window<?').bind(Math.floor(Date.now()/1000/600)-144)

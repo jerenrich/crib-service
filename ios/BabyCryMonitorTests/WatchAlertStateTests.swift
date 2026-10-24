@@ -7,6 +7,24 @@ import XCTest
 #endif
 
 final class WatchAlertStateTests: XCTestCase {
+    @MainActor func testDiscardedAcknowledgementAdvancesDurableQueueWithoutMutingNewAlerts() throws {
+        let fixture = try Fixture()
+        let deleted = fixture.alert(), current = fixture.alert()
+        var state = fixture.makeState()
+        state.handleNotification(deleted, acknowledging: true)
+        state.handleNotification(current, acknowledging: true)
+        state = fixture.makeState()
+        fixture.activated = true
+        let encoded = try JSONEncoder().encode(WatchSnapshot(discardedAcknowledgementEventId: deleted.eventId))
+        state.resolveAcknowledgements(from: try JSONDecoder().decode(WatchSnapshot.self, from: encoded))
+        XCTAssertTrue(state.acknowledgementPending)
+        XCTAssertEqual(fixture.commands.last?.eventId, current.eventId)
+        state.resolveAcknowledgements(from: WatchSnapshot(acknowledgedEventId: current.eventId))
+        XCTAssertFalse(fixture.makeState().acknowledgementPending)
+        let next = fixture.alert()
+        state.receive(next)
+        XCTAssertEqual(state.alert, next)
+    }
     @MainActor final class Fixture {
         let suite = "WatchAlertStateTests.\(UUID())"
         let defaults: UserDefaults

@@ -18,6 +18,10 @@ import UIKit
     var testPushStatus: String?
     var pairingCode: PairingCode?
     var parentStatus: ParentStatus?
+    var timeline: TimelineResponse?
+    var timelineClockOffset: TimeInterval = 0
+    var timelineError: String?
+    var loadingTimeline = false
     var currentDBFS: Double = -100
     var meter: [Double] = Array(repeating: -100, count: 32)
     var batteryLevel: Double?
@@ -88,6 +92,7 @@ import UIKit
     @ObservationIgnored private var parentWarningRetryAt: Date?
     private static let parentWarningDeadlineKey = "parentConnectionWarningDeadline"
     private static let parentWarningScopeKey = "parentConnectionWarningScope"
+    private static let parentWarningScheduledKey = "parentConnectionWarningScheduledDeadline"
 
     init(defaults: UserDefaults = .standard, metadataStore: MetadataStore? = nil,
          log: DiagnosticLog = DiagnosticLog(),
@@ -111,6 +116,7 @@ import UIKit
         role = defaults.string(forKey: "role").flatMap(DeviceRole.init)
         safetyAccepted = defaults.bool(forKey: "safetyAccepted")
         backendURL = defaults.string(forKey: "backendURL") ?? (Bundle.main.object(forInfoDictionaryKey: "BackendURL") as? String ?? "")
+        var interruptedMonitoringAt: Date?
         do {
             let store = try metadataStore ?? MetadataStore(); self.store = store
             #if DEBUG
@@ -120,6 +126,7 @@ import UIKit
             }
             #endif
             let saved = try store.load(); needsRestart = saved.wasMonitoring
+            if saved.wasMonitoring { interruptedMonitoringAt = saved.lastObservedAt }
             engine = CrySessionManager(snapshot: saved); engine.recoverAfterRelaunch()
             configuration = engine.snapshot.configuration
             try store.save(engine.snapshot)
@@ -160,12 +167,21 @@ import UIKit
             }
         }
         loadCredential()
+        if needsRestart, role == .listener {
+            engine.recordTimeline("monitoring_unverified", at: interruptedMonitoringAt ?? currentTime()); persist()
+        }
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--uitesting-timeline") { seedTimelineForUITest() }
+        #endif
         // Keep an already scheduled warning across relaunch; never postpone it just
         // because the app starts or a network path becomes available.
         if role == .parent, paired,
            defaults.string(forKey: Self.parentWarningScopeKey) == parentWarningScope,
            let deadline = defaults.object(forKey: Self.parentWarningDeadlineKey) as? Date {
             parentConnectionDeadline = deadline
+            if deadline > currentTime() || defaults.object(forKey: Self.parentWarningScheduledKey) as? Date != deadline {
+                setParentConnectionDeadline(deadline, force: true)
+            }
         } else {
             setParentConnectionDeadline(nil, force: true)
         }
@@ -211,6 +227,7 @@ import UIKit
         setParentConnectionDeadline(nil)
         cancelCalibration()
         stop(); environmentRevision += 1; role = value; defaults.set(value.rawValue, forKey: "role")
+        timeline = nil; timelineError = nil
         parentStatus = nil; pairingCode = nil; credential = nil; uploadedToken = nil; loadCredential()
         nextParentRefreshAt = .distantPast
         testPushStatus = nil; latestTestEventID = nil
@@ -226,6 +243,7 @@ import UIKit
         setParentConnectionDeadline(nil)
         environmentRevision += 1; backendURL = url.absoluteString
         defaults.set(backendURL, forKey: "backendURL")
+        timeline = nil; timelineError = nil
         credential = nil; parentStatus = nil; pairingCode = nil; uploadedToken = nil
         nextParentRefreshAt = .distantPast
         testPushStatus = nil; latestTestEventID = nil
@@ -243,6 +261,7 @@ import UIKit
                 let created = try keychain.create(role: role)
                 try keychain.save(created, environment: backendURL); credential = created
             }
+            if let credential { engine.scopeTimeline(to: "\(backendURL)|\(credential.deviceId)"); persist() }
         } catch { self.error = error.localizedDescription; log.record("credential_failed", error: error) }
     }
     private func client() throws -> any BackendServing {
@@ -363,6 +382,7 @@ import UIKit
             return
         }
         let wasActive = monitoring || recoveringAudio
+        let wasRecovering = recoveringAudio
         monitoringGeneration += 1; lastHeartbeatAt = .distantPast
         monitoring = false; recoveringAudio = false
         switch status {
@@ -371,19 +391,23 @@ import UIKit
             monitoring = true; audioStatus = "Microphone active"
             engine.markMonitoring(true); lastSampleAt = currentTime(); lastHeartbeatAt = .distantPast
             needsRestart = false; error = nil
+            if !wasActive || wasRecovering { engine.recordTimeline(wasRecovering ? "audio_resumed" : "monitoring_started", at: currentTime()); persist() }
             queueHeartbeat()
         case .stopped:
             audioStatus = "Stopped"
+            if wasActive { engine.recordTimeline("monitoring_stopped", at: currentTime()) }
             engine.suspend(); persist()
             if wasActive { queueHeartbeat() }
         case .recovering(let message):
             // Route changes and resumable interruptions need no user action.
             // Suspend detection so the missing audio never extends an episode.
             recoveringAudio = true; audioStatus = message; needsRestart = false
+            if wasActive && !wasRecovering { engine.recordTimeline("audio_interrupted", at: currentTime()) }
             engine.suspend(); persist()
             log.record("audio_recovering"); queueHeartbeat()
         case .failed(let message):
             audioStatus = message
+            if wasActive { engine.recordTimeline("audio_interrupted", at: currentTime()) }
             engine.suspend(); persist()
             error = message; needsRestart = true
             log.record("audio_interrupted"); queueHeartbeat()
@@ -412,6 +436,7 @@ import UIKit
     }
     private func persist() {
         guard let store, storageHealthy else { return }
+        if let credential { engine.scopeTimeline(to: "\(backendURL)|\(credential.deviceId)") }
         do { try store.save(engine.snapshot) }
         catch {
             storageHealthy = false; storageFailure = error; monitoring = false; audio.stop()
@@ -432,7 +457,11 @@ import UIKit
     private func updateLocalState() {
         now = currentTime(); let device = UIDevice.current
         batteryLevel = device.batteryLevel >= 0 ? Double(device.batteryLevel) : nil
-        powerConnected = device.batteryState == .charging || device.batteryState == .full
+        let powered = device.batteryState == .charging || device.batteryState == .full
+        if powerConnected != powered, role == .listener, paired {
+            engine.recordTimeline(powered ? "power_connected" : "power_disconnected", at: now); persist()
+        }
+        powerConnected = powered
         if monitoring, let lastSampleAt, now.timeIntervalSince(lastSampleAt) > 3 {
             stop(); error = "Monitoring stopped: microphone samples stopped arriving."; needsRestart = true; log.record("audio_stalled")
         }
@@ -466,6 +495,8 @@ import UIKit
                 self.parentWarningUpdatePending = false
                 do {
                     try await self.notifications.setParentConnectionDeadline(deadline)
+                    if let deadline { self.defaults.set(deadline, forKey: Self.parentWarningScheduledKey) }
+                    else { self.defaults.removeObject(forKey: Self.parentWarningScheduledKey) }
                     if !self.parentWarningUpdatePending {
                         self.parentConnectionWarningError = nil; self.parentWarningRetryAt = nil
                     }
@@ -580,18 +611,24 @@ import UIKit
         }
         return Heartbeat(listenerId: listenerID, timestamp: currentTime(), monitoring: monitoring,
                          batteryLevel: batteryLevel, powerConnected: powerConnected, state: state,
-                         currentEpisode: snapshot.current.map(remote), episodes: Array(snapshot.history.prefix(100)).map(remote), appliedConfiguration: configuration)
+                         currentEpisode: snapshot.current.map(remote), episodes: Array(snapshot.history.prefix(100)).map(remote), appliedConfiguration: configuration,
+                         timelineEvents: Array(snapshot.timelineEvents.filter { snapshot.pendingTimelineIDs.contains($0.id) }.prefix(100)))
     }
     private func scheduleHeartbeatIfDue() {
         guard !managingDevice else { return }
         let available = connectivity.available
-        if available != lastConnectivityAvailable { log.record(available ? "network_available" : "network_unavailable") }
+        if available != lastConnectivityAvailable {
+            log.record(available ? "network_available" : "network_unavailable")
+            if role == .listener, paired {
+                engine.recordTimeline(available ? "network_restored" : "network_lost", at: currentTime()); persist()
+            }
+        }
         if available && !lastConnectivityAvailable {
             // A recovered path gets one immediate attempt, then normal backoff.
             for key in Array(pendingHeartbeats.keys) { pendingHeartbeats[key]?.nextAttemptAt = currentTime() }
         }
         lastConnectivityAvailable = available
-        if monitoring, let key = heartbeatKey, pendingHeartbeats[key] == nil,
+        if (monitoring || !snapshot.pendingTimelineIDs.isEmpty), let key = heartbeatKey, pendingHeartbeats[key] == nil,
            currentTime().timeIntervalSince(lastHeartbeatAt) >= 15 {
             queueHeartbeat()
         }
@@ -626,6 +663,9 @@ import UIKit
             }
             do {
                 let config = try await attempt.client.heartbeat(attempt.value)
+                if attempt.revision == self.environmentRevision {
+                    self.engine.uploadedTimeline(Set((attempt.value.timelineEvents ?? []).map(\.id))); self.persist()
+                }
                 if attempt.failures > 0 { self.log.record("heartbeat_recovered") }
                 if self.pendingHeartbeats[key]?.id == attempt.id { self.pendingHeartbeats.removeValue(forKey: key) }
                 if attempt.revision == self.environmentRevision, attempt.observation == self.monitoringGeneration {
@@ -668,6 +708,7 @@ import UIKit
         do {
             let client = try await registeredClient(); let status = try await client.status()
             guard revision == environmentRevision, role == .parent else { return }
+            if !status.paired || (parentStatus?.pairingID != nil && parentStatus?.pairingID != status.pairingID) { timeline = nil; timelineError = nil }
             parentStatus = status; paired = status.paired; defaults.set(paired, forKey: pairingKey)
             // Only a successful server response renews the local warning. A failed
             // or suspended request leaves the previous OS notification untouched.
@@ -689,7 +730,7 @@ import UIKit
         let identityKey = pairingKey + "|identity"
         let previous = defaults.string(forKey: identityKey)
         if (!status.paired && paired) || (previous != nil && status.pairingID != nil && previous != status.pairingID) {
-            stop(); pendingHeartbeats.removeAll()
+            stop(); pendingHeartbeats.removeAll(); timeline = nil; timelineError = nil
             engine = CrySessionManager(); configuration = engine.snapshot.configuration; persist()
             settingsDirty = false; defaults.set(false, forKey: "settingsDirty")
             needsRestart = false
@@ -714,6 +755,44 @@ import UIKit
             }
         }
     }
+    func refreshTimeline() async {
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--uitesting-timeline") { return }
+        #endif
+        guard !loadingTimeline, paired else { return }
+        loadingTimeline = true; defer { loadingTimeline = false }
+        let revision = environmentRevision
+        do {
+            let client = try await registeredClient()
+            let page = try await client.timeline()
+            guard revision == environmentRevision, paired else { return }
+            timeline = page; timelineClockOffset = page.serverTime.timeIntervalSince(currentTime()); timelineError = nil
+        } catch {
+            guard revision == environmentRevision else { return }
+            timelineError = "Could not refresh timeline. \(error.localizedDescription)"
+            log.record("timeline_failed", error: error)
+        }
+    }
+    #if DEBUG
+    private func seedTimelineForUITest() {
+        role = .parent; safetyAccepted = true; paired = true
+        let now = currentTime(), episode = UUID().uuidString
+        func time(_ seconds: Double) -> Date { now.addingTimeInterval(seconds) }
+        parentStatus = ParentStatus(paired: true, lastHeartbeat: now, monitoring: true, state: .quiet, configuration: configuration)
+        timeline = TimelineResponse(paired: true, serverTime: now, availableSince: time(-13 * 3600), events: [
+            TimelineEvent(kind: "monitoring_started", occurredAt: time(-48 * 60)),
+            TimelineEvent(kind: "monitoring_stopped", occurredAt: time(-50 * 60)),
+            TimelineEvent(kind: "cry_ended", occurredAt: time(-4 * 3600 + 78), endAt: time(-4 * 3600), episodeID: episode),
+            TimelineEvent(kind: "alert_acknowledged", occurredAt: time(-4 * 3600 + 38), endAt: time(-4 * 3600 + 98), episodeID: episode),
+            TimelineEvent(kind: "alert", occurredAt: time(-4 * 3600 + 5), endAt: time(-4 * 3600 + 35), episodeID: episode, target: "watch", count: 7, status: "sent"),
+            TimelineEvent(kind: "cry_started", occurredAt: time(-4 * 3600), episodeID: episode),
+            TimelineEvent(kind: "connection_restored", occurredAt: time(-5 * 3600), endAt: time(-5 * 3600 - 444)),
+            TimelineEvent(kind: "monitoring_observed", occurredAt: time(-5 * 3600)),
+            TimelineEvent(kind: "heartbeat_missing", occurredAt: time(-5 * 3600 - 264), endAt: time(-5 * 3600 - 444)),
+            TimelineEvent(kind: "monitoring_started", occurredAt: time(-11 * 3600))
+        ], truncated: false)
+    }
+    #endif
     func acknowledge(_ id: UUID) async {
         do { let client = try await registeredClient(); try await client.acknowledge(id); await refreshParent() }
         catch { self.error = error.localizedDescription; log.record("acknowledgement_failed", error: error) }
@@ -770,7 +849,7 @@ import UIKit
         environmentRevision += 1
         pendingHeartbeats.removeAll(); heartbeatTask?.cancel(); settingsTask?.cancel(); listenerStatusTask?.cancel()
         let old = credential
-        let watchKeys = [watchAcknowledgementsKey, watchConfirmedKey, watchRegistrationKey, watchRegistrationDateKey]
+        let watchKeys = [watchAcknowledgementsKey, watchConfirmedKey, watchDiscardedKey, watchRegistrationKey, watchRegistrationDateKey]
         do {
             let client = try await registeredClient()
             if deleteDevice { try await client.deleteDevice() } else { try await client.unpair() }
@@ -783,6 +862,7 @@ import UIKit
             defaults.removeObject(forKey: pairingKey + "|identity")
             paired = false; defaults.set(false, forKey: pairingKey)
             setParentConnectionDeadline(nil)
+            timeline = nil; timelineError = nil
             parentStatus = nil; pairingCode = nil; needsRestart = false
             settingsDirty = false; defaults.set(false, forKey: "settingsDirty")
             engine = CrySessionManager(); configuration = engine.snapshot.configuration; persist()
@@ -825,6 +905,11 @@ import UIKit
     }
     func foreground() async {
         log.record("foreground")
+        #if DEBUG
+        // This offline UI fixture supplies a complete paired snapshot. Loading
+        // real credentials here would replace it with the empty test defaults.
+        if ProcessInfo.processInfo.arguments.contains("--uitesting-timeline") { return }
+        #endif
         if credential == nil { loadCredential() }
         if role == .parent { await notifications.register(); await refreshParent() }
         if role == .listener && needsRestart && !monitoring && !starting && !recoveringAudio { error = "Monitoring needs to be restarted. Check the microphone and tap Start Monitoring." }
@@ -832,6 +917,7 @@ import UIKit
 
     private var watchAcknowledgementsKey: String { "watchAcknowledgements|\(backendURL)|\(credential?.deviceId.uuidString ?? "none")" }
     private var watchConfirmedKey: String { "watchConfirmed|\(backendURL)|\(credential?.deviceId.uuidString ?? "none")" }
+    private var watchDiscardedKey: String { "watchDiscarded|\(backendURL)|\(credential?.deviceId.uuidString ?? "none")" }
     private var watchRegistrationKey: String { "watchRegistration|\(backendURL)|\(credential?.deviceId.uuidString ?? "none")" }
     private var watchRegistrationDateKey: String { watchRegistrationKey + "|date" }
 
@@ -851,6 +937,7 @@ import UIKit
         value.watchPushRegistered = value.parentMode && parentStatus?.watchPushRegistered == true
         value.alertsMutedUntil = value.parentMode ? parentStatus?.alertsMutedUntil : nil
         value.acknowledgedEventId = defaults.string(forKey: watchConfirmedKey).flatMap(UUID.init(uuidString:))
+        value.discardedAcknowledgementEventId = defaults.string(forKey: watchDiscardedKey).flatMap(UUID.init(uuidString:))
         if value.parentMode, let alert = activeAlert {
             value.alert = WatchCryAlert(eventId: alert.eventId, episodeId: alert.episodeId, startedAt: alert.cryStartedAt,
                                         createdAt: alert.createdAt, duration: alert.durationSeconds, isTest: alert.isTest == true)
@@ -891,6 +978,7 @@ import UIKit
         let revision = environmentRevision
         let queueKey = watchAcknowledgementsKey
         let confirmedKey = watchConfirmedKey
+        let discardedKey = watchDiscardedKey
         let registrationKey = watchRegistrationKey
         do {
             let client = try await registeredClient()
@@ -912,12 +1000,21 @@ import UIKit
             let queue = defaults.stringArray(forKey: queueKey) ?? []
             for rawID in queue {
                 guard let id = UUID(uuidString: rawID), revision == environmentRevision else { continue }
-                try await client.acknowledge(id)
-                log.record("watch_acknowledged")
+                let discarded: Bool
+                do {
+                    try await client.acknowledge(id)
+                    discarded = false
+                } catch BackendError.response(404, _) {
+                    // Deleted/old-pair alerts cannot be acknowledged. Resolve the
+                    // Watch's durable item too, or it will enqueue this ID forever.
+                    discarded = true
+                }
+                guard revision == environmentRevision else { return nil }
+                log.record(discarded ? "watch_acknowledgement_discarded" : "watch_acknowledged")
                 var remaining = defaults.stringArray(forKey: queueKey) ?? []
                 remaining.removeAll { $0 == rawID }
                 defaults.set(remaining, forKey: queueKey)
-                defaults.set(rawID, forKey: confirmedKey)
+                defaults.set(rawID, forKey: discarded ? discardedKey : confirmedKey)
             }
             return nil
         } catch { log.record("watch_sync_failed", error: error); return "Watch sync pending. Check the Parent iPhone connection and backend setup." }

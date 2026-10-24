@@ -13,14 +13,14 @@ struct RootView: View {
                 else {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 24) {
-                            HStack { Label("Crib Service", systemImage: "moon.stars").font(.title3.weight(.semibold)); Spacer(); Button { settings = true } label: { Image(systemName: "slider.horizontal.3").font(.title3).frame(width: 44, height: 44) }.accessibilityLabel("Settings") }
+                            HStack { Label("Crib Service", systemImage: "moon.stars").font(.title3.weight(.semibold)); Spacer(); NavigationLink { TimelineView() } label: { Image(systemName: "clock.arrow.circlepath").font(.title3).frame(width: 44, height: 44) }.accessibilityLabel("Timeline"); Button { settings = true } label: { Image(systemName: "slider.horizontal.3").font(.title3).frame(width: 44, height: 44) }.accessibilityLabel("Settings") }
                             if model.role == .listener { ListenerView() } else { ParentView() }
                             Text("Audio never leaves the Listener iPhone.").font(.footnote).foregroundStyle(Palette.muted).frame(maxWidth: .infinity)
                             Text("Sound detection only · Adult supervision required").font(.caption2).foregroundStyle(Palette.muted).frame(maxWidth: .infinity)
                         }.padding(24)
                     }
                 }
-            }.foregroundStyle(.white).toolbar(.hidden, for: .navigationBar)
+            }.foregroundStyle(.white).navigationTitle("Crib Service").toolbar(.hidden, for: .navigationBar)
                 .sheet(isPresented: $settings) { SettingsView() }
                 .alert("Attention needed", isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) { Button("OK") { model.error = nil } } message: { Text(model.error ?? "") }
         }.tint(Palette.mint).preferredColorScheme(.dark)

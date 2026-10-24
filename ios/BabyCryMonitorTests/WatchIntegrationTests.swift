@@ -9,8 +9,11 @@ final class WatchIntegrationTests: XCTestCase {
         private(set) var tokens: [String?] = []
         private(set) var acknowledgements: [UUID] = []
         private var failing = false
+        private var acknowledgementFailures: [UUID: Int] = [:]
+        private(set) var acknowledgementAttempts: [UUID] = []
         init(_ credential: DeviceCredential) { self.credential = credential }
         func fail(_ value: Bool) { failing = value }
+        func failAcknowledgement(_ id: UUID, status: Int?) { acknowledgementFailures[id] = status }
         func register() async throws {}
         func createPairing() async throws -> PairingCode { PairingCode(code: "123456", expiresAt: .distantFuture) }
         func claim(_ code: String) async throws {}
@@ -22,7 +25,9 @@ final class WatchIntegrationTests: XCTestCase {
         func settings(_ configuration: MonitoringConfiguration) async throws {}
         func send(_ alert: CryAlert) async throws -> AlertReceipt { AlertReceipt(status: "sent") }
         func acknowledge(_ id: UUID) async throws {
+            acknowledgementAttempts.append(id)
             if failing { throw URLError(.notConnectedToInternet) }
+            if let status = acknowledgementFailures[id] { throw BackendError.response(status, "Test failure") }
             acknowledgements.append(id)
         }
         func pushToken(_ token: String) async throws {}
@@ -94,6 +99,40 @@ final class WatchIntegrationTests: XCTestCase {
         XCTAssertNil(result.alert)
         let tokens = await fixture.backend.tokens
         XCTAssertTrue(tokens.isEmpty)
+    }
+    @MainActor func testDeletedAlertIsDiscardedAndDoesNotBlockNewWatchAcknowledgements() async throws {
+        let fixture = try Fixture()
+        let deleted = UUID(), current = UUID()
+        await fixture.backend.failAcknowledgement(deleted, status: 404)
+        let resolved = try await fixture.command(WatchCommand(kind: .acknowledge, eventId: deleted))
+        XCTAssertEqual(resolved.discardedAcknowledgementEventId, deleted)
+        XCTAssertNil(resolved.acknowledgedEventId)
+        XCTAssertNil(resolved.message)
+        let next = try await fixture.command(WatchCommand(kind: .acknowledge, eventId: current))
+        XCTAssertEqual(next.acknowledgedEventId, current)
+        _ = try await fixture.command(WatchCommand(kind: .refresh))
+        let attempts = await fixture.backend.acknowledgementAttempts
+        let acknowledgements = await fixture.backend.acknowledgements
+        XCTAssertEqual(attempts, [deleted, current])
+        XCTAssertEqual(acknowledgements, [current])
+    }
+
+    @MainActor func testRetryableWatchAcknowledgementFailuresRemainQueued() async throws {
+        for status in [401, 409, 429, 503] {
+            let fixture = try Fixture()
+            let first = UUID(), second = UUID()
+            await fixture.backend.failAcknowledgement(first, status: status)
+            _ = try await fixture.command(WatchCommand(kind: .acknowledge, eventId: first))
+            let failed = try await fixture.command(WatchCommand(kind: .acknowledge, eventId: second))
+            XCTAssertNil(failed.discardedAcknowledgementEventId)
+            XCTAssertNil(failed.acknowledgedEventId)
+            XCTAssertNotNil(failed.message)
+            await fixture.backend.failAcknowledgement(first, status: nil)
+            let recovered = try await fixture.command(WatchCommand(kind: .refresh))
+            XCTAssertEqual(recovered.acknowledgedEventId, second)
+            let acknowledgements = await fixture.backend.acknowledgements
+            XCTAssertEqual(acknowledgements, [first, second])
+        }
     }
     @MainActor func testWatchRegistrationFailureRemainsPendingUntilBackendRecovers() async throws {
         let fixture = try Fixture()

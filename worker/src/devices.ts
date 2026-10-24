@@ -40,6 +40,8 @@ export async function removeDeviceData(env:Env,device:Device,deleteDevice=false)
  const listener=pair?.listener_id??device.id, parent=pair?.parent_id??device.id;
  await env.DB.batch([
   env.DB.prepare('UPDATE devices SET alerts_muted_until=0,alerts_muted_at=0 WHERE id=?').bind(parent),
+  env.DB.prepare('DELETE FROM alert_snoozes WHERE listener_id=? OR parent_id=?').bind(listener,parent),
+  env.DB.prepare('DELETE FROM timeline_events WHERE listener_id=? OR parent_id=?').bind(listener,parent),
   env.DB.prepare('DELETE FROM connection_notices WHERE listener_id=? OR parent_id=?').bind(listener,parent),
   env.DB.prepare('DELETE FROM connection_states WHERE listener_id=?').bind(listener),
   env.DB.prepare('DELETE FROM events WHERE listener_id=? OR parent_id=?').bind(listener,parent),
