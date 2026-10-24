@@ -6,6 +6,8 @@ struct SoundLevelChart: View {
     let trigger: Double
     let currentLevel: Double
     let monitoring: Bool
+    var height: CGFloat = 88
+    var color: Color = Palette.mint
 
     var body: some View {
         VStack(spacing: 12) {
@@ -16,7 +18,7 @@ struct SoundLevelChart: View {
                         ForEach(Array(levels.enumerated()), id: \.offset) { _, level in
                             let barHeight = max(3, levelHeight(level, in: geometry.size.height))
                             Capsule()
-                                .fill(Palette.mint.opacity(monitoring ? 0.65 : 0.2))
+                                .fill(color.opacity(monitoring ? 0.65 : 0.2))
                                 .overlay(alignment: .top) {
                                     if monitoring, level >= trigger {
                                         Rectangle()
@@ -34,10 +36,21 @@ struct SoundLevelChart: View {
                 .frame(width: geometry.size.width, height: geometry.size.height, alignment: .bottom)
                 .clipped()
             }
-            .frame(height: 88)
+            .frame(height: height)
 
-            thresholdLabel("Trigger", value: trigger, color: Palette.amber, dash: [6, 4])
-                .frame(maxWidth: .infinity, alignment: .trailing)
+            ViewThatFits(in: .horizontal) {
+                HStack {
+                    Text(monitoring ? "Current \(levelText(currentLevel))" : "Inactive")
+                        .font(.caption.monospacedDigit()).foregroundStyle(Palette.muted)
+                    Spacer(minLength: 12)
+                    thresholdLabel("Trigger", value: trigger, color: Palette.amber, dash: [6, 4])
+                }
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(monitoring ? "Current \(levelText(currentLevel))" : "Inactive")
+                        .font(.caption.monospacedDigit()).foregroundStyle(Palette.muted)
+                    thresholdLabel("Trigger", value: trigger, color: Palette.amber, dash: [6, 4])
+                }.frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
         .accessibilityElement(children: .ignore)
         .accessibilityIdentifier("soundLevelChart")

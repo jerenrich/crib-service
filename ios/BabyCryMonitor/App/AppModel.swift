@@ -18,6 +18,8 @@ import UIKit
     var testPushStatus: String?
     var pairingCode: PairingCode?
     var parentStatus: ParentStatus?
+    private(set) var listenerPairStatus: ParentStatus?
+    private(set) var listenerPairStatusReceivedAt: Date?
     var timeline: TimelineResponse?
     var timelineClockOffset: TimeInterval = 0
     var timelineError: String?
@@ -214,7 +216,10 @@ import UIKit
             engine.recordTimeline("monitoring_unverified", at: interruptedMonitoringAt ?? currentTime()); persist()
         }
         #if DEBUG
-        if ProcessInfo.processInfo.arguments.contains("--uitesting-timeline") { seedTimelineForUITest() }
+        if ProcessInfo.processInfo.arguments.contains("--uitesting-timeline") {
+            seedTimelineForUITest()
+            if ProcessInfo.processInfo.arguments.contains("--uitesting-monitoring-rejected") { parentStatus?.monitoring = false }
+        }
         if ProcessInfo.processInfo.arguments.contains("--uitesting-live-sound") {
             safetyAccepted = true; paired = true
             role = ProcessInfo.processInfo.arguments.contains("--uitesting-listener") ? .listener : .parent
@@ -222,6 +227,11 @@ import UIKit
             meter = (0..<SoundLevelFrame.barCount).map { -80 + Double(($0 * 17) % 65) }
             currentDBFS = meter.last ?? -100
             monitoring = role == .listener
+            let status = ParentStatus(paired: true, watchPushRegistered: true, phonePushRegistered: true,
+                lastHeartbeat: now, monitoring: true, batteryLevel: 1, powerConnected: true,
+                state: .quiet, configuration: configuration)
+            if role == .parent { parentStatus = status }
+            else { listenerPairStatus = status; listenerPairStatusReceivedAt = now }
             seedLiveSoundFrameForUITest()
         }
         #endif
@@ -318,6 +328,7 @@ import UIKit
     }
     private var pairingKey: String { "paired|\(backendURL)|\(role?.rawValue ?? "")" }
     private func loadCredential() {
+        listenerPairStatus = nil; listenerPairStatusReceivedAt = nil
         paired = defaults.bool(forKey: pairingKey)
         guard let role else { return }
         do {
@@ -1027,6 +1038,8 @@ import UIKit
             needsRestart = false
         }
         paired = status.paired; defaults.set(paired, forKey: pairingKey)
+        listenerPairStatus = status.paired ? status : nil
+        listenerPairStatusReceivedAt = status.paired ? currentTime() : nil
         if let identity = status.pairingID { defaults.set(identity, forKey: identityKey) }
         else { defaults.removeObject(forKey: identityKey) }
     }
@@ -1177,6 +1190,7 @@ import UIKit
             setParentConnectionDeadline(nil)
             timeline = nil; timelineError = nil
             parentStatus = nil; pairingCode = nil; needsRestart = false
+            listenerPairStatus = nil; listenerPairStatusReceivedAt = nil
             settingsDirty = false; defaults.set(false, forKey: "settingsDirty")
             engine = CrySessionManager(); configuration = engine.snapshot.configuration; persist()
             calibration = SoundCalibration(); testPushStatus = nil; latestTestEventID = nil
@@ -1219,9 +1233,9 @@ import UIKit
     func foreground() async {
         log.record("foreground")
         #if DEBUG
-        // This offline UI fixture supplies a complete paired snapshot. Loading
+        // These offline UI fixtures supply a complete paired snapshot. Loading
         // real credentials here would replace it with the empty test defaults.
-        if ProcessInfo.processInfo.arguments.contains("--uitesting-timeline") { return }
+        if ProcessInfo.processInfo.arguments.contains("--uitesting-timeline") || ProcessInfo.processInfo.arguments.contains("--uitesting-live-sound") { return }
         #endif
         if credential == nil { loadCredential() }
         if role == .parent { await notifications.register(); await refreshParent() }

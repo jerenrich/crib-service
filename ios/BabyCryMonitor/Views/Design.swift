@@ -1,8 +1,9 @@
 import SwiftUI
 
 enum Palette {
-    static let background = Color(red: 0.05, green: 0.09, blue: 0.14)
-    static let panel = Color(red: 0.09, green: 0.15, blue: 0.21)
+    static let background = Color(red: 0.047, green: 0.067, blue: 0.133)
+    static let panel = Color(red: 0.106, green: 0.133, blue: 0.208)
+    static let lavender = Color(red: 0.706, green: 0.698, blue: 0.929)
     static let mint = Color(red: 0.55, green: 0.86, blue: 0.76)
     static let muted = Color(red: 0.64, green: 0.73, blue: 0.79)
     static let amber = Color(red: 1, green: 0.75, blue: 0.44)

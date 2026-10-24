@@ -10,16 +10,28 @@ final class OnboardingUITests: XCTestCase {
             app.launch()
             let chart = app.descendants(matching: .any)["soundLevelChart"].firstMatch
             XCTAssertTrue(chart.waitForExistence(timeout: 5))
+            XCTAssertTrue(app.staticTexts["nightstandState"].exists)
+            XCTAssertGreaterThan(chart.frame.height, 150)
+            XCTAssertTrue(app.tabBars.buttons["Monitor"].exists)
+            XCTAssertTrue(app.tabBars.buttons["Activity"].exists)
+            XCTAssertTrue(app.tabBars.buttons["Devices"].exists)
             let value = chart.value as? String
             XCTAssertTrue(value?.contains("Trigger -45 dBFS") == true)
             XCTAssertFalse(value?.contains("Inactive") == true)
             if listener {
                 XCTAssertEqual(value, parentValue)
-                XCTAssertEqual(chart.frame.size, parentSize)
+                if let parentSize {
+                    XCTAssertEqual(chart.frame.width, parentSize.width, accuracy: 0.5)
+                    XCTAssertEqual(chart.frame.height, parentSize.height, accuracy: 0.5)
+                } else { XCTFail("Parent chart was not measured") }
             } else { parentValue = value; parentSize = chart.frame.size }
             let image = XCTAttachment(screenshot: app.screenshot())
             image.name = listener ? "Nursery shared sound chart" : "Parent shared sound chart"
             image.lifetime = .keepAlways; add(image)
+            app.tabBars.buttons["Devices"].tap()
+            XCTAssertTrue(app.navigationBars["Devices"].waitForExistence(timeout: 5))
+            XCTAssertTrue(app.descendants(matching: .any)["pairedDevice_listener"].exists)
+            XCTAssertTrue(app.descendants(matching: .any)["pairedDevice_parent"].exists)
             app.terminate()
         }
     }
@@ -70,7 +82,6 @@ final class OnboardingUITests: XCTestCase {
         app.launch()
         let start = app.buttons["Start Monitoring"]
         XCTAssertTrue(start.waitForExistence(timeout: 5))
-        XCTAssertTrue(app.buttons["Stop Monitoring"].exists)
         start.tap()
         let warning = app.alerts["Monitoring not confirmed"]
         XCTAssertTrue(warning.waitForExistence(timeout: 5))
@@ -85,7 +96,7 @@ final class OnboardingUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-timeline"]
         app.launch()
-        let timeline = app.buttons["Timeline"]
+        let timeline = app.tabBars.buttons["Activity"]
         XCTAssertTrue(timeline.waitForExistence(timeout: 5)); timeline.tap()
         XCTAssertTrue(app.navigationBars["Timeline"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.staticTexts["Last 12 hours"].exists)
