@@ -2,6 +2,10 @@ import SwiftUI
 
 struct ListenerView: View {
     @Environment(AppModel.self) private var model
+    private var powerReadiness: ListenerPowerReadiness {
+        ListenerPowerReadiness(batteryLevel: model.batteryLevel, powerConnected: model.powerConnected,
+                               fresh: true, now: model.now)
+    }
     @State private var pairing = false
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
@@ -29,7 +33,7 @@ struct ListenerView: View {
             PrimaryButton(title: model.starting ? "Starting…" : model.monitoring || model.recoveringAudio ? "Stop Monitoring" : "Start Monitoring", destructive: model.monitoring || model.recoveringAudio) {
                 if model.monitoring || model.recoveringAudio { model.stop() } else { Task { await model.start() } }
             }.disabled(model.starting || !model.paired)
-            if model.monitoring { Text("Keep this iPhone plugged in. You may lock the screen.").font(.subheadline).foregroundStyle(Palette.muted) }
+            if model.monitoring { Text("You may lock the screen. Connect power if the battery warning appears.").font(.subheadline).foregroundStyle(Palette.muted) }
             if model.needsRestart && !model.monitoring { Label("Monitoring needs to be restarted", systemImage: "exclamationmark.triangle").foregroundStyle(Palette.amber) }
             Panel {
                 Caption(text: "Test notifications")
@@ -49,7 +53,7 @@ struct ListenerView: View {
                     Text("Last alert delivery failed \(failure.failedAt.formatted(date: .abbreviated, time: .shortened)).").foregroundStyle(Palette.amber)
                 }
                 HStack { Label(model.powerConnected ? "Connected" : "On battery", systemImage: "powerplug"); Spacer(); Text(model.batteryLevel.map { "\(Int($0 * 100))%" } ?? "Battery unknown") }.font(.subheadline)
-                if !model.powerConnected, let battery = model.batteryLevel, battery < 0.2 { Label("Low battery · Connect power", systemImage: "battery.25percent").foregroundStyle(Palette.amber) }
+                if powerReadiness.needsPower { Label(powerReadiness.title, systemImage: "battery.25percent").foregroundStyle(Palette.amber) }
             }
         }.sheet(isPresented: $pairing) { PairingView() }
     }

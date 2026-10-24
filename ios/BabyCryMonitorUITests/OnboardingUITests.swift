@@ -41,6 +41,10 @@ final class OnboardingUITests: XCTestCase {
         let ready = app.buttons["Ready for tonight?"]
         XCTAssertTrue(ready.waitForExistence(timeout: 5)); ready.tap()
         XCTAssertTrue(app.navigationBars["Tonight's check"].waitForExistence(timeout: 5))
+        let power = app.descendants(matching: .any)["listenerPowerReadiness"]
+        XCTAssertTrue(power.waitForExistence(timeout: 5))
+        XCTAssertTrue(power.label.contains("Listener battery status unavailable"), power.debugDescription)
+        XCTAssertFalse(app.staticTexts["Listener connected to power: Needs checking"].exists)
         app.buttons["Guided overnight setup"].tap()
         XCTAssertTrue(app.navigationBars["Overnight setup"].waitForExistence(timeout: 5))
         let focus = app.switches["overnightFocusChecked"]
