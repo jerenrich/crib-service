@@ -82,6 +82,11 @@ import Observation
         }
     }
 
+    func resolveAcknowledgements(from snapshot: WatchSnapshot) {
+        confirmAcknowledgement(snapshot.acknowledgedEventId)
+        confirmAcknowledgement(snapshot.discardedAcknowledgementEventId)
+    }
+
     func confirmAcknowledgement(_ eventID: UUID?) {
         guard let eventID, pendingAcknowledgements.contains(eventID) else { return }
         pendingAcknowledgements.removeAll { $0 == eventID }

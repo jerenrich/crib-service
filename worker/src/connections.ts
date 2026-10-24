@@ -1,3 +1,4 @@
+import {timelineInsert,missingHeartbeat} from './timeline';
 import {APIError,requireRole,type Device,type Env} from './types';
 import {sendConnectionPush,type PushResult} from './apns';
 import {eventReference,recordDiagnostic} from './diagnostics';
@@ -16,9 +17,9 @@ export async function connectionPreferences(env:Env,device:Device,value:Record<s
 // Atomic transition + unique notice key prevents duplicate notices across cron runs.
 export async function flushConnections(env:Env,requestId=crypto.randomUUID()) {
  const now=Date.now();
- const rows=await env.DB.prepare(`SELECT p.parent_id,p.listener_id,h.received_at,h.metadata,s.state
+ const rows=await env.DB.prepare(`SELECT p.parent_id,p.listener_id,h.received_at,h.metadata,s.state,p.created_at AS pair_created_at
  FROM pairs p JOIN heartbeats h ON h.listener_id=p.listener_id
- LEFT JOIN connection_states s ON s.listener_id=p.listener_id`).all<{parent_id:string;listener_id:string;received_at:string;metadata:string;state:string|null}>();
+ LEFT JOIN connection_states s ON s.listener_id=p.listener_id`).all<{parent_id:string;listener_id:string;received_at:string;metadata:string;state:string|null;pair_created_at:number}>();
  for(const row of rows.results){
   const active=JSON.parse(row.metadata).monitoring===true;
   const state=active?(now-Date.parse(row.received_at)>180000?'offline':'online'):'stopped';
@@ -27,6 +28,7 @@ export async function flushConnections(env:Env,requestId=crypto.randomUUID()) {
    if(active)await env.DB.prepare("INSERT INTO connection_states(listener_id,state,changed_at) SELECT ?,'online',? WHERE EXISTS(SELECT 1 FROM pairs p JOIN heartbeats h ON h.listener_id=p.listener_id WHERE p.parent_id=? AND p.listener_id=? AND h.received_at=?) ON CONFLICT DO NOTHING").bind(row.listener_id,row.received_at,row.parent_id,row.listener_id,row.received_at).run();
    continue;
   }
+  if(state==='offline')await timelineInsert(env,{parent_id:row.parent_id,listener_id:row.listener_id,created_at:row.pair_created_at},missingHeartbeat(row.received_at)).run();
   if(state===row.state)continue;
   await env.DB.batch([
    env.DB.prepare(`INSERT INTO connection_notices(id,listener_id,parent_id,state,observed_at,created_at)
@@ -62,8 +64,8 @@ export async function flushConnections(env:Env,requestId=crypto.randomUUID()) {
    ]);
   } else {
    // Unknown acceptance is terminal; never replay it to another destination.
-   await env.DB.prepare('UPDATE connection_notices SET status=?,next_attempt=?,lease_until=NULL WHERE id=?')
-    .bind(result.status==='retry'?'pending':result.status,now+Math.min(300000,2000*2**Math.min(notice.attempts,8)),id).run();
+   await env.DB.prepare("UPDATE connection_notices SET status=?,next_attempt=?,lease_until=NULL,sent_at=CASE WHEN ?='sent' THEN ? ELSE sent_at END WHERE id=?")
+    .bind(result.status==='retry'?'pending':result.status,now+Math.min(300000,2000*2**Math.min(notice.attempts,8)),result.status,new Date().toISOString(),id).run();
   }
   let eventRef:string|undefined;try{eventRef=await eventReference(env,id);}catch{/* Diagnostics cannot change delivery. */}
   await recordDiagnostic(env,{requestId,started:now,operation:'dispatch',stage:'push',outcome:result.reason??result.status,eventRef,target,httpStatus:result.httpStatus});

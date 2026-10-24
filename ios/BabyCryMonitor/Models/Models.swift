@@ -92,6 +92,9 @@ public struct SessionSnapshot: Codable, Sendable {
     public var pending: [PendingAlert] = []
     public var failedAlerts: [FailedAlert] = []
     public var lastObservedAt: Date?
+    public var timelineScope: String?
+    public var timelineEvents: [TimelineEvent] = []
+    public var pendingTimelineIDs: [String] = []
     public var wasMonitoring = false
     public init() {}
     public func alertStatus(for episode: CryEpisode) -> EpisodeAlertStatus {
@@ -102,7 +105,7 @@ public struct SessionSnapshot: Codable, Sendable {
         return episode.alertQueuedAt == nil ? .notQueued : .acknowledged
     }
     private enum CodingKeys: String, CodingKey {
-        case configuration, history, current, pending, failedAlerts, lastObservedAt, wasMonitoring
+        case configuration, history, current, pending, failedAlerts, lastObservedAt, wasMonitoring, timelineEvents, pendingTimelineIDs, timelineScope
     }
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -113,5 +116,8 @@ public struct SessionSnapshot: Codable, Sendable {
         failedAlerts = try values.decodeIfPresent([FailedAlert].self, forKey: .failedAlerts) ?? []
         lastObservedAt = try values.decodeIfPresent(Date.self, forKey: .lastObservedAt)
         wasMonitoring = try values.decode(Bool.self, forKey: .wasMonitoring)
+        timelineScope = try values.decodeIfPresent(String.self, forKey: .timelineScope)
+        timelineEvents = try values.decodeIfPresent([TimelineEvent].self, forKey: .timelineEvents) ?? []
+        pendingTimelineIDs = try values.decodeIfPresent([String].self, forKey: .pendingTimelineIDs) ?? []
     }
 }

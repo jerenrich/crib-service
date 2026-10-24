@@ -1,3 +1,4 @@
+import {heartbeatTimeline} from './timeline';
 import {scheduleReminders} from './reminders';
 import {APIError,defaultConfiguration,requireRole,type Device,type Env,type Heartbeat} from './types';
 import {configuration,heartbeat as validateHeartbeat} from './security';
@@ -9,8 +10,11 @@ export async function saveHeartbeat(env:Env,device:Device,value:Record<string,un
  // A replacement pairing must not resurrect the previous family's history.
  heartbeat.episodes=heartbeat.episodes.filter(e=>Date.parse(e.startedAt)>=pair.created_at);
  if(heartbeat.currentEpisode&&Date.parse(heartbeat.currentEpisode.startedAt)<pair.created_at)heartbeat.currentEpisode=null;
+ const previous=await env.DB.prepare('SELECT received_at,metadata FROM heartbeats WHERE listener_id=?').bind(device.id).first<{received_at:string;metadata:string}>();
+ const observedAt=Date.now();
  // Server receive time is authoritative for freshness, never a client's clock.
- const saved=await env.DB.prepare('INSERT INTO heartbeats(listener_id,received_at,metadata) SELECT ?,?,? WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?) ON CONFLICT(listener_id) DO UPDATE SET received_at=excluded.received_at,metadata=excluded.metadata').bind(device.id,new Date().toISOString(),JSON.stringify(heartbeat),pair.parent_id,pair.listener_id,pair.created_at).run();
+ const heartbeatWrite=env.DB.prepare('INSERT INTO heartbeats(listener_id,received_at,metadata) SELECT ?,?,? WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?) ON CONFLICT(listener_id) DO UPDATE SET received_at=excluded.received_at,metadata=excluded.metadata').bind(device.id,new Date().toISOString(),JSON.stringify(heartbeat),pair.parent_id,pair.listener_id,pair.created_at);
+ const [saved]=await env.DB.batch([heartbeatWrite,...heartbeatTimeline(env,pair,heartbeat,previous,observedAt)]);
  if(!saved.meta.changes)throw new APIError(409,'Pairing changed. Pair again.');
  if(heartbeat.monitoring)await env.DB.prepare("INSERT INTO connection_states(listener_id,state,changed_at) SELECT ?,'online',? WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?) ON CONFLICT DO NOTHING").bind(device.id,new Date().toISOString(),pair.parent_id,pair.listener_id,pair.created_at).run();
  const parent=await env.DB.prepare('SELECT config,alerts_muted_until FROM devices WHERE id=?').bind(pair.parent_id).first<{config:string;alerts_muted_until:number}>();

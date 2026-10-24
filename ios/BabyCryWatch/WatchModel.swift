@@ -146,7 +146,7 @@ import UserNotifications
 
     private func accept(_ value: WatchSnapshot) {
         // Confirmation remains valid even if a newer status snapshot arrived first.
-        alertState.confirmAcknowledgement(value.acknowledgedEventId)
+        alertState.resolveAcknowledgements(from: value)
         guard value.updatedAt >= snapshot.updatedAt || !snapshot.parentMode else { return }
         snapshot = value
         updateConnectionWarning(value.localConnectionDeadline)
@@ -159,7 +159,7 @@ import UserNotifications
     }
 
     private func updateConnectionWarning(_ deadline: Date?, force: Bool = false) {
-        guard force || deadline != connectionWarningDeadline else { return }
+        guard force || deadline != connectionWarningDeadline || connectionWarningError != nil else { return }
         connectionWarningDeadline = deadline
         connectionWarningUpdatePending = true
         guard connectionWarningTask == nil else { return }

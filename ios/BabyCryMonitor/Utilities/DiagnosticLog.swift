@@ -25,7 +25,7 @@ import Observation
         "push_registration_failed", "local_notification_scheduled", "local_notification_failed", "watch_sync_failed", "watch_token_synced",
         "watch_notification_authorization", "watch_alert_permission", "watch_sound_permission", "watch_time_sensitive_permission",
         "watch_foreground_notification", "watch_haptic_started", "watch_haptic_requested", "watch_haptic_stopped", "watch_haptic_inactive", "watch_acknowledgement_requested",
-        "watch_acknowledged", "watch_activation_failed", "watch_activated", "watch_reachable", "watch_unreachable",
+        "watch_acknowledged", "watch_acknowledgement_discarded", "watch_activation_failed", "watch_activated", "watch_reachable", "watch_unreachable",
         "watch_snapshot_failed", "watch_snapshot_received", "watch_command_queued", "watch_command_failed", "watch_push_received",
         "monitoring_start_blocked_safety", "monitoring_start_blocked_storage", "test_push_failed",
         "acknowledgement_failed", "connection_preferences_failed", "device_removal_failed",
@@ -59,7 +59,7 @@ import Observation
     }
     func network(operation: String, outcome: String, status: Int? = nil, requestID: UUID? = nil,
                  elapsedMS: Int, storageUnavailable: Bool = false, error: (any Error)? = nil) {
-        let operations: Set<String> = ["register", "pairing_create", "pairing_claim", "push_token", "watch_token", "heartbeat", "alert", "status", "settings", "acknowledge", "test_push", "connection_preferences", "unpair", "delete_device"]
+        let operations: Set<String> = ["register", "pairing_create", "pairing_claim", "push_token", "watch_token", "heartbeat", "alert", "status", "timeline", "settings", "acknowledge", "test_push", "connection_preferences", "unpair", "delete_device"]
         guard operations.contains(operation), ["ok", "http_error", "transport_error", "decode_error", "encode_error", "cancelled", "invalid_response"].contains(outcome) else { return }
         // Routine successes are sampled; preserve a failure and its first recovery.
         let failureKey = "failure_\(operation)"
@@ -67,7 +67,7 @@ import Observation
         let fingerprint = "network_\(operation)_\(outcome)_\(status ?? 0)_\(details)"
         let recovered = outcome == "ok" && recent.removeValue(forKey: failureKey) != nil
         if outcome != "ok" { recent[failureKey] = Date() }
-        let routine = ["status", "heartbeat"].contains(operation)
+        let routine = ["status", "heartbeat", "timeline"].contains(operation)
         let sample = outcome == "ok" ? routine : operation != "alert"
         if sample, !recovered, !storageUnavailable, let last = recent[fingerprint], Date().timeIntervalSince(last) < (outcome == "ok" ? 900 : 60) { return }
         recent[fingerprint] = Date()

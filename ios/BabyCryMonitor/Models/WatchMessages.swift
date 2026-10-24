@@ -19,6 +19,8 @@ struct WatchSnapshot: Codable, Equatable, Sendable {
     var snoozeDuration: Double?
     var alertsMutedUntil: Date?
     var acknowledgedEventId: UUID?
+    // Terminal queue resolution, distinct from an acknowledgement/snooze.
+    var discardedAcknowledgementEventId: UUID?
     var alert: WatchCryAlert?
     var message: String?
     // An absolute deadline from a successful Parent server check. An unrelated

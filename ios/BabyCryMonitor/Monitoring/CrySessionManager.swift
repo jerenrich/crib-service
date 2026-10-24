@@ -35,6 +35,10 @@ public struct CrySessionManager: Sendable {
         snapshot.lastObservedAt = sample.timestamp
         if state == .crying && previous != .crying {
             snapshot.current = CryEpisode(startedAt: sample.timestamp)
+            if let episode = snapshot.current {
+                appendTimeline(TimelineEvent(id: "cry:\(episode.id.uuidString.lowercased())", kind: "cry_started",
+                                             occurredAt: episode.startedAt, episodeID: episode.id.uuidString.lowercased()))
+            }
         }
         if previous == .crying && state == .quiet {
             end(at: detector.quietSince ?? sample.timestamp)
@@ -59,10 +63,31 @@ public struct CrySessionManager: Sendable {
         snapshot.current = episode
         return alerts
     }
+    public mutating func scopeTimeline(to scope: String) {
+        guard snapshot.timelineScope != scope else { return }
+        snapshot.timelineEvents = []; snapshot.pendingTimelineIDs = []; snapshot.timelineScope = scope
+    }
+    public mutating func recordTimeline(_ kind: String, at date: Date) {
+        appendTimeline(TimelineEvent(kind: kind, occurredAt: date))
+    }
+    private mutating func appendTimeline(_ event: TimelineEvent) {
+        guard !snapshot.timelineEvents.contains(where: { $0.id == event.id }) else { return }
+        snapshot.timelineEvents.append(event); snapshot.pendingTimelineIDs.append(event.id)
+        let cutoff = event.occurredAt.addingTimeInterval(-24 * 3600)
+        snapshot.timelineEvents = Array(snapshot.timelineEvents.filter { $0.occurredAt >= cutoff }.suffix(1000))
+        let retained = Set(snapshot.timelineEvents.map(\.id))
+        snapshot.pendingTimelineIDs.removeAll { !retained.contains($0) }
+    }
+    public mutating func uploadedTimeline(_ ids: Set<String>) {
+        snapshot.pendingTimelineIDs.removeAll { ids.contains($0) }
+    }
     public mutating func markMonitoring(_ active: Bool) { snapshot.wasMonitoring = active }
     public mutating func end(at date: Date? = nil) {
         if var episode = snapshot.current {
-            episode.endedAt = max(episode.startedAt, date ?? clock.now)
+            let endedAt = max(episode.startedAt, date ?? clock.now)
+            episode.endedAt = endedAt
+            appendTimeline(TimelineEvent(id: "cry-end:\(episode.id.uuidString.lowercased())", kind: "cry_ended",
+                                         occurredAt: endedAt, endAt: episode.startedAt, episodeID: episode.id.uuidString.lowercased()))
             snapshot.history.insert(episode, at: 0)
             snapshot.history = Array(snapshot.history.prefix(100))
             snapshot.current = nil
