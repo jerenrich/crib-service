@@ -84,6 +84,7 @@ protocol BackendServing: AlertSending {
     func completeMonitoring(_ id: UUID, succeeded: Bool) async throws
     func settings(_ configuration: MonitoringConfiguration) async throws
     func acknowledge(_ id: UUID) async throws
+    func resumeAlerts(until: Date) async throws
     func pushToken(_ token: String) async throws
     func watchPushToken(_ token: String?) async throws
     func connectionAlerts(_ enabled: Bool) async throws
@@ -92,6 +93,7 @@ protocol BackendServing: AlertSending {
     func deleteDevice() async throws
 }
 extension BackendServing {
+    func resumeAlerts(until: Date) async throws { throw BackendError.message("Resume alerts requires an updated connection service.") }
     func setMonitoring(_ enabled: Bool, id: UUID) async throws -> MonitoringCommand { throw BackendError.message("Monitoring controls require an updated connection service.") }
     func completeMonitoring(_ id: UUID, succeeded: Bool) async throws { throw BackendError.message("Monitoring confirmation unavailable.") }
     func timeline() async throws -> TimelineResponse { throw BackendError.message("Timeline requires an updated connection service.") }
@@ -125,6 +127,9 @@ struct BackendClient: BackendServing {
     }
     func settings(_ configuration: MonitoringConfiguration) async throws { let _: EmptyResponse = try await request("/v1/settings", body: configuration) }
     func acknowledge(_ id: UUID) async throws { let _: EmptyResponse = try await request("/v1/alert/acknowledge", body: ["eventId": id.uuidString]) }
+    func resumeAlerts(until: Date) async throws {
+        let _: EmptyResponse = try await request("/v1/alert/resume", body: ["expectedUntil": Int64((until.timeIntervalSince1970 * 1000).rounded())])
+    }
     func pushToken(_ token: String) async throws { let _: EmptyResponse = try await request("/v1/device/push-token", body: ["token": token]) }
     func connectionAlerts(_ enabled: Bool) async throws { let _: EmptyResponse = try await request("/v1/connection-alerts", body: ["enabled": enabled]) }
     func requestTestPush() async throws { let _: AlertReceipt = try await request("/v1/test-push", body: [String:String]()) }
@@ -150,7 +155,7 @@ struct BackendClient: BackendServing {
         let operation = ["/v1/device/register": "register", "/v1/pairing/create": "pairing_create", "/v1/pairing/claim": "pairing_claim",
                          "/v1/device/push-token": "push_token", "/v1/device/watch-push-token": "watch_token",
                          "/v1/listener/heartbeat": "heartbeat", "/v1/listener/event": "alert", "/v1/listener/status": "status",
-                         "/v1/timeline": "timeline", "/v1/monitoring": "monitoring", "/v1/monitoring/complete": "monitoring_complete", "/v1/settings": "settings", "/v1/alert/acknowledge": "acknowledge", "/v1/test-push": "test_push",
+                         "/v1/timeline": "timeline", "/v1/monitoring": "monitoring", "/v1/monitoring/complete": "monitoring_complete", "/v1/settings": "settings", "/v1/alert/acknowledge": "acknowledge", "/v1/test-push": "test_push", "/v1/alert/resume": "resume_alerts",
                          "/v1/connection-alerts": "connection_preferences", "/v1/pairing/remove": "unpair", "/v1/device/delete": "delete_device"][path] ?? "unknown"
         let started = Date()
         let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601

@@ -7,6 +7,23 @@ import XCTest
 #endif
 
 final class WatchAlertStateTests: XCTestCase {
+    @MainActor func testEarlyResumeAllowsNewRemindersButKeepsOldNotificationsDismissed() throws {
+        let fixture = try Fixture()
+        var now = Date()
+        let state = WatchAlertState(defaults: fixture.defaults, currentTime: { now })
+        let initial = fixture.alert()
+        state.receive(initial); state.acknowledgeCurrent(); state.confirmAcknowledgement(initial.eventId)
+        state.acceptAlert(from: WatchSnapshot(statusAvailable: true, alertsMutedUntil: now.addingTimeInterval(60)))
+        now = now.addingTimeInterval(10)
+        state.acceptAlert(from: WatchSnapshot(statusAvailable: true, alertsMutedUntil: now))
+        state.receive(initial)
+        XCTAssertNil(state.alert)
+        let reminder = WatchCryAlert(eventId: UUID(), episodeId: initial.episodeId, startedAt: initial.startedAt,
+                                     createdAt: now.addingTimeInterval(1), duration: 300, isTest: false)
+        state.receive(reminder)
+        XCTAssertEqual(state.alert?.eventId, reminder.eventId)
+    }
+
     @MainActor func testDiscardedAcknowledgementAdvancesDurableQueueWithoutMutingNewAlerts() throws {
         let fixture = try Fixture()
         let deleted = fixture.alert(), current = fixture.alert()

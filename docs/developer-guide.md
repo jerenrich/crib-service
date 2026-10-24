@@ -72,6 +72,16 @@ An inactive iOS app cannot reliably reactivate its microphone remotely. After St
 
 For rollout, apply `0009_monitoring_commands.sql`, deploy the updated Worker, then update both iPhones. These source changes do not deploy the service or install device builds automatically. Validate physical locked-screen Stop and suspended-app Start failure before relying on the feature.
 
+## Usability update (24 October 2026)
+
+Monitor places the active alert and explicit snooze action first, with a countdown and early resume on iPhone and Watch. Watch resume requires a reachable Parent iPhone and waits for its confirmed status. The device list lives in Devices, with a compact summary on Monitor; tapping alert timing opens a focused picker. Sound sensitivity and calibration are unchanged.
+
+The bedtime guide now walks through pairing, Watch/Focus/haptic checks, a user-confirmed wrist test, and confirmed monitoring. Completion is saved for that pairing; subsequent visits use the shorter nightly check. Connection recovery distinguishes a paused live chart from unconfirmed microphone status and offers a retry that reconnects the stream and refreshes the status.
+
+Early resume adds authenticated `POST /v1/alert/resume` with the observed snooze deadline in epoch milliseconds (`expectedUntil`). The service shortens the current mute and retained snooze intervals transactionally. Delayed uploads from the actual muted interval remain suppressed; a delayed resume request cannot end a newer snooze. A fresh crying heartbeat is still required to restart reminders for an acknowledged episode. Existing monitoring Stop behavior takes precedence.
+
+Deploy the updated Worker before distributing these app builds to enable early resume. No database migration is needed. Until the Worker is updated, resume reports a failure instead of claiming success. Source changes and simulator checks do not install builds on physical devices or deploy the Worker.
+
 ## Xcode and iPhone setup
 
 Requirements: current Xcode (verified with Xcode 27 / Swift 6.4), an iOS 17+ device, and an Apple Developer team with push notification entitlement for remote alerts. Two physical iPhones and a paired Apple Watch are required to verify the overnight acceptance scenario.

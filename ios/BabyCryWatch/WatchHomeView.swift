@@ -18,7 +18,11 @@ struct WatchHomeView: View {
                             Text("Acknowledgement queued for iPhone. The snooze starts when it syncs.").font(.caption2).foregroundStyle(.orange)
                         }
                         if let until = model.snapshot.alertsMutedUntil, until > context.date {
-                            Text("Crying alerts snoozed. Resume at \(until.formatted(date: .omitted, time: .shortened)).").font(.caption2).foregroundStyle(.secondary)
+                            VStack(spacing: 4) {
+                                Text("Crying alerts resume in")
+                                Text(timerInterval: context.date...until, countsDown: true).monospacedDigit()
+                                Button("Resume alerts") { model.resumeAlerts() }.disabled(model.refreshing)
+                            }.font(.caption2).foregroundStyle(.secondary)
                         }
                         NavigationLink { WatchSetupView() } label: {
                             Label("Wrist alerts", systemImage: "applewatch.radiowaves.left.and.right")
@@ -36,7 +40,7 @@ struct WatchHomeView: View {
                 }
                 .safeAreaInset(edge: .top, spacing: 4) {
                     if model.alert != nil {
-                        Button("Acknowledge") { model.acknowledge() }
+                        Button(model.alert?.isTest == true ? "Test received" : "Snooze \(duration(model.snapshot.snoozeDuration ?? 60))") { model.acknowledge() }
                             .buttonStyle(.borderedProminent).tint(mint).foregroundStyle(.black)
                             .frame(maxWidth: .infinity)
                     }
@@ -101,7 +105,7 @@ struct WatchHomeView: View {
             Text(alert.isTest ? "A test from your Listener." : "Crying-like sound continued for \(duration(alert.duration)).").font(.footnote).multilineTextAlignment(.center)
             Text("Sent \(alert.createdAt.formatted(date: .omitted, time: .shortened))").font(.caption2).foregroundStyle(.secondary)
             if !alert.isRecent(at: now) { Text("Earlier alert · Check current nursery status.").font(.caption2).foregroundStyle(.orange) }
-            if !alert.isTest { Text("Acknowledge to snooze crying alerts for \(duration(model.snapshot.snoozeDuration ?? 60)).").font(.caption2).foregroundStyle(.secondary) }
+            if !alert.isTest { Text("Snooze crying alerts for \(duration(model.snapshot.snoozeDuration ?? 60)).").font(.caption2).foregroundStyle(.secondary) }
         }.padding(.vertical, 8)
     }
     private func stateTitle(online: Bool) -> String {
@@ -155,7 +159,7 @@ struct WatchSetupView: View {
                     .font(.caption2).foregroundStyle(.secondary)
                 Text("The optional local overdue-check warning is off by default. Enable it in Parent iPhone Settings, separately from server connection alerts. Once armed, it works without internet and warns 3 minutes after the last verified Parent server check. Keep Parent Mode open; Keep screen awake prevents automatic locking. Locking or leaving the app can pause checks and trigger the warning. Watch notification, Focus and haptic settings still apply.")
                     .font(.caption2).foregroundStyle(.secondary)
-                Text("While the app is active, recent alerts repeat three-tap bursts for up to 3 minutes. Tap Acknowledge to stop. watchOS controls background vibration; use Prominent Haptics for a more noticeable wrist alert.")
+                Text("While the app is active, recent alerts repeat three-tap bursts for up to 3 minutes. Tap Snooze to pause crying alerts. watchOS controls background vibration; use Prominent Haptics for a more noticeable wrist alert.")
                     .font(.caption2).foregroundStyle(.secondary)
                 if let notice = model.notice { Text(notice).font(.caption2).foregroundStyle(.orange) }
                 NavigationLink("Diagnostics") {

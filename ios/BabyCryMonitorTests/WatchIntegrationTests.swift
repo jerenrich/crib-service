@@ -9,6 +9,14 @@ final class WatchIntegrationTests: XCTestCase {
         private(set) var tokens: [String?] = []
         private(set) var acknowledgements: [UUID] = []
         private var failing = false
+        private(set) var resumedDeadlines: [Date] = []
+        var muteUntil: Date?
+        func setMute(_ until: Date) { muteUntil = until }
+        func resumeAlerts(until: Date) async throws {
+            if failing { throw URLError(.notConnectedToInternet) }
+            resumedDeadlines.append(until)
+            if until == muteUntil { muteUntil = Date().addingTimeInterval(-1) }
+        }
         private var acknowledgementFailures: [UUID: Int] = [:]
         private(set) var acknowledgementAttempts: [UUID] = []
         init(_ credential: DeviceCredential) { self.credential = credential }
@@ -19,7 +27,7 @@ final class WatchIntegrationTests: XCTestCase {
         func claim(_ code: String) async throws {}
         func status() async throws -> ParentStatus {
             if failing { throw URLError(.notConnectedToInternet) }
-            return ParentStatus(paired: true, watchPushRegistered: tokens.last.flatMap { $0 } != nil, configuration: MonitoringConfiguration())
+            return ParentStatus(paired: true, watchPushRegistered: tokens.last.flatMap { $0 } != nil, alertsMutedUntil: muteUntil, configuration: MonitoringConfiguration())
         }
         func heartbeat(_ value: Heartbeat) async throws -> MonitoringConfiguration { MonitoringConfiguration() }
         func settings(_ configuration: MonitoringConfiguration) async throws {}
@@ -65,6 +73,20 @@ final class WatchIntegrationTests: XCTestCase {
             let handler = try XCTUnwrap(model.watch.onCommand)
             return await handler(command)
         }
+    }
+
+    @MainActor func testWatchResumeCarriesObservedDeadlineAndPreservesNewerSnooze() async throws {
+        let fixture = try Fixture()
+        let original = Date().addingTimeInterval(60), newer = Date().addingTimeInterval(120)
+        await fixture.backend.setMute(newer)
+        let unchanged = try await fixture.command(WatchCommand(kind: .resumeAlerts, snoozeDeadline: original))
+        XCTAssertEqual(unchanged.alertsMutedUntil, newer)
+        XCTAssertTrue(unchanged.message?.contains("not confirmed") == true)
+        let resumed = try await fixture.command(WatchCommand(kind: .resumeAlerts, snoozeDeadline: newer))
+        XCTAssertLessThan(try XCTUnwrap(resumed.alertsMutedUntil), Date())
+        XCTAssertEqual(resumed.message, "Crying alerts resumed.")
+        let sent = await fixture.backend.resumedDeadlines
+        XCTAssertEqual(sent, [original, newer])
     }
 
     @MainActor func testOldQueuedTokenCannotUndoNewerRemoval() async throws {

@@ -14,8 +14,13 @@ import UIKit
     var error: String?
     var audioStatus = "Stopped"
     var deliveryStatus = "Not connected"
+    var resumingAlerts = false
+    var acknowledgingAlert = false
+    var retryingConnection = false
+    var connectionRetryMessage: String?
     var sendingTestPush = false
     var testPushStatus: String?
+    var pairingError: String?
     var pairingCode: PairingCode?
     var parentStatus: ParentStatus?
     private(set) var listenerPairStatus: ParentStatus?
@@ -227,12 +232,19 @@ import UIKit
             meter = (0..<SoundLevelFrame.barCount).map { -80 + Double(($0 * 17) % 65) }
             currentDBFS = meter.last ?? -100
             monitoring = role == .listener
-            let status = ParentStatus(paired: true, watchPushRegistered: true, phonePushRegistered: true,
+            let status = ParentStatus(paired: true, pairingID: "ui-test-pair", watchPushRegistered: true, phonePushRegistered: true,
                 lastHeartbeat: now, monitoring: true, batteryLevel: 1, powerConnected: true,
                 state: .quiet, configuration: configuration)
             if role == .parent { parentStatus = status }
             else { listenerPairStatus = status; listenerPairStatusReceivedAt = now }
             seedLiveSoundFrameForUITest()
+            if ProcessInfo.processInfo.arguments.contains("--uitesting-active-alert") {
+                parentStatus?.alerts = [RemoteAlert(eventId: UUID(), episodeId: UUID(), cryStartedAt: now.addingTimeInterval(-60),
+                    durationSeconds: 60, createdAt: now, status: "sent", acknowledgedAt: nil, isTest: false)]
+            }
+            if ProcessInfo.processInfo.arguments.contains("--uitesting-snoozed") { parentStatus?.alertsMutedUntil = now.addingTimeInterval(60) }
+            if ProcessInfo.processInfo.arguments.contains("--uitesting-chart-paused") { remoteSound.disconnected() }
+            if ProcessInfo.processInfo.arguments.contains("--uitesting-setup-complete") { completeBedtimeSetup() }
         }
         #endif
         // Restore a warning only after explicit opt-in; clear legacy deadlines on
@@ -288,6 +300,43 @@ import UIKit
             $0.isTest == true && $0.acknowledgedAt != nil && (-5...1800).contains(now.timeIntervalSince($0.createdAt))
         }
     }
+    private var bedtimeSetupKey: String { "bedtimeSetup|\(backendURL)|\(parentStatus?.pairingID ?? "unpaired")" }
+    var hasCompletedBedtimeSetup: Bool { paired && parentStatus?.pairingID != nil && defaults.bool(forKey: bedtimeSetupKey) }
+    func completeBedtimeSetup() { defaults.set(true, forKey: bedtimeSetupKey) }
+
+    func retryConnection() async {
+        guard role == .parent, !retryingConnection else { return }
+        retryingConnection = true; connectionRetryMessage = nil
+        defer { retryingConnection = false }
+        liveSound.disconnect()
+        remoteSound.disconnected()
+        await refreshParent()
+        synchronizeLiveSound()
+        connectionRetryMessage = parentOnline
+            ? "Monitoring confirmed. Waiting for live sound readings."
+            : "Monitoring is not confirmed. Check internet on both phones, then reopen Crib Service on the nursery iPhone."
+    }
+
+    @discardableResult func resumeAlerts(until expected: Date? = nil) async -> Bool {
+        guard role == .parent, paired, !resumingAlerts, !managingDevice,
+              let until = expected ?? parentStatus?.alertsMutedUntil, until > currentTime() else { return false }
+        resumingAlerts = true; defer { resumingAlerts = false }
+        let revision = environmentRevision
+        do {
+            let client = try await registeredClient()
+            guard revision == environmentRevision else { return false }
+            try await client.resumeAlerts(until: until)
+            guard revision == environmentRevision else { return false }
+            await refreshParent()
+            return parentStatus != nil && (parentStatus?.alertsMutedUntil ?? .distantPast) <= currentTime()
+        } catch {
+            guard revision == environmentRevision else { return false }
+            self.error = "Could not confirm alerts resumed. Retry when connected. \(error.localizedDescription)"
+            log.record("resume_alerts_failed", error: error)
+            return false
+        }
+    }
+
     var activeAlert: RemoteAlert? {
         let alerts = parentStatus?.alerts?.filter { $0.acknowledgedAt == nil }
         return alerts?.first { $0.isTest != true } ?? alerts?.first
@@ -369,20 +418,20 @@ import UIKit
         let revision = environmentRevision
         do {
             let client = try await registeredClient(); let created = try await client.createPairing()
-            guard revision == environmentRevision else { return }; pairingCode = created; error = nil; log.record("pairing_created")
+            guard revision == environmentRevision else { return }; pairingCode = created; pairingError = nil; log.record("pairing_created")
         }
-        catch { self.error = error.localizedDescription; log.record("pairing_failed", error: error) }
+        catch { self.pairingError = error.localizedDescription; log.record("pairing_failed", error: error) }
     }
     func claimPairing(_ code: String) async {
-        guard code.count == 6, code.allSatisfy(\.isNumber) else { error = "Enter the six-digit code shown on the Parent iPhone."; return }
+        guard code.count == 6, code.allSatisfy(\.isNumber) else { pairingError = "Enter the six-digit code shown on the Parent iPhone."; return }
         let revision = environmentRevision
         do {
             let client = try await registeredClient(); try await client.claim(code)
             guard revision == environmentRevision else { return }
             environmentRevision += 1
             paired = true; defaults.set(true, forKey: pairingKey)
-            log.record("paired_successfully"); error = nil
-        } catch { self.error = error.localizedDescription; log.record("pairing_failed", error: error) }
+            log.record("paired_successfully"); pairingError = nil
+        } catch { self.pairingError = error.localizedDescription; log.record("pairing_failed", error: error) }
     }
     func start(remote: Bool = false, deadline: Date? = nil, commandID: UUID? = nil) async {
         guard !starting, !monitoring, !recoveringAudio, !calibrationActive, !managingDevice, role == .listener else { return }
@@ -725,7 +774,7 @@ import UIKit
     private func updateLocalState() {
         now = currentTime(); let device = UIDevice.current
         #if DEBUG
-        if ProcessInfo.processInfo.arguments.contains("--uitesting-live-sound") { seedLiveSoundFrameForUITest() }
+        if ProcessInfo.processInfo.arguments.contains("--uitesting-live-sound") && !ProcessInfo.processInfo.arguments.contains("--uitesting-chart-paused") { seedLiveSoundFrameForUITest() }
         #endif
         batteryLevel = device.batteryLevel >= 0 ? Double(device.batteryLevel) : nil
         let powered = device.batteryState == .charging || device.batteryState == .full
@@ -987,6 +1036,9 @@ import UIKit
         }
     }
     func refreshParent() async {
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--uitesting-live-sound") { return }
+        #endif
         guard role == .parent else { return }
         if let task = parentRefreshTask { await task.value; return }
         let task = Task { [weak self] in
@@ -1100,9 +1152,22 @@ import UIKit
         ], truncated: false)
     }
     #endif
-    func acknowledge(_ id: UUID) async {
-        do { let client = try await registeredClient(); try await client.acknowledge(id); await refreshParent() }
-        catch { self.error = error.localizedDescription; log.record("acknowledgement_failed", error: error) }
+    @discardableResult func acknowledge(_ id: UUID) async -> Bool {
+        guard !acknowledgingAlert else { return false }
+        acknowledgingAlert = true; defer { acknowledgingAlert = false }
+        let revision = environmentRevision
+        do {
+            let client = try await registeredClient()
+            guard revision == environmentRevision else { return false }
+            try await client.acknowledge(id)
+            guard revision == environmentRevision else { return false }
+            await refreshParent()
+            return true
+        } catch {
+            guard revision == environmentRevision else { return false }
+            self.error = error.localizedDescription; log.record("acknowledgement_failed", error: error)
+            return false
+        }
     }
     var canTestWatchAlert: Bool {
         role == .parent && paired && parentStatus?.watchPushRegistered == true && !sendingTestPush && !managingDevice
@@ -1279,6 +1344,11 @@ import UIKit
         guard role == .parent else { return watchSnapshot(message: "Choose Parent Mode on your paired iPhone.") }
         switch command.kind {
         case .refresh: break
+        case .resumeAlerts:
+            guard let deadline = command.snoozeDeadline else { return watchSnapshot(message: "Open your iPhone to resume alerts.") }
+            await refreshParent()
+            let resumed = await resumeAlerts(until: deadline)
+            return watchSnapshot(message: resumed ? "Crying alerts resumed." : "Resume not confirmed. Check the Parent iPhone; a newer snooze may be active.")
         case .registerToken:
             let latest = defaults.object(forKey: watchRegistrationDateKey) as? Date ?? .distantPast
             if command.issuedAt >= latest {

@@ -162,6 +162,7 @@ struct NightstandDevicesView: View {
             }.padding(20)
         }
         .background(Palette.background).navigationTitle("Devices")
+        .toolbar(.visible, for: .navigationBar)
         .toolbarBackground(Palette.background, for: .navigationBar)
         .sheet(isPresented: $pairing) { PairingView() }
     }

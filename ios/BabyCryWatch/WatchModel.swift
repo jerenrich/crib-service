@@ -123,6 +123,15 @@ import UserNotifications
         log.record("watch_push_received")
         alertState.handleNotification(value, acknowledging: acknowledging)
     }
+    func resumeAlerts() {
+        guard let until = snapshot.alertsMutedUntil, until > Date() else { return }
+        guard WCSession.isSupported(), WCSession.default.activationState == .activated, WCSession.default.isReachable else {
+            notice = "Open the Parent app on your iPhone to resume alerts."
+            return
+        }
+        notice = "Requesting resume. Waiting for iPhone confirmation."
+        send(WatchCommand(kind: .resumeAlerts, snoozeDeadline: until))
+    }
     func acknowledge() { log.record("watch_acknowledgement_requested"); alertState.acknowledgeCurrent() }
     func previewHaptic() async {
         await WatchAlertHaptics.play(for: .seconds(4.5), log: log) { self.alert == nil }

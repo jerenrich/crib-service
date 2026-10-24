@@ -19,6 +19,44 @@ actor RequestGate {
 }
 
 final class AppModelTests: XCTestCase {
+    @MainActor func testResumeAlertsRefreshesConfirmedDeadlineAndKeepsMonitoringActive() async throws {
+        let fixture = try Fixture()
+        fixture.model.role = .parent; fixture.model.paired = true
+        let until = fixture.time.now.addingTimeInterval(60)
+        let status = ParentStatus(paired: true, alertsMutedUntil: until, lastHeartbeat: fixture.time.now, monitoring: true,
+                                  configuration: MonitoringConfiguration())
+        await fixture.backend.setStatus(status); fixture.model.parentStatus = status
+        await fixture.model.resumeAlerts()
+        let deadlines = await fixture.backend.resumedDeadlines
+        XCTAssertEqual(deadlines, [until])
+        XCTAssertTrue(fixture.model.parentOnline)
+        XCTAssertLessThan(try XCTUnwrap(fixture.model.parentStatus?.alertsMutedUntil), fixture.time.now)
+        XCTAssertFalse(fixture.model.resumingAlerts)
+    }
+
+    @MainActor func testFailedResumeDoesNotPretendSnoozeEnded() async throws {
+        let fixture = try Fixture()
+        fixture.model.role = .parent; fixture.model.paired = true
+        let until = fixture.time.now.addingTimeInterval(60)
+        fixture.model.parentStatus = ParentStatus(paired: true, alertsMutedUntil: until, configuration: MonitoringConfiguration())
+        await fixture.backend.setResumeFailure(true)
+        await fixture.model.resumeAlerts()
+        XCTAssertEqual(fixture.model.parentStatus?.alertsMutedUntil, until)
+        XCTAssertTrue(fixture.model.error?.contains("Could not confirm") == true)
+        XCTAssertFalse(fixture.model.resumingAlerts)
+    }
+
+    @MainActor func testBedtimeSetupCompletionBelongsToPairing() throws {
+        let fixture = try Fixture()
+        fixture.model.role = .parent; fixture.model.paired = true
+        fixture.model.parentStatus = ParentStatus(paired: true, pairingID: "first", configuration: MonitoringConfiguration())
+        XCTAssertFalse(fixture.model.hasCompletedBedtimeSetup)
+        fixture.model.completeBedtimeSetup()
+        XCTAssertTrue(fixture.model.hasCompletedBedtimeSetup)
+        fixture.model.parentStatus?.pairingID = "replacement"
+        XCTAssertFalse(fixture.model.hasCompletedBedtimeSetup)
+    }
+
     @MainActor final class Audio: AudioLevelProviding {
         let levels: AsyncStream<AudioLevelSample>
         private let continuation: AsyncStream<AudioLevelSample>.Continuation
@@ -169,6 +207,14 @@ final class AppModelTests: XCTestCase {
             await sendGate?.wait()
             if sendFail { throw URLError(.notConnectedToInternet) }
             return AlertReceipt(status: receipt)
+        }
+        private(set) var resumedDeadlines: [Date] = []
+        var resumeFails = false
+        func setResumeFailure(_ value: Bool) { resumeFails = value }
+        func resumeAlerts(until: Date) async throws {
+            resumedDeadlines.append(until)
+            if resumeFails { throw URLError(.notConnectedToInternet) }
+            statusValue?.alertsMutedUntil = Date().addingTimeInterval(-1)
         }
         func acknowledge(_ id: UUID) async throws {}
         func pushToken(_ token: String) async throws {}

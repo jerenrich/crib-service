@@ -1,5 +1,88 @@
 import XCTest
 final class OnboardingUITests: XCTestCase {
+    @MainActor func testActiveAlertIsAboveChartAndSnoozeActionIsExplicit() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", "--uitesting-active-alert"]
+        app.launch()
+        let action = app.buttons["activeAlertAction"]
+        XCTAssertTrue(action.waitForExistence(timeout: 5))
+        XCTAssertTrue(action.isHittable)
+        XCTAssertEqual(action.label, "Snooze alerts for 1 min")
+        let chart = app.descendants(matching: .any)["soundLevelChart"].firstMatch
+        XCTAssertLessThan(action.frame.maxY, chart.frame.minY)
+        let shot = XCTAttachment(screenshot: app.screenshot()); shot.name = "Alert first"; shot.lifetime = .keepAlways; add(shot)
+    }
+
+    @MainActor func testSnoozeAndChartRecoveryAreProminent() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", "--uitesting-snoozed", "--uitesting-chart-paused"]
+        app.launch()
+        XCTAssertTrue(app.buttons["resumeAlerts"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["resumeAlerts"].isHittable)
+        XCTAssertTrue(app.buttons["retryConnection"].isHittable, app.debugDescription)
+        XCTAssertTrue(app.staticTexts["Live chart paused"].firstMatch.exists)
+        let shot = XCTAttachment(screenshot: app.screenshot()); shot.name = "Snooze and connection recovery"; shot.lifetime = .keepAlways; add(shot)
+    }
+
+    @MainActor func testQuickTimingEditorAndCompactDevices() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound"]
+        app.launch()
+        let timing = app.buttons["editAlertTiming"]
+        XCTAssertTrue(timing.waitForExistence(timeout: 5))
+        for _ in 0..<4 { if timing.isHittable { break }; app.swipeUp() }
+        timing.tap()
+        XCTAssertTrue(app.navigationBars["Alert timing"].waitForExistence(timeout: 5))
+        app.buttons["30 sec"].tap()
+        app.buttons["Done"].tap()
+        XCTAssertTrue(NSPredicate(format: "label CONTAINS %@", "00:30").evaluate(with: timing) || app.staticTexts["Requested 30 sec · Waiting for nursery confirmation"].exists)
+        XCTAssertFalse(app.descendants(matching: .any)["pairedDevice_listener"].exists)
+        let summary = app.buttons["deviceSummary"]
+        for _ in 0..<4 { if summary.exists && summary.isHittable && summary.frame.maxY < app.frame.maxY - 150 { break }; app.swipeUp() }
+        XCTAssertTrue(summary.exists)
+        summary.tap()
+        XCTAssertTrue(app.navigationBars["Devices"].waitForExistence(timeout: 5))
+    }
+
+    @MainActor func testGuidedSetupRequiresWatchChecksAndReceiptBeforeMonitoring() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound"]
+        app.launch()
+        let ready = app.buttons["Ready for tonight?"]
+        for _ in 0..<4 { if ready.isHittable { break }; app.swipeUp() }
+        ready.tap()
+        XCTAssertTrue(app.navigationBars["Overnight setup"].waitForExistence(timeout: 5))
+        app.buttons["Continue to Watch setup"].tap()
+        let focus = app.switches["overnightFocusChecked"]
+        for _ in 0..<6 { if focus.exists && focus.isHittable && focus.frame.maxY < app.frame.maxY - 140 { break }; app.swipeUp() }
+        focus.coordinate(withNormalizedOffset: CGVector(dx: 0.92, dy: 0.5)).tap()
+        XCTAssertEqual(focus.value as? String, "1")
+        let wrist = app.switches["overnightWristChecked"]
+        for _ in 0..<6 { if wrist.exists && wrist.isHittable && wrist.frame.maxY < app.frame.maxY - 140 { break }; app.swipeUp() }
+        wrist.coordinate(withNormalizedOffset: CGVector(dx: 0.92, dy: 0.5)).tap()
+        XCTAssertEqual(wrist.value as? String, "1")
+        let next = app.buttons["Continue to test"]
+        for _ in 0..<4 { if next.isHittable { break }; app.swipeUp() }
+        XCTAssertTrue(next.isEnabled); next.tap()
+        XCTAssertTrue(app.buttons["testWatchAlert"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["testWatchAlert"].isEnabled)
+        XCTAssertFalse(app.buttons["Continue to monitoring"].isEnabled)
+        XCTAssertFalse(app.buttons["confirmWatchAlert"].exists)
+        let shot = XCTAttachment(screenshot: app.screenshot()); shot.name = "Guided wrist test"; shot.lifetime = .keepAlways; add(shot)
+    }
+
+    @MainActor func testReturningSetupUsesShortNightlyCheck() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", "--uitesting-setup-complete"]
+        app.launch()
+        let ready = app.buttons["Ready for tonight?"]
+        for _ in 0..<4 { if ready.isHittable { break }; app.swipeUp() }
+        ready.tap()
+        XCTAssertTrue(app.navigationBars["Tonight's check"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.descendants(matching: .any)["listenerPowerReadiness"].exists)
+        let shot = XCTAttachment(screenshot: app.screenshot()); shot.name = "Short nightly check"; shot.lifetime = .keepAlways; add(shot)
+    }
+
     @MainActor func testBothModesUseSameLiveSoundChart() {
         let app = XCUIApplication()
         var parentValue: String?
@@ -132,28 +215,12 @@ final class OnboardingUITests: XCTestCase {
         XCTAssertTrue(parent.waitForExistence(timeout: 5)); parent.tap()
         let ready = app.buttons["Ready for tonight?"]
         XCTAssertTrue(ready.waitForExistence(timeout: 5)); ready.tap()
-        XCTAssertTrue(app.navigationBars["Tonight's check"].waitForExistence(timeout: 5))
-        let power = app.descendants(matching: .any)["listenerPowerReadiness"]
-        XCTAssertTrue(power.waitForExistence(timeout: 5))
-        XCTAssertTrue(power.label.contains("Listener battery status unavailable"), power.debugDescription)
-        XCTAssertFalse(app.staticTexts["Listener connected to power: Needs checking"].exists)
-        app.buttons["Guided overnight setup"].tap()
         XCTAssertTrue(app.navigationBars["Overnight setup"].waitForExistence(timeout: 5))
-        let focus = app.switches["overnightFocusChecked"]
-        for _ in 0..<8 { if focus.isHittable { break }; app.swipeUp() }
-        XCTAssertTrue(focus.isHittable); focus.tap()
-        let wrist = app.switches["overnightWristChecked"]
-        for _ in 0..<5 { if wrist.isHittable { break }; app.swipeUp() }
-        XCTAssertTrue(wrist.isHittable); wrist.tap()
-        let watchTest = app.buttons["testWatchAlert"]
-        for _ in 0..<5 { if watchTest.exists { break }; app.swipeUp() }
-        XCTAssertTrue(watchTest.exists); XCTAssertFalse(watchTest.isEnabled)
-        XCTAssertFalse(app.buttons["confirmWatchAlert"].exists)
-        app.navigationBars["Overnight setup"].buttons.element(boundBy: 0).tap()
-        app.swipeUp()
-        let testPush = app.buttons["Send real test notification"]
-        for _ in 0..<8 { if testPush.exists { break }; app.swipeUp() }
-        XCTAssertTrue(testPush.exists); XCTAssertFalse(testPush.isEnabled)
+        XCTAssertTrue(app.staticTexts["Step 1 of 4 · Pair phones"].exists)
+        XCTAssertFalse(app.buttons["Continue to Watch setup"].isEnabled)
+        app.buttons["Pair phones"].tap()
+        XCTAssertTrue(app.navigationBars["Pair iPhones"].waitForExistence(timeout: 5))
+        app.navigationBars["Pair iPhones"].buttons["Done"].tap()
         app.buttons["Done"].tap()
         app.buttons["Settings"].tap()
         let delete = app.buttons["Delete device & shared history"]
