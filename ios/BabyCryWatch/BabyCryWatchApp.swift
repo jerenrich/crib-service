@@ -15,7 +15,7 @@ import UserNotifications
 @MainActor final class WatchAppDelegate: NSObject, WKApplicationDelegate, UNUserNotificationCenterDelegate {
     func applicationDidFinishLaunching() {
         UNUserNotificationCenter.current().delegate = self
-        let action = UNNotificationAction(identifier: WatchNotification.acknowledge, title: "Acknowledge", options: [.foreground])
+        let action = UNNotificationAction(identifier: WatchNotification.acknowledge, title: "Snooze", options: [.foreground])
         UNUserNotificationCenter.current().setNotificationCategories([
             UNNotificationCategory(identifier: WatchNotification.category, actions: [action], intentIdentifiers: [], options: [])
         ])
@@ -96,7 +96,7 @@ struct CryNotificationView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             if alert != nil {
-                Button("Acknowledge", action: acknowledge)
+                Button("Snooze", action: acknowledge)
                     .buttonStyle(.borderedProminent).tint(Color(red: 0.62, green: 0.90, blue: 0.79)).foregroundStyle(.black)
                     .frame(maxWidth: .infinity)
             }

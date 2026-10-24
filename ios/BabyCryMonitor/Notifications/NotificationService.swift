@@ -30,7 +30,7 @@ extension NotificationProviding {
         UNUserNotificationCenter.current().delegate = self
         let action = UNNotificationAction(identifier: "OPEN_CRY", title: "Open nursery", options: [.foreground])
         UNUserNotificationCenter.current().setNotificationCategories([
-            UNNotificationCategory(identifier: WatchNotification.category, actions: [UNNotificationAction(identifier: WatchNotification.acknowledge, title: "Acknowledge · Snooze", options: [.foreground]), action], intentIdentifiers: [], options: [])
+            UNNotificationCategory(identifier: WatchNotification.category, actions: [UNNotificationAction(identifier: WatchNotification.acknowledge, title: "Snooze", options: [.foreground]), action], intentIdentifiers: [], options: [])
         ])
     }
     func register() async {
