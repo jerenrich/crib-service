@@ -15,6 +15,8 @@ const parent = {deviceId: randomUUID(), role: 'parent', secret: randomBytes(32).
 const listener = {deviceId: randomUUID(), role: 'listener', secret: randomBytes(32).toString('base64')};
 const ids = `'${parent.deviceId}','${listener.deviceId}'`;
 const cleanup = [
+    `DELETE FROM alert_snoozes WHERE parent_id IN (${ids}) OR listener_id IN (${ids});`,
+    `DELETE FROM timeline_events WHERE parent_id IN (${ids}) OR listener_id IN (${ids});`,
     `DELETE FROM connection_notices WHERE parent_id IN (${ids}) OR listener_id IN (${ids});`,
     `DELETE FROM connection_states WHERE listener_id IN (${ids});`,
     `DELETE FROM events WHERE parent_id IN (${ids}) OR listener_id IN (${ids});`,
@@ -51,9 +53,10 @@ try {
     for (const absoluteThreshold of [-60.01, -9.99]) {
         check((await request('settings', parent, {...config, absoluteThreshold})).status === 400, `out-of-range sound threshold ${absoluteThreshold} rejected`);
     }
+    const timelineRecord = {id: randomUUID(), kind: 'monitoring_started', occurredAt: new Date().toISOString()};
     const beat = {
         listenerId: listener.deviceId, timestamp: new Date().toISOString(), monitoring: true,
-        powerConnected: false, state: 'quiet', episodes: [], appliedConfiguration: config
+        powerConnected: false, state: 'quiet', episodes: [], appliedConfiguration: config, timelineEvents: [timelineRecord]
     };
     const heartbeat = await request('listener/heartbeat', listener, beat);
     check(heartbeat.status === 200 && heartbeat.body.alertDuration === 5, 'listener receives five-second configuration');
@@ -65,6 +68,10 @@ try {
     check(Date.parse(status.body.serverTime) >= Date.parse(status.body.lastHeartbeat), 'server clock supplied for adaptive polling');
     const repeatedStatus = await request('listener/status', parent, null, 'GET');
     check(repeatedStatus.body.nextHeartbeatExpectedAt === status.body.nextHeartbeatExpectedAt, 'repeated polling does not postpone the expected heartbeat');
+    const history = await request('timeline', parent, null, 'GET');
+    check(history.status === 200 && history.body.paired && history.body.events?.some(event => event.id === timelineRecord.id), 'Parent timeline includes uploaded monitoring transition');
+    check((await request('timeline', listener, null, 'GET')).status === 200, 'Listener can read shared timeline');
+    check((await request('timeline', null, null, 'GET')).status === 401, 'timeline requires authentication');
     check(status.body.configuration?.alertDuration === 5, 'parent sees the same five-second configuration');
     check(status.body.listenerConfiguration?.alertDuration === 5, 'Listener applied-settings acknowledgement');
     check(status.body.configuration?.absoluteThreshold === -45 && status.body.listenerConfiguration?.absoluteThreshold === -45, 'Parent sees the selected and applied fixed threshold');
@@ -88,6 +95,11 @@ try {
     const snoozed = await request('listener/status', parent, null, 'GET');
     const remaining = Date.parse(snoozed.body.alertsMutedUntil) - Date.now();
     check(remaining > 110000 && remaining <= 120000, 'selected two-minute snooze is active on the live backend');
+    check((await request('alert/acknowledge', parent, {eventId: realAlert.eventId})).status === 200, 'duplicate real acknowledgement accepted safely');
+    const repeatedAcknowledgement = await request('listener/status', parent, null, 'GET');
+    check(repeatedAcknowledgement.body.alertsMutedUntil === snoozed.body.alertsMutedUntil, 'duplicate acknowledgement does not extend snooze');
+    const acknowledgedHistory = await request('timeline', parent, null, 'GET');
+    check(acknowledgedHistory.body.events?.filter(event => event.kind === 'alert_acknowledged' && event.episodeID === realAlert.episodeId).length === 1, 'real acknowledgement appears exactly once in timeline');
     check((await request('alert/acknowledge', parent, {eventId: testStatus.body.alerts[0].eventId})).status === 200, 'test acknowledgement accepted');
     const afterTest = await request('listener/status', parent, null, 'GET');
     check(afterTest.body.alertsMutedUntil === snoozed.body.alertsMutedUntil, 'test acknowledgement does not extend the real snooze');
