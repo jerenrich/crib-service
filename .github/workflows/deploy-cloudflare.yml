@@ -1,0 +1,116 @@
+name: Deploy Cloudflare
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never interrupt a migration or deploy with another deployment run.
+concurrency:
+  group: deploy-cloudflare
+  cancel-in-progress: false
+
+env:
+  CI: 'true'
+  WRANGLER_SEND_METRICS: 'false'
+
+jobs:
+  validate:
+    name: Validate Worker
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: worker
+    steps:
+      - name: Require main
+        working-directory: .
+        run: |
+          if [ "$GITHUB_REF" != 'refs/heads/main' ]; then
+            echo '::error::Select main when running this deployment workflow.'
+            exit 1
+          fi
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - name: Check deployment bundle
+        run: npm run deploy -- --dry-run --outdir "$RUNNER_TEMP/cloudflare-dry-run"
+
+  deploy:
+    name: Deploy existing backend
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: cloudflare-production
+      url: https://baby-cry-monitor.jordan-erenrich.workers.dev
+    defaults:
+      run:
+        working-directory: worker
+    steps:
+      - name: Check deployment credentials
+        working-directory: .
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            echo '::error::Add the CLOUDFLARE_API_TOKEN Actions secret before deploying. See docs/developer-guide.md.'
+            exit 1
+          fi
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+      - run: npm ci
+      - name: Apply pending D1 migrations
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: npm run db:remote
+      - name: Deploy Worker and configured triggers
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: npm run deploy -- --message "$GITHUB_SHA"
+      - name: Verify backend health
+        env:
+          WORKER_URL: https://baby-cry-monitor.jordan-erenrich.workers.dev
+        run: |
+          node --input-type=module <<'NODE'
+          import {setTimeout} from 'node:timers/promises';
+          for (let attempt = 1; attempt <= 5; attempt++) {
+            try {
+              const response = await fetch(`${process.env.WORKER_URL}/v1/listener/status`, {
+                signal: AbortSignal.timeout(10000), redirect: 'error'
+              });
+              if (response.status !== 401 || response.headers.get('x-diagnostics-status') !== 'recorded') {
+                throw new Error(`Expected authentication rejection with working D1 diagnostics; got HTTP ${response.status}.`);
+              }
+              console.log('Backend is reachable, rejects unauthenticated access, and writes D1 diagnostics.');
+              break;
+            } catch (error) {
+              if (attempt === 5) throw error;
+              await setTimeout(3000);
+            }
+          }
+          NODE
+      - name: Record release
+        run: |
+          {
+            echo '### Cloudflare deployment'
+            echo "Commit: \`$GITHUB_SHA\`"
+            echo 'Backend: https://baby-cry-monitor.jordan-erenrich.workers.dev'
+            echo 'Pending D1 migrations applied; Worker, bindings, and triggers deployed; backend health check passed.'
+            echo 'Phone/Watch notification delivery still requires a physical device check.'
+          } >> "$GITHUB_STEP_SUMMARY"
