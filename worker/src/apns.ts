@@ -28,9 +28,9 @@ export function payload(alert:Alert,target:'phone'|'watch'='phone') {
 export async function sendPush(env:Env,encryptedToken:string,alert:Alert,target:'phone'|'watch'='phone'):Promise<PushResult> {
  return sendNotification(env,encryptedToken,alert.eventId,payload(alert,target),target,alert.isRepeat?5:3600,alert.isRepeat?alert.episodeId:alert.eventId);
 }
-export async function sendConnectionPush(env:Env,encryptedToken:string,id:string,state:string,target:'phone'|'watch'):Promise<PushResult> {
- const title=state==='online'?'Monitoring connection restored':state==='stopped'?'Listener monitoring stopped':'Listener connection lost';
- const body=state==='online'?'The Listener is reporting active monitoring again.':state==='stopped'?'The Listener reports that monitoring has stopped. Check the nursery phone.':'No Listener update for at least 3 minutes. Check power, internet, and monitoring.';
+export async function sendConnectionPush(env:Env,encryptedToken:string,id:string,state:'offline'|'stopped',target:'phone'|'watch'):Promise<PushResult> {
+ const title=state==='stopped'?'Listener monitoring stopped':'Listener connection lost';
+ const body=state==='stopped'?'The Listener reports that monitoring has stopped. Check the nursery phone.':'No Listener update for at least 3 minutes. Check power, internet, and monitoring.';
  return sendNotification(env,encryptedToken,id,{aps:{alert:{title,body},'thread-id':'listener-connection',...(target==='watch'?{sound:'default','interruption-level':'time-sensitive'}:{})},connectionState:state},target,180);
 }
 async function sendNotification(env:Env,encryptedToken:string,id:string,content:unknown,target:'phone'|'watch',expiration:number,collapseId=id):Promise<PushResult> {

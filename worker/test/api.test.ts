@@ -54,7 +54,7 @@ afterEach(()=>{try{expect(pushResponses).toHaveLength(0);}finally{vi.unstubAllGl
 describe('connection alerts, readiness and replacement',()=>{
  const beat=(listener:TestDevice,monitoring=true,appliedConfiguration=defaultConfiguration)=>({listenerId:listener.deviceId,timestamp:new Date().toISOString(),monitoring,powerConnected:true,state:'quiet',episodes:[],appliedConfiguration});
  async function stale(){await env.DB.prepare('UPDATE heartbeats SET received_at=?').bind(new Date(Date.now()-240000).toISOString()).run();}
- it('defaults connection alerts on, respects opt-out and emits one notice per outage plus recovery',async()=>{
+ it('defaults connection alerts on, respects opt-out and emits one notice per outage with quiet recovery',async()=>{
   const {parent,listener}=await paired();
   await call('device/push-token',parent,{token:'ab'.repeat(32)});
   expect((await call('connection-alerts',listener,{enabled:true})).status).toBe(403);
@@ -68,9 +68,12 @@ describe('connection alerts, readiness and replacement',()=>{
   await call('connection-alerts',parent,{enabled:true});
   await stale();mockPush();await flushConnections(testEnv);await flushConnections(testEnv);
   expect(pushRequests).toHaveLength(1);
-  let content=JSON.parse(String(pushRequests[0].init?.body));expect(content.connectionState).toBe('offline');expect(content.eventId).toBeUndefined();
-  await call('listener/heartbeat',listener,beat(listener));mockPush();await flushConnections(testEnv);await flushConnections(testEnv);
-  expect(pushRequests).toHaveLength(2);content=JSON.parse(String(pushRequests[1].init?.body));expect(content.connectionState).toBe('online');
+  const content=JSON.parse(String(pushRequests[0].init?.body));expect(content.connectionState).toBe('offline');expect(content.eventId).toBeUndefined();
+  await call('listener/heartbeat',listener,beat(listener));await flushConnections(testEnv);await flushConnections(testEnv);
+  expect(pushRequests).toHaveLength(1);
+  expect((await env.DB.prepare('SELECT state FROM connection_states WHERE listener_id=?').bind(listener.deviceId).first<{state:string}>())?.state).toBe('online');
+  await stale();mockPush();await flushConnections(testEnv);await flushConnections(testEnv);
+  expect(pushRequests).toHaveLength(2);expect(JSON.parse(String(pushRequests[1].init?.body)).connectionState).toBe('offline');
  });
  it('defaults stopped-monitor warnings on but does not warn before first start',async()=>{
   const {parent,listener}=await paired();
@@ -112,9 +115,29 @@ describe('connection alerts, readiness and replacement',()=>{
   const {parent,listener}=await paired();await call('connection-alerts',parent,{enabled:true});
   await call('listener/heartbeat',listener,beat(listener));await stale();await flushConnections(testEnv);
   await call('listener/heartbeat',listener,beat(listener));await call('device/push-token',parent,{token:'ab'.repeat(32)});
-  await env.DB.prepare('UPDATE connection_notices SET next_attempt=0').run();mockPush();await flushConnections(testEnv);
-  expect(pushRequests).toHaveLength(1);expect(JSON.parse(String(pushRequests[0].init?.body)).connectionState).toBe('online');
+  await env.DB.prepare('UPDATE connection_notices SET next_attempt=0').run();await flushConnections(testEnv);
+  expect(pushRequests).toHaveLength(0);
   const offline=await env.DB.prepare("SELECT status FROM connection_notices WHERE state='offline'").first<{status:string}>();expect(offline?.status).toBe('cancelled');
+ });
+ it.each(['offline','stopped'] as const)('recovers quietly on the Watch after %s and cancels legacy recovery notices',async(state)=>{
+  const {parent,listener}=await paired();
+  await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
+  await call('listener/heartbeat',listener,beat(listener));
+  if(state==='offline')await stale();else await call('listener/heartbeat',listener,beat(listener,false));
+  mockPush();await flushConnections(testEnv);
+  expect(pushRequests).toHaveLength(1);expect(pushRequests[0].url).toContain('cd'.repeat(32));
+  expect(JSON.parse(String(pushRequests[0].init?.body)).connectionState).toBe(state);
+  await call('listener/heartbeat',listener,beat(listener));
+  for(const status of ['pending','blocked']){
+   await env.DB.prepare("INSERT INTO connection_notices(id,listener_id,parent_id,state,observed_at,created_at,status,next_attempt) VALUES(?,?,?,'online',?,?,?,?)")
+    .bind(crypto.randomUUID(),listener.deviceId,parent.deviceId,`${new Date().toISOString()}-${status}`,Date.now(),status,Date.now()+3600000).run();
+  }
+  await flushConnections(testEnv);await flushConnections(testEnv);
+  expect(pushRequests).toHaveLength(1);
+  const notices=await env.DB.prepare("SELECT status FROM connection_notices WHERE state='online'").all<{status:string}>();
+  expect(notices.results.map(n=>n.status)).toEqual(['cancelled','cancelled']);
+  expect((await env.DB.prepare('SELECT state FROM connection_states WHERE listener_id=?').bind(listener.deviceId).first<{state:string}>())?.state).toBe('online');
  });
  it('retries explicit rejection once without duplicating concurrent dispatch',async()=>{
   const {parent,listener}=await paired();await call('connection-alerts',parent,{enabled:true});await call('device/push-token',parent,{token:'ab'.repeat(32)});
