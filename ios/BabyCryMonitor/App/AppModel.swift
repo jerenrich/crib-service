@@ -905,6 +905,11 @@ import UIKit
     }
     func foreground() async {
         log.record("foreground")
+        #if DEBUG
+        // This offline UI fixture supplies a complete paired snapshot. Loading
+        // real credentials here would replace it with the empty test defaults.
+        if ProcessInfo.processInfo.arguments.contains("--uitesting-timeline") { return }
+        #endif
         if credential == nil { loadCredential() }
         if role == .parent { await notifications.register(); await refreshParent() }
         if role == .listener && needsRestart && !monitoring && !starting && !recoveringAudio { error = "Monitoring needs to be restarted. Check the microphone and tap Start Monitoring." }
