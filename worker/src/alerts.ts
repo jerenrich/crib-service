@@ -1,3 +1,4 @@
+import {stoppedMonitoringSQL} from './monitoring';
 import {scheduleReminders} from './reminders';
 import {APIError,requireRole,type Alert,type Device,type Env,type StoredEvent} from './types';
 import {alert as validateAlert,uuid,configuration} from './security';
@@ -44,8 +45,12 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  OR EXISTS(SELECT 1 FROM alert_snoozes s JOIN pairs p ON p.parent_id=s.parent_id AND p.listener_id=s.listener_id AND p.created_at=s.pair_created_at
  WHERE s.parent_id=events.parent_id AND s.listener_id=events.listener_id
  AND CAST(ROUND((julianday(json_extract(events.payload,'$.createdAt'))-2440587.5)*86400000) AS INTEGER) BETWEEN s.started_at AND s.until_at)
+ OR ${stoppedMonitoringSQL}
+ OR EXISTS(SELECT 1 FROM monitoring_commands m JOIN pairs p ON p.parent_id=m.parent_id AND p.listener_id=m.listener_id AND p.created_at=m.pair_created_at
+ WHERE m.parent_id=events.parent_id AND m.listener_id=events.listener_id AND m.enabled=0
+ AND CAST(ROUND((julianday(json_extract(events.payload,'$.createdAt'))-2440587.5)*86400000) AS INTEGER)<=m.created_at)
  OR (is_repeat=1 AND EXISTS(SELECT 1 FROM events prior WHERE prior.parent_id=events.parent_id AND prior.episode_id=events.episode_id AND prior.acknowledged_at IS NOT NULL AND prior.created_at>=events.created_at))
- )`).bind(new Date(now).toISOString(),eventId,now).run();
+ )`).bind(new Date(now).toISOString(),eventId,now,now).run();
  const event=await env.DB.prepare("UPDATE events SET status='sending',lease_until=?,attempts=attempts+1,push_target=COALESCE(push_target,CASE WHEN (SELECT watch_push_token FROM devices WHERE id=events.parent_id) IS NOT NULL THEN 'watch' ELSE 'phone' END) WHERE event_id=? AND status='pending' AND acknowledged_at IS NULL AND next_attempt<=? RETURNING *").bind(now+30000,eventId,now).first<StoredEvent>();
  if(!event)return;
  attempt=event.attempts;target=event.push_target??'phone';stage='storage';
@@ -140,6 +145,7 @@ export async function flushPending(env:Env,requestId=crypto.randomUUID()) {
  // Keep deduplication tombstones for 30 days. Codes are short-lived; claimed codes retain
  // enough time to recover a lost claim response. Status metadata retains max 100 episodes.
  await env.DB.batch([
+  env.DB.prepare('DELETE FROM monitoring_commands WHERE created_at<? AND sequence NOT IN (SELECT MAX(sequence) FROM monitoring_commands GROUP BY parent_id,listener_id,pair_created_at)').bind(Date.now()-30*86400000),
   env.DB.prepare('DELETE FROM alert_snoozes WHERE until_at<?').bind(Date.now()-86400000),
   env.DB.prepare(`DELETE FROM timeline_events WHERE occurred_at<? AND id NOT IN (SELECT id FROM timeline_events t2 WHERE t2.parent_id=timeline_events.parent_id AND t2.listener_id=timeline_events.listener_id AND t2.pair_created_at=timeline_events.pair_created_at AND t2.kind IN ('coverage_active','coverage_stopped') ORDER BY occurred_at DESC LIMIT 1)`).bind(Date.now()-24*3600000),
   env.DB.prepare('DELETE FROM events WHERE created_at<?').bind(Date.now()-30*86400000),

@@ -1,6 +1,7 @@
 import XCTest
 final class OnboardingUITests: XCTestCase {
     @MainActor func testParentWarningAndScreenPreferencesDefaultOffAndPersist() {
+        continueAfterFailure = false
         let app = XCUIApplication()
         app.launchArguments = ["--uitesting-reset", "--uitesting-offline"]
         app.launch()
@@ -14,23 +15,49 @@ final class OnboardingUITests: XCTestCase {
         let form = app.descendants(matching: .any)["settingsForm"]
         let local = app.switches["localConnectionWarning"]
         let awake = app.switches["keepScreenAwake"]
-        for _ in 0..<12 { if local.exists && local.isHittable { break }; scrollDown(in: form) }
+        func reveal(_ toggle: XCUIElement) {
+            for _ in 0..<16 {
+                if toggle.exists && toggle.isHittable && toggle.frame.maxY < form.frame.maxY - 80 { return }
+                scrollDown(in: form)
+            }
+        }
+        reveal(local)
         XCTAssertTrue(local.exists && local.isHittable)
         XCTAssertEqual(local.value as? String, "0")
-        local.tap()
-        for _ in 0..<5 { if awake.exists && awake.isHittable { break }; scrollDown(in: form) }
+        local.coordinate(withNormalizedOffset: CGVector(dx: 0.92, dy: 0.5)).tap()
+        XCTAssertTrue(NSPredicate(format: "value == '1'").evaluate(with: local))
+        reveal(awake)
         XCTAssertEqual(awake.value as? String, "0")
-        awake.tap()
+        awake.coordinate(withNormalizedOffset: CGVector(dx: 0.92, dy: 0.5)).tap()
+        XCTAssertTrue(NSPredicate(format: "value == '1'").evaluate(with: awake))
         app.terminate(); app.launchArguments = ["--uitesting-offline"]; app.launch()
         XCTAssertTrue(app.buttons["Settings"].waitForExistence(timeout: 5)); app.buttons["Settings"].tap()
-        for _ in 0..<12 { if local.exists && local.isHittable { break }; scrollDown(in: form) }
+        reveal(local)
         XCTAssertEqual(local.value as? String, "1")
-        local.tap()
-        for _ in 0..<5 { if awake.exists && awake.isHittable { break }; scrollDown(in: form) }
+        local.coordinate(withNormalizedOffset: CGVector(dx: 0.92, dy: 0.5)).tap()
+        reveal(awake)
         XCTAssertEqual(awake.value as? String, "1")
-        awake.tap()
+        awake.coordinate(withNormalizedOffset: CGVector(dx: 0.92, dy: 0.5)).tap()
     }
 
+
+    @MainActor func testParentMonitoringFailureIsProminentAndRemainsVisible() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-timeline"]
+        app.launch()
+        let start = app.buttons["Start Monitoring"]
+        XCTAssertTrue(start.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["Stop Monitoring"].exists)
+        start.tap()
+        let warning = app.alerts["Monitoring not confirmed"]
+        XCTAssertTrue(warning.waitForExistence(timeout: 5))
+        XCTAssertTrue(warning.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "Could not verify that monitoring started")).firstMatch.exists)
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "Parent monitoring failure"; screenshot.lifetime = .keepAlways; add(screenshot)
+        warning.buttons["OK"].tap()
+        XCTAssertTrue(app.staticTexts["Monitoring not confirmed"].exists)
+        XCTAssertTrue(app.buttons["Stop Monitoring"].isEnabled)
+    }
     @MainActor func testTimelineOverviewFilteringAndDetails() {
         let app = XCUIApplication()
         app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-timeline"]
@@ -72,6 +99,10 @@ final class OnboardingUITests: XCTestCase {
         let ready = app.buttons["Ready for tonight?"]
         XCTAssertTrue(ready.waitForExistence(timeout: 5)); ready.tap()
         XCTAssertTrue(app.navigationBars["Tonight's check"].waitForExistence(timeout: 5))
+        let power = app.descendants(matching: .any)["listenerPowerReadiness"]
+        XCTAssertTrue(power.waitForExistence(timeout: 5))
+        XCTAssertTrue(power.label.contains("Listener battery status unavailable"), power.debugDescription)
+        XCTAssertFalse(app.staticTexts["Listener connected to power: Needs checking"].exists)
         app.buttons["Guided overnight setup"].tap()
         XCTAssertTrue(app.navigationBars["Overnight setup"].waitForExistence(timeout: 5))
         let focus = app.switches["overnightFocusChecked"]

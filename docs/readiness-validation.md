@@ -8,7 +8,21 @@ Record device/OS versions, build and Worker revision, timestamps, Focus settings
 
 The current source separates server connection alerts (on by default for new registrations, preserving existing preferences) from the optional local overdue-check warning (off by default, including upgrades). The local preference controls both Parent and Watch and clears legacy deadlines unless explicitly enabled. Keep screen awake is a separate, persisted Parent-only option, off by default. Manual locking can still pause checks. These app changes have not been installed on physical devices and require no backend deployment or migration.
 
-All 78 Foundation core tests and 149 iOS unit tests passed. Coverage includes independent preferences, upgrade cancellation, explicit opt-in, offline opt-out, pending-request/scheduling races, Watch snapshot compatibility, and saved screen-awake preferences. The combined unsigned iPhone/Watch device build passed. Notification-service scheduling/cancellation runs outside the UI actor after simulator traces exposed a synchronous cancellation call blocking startup. The added Settings UI persistence scenario compiles, but its final run is pending because Xcode stalled during simulator test startup. Physical Auto-Lock, Watch cancellation after sync and locked-screen delivery still require the checks below.
+After integration with main's nursery monitoring controls and battery checks, all 92 Foundation core tests and 171 iOS unit tests passed. Coverage includes independent preferences, upgrade cancellation, explicit opt-in, offline opt-out, pending-request/scheduling races, Watch snapshot compatibility, and saved screen-awake preferences. The Settings UI test passed, verifying both optional preferences default off, can be enabled, and survive app relaunch. The combined unsigned iPhone/Watch device build passed. Notification-service scheduling/cancellation runs outside the UI actor after simulator traces exposed a synchronous cancellation call blocking startup. Main's removal of the home-screen warning panel is preserved; the local warning's scheduling status appears in Settings. Physical Auto-Lock, Watch cancellation after sync and locked-screen delivery still require the checks below.
+
+## Monitoring control checks
+
+Apply `0009_monitoring_commands.sql` and deploy the updated Worker before installing the updated apps. Validation on 24 October 2026: 77 Foundation core tests, 90 Worker/D1 tests and TypeScript checks passed. The iOS suite passed all monitoring-control scenarios; its warning-cancellation expectation was updated for the first-launch notification fix and passed on rerun. The Parent UI test verified the error dialog and persistent warning. Physical checks for this change have not been run.
+
+| Check | Expected observation |
+| --- | --- |
+| Stop from Parent with nursery screen locked | Requests Stop, nursery microphone stops, Parent confirms stopped, existing crying reminders end |
+| Start from Parent with nursery app open | Nursery microphone becomes active; Parent confirms only after the command result and a fresh heartbeat |
+| Start with nursery app suspended or force-quit | Parent shows a prominent failure/unverified alert and persistent red warning within 30 seconds; reopening the nursery app after expiry does not replay Start |
+| Denied permission or unavailable microphone | Listener reports failure; Parent shows a prominent warning and never claims monitoring was confirmed |
+| Network loss while changing monitoring | Parent shows that the action could not be verified; local nursery controls still work |
+| Local Stop while a remote Start is pending | Local Stop wins over an older status response; no delayed restart |
+| Stop during repeating Watch alerts | Outstanding crying alerts are retired; already submitted APNs notifications may still arrive |
 
 ## Fixed threshold integration
 

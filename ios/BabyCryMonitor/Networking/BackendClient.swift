@@ -12,6 +12,7 @@ struct ParentStatus: Codable, Sendable {
     var lastHeartbeat: Date?
     var serverTime: Date?
     var nextHeartbeatExpectedAt: Date?
+    var monitoringCommand: MonitoringCommand?
     var monitoring: Bool?
     var batteryLevel: Double?
     var powerConnected: Bool?
@@ -30,6 +31,13 @@ struct ParentStatus: Codable, Sendable {
         guard remaining.isFinite, remaining >= -15 else { return 15 }
         return min(15, max(1, remaining))
     }
+}
+struct MonitoringCommand: Codable, Sendable, Equatable {
+    let id: UUID
+    let enabled: Bool
+    var status: String
+    let createdAt: Date
+    let expiresAt: Date
 }
 struct RemoteEpisode: Identifiable, Codable, Sendable {
     let id: UUID
@@ -72,6 +80,8 @@ protocol BackendServing: AlertSending {
     func status() async throws -> ParentStatus
     func timeline() async throws -> TimelineResponse
     func heartbeat(_ value: Heartbeat) async throws -> MonitoringConfiguration
+    func setMonitoring(_ enabled: Bool, id: UUID) async throws -> MonitoringCommand
+    func completeMonitoring(_ id: UUID, succeeded: Bool) async throws
     func settings(_ configuration: MonitoringConfiguration) async throws
     func acknowledge(_ id: UUID) async throws
     func pushToken(_ token: String) async throws
@@ -82,6 +92,8 @@ protocol BackendServing: AlertSending {
     func deleteDevice() async throws
 }
 extension BackendServing {
+    func setMonitoring(_ enabled: Bool, id: UUID) async throws -> MonitoringCommand { throw BackendError.message("Monitoring controls require an updated connection service.") }
+    func completeMonitoring(_ id: UUID, succeeded: Bool) async throws { throw BackendError.message("Monitoring confirmation unavailable.") }
     func timeline() async throws -> TimelineResponse { throw BackendError.message("Timeline requires an updated connection service.") }
     func connectionAlerts(_ enabled: Bool) async throws { throw BackendError.message("Connection alerts unavailable.") }
     func requestTestPush() async throws { throw BackendError.message("Remote test unavailable.") }
@@ -103,6 +115,14 @@ struct BackendClient: BackendServing {
     func timeline() async throws -> TimelineResponse { try await request("/v1/timeline", method: "GET", body: Optional<String>.none) }
     func heartbeat(_ value: Heartbeat) async throws -> MonitoringConfiguration { try await request("/v1/listener/heartbeat", body: value) }
     func send(_ alert: CryAlert) async throws -> AlertReceipt { try await request("/v1/listener/event", body: alert) }
+    func setMonitoring(_ enabled: Bool, id: UUID) async throws -> MonitoringCommand {
+        struct Request: Encodable { let id: UUID; let enabled: Bool }
+        return try await request("/v1/monitoring", body: Request(id: id, enabled: enabled))
+    }
+    func completeMonitoring(_ id: UUID, succeeded: Bool) async throws {
+        struct Request: Encodable { let id: UUID; let succeeded: Bool }
+        let _: EmptyResponse = try await request("/v1/monitoring/complete", body: Request(id: id, succeeded: succeeded))
+    }
     func settings(_ configuration: MonitoringConfiguration) async throws { let _: EmptyResponse = try await request("/v1/settings", body: configuration) }
     func acknowledge(_ id: UUID) async throws { let _: EmptyResponse = try await request("/v1/alert/acknowledge", body: ["eventId": id.uuidString]) }
     func pushToken(_ token: String) async throws { let _: EmptyResponse = try await request("/v1/device/push-token", body: ["token": token]) }
@@ -130,7 +150,7 @@ struct BackendClient: BackendServing {
         let operation = ["/v1/device/register": "register", "/v1/pairing/create": "pairing_create", "/v1/pairing/claim": "pairing_claim",
                          "/v1/device/push-token": "push_token", "/v1/device/watch-push-token": "watch_token",
                          "/v1/listener/heartbeat": "heartbeat", "/v1/listener/event": "alert", "/v1/listener/status": "status",
-                         "/v1/timeline": "timeline", "/v1/settings": "settings", "/v1/alert/acknowledge": "acknowledge", "/v1/test-push": "test_push",
+                         "/v1/timeline": "timeline", "/v1/monitoring": "monitoring", "/v1/monitoring/complete": "monitoring_complete", "/v1/settings": "settings", "/v1/alert/acknowledge": "acknowledge", "/v1/test-push": "test_push",
                          "/v1/connection-alerts": "connection_preferences", "/v1/pairing/remove": "unpair", "/v1/device/delete": "delete_device"][path] ?? "unknown"
         let started = Date()
         let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601

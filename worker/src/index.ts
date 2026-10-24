@@ -1,3 +1,4 @@
+import {requestMonitoring,completeMonitoring} from './monitoring';
 import {timeline} from './timeline';
 export {AlertReminders} from './reminders';
 import {APIError,type Env} from './types';
@@ -56,6 +57,8 @@ export default {
      case 'POST /v1/listener/event':result=await receiveAlert(env,device,await body(request),requestId);break;
      case 'GET /v1/timeline':result=await timeline(env,device);break;
      case 'GET /v1/listener/status':result=await listenerStatus(env,device);break;
+     case 'POST /v1/monitoring':result=await requestMonitoring(env,device,await body(request));break;
+     case 'POST /v1/monitoring/complete':result=await completeMonitoring(env,device,await body(request));break;
      case 'POST /v1/settings':result=await saveSettings(env,device,await body(request));break;
      case 'POST /v1/alert/acknowledge':result=await acknowledge(env,device,await body(request));break;
      default:throw new APIError(404,'Endpoint not found.');

@@ -28,6 +28,19 @@ private final class DiagnosticsURLProtocol: URLProtocol, @unchecked Sendable {
 }
 
 final class DiagnosticsTests: XCTestCase {
+    @MainActor func testBatteryHistorySurvivesDiagnosticRingAndRelaunch() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let log = DiagnosticLog(directory: directory)
+        log.battery(batteryLevel: 0.65, powerConnected: false, monitoring: true, audioActive: true,
+                    lowPowerMode: false, appActive: false, at: Date())
+        for _ in 0..<600 { log.record("foreground") }
+        XCTAssertEqual(log.lines.count, 500)
+        let restored = DiagnosticLog(directory: directory)
+        XCTAssertTrue(restored.export.contains("Battery drain samples"))
+        XCTAssertTrue(restored.export.contains(",65.00,0,1,1,0,0"))
+        XCTAssertTrue(restored.export.contains("sampled_at,run_id,battery_percent"))
+    }
     @MainActor func testBoundedPersistentLogAndPrivacyAllowlist() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

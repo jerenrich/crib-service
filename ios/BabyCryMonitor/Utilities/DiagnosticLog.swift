@@ -6,6 +6,7 @@ import Observation
     private(set) var persistenceAvailable = true
     private(set) var persistenceFailure: String?
     private let url: URL?
+    private let batteryDrain: BatteryDrainLog
     private var recent: [String: Date] = [:]
     private static let events: Set<String> = [
         "app_launched", "foreground", "background", "monitoring_recovered_after_relaunch",
@@ -29,11 +30,12 @@ import Observation
         "watch_snapshot_failed", "watch_snapshot_received", "watch_command_queued", "watch_command_failed", "watch_push_received",
         "monitoring_start_blocked_safety", "monitoring_start_blocked_storage", "test_push_failed",
         "acknowledgement_failed", "connection_preferences_failed", "device_removal_failed",
-        "calibration_failed", "listener_status_failed"
+        "calibration_failed", "listener_status_failed", "monitoring_control_failed"
     ]
     init(directory: URL? = nil) {
         let folder = directory ?? (try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true))
         url = folder?.appendingPathComponent("diagnostics.txt")
+        batteryDrain = BatteryDrainLog(directory: folder)
         do {
             guard let folder, let url else { persistenceAvailable = false; return }
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -42,6 +44,11 @@ import Observation
                 lines = Array(text.components(separatedBy: "\n").filter { !$0.isEmpty }.suffix(500))
             }
         } catch { persistenceAvailable = false; persistenceFailure = Self.errorDetails(error) }
+    }
+    func battery(batteryLevel: Double?, powerConnected: Bool?, monitoring: Bool, audioActive: Bool,
+                 lowPowerMode: Bool, appActive: Bool, at now: Date) {
+        batteryDrain.record(batteryLevel: batteryLevel, powerConnected: powerConnected, monitoring: monitoring,
+                            audioActive: audioActive, lowPowerMode: lowPowerMode, appActive: appActive, at: now)
     }
     func record(_ event: String, code: Int? = nil, error: (any Error)? = nil) {
         // Enforced allowlist: callers cannot accidentally append an exception, token or URL.
@@ -59,7 +66,7 @@ import Observation
     }
     func network(operation: String, outcome: String, status: Int? = nil, requestID: UUID? = nil,
                  elapsedMS: Int, storageUnavailable: Bool = false, error: (any Error)? = nil) {
-        let operations: Set<String> = ["register", "pairing_create", "pairing_claim", "push_token", "watch_token", "heartbeat", "alert", "status", "timeline", "settings", "acknowledge", "test_push", "connection_preferences", "unpair", "delete_device"]
+        let operations: Set<String> = ["register", "pairing_create", "pairing_claim", "push_token", "watch_token", "heartbeat", "alert", "status", "timeline", "monitoring", "monitoring_complete", "settings", "acknowledge", "test_push", "connection_preferences", "unpair", "delete_device"]
         guard operations.contains(operation), ["ok", "http_error", "transport_error", "decode_error", "encode_error", "cancelled", "invalid_response"].contains(outcome) else { return }
         // Routine successes are sampled; preserve a failure and its first recovery.
         let failureKey = "failure_\(operation)"
@@ -165,10 +172,11 @@ import Observation
             persistenceAvailable = true; persistenceFailure = nil
         } catch { persistenceAvailable = false; persistenceFailure = Self.errorDetails(error) }
     }
-    var export: String {
+    var recentExport: String {
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
         return "Crib Service diagnostics · app=\(version) build=\(build) os=\(ProcessInfo.processInfo.operatingSystemVersionString)\npersistence=\(persistenceAvailable ? "available" : "unavailable")\n"
             + (persistenceFailure.map { "diagnostic_storage_error \($0)\n" } ?? "") + lines.joined(separator: "\n")
     }
+    var export: String { recentExport + "\n\n" + batteryDrain.export }
 }

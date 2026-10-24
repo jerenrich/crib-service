@@ -98,6 +98,16 @@ final class AppModelTests: XCTestCase {
         var statusGate: RequestGate?
         private(set) var statusCalls = 0
         var statusFails = false
+        var monitoringFails = false
+        private(set) var monitoringRequests: [(Bool, UUID)] = []
+        private(set) var monitoringResults: [(UUID, Bool)] = []
+        func setMonitoringFailure(_ value: Bool) { monitoringFails = value }
+        func setMonitoring(_ enabled: Bool, id: UUID) async throws -> MonitoringCommand {
+            monitoringRequests.append((enabled, id))
+            if monitoringFails { throw URLError(.notConnectedToInternet) }
+            return MonitoringCommand(id: id, enabled: enabled, status: "pending", createdAt: Date(), expiresAt: Date().addingTimeInterval(30))
+        }
+        func completeMonitoring(_ id: UUID, succeeded: Bool) async throws { monitoringResults.append((id, succeeded)) }
         init(credential: DeviceCredential) { self.credential = credential }
         func configure(settingsFail: Bool = false, settingsGate: RequestGate? = nil,
                        heartbeatGate: RequestGate? = nil, sendGate: RequestGate? = nil,
@@ -198,6 +208,91 @@ final class AppModelTests: XCTestCase {
             try? FileManager.default.removeItem(at: directory)
         }
     }
+    @MainActor func testParentRequestRequiresMicrophoneConfirmationAndTimesOutProminently() async throws {
+        let fixture = try Fixture(); fixture.model.selectRole(.parent)
+        await fixture.model.refreshParent()
+        await fixture.model.requestMonitoring(true)
+        XCTAssertNotNil(fixture.model.pendingMonitoringCommand)
+        XCTAssertFalse(fixture.model.monitoring)
+        XCTAssertNil(fixture.model.monitoringControlError)
+        fixture.time.now = fixture.time.now.addingTimeInterval(31)
+        await fixture.model.tick()
+        XCTAssertNil(fixture.model.pendingMonitoringCommand)
+        XCTAssertTrue(fixture.model.monitoringControlError?.contains("could not be started or verified") == true)
+    }
+    @MainActor func testParentConfirmsOnlyAppliedCommandWithFreshMatchingHeartbeat() async throws {
+        let fixture = try Fixture(); fixture.model.selectRole(.parent)
+        await fixture.model.refreshParent(); await fixture.model.requestMonitoring(true)
+        let pending = try XCTUnwrap(fixture.model.pendingMonitoringCommand)
+        let command = MonitoringCommand(id: pending.id, enabled: true, status: "applied", createdAt: fixture.time.now.addingTimeInterval(-1), expiresAt: fixture.time.now.addingTimeInterval(30))
+        var status = ParentStatus(paired: true, serverTime: fixture.time.now, monitoringCommand: command, monitoring: false, configuration: MonitoringConfiguration())
+        await fixture.backend.setStatus(status); await fixture.model.refreshParent()
+        XCTAssertNotNil(fixture.model.pendingMonitoringCommand)
+        status.monitoring = true; status.lastHeartbeat = fixture.time.now.addingTimeInterval(-45)
+        await fixture.backend.setStatus(status); await fixture.model.refreshParent()
+        XCTAssertNotNil(fixture.model.pendingMonitoringCommand)
+        status.lastHeartbeat = fixture.time.now
+        await fixture.backend.setStatus(status); await fixture.model.refreshParent()
+        XCTAssertNil(fixture.model.pendingMonitoringCommand)
+        XCTAssertEqual(fixture.model.monitoringControlMessage, "Monitoring confirmed on nursery phone")
+        XCTAssertNil(fixture.model.monitoringControlError)
+    }
+    @MainActor func testParentShowsExplicitFailureAndTransportError() async throws {
+        let fixture = try Fixture(); fixture.model.selectRole(.parent)
+        await fixture.model.refreshParent(); await fixture.model.requestMonitoring(true)
+        var command = try XCTUnwrap(fixture.model.pendingMonitoringCommand); command.status = "failed"
+        await fixture.backend.setStatus(ParentStatus(paired: true, monitoringCommand: command, configuration: MonitoringConfiguration()))
+        await fixture.model.refreshParent()
+        XCTAssertNotNil(fixture.model.monitoringControlError)
+        XCTAssertNil(fixture.model.pendingMonitoringCommand)
+        await fixture.backend.setMonitoringFailure(true)
+        await fixture.model.requestMonitoring(false)
+        XCTAssertTrue(fixture.model.monitoringControlError?.contains("Could not verify that monitoring stopped") == true)
+    }
+    @MainActor func testRemoteStopStopsAudioAndPublishesStoppedHeartbeat() async throws {
+        let fixture = try Fixture(); await fixture.model.start()
+        let command = MonitoringCommand(id: UUID(), enabled: false, status: "pending", createdAt: fixture.time.now, expiresAt: fixture.time.now.addingTimeInterval(30))
+        await fixture.backend.setStatus(ParentStatus(paired: true, serverTime: fixture.time.now, monitoringCommand: command, configuration: MonitoringConfiguration()))
+        await fixture.model.tick()
+        let stopped = await eventually {
+            let results = await fixture.backend.monitoringResults
+            return !fixture.model.monitoring && results.contains { $0.0 == command.id && $0.1 }
+        }
+        XCTAssertTrue(stopped)
+        let reported = await eventually { await fixture.backend.beats.last?.monitoring == false }
+        XCTAssertTrue(reported)
+    }
+    @MainActor func testRemoteStartActivatesMicrophoneAndReportsSuccess() async throws {
+        let fixture = try Fixture()
+        let command = MonitoringCommand(id: UUID(), enabled: true, status: "pending", createdAt: fixture.time.now, expiresAt: fixture.time.now.addingTimeInterval(30))
+        await fixture.backend.setStatus(ParentStatus(paired: true, serverTime: fixture.time.now, monitoringCommand: command, configuration: MonitoringConfiguration()))
+        await fixture.model.tick()
+        let started = await eventually { (await fixture.backend.monitoringResults).contains { $0.0 == command.id && $0.1 } }
+        XCTAssertTrue(started); XCTAssertTrue(fixture.model.monitoring); XCTAssertEqual(fixture.audio.starts, 1)
+        fixture.model.stop()
+    }
+    @MainActor func testRemoteStartFailureIsReportedAndNotReplayed() async throws {
+        let fixture = try Fixture(); fixture.audio.startFailure = URLError(.cannotOpenFile)
+        let command = MonitoringCommand(id: UUID(), enabled: true, status: "pending", createdAt: fixture.time.now, expiresAt: fixture.time.now.addingTimeInterval(30))
+        await fixture.backend.setStatus(ParentStatus(paired: true, serverTime: fixture.time.now, monitoringCommand: command, configuration: MonitoringConfiguration()))
+        await fixture.model.tick()
+        let failed = await eventually { (await fixture.backend.monitoringResults).contains { $0.0 == command.id && !$0.1 } }
+        XCTAssertTrue(failed); XCTAssertFalse(fixture.model.monitoring)
+        fixture.time.now = fixture.time.now.addingTimeInterval(4); await fixture.model.tick()
+        let retried = await eventually { await fixture.backend.monitoringResults.count == 2 }
+        XCTAssertTrue(retried); XCTAssertEqual(fixture.audio.starts, 1)
+    }
+    @MainActor func testLocalStopInvalidatesSuspendedRemoteStartRead() async throws {
+        let fixture = try Fixture(); let gate = RequestGate()
+        let command = MonitoringCommand(id: UUID(), enabled: true, status: "pending", createdAt: fixture.time.now, expiresAt: fixture.time.now.addingTimeInterval(30))
+        await fixture.backend.setStatus(ParentStatus(paired: true, serverTime: fixture.time.now, monitoringCommand: command, configuration: MonitoringConfiguration()))
+        await fixture.backend.setStatusGate(gate); await fixture.model.tick()
+        let reading = await eventually { await fixture.backend.statusCalls > 0 }; XCTAssertTrue(reading)
+        fixture.model.stop(); await gate.open()
+        for _ in 0..<10 { await Task.yield() }
+        XCTAssertFalse(fixture.model.monitoring); XCTAssertEqual(fixture.audio.starts, 0)
+    }
+
     @MainActor func testWatchTestRequiresFreshWatchRegistration() async throws {
         let fixture = try Fixture(); fixture.model.selectRole(.parent)
         await fixture.backend.setStatus(ParentStatus(paired: true, watchPushRegistered: true, configuration: MonitoringConfiguration()))
@@ -423,8 +518,7 @@ final class AppModelTests: XCTestCase {
 
     @MainActor func testLocalOptOutWinsOverPendingSchedulingAndStatusResponse() async throws {
         let fixture = try Fixture(localWarnings: true)
-        let initialized = await eventually { !fixture.notifications.connectionDeadlines.isEmpty }
-        XCTAssertTrue(initialized)
+        XCTAssertTrue(fixture.notifications.connectionDeadlines.isEmpty, "A fresh Listener has no OS warning to cancel")
         let scheduleGate = RequestGate(); fixture.notifications.connectionWarningGate = scheduleGate
         await fixture.backend.setStatus(ParentStatus(paired: true, monitoring: true, configuration: MonitoringConfiguration()))
         fixture.model.selectRole(.parent); await fixture.model.refreshParent()
@@ -536,8 +630,7 @@ final class AppModelTests: XCTestCase {
 
     @MainActor func testLateLocalWarningScheduleCannotUndoRoleChangeCancellation() async throws {
         let fixture = try Fixture(localWarnings: true)
-        let initialized = await eventually { !fixture.notifications.connectionDeadlines.isEmpty }
-        XCTAssertTrue(initialized)
+        XCTAssertTrue(fixture.notifications.connectionDeadlines.isEmpty, "A fresh Listener has no OS warning to cancel")
         let gate = RequestGate(); fixture.notifications.connectionWarningGate = gate
         await fixture.backend.setStatus(ParentStatus(paired: true, monitoring: true, configuration: MonitoringConfiguration()))
         fixture.model.selectRole(.parent); await fixture.model.refreshParent()
@@ -545,7 +638,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(requested)
         fixture.model.selectRole(.listener)
         await gate.open()
-        let cancelled = await eventually { fixture.notifications.connectionDeadlines.count >= 3 && fixture.notifications.scheduledConnectionDeadline == nil }
+        let cancelled = await eventually { fixture.notifications.connectionDeadlines.count >= 2 && fixture.notifications.scheduledConnectionDeadline == nil }
         XCTAssertTrue(cancelled)
         XCTAssertNil(fixture.model.parentConnectionDeadline)
     }

@@ -5,27 +5,29 @@ struct ParentView: View {
     @State private var pairing = false
     @State private var readiness = false
     @State private var overnightSetup = false
+    @State private var showMonitoringError = false
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
             HStack { Caption(text: "Parent Mode"); Spacer(); StatusPill(text: model.nurseryConnection, active: model.parentOnline) }
             PrimaryButton(title: "Ready for tonight?") { readiness = true }
             if model.paired {
                 Panel {
-                    Label("Local overdue-check warning", systemImage: "wifi.exclamationmark").font(.headline)
-                    if !model.localConnectionWarningEnabled {
-                        Text("Off · Optional in Settings. Server connection alerts are controlled separately.").foregroundStyle(Palette.muted)
-                    } else if let failure = model.parentConnectionWarningError {
-                        Text("Warning unavailable: \(failure)").foregroundStyle(Palette.amber)
-                    } else if let deadline = model.parentConnectionDeadline {
-                        Text(model.now >= deadline ? "Server check overdue. Check both phones and your internet connection." : "Armed · Warns after 3 minutes without a successful server check.")
-                            .foregroundStyle(model.now >= deadline ? Palette.amber : Palette.mint)
-                    } else {
-                        Text("Waiting for a successful server check with monitoring active.").foregroundStyle(Palette.muted)
+                    Caption(text: "Nursery monitoring")
+                    Text(model.nurseryConnection).font(.title2.weight(.semibold))
+                    HStack {
+                        PrimaryButton(title: "Start Monitoring") { Task { await model.requestMonitoring(true) } }
+                        PrimaryButton(title: "Stop Monitoring", destructive: true) { Task { await model.requestMonitoring(false) } }
+                    }.disabled(model.requestingMonitoring || model.managingDevice)
+                    if let message = model.monitoringControlMessage {
+                        Text(message).font(.subheadline).foregroundStyle(Palette.muted)
                     }
-                    if model.localConnectionWarningEnabled {
-                        Text("Once armed, this iPhone can warn without internet. Keep Parent Mode open for ongoing checks. Enable Keep screen awake in Settings to prevent automatic locking. Locking the phone or leaving the app may pause checks and trigger the warning. iPhone Silent Mode and Focus can silence it.")
-                            .font(.footnote).foregroundStyle(Palette.muted)
+                    if let failure = model.monitoringControlError {
+                        Label("Monitoring not confirmed", systemImage: "exclamationmark.triangle.fill")
+                            .font(.headline).foregroundStyle(.red)
+                        Text(failure).font(.subheadline).foregroundStyle(.red)
                     }
+                    Text("Stop cancels repeating crying alerts. Remote start needs the nursery app to be running. If iOS has suspended it, reopen it on that phone. Always wait for monitoring confirmation.")
+                        .font(.footnote).foregroundStyle(Palette.muted)
                 }
             }
             if let alert = model.activeAlert {
@@ -57,8 +59,8 @@ struct ParentView: View {
                         Text(status.batteryLevel.map { "\(Int($0 * 100))%" } ?? "Battery unknown")
                     }.font(.subheadline)
                     if !model.parentOnline { Text("Power and battery information is from the last update.").font(.caption).foregroundStyle(Palette.muted) }
-                    if model.parentOnline, status.powerConnected != true, let level = status.batteryLevel, level < 0.2 {
-                        Label("Listener battery low · Connect power", systemImage: "exclamationmark.triangle").foregroundStyle(Palette.amber)
+                    if model.listenerPowerReadiness.needsPower {
+                        Label(model.listenerPowerReadiness.title, systemImage: "exclamationmark.triangle").foregroundStyle(Palette.amber)
                     }
                 }
                 if let episode = model.parentStatus?.currentEpisode, model.parentOnline {
@@ -84,7 +86,14 @@ struct ParentView: View {
                 Text("Use Ready for tonight? → Guided overnight setup to check Sleep Focus and test a wrist alert before sleeping.").font(.footnote).foregroundStyle(Palette.muted)
             }
             Panel { Caption(text: "Connection"); Text(model.deliveryStatus).font(.subheadline).foregroundStyle(Palette.muted); Text(model.notifications.status).font(.subheadline).foregroundStyle(Palette.muted) }
-        }.sheet(isPresented: $pairing) { PairingView() }
+        }.onAppear { showMonitoringError = model.monitoringControlError != nil }
+            .onChange(of: model.monitoringControlError) { _, failure in
+            if failure != nil { showMonitoringError = true }
+        }
+            .alert("Monitoring not confirmed", isPresented: $showMonitoringError) {
+                Button("OK", role: .cancel) { }
+            } message: { Text(model.monitoringControlError ?? "Check the nursery phone before relying on monitoring.") }
+            .sheet(isPresented: $pairing) { PairingView() }
             .sheet(isPresented: $readiness) { ReadinessView() }
             .sheet(isPresented: $overnightSetup) {
                 NavigationStack {

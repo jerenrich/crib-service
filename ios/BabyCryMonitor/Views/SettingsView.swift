@@ -88,6 +88,16 @@ struct SettingsView: View {
                     Section {
                         Toggle("Local overdue-check warning", isOn: Binding(get: { model.localConnectionWarningEnabled }, set: { model.setLocalConnectionWarning($0) }))
                             .accessibilityIdentifier("localConnectionWarning")
+                        if model.localConnectionWarningEnabled {
+                            if let failure = model.parentConnectionWarningError {
+                                Text("Warning unavailable: \(failure)").foregroundStyle(.orange)
+                            } else if let deadline = model.parentConnectionDeadline {
+                                Text(model.now >= deadline ? "Server check overdue. Open Parent Mode to check." : "Armed · Warns after 3 minutes without a successful server check.")
+                                    .foregroundStyle(model.now >= deadline ? .orange : .secondary)
+                            } else {
+                                Text("Waiting for a successful server check with monitoring active.").foregroundStyle(.secondary)
+                            }
+                        }
                     } footer: {
                         Text("Optional · Off by default. During monitoring, warns on this iPhone and its Watch after 3 minutes without a successful Parent server check. Works without internet once armed. Locking the phone or leaving the app can pause checks and trigger it on a healthy network. Independent of server connection alerts. Notification, Focus and haptic settings still apply.")
                     }
