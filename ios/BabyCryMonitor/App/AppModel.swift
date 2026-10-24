@@ -212,6 +212,10 @@ import UIKit
         guard let applied = parentStatus?.listenerConfiguration else { return "Waiting for Listener confirmation" }
         return applied == configuration && parentOnline ? "Applied on Listener" : "Waiting for Listener"
     }
+    var listenerPowerReadiness: ListenerPowerReadiness {
+        ListenerPowerReadiness(batteryLevel: parentStatus?.batteryLevel, powerConnected: parentStatus?.powerConnected,
+                               fresh: parentOnline, now: now)
+    }
     var recentConfirmedTest: RemoteAlert? {
         parentStatus?.alerts?.first {
             $0.isTest == true && $0.acknowledgedAt != nil && (-5...1800).contains(now.timeIntervalSince($0.createdAt))
@@ -343,6 +347,7 @@ import UIKit
             guard storageHealthy else { return }
             lastSampleAt = currentTime(); needsRestart = false; error = nil
             log.record("monitoring_started")
+            recordBatterySample()
         } catch is CancellationError { return }
         catch { self.error = error.localizedDescription; log.record("monitoring_start_failed", error: error) }
     }
@@ -350,6 +355,7 @@ import UIKit
         let wasActive = monitoring || recoveringAudio
         audio.stop(); engine.suspend(); persist()
         if wasActive { log.record("monitoring_stopped") }
+        recordBatterySample()
     }
     func sendTestPush() async {
         guard !sendingTestPush, role == .listener, paired else { return }
@@ -465,11 +471,21 @@ import UIKit
         if monitoring, let lastSampleAt, now.timeIntervalSince(lastSampleAt) > 3 {
             stop(); error = "Monitoring stopped: microphone samples stopped arriving."; needsRestart = true; log.record("audio_stalled")
         }
+        recordBatterySample()
         scheduleHeartbeatIfDue()
         if let retry = parentWarningRetryAt, now >= retry, parentWarningTask == nil {
             parentWarningUpdatePending = true
             dispatchParentConnectionWarning()
         }
+    }
+    private func recordBatterySample() {
+        guard role == .listener else { return }
+        let device = UIDevice.current
+        log.battery(batteryLevel: device.batteryLevel >= 0 ? Double(device.batteryLevel) : nil,
+                    powerConnected: device.batteryState == .unknown ? nil : device.batteryState == .charging || device.batteryState == .full,
+                    monitoring: monitoring || recoveringAudio, audioActive: monitoring && !recoveringAudio,
+                    lowPowerMode: ProcessInfo.processInfo.isLowPowerModeEnabled,
+                    appActive: UIApplication.shared.applicationState == .active, at: currentTime())
     }
     private var parentWarningScope: String { "\(backendURL)|\(credential?.deviceId.uuidString ?? "none")" }
     private func setParentConnectionDeadline(_ deadline: Date?, force: Bool = false) {
