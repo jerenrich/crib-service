@@ -5,36 +5,68 @@ struct RootView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.scenePhase) private var phase
     @State private var settings = false
+    @State private var tab = HomeTab.monitor
+    private enum HomeTab { case monitor, activity, devices }
+
     var body: some View {
-        NavigationStack {
-            ZStack {
-                Palette.background.ignoresSafeArea()
-                if !model.safetyAccepted { OnboardingView() }
-                else if model.role == nil { RoleSelectionView() }
-                else {
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 24) {
-                            HStack { Label("Crib Service", systemImage: "moon.stars").font(.title3.weight(.semibold)); Spacer(); NavigationLink { TimelineView() } label: { Image(systemName: "clock.arrow.circlepath").font(.title3).frame(width: 44, height: 44) }.accessibilityLabel("Timeline"); Button { settings = true } label: { Image(systemName: "slider.horizontal.3").font(.title3).frame(width: 44, height: 44) }.accessibilityLabel("Settings") }
-                            if model.role == .listener { ListenerView() } else { ParentView() }
-                            Text("Audio never leaves the Listener iPhone.").font(.footnote).foregroundStyle(Palette.muted).frame(maxWidth: .infinity)
-                            Text("Sound detection only · Adult supervision required").font(.caption2).foregroundStyle(Palette.muted).frame(maxWidth: .infinity)
-                        }.padding(24)
-                    }
+        Group {
+            if !model.safetyAccepted {
+                NavigationStack { OnboardingView().background(Palette.background) }
+            } else if model.role == nil {
+                NavigationStack { RoleSelectionView().background(Palette.background) }
+            } else {
+                TabView(selection: $tab) {
+                    NavigationStack { monitorHome }
+                        .tabItem { Label("Monitor", systemImage: "waveform") }.tag(HomeTab.monitor)
+                    NavigationStack { TimelineView() }
+                        .tabItem { Label("Activity", systemImage: "clock.arrow.circlepath") }.tag(HomeTab.activity)
+                    NavigationStack { NightstandDevicesView() }
+                        .tabItem { Label("Devices", systemImage: "iphone") }.tag(HomeTab.devices)
                 }
-            }.foregroundStyle(.white).navigationTitle("Crib Service").toolbar(.hidden, for: .navigationBar)
-                .sheet(isPresented: $settings) { SettingsView() }
-                .alert("Attention needed", isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) { Button("OK") { model.error = nil } } message: { Text(model.error ?? "") }
-        }.tint(Palette.mint).preferredColorScheme(.dark)
-            .onChange(of: phase == .active && model.shouldKeepScreenAwake, initial: true) { _, keepAwake in
-                UIApplication.shared.isIdleTimerDisabled = keepAwake
+                .toolbarBackground(Palette.background, for: .tabBar)
             }
-            .onDisappear { UIApplication.shared.isIdleTimerDisabled = false }
-            .task { model.setAppActive(phase == .active); await model.foreground() }
-            .onChange(of: phase) { _, value in
-                model.setAppActive(value == .active)
-                if value == .active { Task { await model.foreground() } }
-                else if value == .background { model.log.record("background") }
+        }
+        .foregroundStyle(.white).tint(Palette.lavender).preferredColorScheme(.dark)
+        .sheet(isPresented: $settings) { SettingsView() }
+        .alert("Attention needed", isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
+            Button("OK") { model.error = nil }
+        } message: { Text(model.error ?? "") }
+        .onChange(of: phase == .active && model.shouldKeepScreenAwake, initial: true) { _, keepAwake in
+            UIApplication.shared.isIdleTimerDisabled = keepAwake
+        }
+        .onChange(of: model.role) { _, _ in tab = .monitor }
+        .onDisappear { UIApplication.shared.isIdleTimerDisabled = false }
+        .task { model.setAppActive(phase == .active); await model.foreground() }
+        .onChange(of: phase) { _, value in
+            model.setAppActive(value == .active)
+            if value == .active { Task { await model.foreground() } }
+            else if value == .background { model.log.record("background") }
+        }
+    }
+
+    private var monitorHome: some View {
+        ZStack {
+            Palette.background.ignoresSafeArea()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    HStack {
+                        Label {
+                            Text("Crib Service")
+                        } icon: {
+                            Image(systemName: "moon.stars").foregroundStyle(Palette.lavender)
+                        }.font(.title3.weight(.medium))
+                        Spacer()
+                        Button { settings = true } label: {
+                            Image(systemName: "slider.horizontal.3").font(.body)
+                                .frame(width: 44, height: 44).background(Palette.panel, in: Circle())
+                        }.accessibilityLabel("Settings")
+                    }
+                    if model.role == .listener { ListenerView() } else { ParentView() }
+                    Text("Sound detection only · Adult supervision required")
+                        .font(.caption2).foregroundStyle(Palette.muted).frame(maxWidth: .infinity)
+                }.padding(20)
             }
+        }.navigationTitle("Crib Service").toolbar(.hidden, for: .navigationBar)
     }
 }
 struct OnboardingView: View {
