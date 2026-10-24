@@ -1,6 +1,7 @@
 #if !canImport(MonitorCore)
 import Foundation
 import XCTest
+import UserNotifications
 @testable import BabyCryMonitor
 
 actor RequestGate {
@@ -51,10 +52,20 @@ final class AppModelTests: XCTestCase {
         var status = "Test notifications"
         var onToken: ((String) -> Void)?
         var onAlert: (() -> Void)?
+        var connectionDeadlines: [Date?] = []
+        var scheduledConnectionDeadline: Date?
+        var connectionWarningFails = false
+        var connectionWarningGate: RequestGate?
         func register() async {}
         func registered(_ token: Data) {}
         func failed() {}
         func simulate(_ alert: CryAlert) async throws {}
+        func setParentConnectionDeadline(_ deadline: Date?) async throws {
+            connectionDeadlines.append(deadline)
+            await connectionWarningGate?.wait()
+            if deadline != nil, connectionWarningFails { throw URLError(.notConnectedToInternet) }
+            scheduledConnectionDeadline = deadline
+        }
     }
     struct Credentials: CredentialStoring {
         let listener: DeviceCredential
@@ -140,11 +151,13 @@ final class AppModelTests: XCTestCase {
         let model: AppModel
         let audio = Audio()
         let connectivity = Connectivity()
+        let notifications = Notifications()
         let backend: Backend
         let defaults: UserDefaults
         let suite: String
         let directory: URL
         let listener: DeviceCredential
+        let parent: DeviceCredential
         final class Time { var now = Date() }
         let time: Time
         init(pending: Bool = false, automaticallyStart: Bool = false, logEvents: [String] = [], snapshotData: Data? = nil, heartbeatJitter: @escaping () -> Double = { 1 }) throws {
@@ -152,7 +165,7 @@ final class AppModelTests: XCTestCase {
             defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
             directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             listener = DeviceCredential(deviceId: UUID(), secret: "test-listener", role: .listener, registered: true)
-            let parent = DeviceCredential(deviceId: UUID(), secret: "test-parent", role: .parent, registered: true)
+            parent = DeviceCredential(deviceId: UUID(), secret: "test-parent", role: .parent, registered: true)
             defaults.set("listener", forKey: "role")
             defaults.set(true, forKey: "safetyAccepted")
             defaults.set("https://monitor.test", forKey: "backendURL")
@@ -171,7 +184,7 @@ final class AppModelTests: XCTestCase {
             let log = DiagnosticLog(directory: directory)
             for event in logEvents { log.record(event) }
             model = AppModel(defaults: defaults, metadataStore: store, log: log, audio: audio, connectivity: connectivity,
-                             notifications: Notifications(), keychain: Credentials(listener: listener, parent: parent),
+                             notifications: notifications, keychain: Credentials(listener: listener, parent: parent),
                              makeClient: { _, _ in backend }, currentTime: { time.now }, heartbeatJitter: heartbeatJitter, automaticallyStart: automaticallyStart)
         }
         deinit {
@@ -331,6 +344,146 @@ final class AppModelTests: XCTestCase {
         await fixture.backend.setStatus(status); await fixture.model.refreshParent()
         XCTAssertEqual(fixture.model.nurseryConnection, "Connection lost"); XCTAssertFalse(fixture.model.parentOnline)
         XCTAssertEqual(fixture.model.settingsSyncStatus, "Waiting for Listener")
+    }
+
+    @MainActor func testLocalConnectionWarningSurvivesBothDevicesLosingInternetAndOnlySuccessRenewsIt() async throws {
+        let fixture = try Fixture()
+        let status = ParentStatus(paired: true, connectionAlertsEnabled: true, lastHeartbeat: fixture.time.now,
+                                  monitoring: true, configuration: MonitoringConfiguration())
+        await fixture.backend.setStatus(status); fixture.model.selectRole(.parent)
+        await fixture.model.refreshParent()
+        let deadline = fixture.time.now.addingTimeInterval(180)
+        let armed = await eventually { fixture.notifications.scheduledConnectionDeadline == deadline }
+        XCTAssertTrue(armed)
+        fixture.connectivity.available = false
+        fixture.time.now = fixture.time.now.addingTimeInterval(181)
+        await fixture.model.tick()
+        XCTAssertEqual(fixture.notifications.scheduledConnectionDeadline, deadline)
+        fixture.connectivity.available = true
+        await fixture.backend.setStatusFailure(true); await fixture.model.refreshParent()
+        XCTAssertEqual(fixture.model.parentConnectionDeadline, deadline)
+        XCTAssertEqual(fixture.notifications.scheduledConnectionDeadline, deadline)
+        await fixture.backend.setStatusFailure(false); await fixture.model.refreshParent()
+        let renewed = fixture.time.now.addingTimeInterval(180)
+        let recovered = await eventually { fixture.notifications.scheduledConnectionDeadline == renewed }
+        XCTAssertTrue(recovered)
+    }
+
+    @MainActor func testSuspendedStatusRequestDoesNotDelayLocalConnectionWarning() async throws {
+        let fixture = try Fixture()
+        await fixture.backend.setStatus(ParentStatus(paired: true, monitoring: true, configuration: MonitoringConfiguration()))
+        fixture.model.selectRole(.parent); await fixture.model.refreshParent()
+        let deadline = try XCTUnwrap(fixture.model.parentConnectionDeadline)
+        let gate = RequestGate(); await fixture.backend.setStatusGate(gate)
+        let calls = await fixture.backend.statusCalls
+        let refresh = Task { await fixture.model.refreshParent() }
+        let waiting = await eventually { await fixture.backend.statusCalls > calls }
+        XCTAssertTrue(waiting)
+        fixture.time.now = deadline.addingTimeInterval(1)
+        XCTAssertEqual(fixture.model.parentConnectionDeadline, deadline)
+        await fixture.backend.setStatusFailure(true); await gate.open(); await refresh.value
+        XCTAssertEqual(fixture.model.parentConnectionDeadline, deadline)
+    }
+
+    @MainActor func testLocalWarningCancelsForStopOptOutAndUnpairAndIgnoresCrySnooze() async throws {
+        let fixture = try Fixture()
+        var status = ParentStatus(paired: true, connectionAlertsEnabled: true,
+                                  alertsMutedUntil: fixture.time.now.addingTimeInterval(900),
+                                  monitoring: true, configuration: MonitoringConfiguration())
+        await fixture.backend.setStatus(status); fixture.model.selectRole(.parent); await fixture.model.refreshParent()
+        XCTAssertNotNil(fixture.model.parentConnectionDeadline)
+        status.monitoring = false
+        await fixture.backend.setStatus(status); await fixture.model.refreshParent()
+        let stopped = await eventually { fixture.notifications.scheduledConnectionDeadline == nil }
+        XCTAssertTrue(stopped); XCTAssertNil(fixture.model.parentConnectionDeadline)
+        status.monitoring = true; status.connectionAlertsEnabled = false
+        await fixture.backend.setStatus(status); await fixture.model.refreshParent()
+        XCTAssertNil(fixture.model.parentConnectionDeadline)
+        status.connectionAlertsEnabled = true
+        await fixture.backend.setStatus(status); await fixture.model.refreshParent()
+        XCTAssertNotNil(fixture.model.parentConnectionDeadline)
+        await fixture.model.removePairing(deleteDevice: false)
+        let unpaired = await eventually { fixture.notifications.scheduledConnectionDeadline == nil }
+        XCTAssertTrue(unpaired); XCTAssertNil(fixture.model.parentConnectionDeadline)
+    }
+
+    @MainActor func testLateLocalWarningScheduleCannotUndoRoleChangeCancellation() async throws {
+        let fixture = try Fixture()
+        let initialized = await eventually { !fixture.notifications.connectionDeadlines.isEmpty }
+        XCTAssertTrue(initialized)
+        let gate = RequestGate(); fixture.notifications.connectionWarningGate = gate
+        await fixture.backend.setStatus(ParentStatus(paired: true, monitoring: true, configuration: MonitoringConfiguration()))
+        fixture.model.selectRole(.parent); await fixture.model.refreshParent()
+        let requested = await eventually { fixture.notifications.connectionDeadlines.contains { $0 != nil } }
+        XCTAssertTrue(requested)
+        fixture.model.selectRole(.listener)
+        await gate.open()
+        let cancelled = await eventually { fixture.notifications.connectionDeadlines.count >= 3 && fixture.notifications.scheduledConnectionDeadline == nil }
+        XCTAssertTrue(cancelled)
+        XCTAssertNil(fixture.model.parentConnectionDeadline)
+    }
+
+    @MainActor func testLocalWarningSchedulingFailureIsVisibleAndCanRecover() async throws {
+        let fixture = try Fixture(); fixture.notifications.connectionWarningFails = true
+        await fixture.backend.setStatus(ParentStatus(paired: true, monitoring: true, configuration: MonitoringConfiguration()))
+        fixture.model.selectRole(.parent); await fixture.model.refreshParent()
+        let failed = await eventually { fixture.model.parentConnectionWarningError != nil }
+        XCTAssertTrue(failed)
+        fixture.notifications.connectionWarningFails = false
+        fixture.time.now = fixture.time.now.addingTimeInterval(15)
+        await fixture.model.refreshParent()
+        let recovered = await eventually { fixture.model.parentConnectionWarningError == nil && fixture.notifications.scheduledConnectionDeadline != nil }
+        XCTAssertTrue(recovered)
+    }
+
+    @MainActor func testRelaunchRetainsWarningDeadlineWithoutRenewingIt() async throws {
+        let fixture = try Fixture()
+        await fixture.backend.setStatus(ParentStatus(paired: true, monitoring: true, configuration: MonitoringConfiguration()))
+        fixture.model.selectRole(.parent); await fixture.model.refreshParent()
+        let deadline = try XCTUnwrap(fixture.model.parentConnectionDeadline)
+        fixture.time.now = deadline.addingTimeInterval(1)
+        let restoredNotifications = Notifications()
+        let restored = AppModel(defaults: fixture.defaults, metadataStore: try MetadataStore(directory: fixture.directory),
+            log: DiagnosticLog(directory: fixture.directory), audio: Audio(), connectivity: fixture.connectivity,
+            notifications: restoredNotifications, keychain: Credentials(listener: fixture.listener, parent: fixture.parent),
+            makeClient: { _, _ in fixture.backend }, currentTime: { fixture.time.now }, automaticallyStart: false)
+        XCTAssertEqual(restored.parentConnectionDeadline, deadline)
+        await fixture.backend.setStatusFailure(true); await restored.refreshParent()
+        XCTAssertEqual(restored.parentConnectionDeadline, deadline)
+        XCTAssertTrue(restoredNotifications.connectionDeadlines.isEmpty, "Do not replay an already delivered deadline on relaunch")
+    }
+
+    @MainActor func testWatchReceivesOriginalDeadlineWhenParentServerChecksFail() async throws {
+        let fixture = try Fixture()
+        await fixture.backend.setStatus(ParentStatus(paired: true, monitoring: true, configuration: MonitoringConfiguration()))
+        fixture.model.selectRole(.parent); await fixture.model.refreshParent()
+        let deadline = try XCTUnwrap(fixture.model.parentConnectionDeadline)
+        let handler = try XCTUnwrap(fixture.model.watch.onCommand)
+        fixture.time.now = fixture.time.now.addingTimeInterval(120)
+        await fixture.backend.setStatusFailure(true)
+        let failed = await handler(WatchCommand(kind: .refresh))
+        XCTAssertFalse(failed.statusAvailable)
+        XCTAssertEqual(failed.localConnectionDeadline, deadline, "A new Bluetooth snapshot must not renew an unverified server check")
+        fixture.model.selectRole(.listener)
+        let changed = await handler(WatchCommand(kind: .refresh))
+        XCTAssertNil(changed.localConnectionDeadline)
+    }
+
+    @MainActor func testLocalWarningNotificationHasSoundAndWatchTimeSensitiveHapticsWithoutCryActions() throws {
+        let now = Date()
+        for watch in [false, true] {
+            let request = ConnectionWarningNotification.request(deadline: now.addingTimeInterval(180), now: now, watch: watch)
+            XCTAssertEqual(request.identifier, ConnectionWarningNotification.identifier)
+            XCTAssertEqual((request.trigger as? UNTimeIntervalNotificationTrigger)?.timeInterval, 180)
+            XCTAssertFalse(try XCTUnwrap(request.trigger).repeats)
+            XCTAssertNotNil(request.content.sound)
+            XCTAssertEqual(request.content.interruptionLevel, watch ? .timeSensitive : .active)
+            XCTAssertEqual(request.content.categoryIdentifier, "")
+            XCTAssertNil(request.content.userInfo["eventId"])
+            XCTAssertEqual(request.content.userInfo["localConnectionWarning"] as? Bool, true)
+        }
+        let expired = ConnectionWarningNotification.request(deadline: now.addingTimeInterval(-1), now: now)
+        XCTAssertEqual((expired.trigger as? UNTimeIntervalNotificationTrigger)?.timeInterval, 1)
     }
 
     func testParentPollTimingUsesServerClockAndBoundsLateRetries() {

@@ -61,6 +61,10 @@ try {
     check(heartbeat.body.absoluteThreshold === -45 && !('sensitivity' in heartbeat.body), 'listener receives fixed -45 dBFS threshold without sensitivity');
     const status = await request('listener/status', parent, null, 'GET');
     check(status.status === 200 && status.body.paired && status.body.listenerId === listener.deviceId && status.body.monitoring === true, 'parent status and listener identity');
+    check(Date.parse(status.body.nextHeartbeatExpectedAt) - Date.parse(status.body.lastHeartbeat) === 15000, 'next heartbeat estimate is anchored 15 seconds after server receipt');
+    check(Date.parse(status.body.serverTime) >= Date.parse(status.body.lastHeartbeat), 'server clock supplied for adaptive polling');
+    const repeatedStatus = await request('listener/status', parent, null, 'GET');
+    check(repeatedStatus.body.nextHeartbeatExpectedAt === status.body.nextHeartbeatExpectedAt, 'repeated polling does not postpone the expected heartbeat');
     check(status.body.configuration?.alertDuration === 5, 'parent sees the same five-second configuration');
     check(status.body.listenerConfiguration?.alertDuration === 5, 'Listener applied-settings acknowledgement');
     check(status.body.configuration?.absoluteThreshold === -45 && status.body.listenerConfiguration?.absoluteThreshold === -45, 'Parent sees the selected and applied fixed threshold');
