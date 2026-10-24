@@ -86,10 +86,13 @@ final class OnboardingUITests: XCTestCase {
             XCTAssertLessThanOrEqual(ready.frame.maxY, app.tabBars.firstMatch.frame.minY)
             let frames = [state.frame, chart.frame, details.frame, control.frame, timing.frame, ready.frame, app.tabBars.firstMatch.frame]
             if let baseline {
-                for (actual, expected) in zip(frames, baseline) {
+                for (index, pair) in zip(frames, baseline).enumerated() {
+                    let (actual, expected) = pair
                     XCTAssertEqual(actual.minX, expected.minX, accuracy: 1)
                     XCTAssertEqual(actual.minY, expected.minY, accuracy: 1)
-                    XCTAssertEqual(actual.width, expected.width, accuracy: 1)
+                    // Accessibility reports the status text's glyph width,
+                    // which naturally changes between Quiet and Standby.
+                    if index != 0 { XCTAssertEqual(actual.width, expected.width, accuracy: 1) }
                     XCTAssertEqual(actual.height, expected.height, accuracy: 1)
                 }
             } else { baseline = frames }
