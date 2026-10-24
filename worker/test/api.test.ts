@@ -40,7 +40,7 @@ beforeAll(async()=>{
  testEnv={...env,APNS_KEY_ID:'TESTKEY',APNS_TEAM_ID:'TESTTEAM',APNS_PRIVATE_KEY:`-----BEGIN PRIVATE KEY-----\n${pem}\n-----END PRIVATE KEY-----`,APNS_BUNDLE_ID:'com.example.BabyCryMonitor',APNS_ENVIRONMENT:'development'};
 });
 beforeEach(async()=>{
- await env.DB.batch(['alert_snoozes','timeline_events','diagnostics','connection_notices','connection_states','events','heartbeats','pairs','pairing_codes','devices','rate_limits'].map(table=>env.DB.prepare(`DELETE FROM ${table}`)));
+ await env.DB.batch(['monitoring_commands','alert_snoozes','timeline_events','diagnostics','connection_notices','connection_states','events','heartbeats','pairs','pairing_codes','devices','rate_limits'].map(table=>env.DB.prepare(`DELETE FROM ${table}`)));
  pushResponses=[];pushRequests=[];
  vi.stubGlobal('fetch',vi.fn(async(input:string|URL|Request,init?:RequestInit)=>{
   const url=String(input);expect(url).toMatch(/^https:\/\/api\.sandbox\.push\.apple\.com\/3\/device\//);
@@ -990,5 +990,69 @@ describe('alert delivery regressions',()=>{
   const delayed={...alert(listener),createdAt:new Date(created).toISOString(),cryStartedAt:new Date(created-300000).toISOString()};
   expect(await (await call('listener/event',listener,delayed)).json()).toEqual({status:'acknowledged'});
   expect(pushRequests).toHaveLength(0);
+ });
+});
+
+describe('monitoring controls',()=>{
+ const command=async(d:TestDevice,enabled:boolean,id=crypto.randomUUID())=>{
+  const response=await call('monitoring',d,{id,enabled});expect(response.status).toBe(200);
+  return await response.json() as {id:string;enabled:boolean;status:string;expiresAt:string};
+ };
+ const status=async(d:TestDevice)=>(await (await call('listener/status',d,undefined,'GET')).json()) as {monitoring:boolean;monitoringCommand:{id:string;status:string}|null};
+ it('requires pairing, validates requests and restricts completion to the paired Listener',async()=>{
+  const parent=device('parent');await register(parent);
+  expect((await call('monitoring',parent,{id:crypto.randomUUID(),enabled:true})).status).toBe(409);
+  const pair=await paired();
+  expect((await call('monitoring',pair.parent,{id:crypto.randomUUID(),enabled:'yes'})).status).toBe(400);
+  const request=await command(pair.parent,true);
+  expect((await call('monitoring/complete',pair.parent,{id:request.id,succeeded:true})).status).toBe(403);
+  const stranger=await paired();
+  await call('monitoring/complete',stranger.listener,{id:request.id,succeeded:true});
+  expect((await status(pair.parent)).monitoringCommand?.status).toBe('pending');
+ });
+ it('keeps requests pending until Listener confirmation and leaves observed monitoring truthful',async()=>{
+  const {parent,listener}=await paired();const request=await command(parent,true);
+  const pending=await status(parent);expect(pending.monitoring).toBe(false);expect(pending.monitoringCommand?.status).toBe('pending');
+  expect((await status(listener)).monitoringCommand?.id).toBe(request.id);
+  await call('monitoring/complete',listener,{id:request.id,succeeded:true});
+  expect((await status(parent)).monitoringCommand?.status).toBe('applied');
+  expect((await status(parent)).monitoring).toBe(false); // A separate heartbeat proves microphone activity.
+ });
+ it('expires unprocessed commands and records explicit startup failures',async()=>{
+  const {parent,listener}=await paired();const failed=await command(parent,true);
+  await call('monitoring/complete',listener,{id:failed.id,succeeded:false});
+  expect((await status(parent)).monitoringCommand?.status).toBe('failed');
+  const expired=await command(parent,true);
+  await env.DB.prepare('UPDATE monitoring_commands SET expires_at=? WHERE id=?').bind(Date.now()-1,expired.id).run();
+  await call('monitoring/complete',listener,{id:expired.id,succeeded:true});
+  expect((await status(parent)).monitoringCommand?.status).toBe('expired');
+ });
+ it('lets local controls supersede remote requests and makes retries idempotent',async()=>{
+  const {parent,listener}=await paired();const start=await command(parent,true);
+  const stop=await command(listener,false);expect(stop.status).toBe('applied');
+  await command(parent,true,start.id); // Lost response retry must not reorder the command log.
+  await call('monitoring/complete',listener,{id:start.id,succeeded:true});
+  expect((await status(parent)).monitoringCommand?.id).toBe(stop.id);
+  expect((await status(parent)).monitoringCommand?.status).toBe('applied');
+  expect((await call('monitoring',parent,{id:start.id,enabled:false})).status).toBe(409);
+ });
+ it('stops repeating alerts and suppresses delayed cry uploads, while allowing a new episode after restart',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  const original=alert(listener);mockPush();await call('listener/event',listener,original);
+  const late=alert(listener);await command(parent,false);
+  expect(await runReminder(testEnv,parent.deviceId)).toBe(false);
+  expect((await (await call('listener/event',listener,late)).json() as {status:string}).status).toBe('acknowledged');
+  expect(pushRequests).toHaveLength(1);
+  await command(listener,true);
+  const next=alert(listener);next.createdAt=new Date(Date.now()+10).toISOString();mockPush();
+  expect((await (await call('listener/event',listener,next)).json() as {status:string}).status).toBe('sent');
+  expect(pushRequests).toHaveLength(2);
+ });
+ it('removes monitoring commands on unpair and deletion',async()=>{
+  const {parent,listener}=await paired();await command(parent,true);
+  expect((await call('pairing/remove',listener)).status).toBe(200);
+  expect((await env.DB.prepare('SELECT COUNT(*) AS n FROM monitoring_commands').first<{n:number}>())?.n).toBe(0);
+  const again=await paired();await command(again.parent,false);
+  expect((await call('device/delete',again.parent)).status).toBe(200);
  });
 });

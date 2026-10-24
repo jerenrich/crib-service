@@ -4,6 +4,20 @@ The readiness release is deployed to the configured backend and installed on bot
 
 Record device/OS versions, build and Worker revision, timestamps, Focus settings and observed outcomes. Use a dedicated test pair for destructive checks. Never erase the family's active pairing as a test without the user's explicit intent.
 
+## Monitoring control checks
+
+Apply `0009_monitoring_commands.sql` and deploy the updated Worker before installing the updated apps. Validation on 24 October 2026: 77 Foundation core tests, 90 Worker/D1 tests and TypeScript checks passed. The iOS suite passed all monitoring-control scenarios; its warning-cancellation expectation was updated for the first-launch notification fix and passed on rerun. The Parent UI test verified the error dialog and persistent warning. Physical checks for this change have not been run.
+
+| Check | Expected observation |
+| --- | --- |
+| Stop from Parent with nursery screen locked | Requests Stop, nursery microphone stops, Parent confirms stopped, existing crying reminders end |
+| Start from Parent with nursery app open | Nursery microphone becomes active; Parent confirms only after the command result and a fresh heartbeat |
+| Start with nursery app suspended or force-quit | Parent shows a prominent failure/unverified alert and persistent red warning within 30 seconds; reopening the nursery app after expiry does not replay Start |
+| Denied permission or unavailable microphone | Listener reports failure; Parent shows a prominent warning and never claims monitoring was confirmed |
+| Network loss while changing monitoring | Parent shows that the action could not be verified; local nursery controls still work |
+| Local Stop while a remote Start is pending | Local Stop wins over an older status response; no delayed restart |
+| Stop during repeating Watch alerts | Outstanding crying alerts are retired; already submitted APNs notifications may still arrive |
+
 ## Fixed threshold integration
 
 The fixed-threshold changes are integrated with readiness, connection alerts and device management. Calibration now recommends a selectable absolute level, and the server normalizes retired sensitivity fields in saved settings and applied-configuration heartbeats. This integration is not covered by the earlier rollout record below: deploy the updated Worker before updating both iPhones, then repeat the physical checks. No schema migration is needed.

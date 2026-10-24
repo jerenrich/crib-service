@@ -1,5 +1,22 @@
 import XCTest
 final class OnboardingUITests: XCTestCase {
+    @MainActor func testParentMonitoringFailureIsProminentAndRemainsVisible() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-timeline"]
+        app.launch()
+        let start = app.buttons["Start Monitoring"]
+        XCTAssertTrue(start.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["Stop Monitoring"].exists)
+        start.tap()
+        let warning = app.alerts["Monitoring not confirmed"]
+        XCTAssertTrue(warning.waitForExistence(timeout: 5))
+        XCTAssertTrue(warning.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "Could not verify that monitoring started")).firstMatch.exists)
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "Parent monitoring failure"; screenshot.lifetime = .keepAlways; add(screenshot)
+        warning.buttons["OK"].tap()
+        XCTAssertTrue(app.staticTexts["Monitoring not confirmed"].exists)
+        XCTAssertTrue(app.buttons["Stop Monitoring"].isEnabled)
+    }
     @MainActor func testTimelineOverviewFilteringAndDetails() {
         let app = XCUIApplication()
         app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-timeline"]
