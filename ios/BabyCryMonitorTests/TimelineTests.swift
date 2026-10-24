@@ -9,13 +9,13 @@ import XCTest
 final class TimelineTests: XCTestCase {
     private let zero = Date(timeIntervalSince1970: 1_700_000_000)
     private func at(_ seconds: Double) -> Date { zero.addingTimeInterval(seconds) }
-    func testMissingHeartbeatBackdatesUnknownCoverageAndFreshObservationEndsIt() {
+    func testMissingHeartbeatBackdatesMissingUpdatesAndFreshObservationEndsIt() {
         let events = [TimelineEvent(kind: "monitoring_started", occurredAt: at(0)),
                       TimelineEvent(kind: "heartbeat_missing", occurredAt: at(480), endAt: at(300)),
                       TimelineEvent(kind: "monitoring_observed", occurredAt: at(700)),
                       TimelineEvent(kind: "monitoring_stopped", occurredAt: at(900))]
         let segments = TimelineCoverage.segments(events: events, from: at(0), to: at(1000), availableSince: at(0))
-        XCTAssertEqual(segments.map(\.state), [.monitoring, .unknown, .monitoring, .stopped])
+        XCTAssertEqual(segments.map(\.state), [.monitoring, .updatesMissing, .monitoring, .stopped])
         XCTAssertEqual(segments.map(\.start), [at(0), at(300), at(700), at(900)])
         XCTAssertEqual(segments.last?.end, at(1000))
     }
@@ -25,7 +25,7 @@ final class TimelineTests: XCTestCase {
                       TimelineEvent(kind: "connection_restored", occurredAt: at(250)),
                       TimelineEvent(kind: "monitoring_observed", occurredAt: at(400))]
         let segments = TimelineCoverage.segments(events: events, from: at(0), to: at(500), availableSince: at(100))
-        XCTAssertEqual(segments.map(\.state), [.unknown, .monitoring])
+        XCTAssertEqual(segments.map(\.state), [.noHistory, .monitoring])
         XCTAssertEqual(segments.first?.end, at(400))
     }
     func testCoverageUsesBoundaryEventBeforeWindowAndClipsFutureEvents() {
@@ -35,6 +35,41 @@ final class TimelineTests: XCTestCase {
         XCTAssertEqual(segments.count, 1)
         XCTAssertEqual(segments.first?.state, .monitoring)
         XCTAssertEqual(segments.first?.end, at(1000))
+    }
+    func testHistoryBeforeLoggingIsSeparateFromMissingUpdates() {
+        let events = [TimelineEvent(kind: "monitoring_started", occurredAt: at(100)),
+                      TimelineEvent(kind: "heartbeat_missing", occurredAt: at(480), endAt: at(300)),
+                      TimelineEvent(kind: "monitoring_observed", occurredAt: at(700))]
+        let segments = TimelineCoverage.segments(events: events, from: at(0), to: at(800), availableSince: at(100))
+        XCTAssertEqual(segments.map(\.state), [.noHistory, .monitoring, .updatesMissing, .monitoring])
+        XCTAssertEqual(segments.map(\.start), [at(0), at(100), at(300), at(700)])
+    }
+    func testUnavailableRefreshPreservesFetchedHistoryAndDoesNotClaimDisconnection() {
+        let events = [TimelineEvent(kind: "monitoring_started", occurredAt: at(0)),
+                      TimelineEvent(kind: "heartbeat_missing", occurredAt: at(480), endAt: at(300))]
+        let segments = TimelineCoverage.segments(events: events, from: at(0), to: at(1000), availableSince: at(0),
+                                                statusUnavailableSince: at(600))
+        XCTAssertEqual(segments.map(\.state), [.monitoring, .updatesMissing, .unavailable])
+        XCTAssertEqual(segments.map(\.start), [at(0), at(300), at(600)])
+        XCTAssertEqual(segments.last?.end, at(1000))
+        let refreshed = TimelineCoverage.segments(events: events + [TimelineEvent(kind: "monitoring_observed", occurredAt: at(900))],
+                                                 from: at(0), to: at(1000), availableSince: at(0))
+        XCTAssertEqual(refreshed.map(\.state), [.monitoring, .updatesMissing, .monitoring])
+    }
+    func testNoFetchedHistoryIsUnavailableAndTruncatedHistoryIsMissing() {
+        let unavailable = TimelineCoverage.segments(events: [], from: at(0), to: at(1000), availableSince: at(1000),
+                                                   statusUnavailableSince: at(0))
+        XCTAssertEqual(unavailable.map(\.state), [.unavailable])
+        let truncated = TimelineCoverage.segments(events: [TimelineEvent(kind: "monitoring_started", occurredAt: at(300))],
+                                                 from: at(0), to: at(1000), availableSince: at(100), historyTruncated: true)
+        XCTAssertEqual(truncated.map(\.state), [.noHistory])
+    }
+    func testRelaunchIsUnverifiedRatherThanAConnectionGap() {
+        let events = [TimelineEvent(kind: "monitoring_started", occurredAt: at(0)),
+                      TimelineEvent(kind: "monitoring_unverified", occurredAt: at(300)),
+                      TimelineEvent(kind: "monitoring_started", occurredAt: at(600))]
+        let segments = TimelineCoverage.segments(events: events, from: at(0), to: at(1000), availableSince: at(0))
+        XCTAssertEqual(segments.map(\.state), [.monitoring, .unverified, .monitoring])
     }
     func testOfflineJournalRoundTripsAndAcknowledgesOnlyUploadedBatch() throws {
         var engine = CrySessionManager()
@@ -78,7 +113,7 @@ final class TimelineTests: XCTestCase {
         let events = [TimelineEvent(id: "state:0", kind: "monitoring_observed", occurredAt: at(0)),
                       TimelineEvent(id: "missing:0", kind: "heartbeat_missing", occurredAt: at(180), endAt: at(0))]
         let segments = TimelineCoverage.segments(events: events, from: at(0), to: at(300), availableSince: at(0))
-        XCTAssertEqual(segments.map(\.state), [.unknown])
+        XCTAssertEqual(segments.map(\.state), [.updatesMissing])
     }
     func testCryTransitionsAreRetainedAndQueuedSeparatelyFromBoundedEpisodeHistory() throws {
         var engine = CrySessionManager()
