@@ -80,7 +80,11 @@ The bedtime guide now walks through pairing, Watch/Focus/haptic checks, a user-c
 
 Early resume adds authenticated `POST /v1/alert/resume` with the observed snooze deadline in epoch milliseconds (`expectedUntil`). The service shortens the current mute and retained snooze intervals transactionally. Delayed uploads from the actual muted interval remain suppressed; a delayed resume request cannot end a newer snooze. A fresh crying heartbeat is still required to restart reminders for an acknowledged episode. Existing monitoring Stop behavior takes precedence.
 
-Deploy the updated Worker before distributing these app builds to enable early resume. No database migration is needed. Until the Worker is updated, resume reports a failure instead of claiming success. Source changes and simulator checks do not install builds on physical devices or deploy the Worker.
+Deployed on 24 October 2026 through the existing local Wrangler login, without GitHub Actions: source `f5db6893660bce4624031c4ca1da14be0b69f977`, Worker version `ecd8a198-c756-42bc-a64e-57a6e1aa3832` at `https://baby-cry-monitor.jordan-erenrich.workers.dev`. This integrates main's Standby behavior and compact monitor layout. The previous version was `2a5b8da0-ca07-440d-97d0-0950f7c226a2`. No database migrations were pending; the existing D1 database, five secrets, Durable Object bindings, development APNs settings and minute cron were preserved.
+
+Live temporary-device checks passed for early resume, stale-request protection, Parent-only authorization, standby microphone status and the existing pairing/settings/monitoring/timeline APIs. All temporary devices and shared metadata were deleted through the authenticated API; no push tokens were registered or notifications sent. The unauthenticated health check returned HTTP 401 with successful D1 diagnostics. This rollout did not install app builds on physical phones or Watch. Scheduled maintenance for the new version completed successfully.
+
+Validation passed TypeScript checks, 107 Worker integration tests, 98 shared Swift tests, 203 iOS unit tests and all 13 UI scenarios across the combined run and a targeted rerun. The rerun corrected a test scroll gesture that began over the fixed footer; no app change was needed. The iPhone and embedded Watch simulator builds passed. Local logs and deployment details are retained under `.local/usability-rollout-2026-10-24/`.
 
 ## Xcode and iPhone setup
 

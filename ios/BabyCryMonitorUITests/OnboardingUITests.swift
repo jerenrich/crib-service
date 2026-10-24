@@ -20,8 +20,17 @@ final class OnboardingUITests: XCTestCase {
         XCTAssertTrue(app.buttons["resumeAlerts"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.buttons["resumeAlerts"].isHittable)
         let retry = app.buttons["retryConnection"]
-        for _ in 0..<6 { if retry.isHittable { break }; app.scrollViews.firstMatch.swipeUp() }
+        let timing = app.buttons["editAlertTiming"]
+        for _ in 0..<6 {
+            if retry.isHittable && retry.frame.maxY < timing.frame.minY { break }
+            // The scroll view's accessibility frame includes the fixed footer.
+            // Start the gesture inside the visible content above that footer.
+            let origin = app.coordinate(withNormalizedOffset: .zero)
+            origin.withOffset(CGVector(dx: app.frame.midX, dy: timing.frame.minY - 30))
+                .press(forDuration: 0.05, thenDragTo: origin.withOffset(CGVector(dx: app.frame.midX, dy: app.scrollViews.firstMatch.frame.minY + 40)))
+        }
         XCTAssertTrue(retry.isHittable, app.debugDescription)
+        XCTAssertLessThan(retry.frame.maxY, timing.frame.minY)
         XCTAssertTrue(app.staticTexts["Live chart paused"].firstMatch.exists)
         let shot = XCTAttachment(screenshot: app.screenshot()); shot.name = "Snooze and connection recovery"; shot.lifetime = .keepAlways; add(shot)
     }
