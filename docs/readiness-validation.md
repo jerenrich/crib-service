@@ -31,6 +31,7 @@ Physical regression validation on 24 October 2026, 06:59:29–06:59:52 UTC: a te
 | Network loss while changing monitoring | Parent shows that the action could not be verified; local nursery controls still work |
 | Local Stop while a remote Start is pending | Local Stop wins over an older status response; no delayed restart |
 | Stop during repeating Watch alerts | Outstanding crying alerts are retired; already submitted APNs notifications may still arrive |
+| Nursery microphone stalls, or the nursery app is terminated and reopened, during repeating alerts | Reminders continue until acknowledged; only a person's Stop retires crying alerts |
 
 ## Fixed threshold integration
 

@@ -1008,6 +1008,91 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(fixture.model.now, fixture.time.now)
         await gate.open()
     }
+    @MainActor func testMicrophoneStallDoesNotReportAStopThatWouldRetireAlerts() async throws {
+        let fixture = try Fixture(automaticallyStart: true)
+        await fixture.model.start()
+        let reported = await eventually { await fixture.backend.monitoringRequests.count == 1 }
+        XCTAssertTrue(reported)
+        fixture.time.now = fixture.time.now.addingTimeInterval(4)
+        let stopped = await eventually { !fixture.model.monitoring }
+        XCTAssertTrue(stopped)
+        XCTAssertTrue(fixture.model.needsRestart)
+        try await Task.sleep(for: .seconds(2))
+        let requests = await fixture.backend.monitoringRequests
+        XCTAssertEqual(requests.map(\.0), [true], "Only the person's Start is reported; the stall is not a Stop")
+    }
+    @MainActor func testRelaunchAfterTerminationDoesNotReportAStopButResendsAnUnsentLocalAction() async throws {
+        let fixture = try Fixture()
+        await fixture.model.start()
+        await fixture.model.tick()
+        var requests = await fixture.backend.monitoringRequests
+        XCTAssertEqual(requests.map(\.0), [true])
+        func relaunch() throws -> AppModel {
+            AppModel(defaults: fixture.defaults, metadataStore: try MetadataStore(directory: fixture.directory),
+                     log: DiagnosticLog(directory: fixture.directory), audio: Audio(), liveSound: LiveSound(), connectivity: fixture.connectivity,
+                     notifications: Notifications(), keychain: Credentials(listener: fixture.listener, parent: fixture.parent),
+                     makeClient: { _, _ in fixture.backend }, currentTime: { fixture.time.now }, automaticallyStart: false)
+        }
+        // Terminated while monitoring: the relaunch must leave outstanding alerts and reminders alone.
+        let restored = try relaunch()
+        XCTAssertTrue(restored.needsRestart)
+        await restored.tick()
+        requests = await fixture.backend.monitoringRequests
+        XCTAssertEqual(requests.map(\.0), [true])
+        // A person's Stop that was never sent is replayed with its original identity.
+        await fixture.backend.setMonitoringFailure(true)
+        restored.stop()
+        await restored.tick()
+        requests = await fixture.backend.monitoringRequests
+        let stop = try XCTUnwrap(requests.last)
+        XCTAssertFalse(stop.0)
+        await fixture.backend.setMonitoringFailure(false)
+        let again = try relaunch()
+        await again.tick()
+        requests = await fixture.backend.monitoringRequests
+        XCTAssertEqual(requests.last?.0, false)
+        XCTAssertEqual(requests.last?.1, stop.1, "Retry the same request so the server stays idempotent")
+        let before = requests.count
+        fixture.time.now = fixture.time.now.addingTimeInterval(4)
+        await again.tick()
+        requests = await fixture.backend.monitoringRequests
+        XCTAssertEqual(requests.count, before, "A delivered report is not resent")
+    }
+    @MainActor func testFailedLocalStartDoesNotReportAStop() async throws {
+        let fixture = try Fixture()
+        fixture.audio.startFailure = URLError(.unknown)
+        await fixture.model.start()
+        XCTAssertFalse(fixture.model.monitoring)
+        await fixture.model.tick()
+        let reported = await eventually(timeout: .milliseconds(500)) { await !fixture.backend.monitoringRequests.isEmpty }
+        XCTAssertFalse(reported, "A Stop here would retire alerts the Listener never stopped watching")
+    }
+    @MainActor func testEndedPairingDiscardsUnsentMonitoringReport() async throws {
+        let fixture = try Fixture()
+        await fixture.model.start()
+        await fixture.backend.setMonitoringFailure(true)
+        await fixture.backend.setStatus(ParentStatus(paired: false, configuration: MonitoringConfiguration()))
+        await fixture.model.tick()
+        let unpaired = await eventually { !fixture.model.paired }
+        XCTAssertTrue(unpaired)
+        XCTAssertFalse(fixture.model.monitoring)
+        await fixture.backend.setMonitoringFailure(false)
+        let attempts = await fixture.backend.monitoringRequests.count
+        fixture.time.now = fixture.time.now.addingTimeInterval(4)
+        await fixture.model.tick()
+        let requests = await fixture.backend.monitoringRequests
+        XCTAssertEqual(requests.count, attempts, "Never retry the old pairing's report")
+        XCTAssertNil(fixture.defaults.string(forKey: "paired|https://monitor.test|listener|localMonitoringReport"))
+    }
+    @MainActor func testClippedMicrophoneLevelsCountAsLoudestSoundInsteadOfBeingDropped() async throws {
+        let fixture = try Fixture()
+        await fixture.model.start()
+        fixture.time.now = fixture.time.now.addingTimeInterval(0.25)
+        fixture.audio.emit(AudioLevelSample(timestamp: fixture.time.now, dbFS: 3))
+        let received = await eventually { fixture.model.currentDBFS == 0 }
+        XCTAssertTrue(received)
+        XCTAssertEqual(fixture.model.meter.last, 0)
+    }
     @MainActor func testSettingsFailureDoesNotPreventPendingAlertDeliveryAndRemainsDirty() async throws {
         let fixture = try Fixture(pending: true)
         await fixture.backend.configure(settingsFail: true)
