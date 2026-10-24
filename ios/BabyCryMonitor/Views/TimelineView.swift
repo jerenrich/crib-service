@@ -6,6 +6,7 @@ struct TimelineView: View {
     @State private var filter = TimelineCategory.all
     @State private var showEarlier = false
     @State private var selectedID: String?
+    @State private var selectedCoverage: TimelineCoverage?
     private var end: Date { model.now.addingTimeInterval(model.timelineClockOffset) }
     private var start: Date { end.addingTimeInterval(-12 * 3600) }
     private var events: [TimelineEvent] {
@@ -26,13 +27,20 @@ struct TimelineView: View {
     }
     private var filtered: [TimelineEvent] { visibleEvents.filter { filter == .all || $0.category == filter } }
     private var displayed: [TimelineEvent] { showEarlier ? filtered : Array(filtered.prefix(8)) }
-    private var coverage: [TimelineCoverage] {
-        var observed = events
-        if model.role == .parent, let page = model.timeline, end.timeIntervalSince(page.serverTime) > 180 {
-            observed.append(TimelineEvent(id: "stale-cache", kind: "monitoring_unverified", occurredAt: page.lastHeartbeat ?? page.serverTime))
-        }
-        return TimelineCoverage.segments(events: model.timeline?.truncated == true ? [] : observed, from: start, to: end, availableSince: availableSince)
+    private var sharedStatusUnavailable: Bool {
+        model.role == .parent && (model.timelineError != nil || model.timeline == nil || end.timeIntervalSince(model.timeline?.serverTime ?? end) > 180)
     }
+    private var coverage: [TimelineCoverage] {
+        let unavailableSince: Date?
+        if model.role == .parent, let page = model.timeline {
+            unavailableSince = sharedStatusUnavailable ? page.serverTime : nil
+        } else {
+            unavailableSince = model.role == .parent && model.timeline == nil ? start : nil
+        }
+        return TimelineCoverage.segments(events: events, from: start, to: end, availableSince: availableSince,
+                                         statusUnavailableSince: unavailableSince, historyTruncated: model.timeline?.truncated == true)
+    }
+
     private var episodeCount: Int { Set(visibleEvents.filter { $0.category == .crying }.compactMap(\.episodeID)).count }
     private var acknowledgementCount: Int { visibleEvents.filter { $0.kind == "alert_acknowledged" }.count }
     private var gapCount: Int { visibleEvents.filter { $0.kind == "heartbeat_missing" }.count }
@@ -59,22 +67,22 @@ struct TimelineView: View {
                         Spacer()
                         statistic(gapCount, "Connection gaps")
                     }
-                    if let error = model.timelineError {
+                    if model.timelineError != nil || sharedStatusUnavailable && !model.loadingTimeline {
                         VStack(alignment: .leading, spacing: 8) {
-                            Label("Timeline refresh unavailable", systemImage: "exclamationmark.triangle").foregroundStyle(Palette.amber)
-                            Text(error).font(.footnote).foregroundStyle(Palette.muted)
+                            Label("Status unavailable", systemImage: "exclamationmark.icloud").foregroundStyle(.purple)
+                            Text(model.timelineError ?? "A fresh shared timeline is unavailable. The Listener’s current status cannot be verified here.").font(.footnote).foregroundStyle(Palette.muted)
                             if let last = model.timeline?.serverTime {
                                 Text("Shared history last updated \(last.formatted(date: .omitted, time: .standard)).").font(.caption).foregroundStyle(Palette.muted)
                             }
                             Button("Retry") { Task { await model.refreshTimeline() } }.disabled(model.loadingTimeline)
                         }
                     }
-                    if availableSince > start {
-                        Label("Complete history is available from \(availableSince.formatted(date: .abbreviated, time: .shortened)). Earlier activity may be missing.", systemImage: "clock.badge.questionmark")
+                    if model.timeline != nil && availableSince > start {
+                        Label("History recording began \(availableSince.formatted(date: .abbreviated, time: .shortened)). No history is recorded before then.", systemImage: "clock.badge.questionmark")
                             .font(.footnote).foregroundStyle(Palette.muted)
                     }
                     if model.timeline?.truncated == true {
-                        Label("This busy window exceeds the history limit. Some earlier events are omitted.", systemImage: "ellipsis.circle")
+                        Label("This busy window exceeds the history limit. Some events are omitted, so monitoring coverage is shown as missing history.", systemImage: "ellipsis.circle")
                             .font(.footnote).foregroundStyle(Palette.amber)
                     }
                     HStack {
@@ -122,15 +130,41 @@ struct TimelineView: View {
                 do { try await Task.sleep(for: .seconds(15)) } catch { break }
             }
         }
+        .sheet(item: $selectedCoverage) { segment in
+            NavigationStack {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 18) {
+                        Label(segment.state.title, systemImage: coverageIcon(segment.state))
+                            .font(.title2.weight(.semibold)).foregroundStyle(coverageColor(segment.state))
+                        Text("\(segment.start.formatted(date: .abbreviated, time: .standard)) – \(segment.end.formatted(date: .abbreviated, time: .standard))")
+                            .font(.subheadline.monospacedDigit())
+                        Text(coverageDetail(segment)).font(.body)
+                        if segment.state == .updatesMissing {
+                            if let lastUpdate = missingHeartbeat(for: segment)?.endAt {
+                                Text("Last Listener update: \(lastUpdate.formatted(date: .abbreviated, time: .standard)).")
+                            }
+                            if events.contains(where: { $0.occurredAt == segment.end && ($0.coverageState == .monitoring || $0.coverageState == .stopped) }) {
+                                Text("Updates resumed: \(segment.end.formatted(date: .abbreviated, time: .standard)).")
+                            } else {
+                                Text("No resumed updates are recorded in this interval.")
+                            }
+                        }
+                    }.frame(maxWidth: .infinity, alignment: .leading).padding(24)
+                }.background(Palette.background).foregroundStyle(.white)
+                    .navigationTitle("Timeline status").navigationBarTitleDisplayMode(.inline)
+                    .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { selectedCoverage = nil } } }
+            }.presentationDetents([.medium, .large])
+        }
         .onChange(of: filter) { _, category in
             if let selected = events.first(where: { $0.id == selectedID }), selected.category == category { showEarlier = true }
             else { selectedID = nil; showEarlier = false }
         }
         .onChange(of: phase) { _, value in if value == .active { Task { await model.refreshTimeline() } } }
     }
-    private var statusActive: Bool { model.role == .listener ? model.monitoring : model.parentOnline }
+    private var statusActive: Bool { model.role == .listener ? model.monitoring : !sharedStatusUnavailable && model.parentOnline }
     private var statusText: String {
-        model.role == .listener ? (model.monitoring ? "Monitoring on this iPhone" : model.recoveringAudio ? "Microphone interrupted" : "Monitoring stopped") : model.nurseryConnection
+        if sharedStatusUnavailable { return model.loadingTimeline && model.timeline == nil ? "Loading timeline…" : "Status unavailable" }
+        return model.role == .listener ? (model.monitoring ? "Monitoring on this iPhone" : model.recoveringAudio ? "Microphone interrupted" : "Monitoring stopped") : model.nurseryConnection
     }
     private func statistic(_ count: Int, _ title: String) -> some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -156,19 +190,31 @@ struct TimelineView: View {
                 GeometryReader { geometry in
                     HStack(spacing: 0) {
                         ForEach(coverage) { segment in
-                            Rectangle().fill(coverageColor(segment.state))
-                                .frame(width: max(0, geometry.size.width * segment.end.timeIntervalSince(segment.start) / (12 * 3600)))
+                            Button { selectedCoverage = segment } label: {
+                                Rectangle().fill(coverageColor(segment.state))
+                                    .frame(width: max(0, geometry.size.width * segment.end.timeIntervalSince(segment.start) / (12 * 3600)), height: 24)
+                                    .contentShape(Rectangle())
+                            }.buttonStyle(.plain)
+                                .accessibilityLabel("\(segment.state.title), \(segment.start.formatted(date: .omitted, time: .shortened)) to \(segment.end.formatted(date: .omitted, time: .shortened))")
+                                .accessibilityHint("Show details for this interval")
+                                .accessibilityIdentifier("timelineCoverage_\(segment.state.rawValue)")
                         }
                     }.clipShape(RoundedRectangle(cornerRadius: 3))
-                }.frame(height: 12)
-                .accessibilityLabel("Reported monitoring coverage. Unknown intervals do not confirm whether monitoring continued.")
+                }.frame(height: 24)
             }
             lane("Sound", category: .crying, color: Palette.amber, kinds: ["cry_started"])
             lane("Alerts", category: .alerts, color: .blue, kinds: ["alert", "test_alert", "connection_alert"])
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 12) { legend("Monitoring reported", color: Palette.mint); legend("Unknown", color: Palette.amber); legend("Stopped", color: Palette.muted.opacity(0.45)) }
-                VStack(alignment: .leading, spacing: 6) { legend("Monitoring reported", color: Palette.mint); legend("Unknown", color: Palette.amber); legend("Stopped", color: Palette.muted.opacity(0.45)) }
+            LazyVGrid(columns: [GridItem(.flexible(), alignment: .leading), GridItem(.flexible(), alignment: .leading)], alignment: .leading, spacing: 10) {
+                ForEach(TimelineCoverage.State.allCases.filter { $0 != .unverified || coverage.contains(where: { $0.state == .unverified }) }, id: \.self) { state in
+                    Button {
+                        selectedCoverage = coverage.first { $0.state == state }
+                    } label: {
+                        legend(state.title, color: coverageColor(state))
+                    }.buttonStyle(.plain).disabled(!coverage.contains { $0.state == state })
+                }
             }
+            Text("Tap a status interval for details.").font(.caption2).foregroundStyle(Palette.muted)
+
             if let event = events.first(where: { $0.id == selectedID }) {
                 Text("\(event.occurredAt.formatted(date: .omitted, time: .standard)) · \(event.timelineTitle)")
                     .font(.caption).foregroundStyle(Palette.muted).accessibilityAddTraits(.updatesFrequently)
@@ -176,8 +222,43 @@ struct TimelineView: View {
         }
     }
     private func coverageColor(_ state: TimelineCoverage.State) -> Color {
-        switch state { case .monitoring: Palette.mint.opacity(0.7); case .stopped: Palette.muted.opacity(0.35); case .unknown: Palette.amber.opacity(0.55) }
+        switch state {
+        case .monitoring: Palette.mint.opacity(0.7)
+        case .stopped: Palette.muted.opacity(0.5)
+        case .noHistory: Color.gray.opacity(0.25)
+        case .updatesMissing: Palette.amber
+        case .unavailable: Color.purple
+        case .unverified: Color.orange
+        }
     }
+    private func coverageIcon(_ state: TimelineCoverage.State) -> String {
+        switch state {
+        case .monitoring: "mic"
+        case .stopped: "stop.circle"
+        case .noHistory: "clock.badge.questionmark"
+        case .updatesMissing: "wifi.slash"
+        case .unavailable: "exclamationmark.icloud"
+        case .unverified: "mic.slash"
+        }
+    }
+    private func missingHeartbeat(for segment: TimelineCoverage) -> TimelineEvent? {
+        events.filter { $0.kind == "heartbeat_missing" && ($0.endAt ?? $0.occurredAt) <= segment.start }
+            .max { ($0.endAt ?? $0.occurredAt) < ($1.endAt ?? $1.occurredAt) }
+    }
+    private func coverageDetail(_ segment: TimelineCoverage) -> String {
+        switch segment.state {
+        case .monitoring: "The Listener reported active monitoring during this interval."
+        case .stopped: "The Listener reported stopped or interrupted sound detection during this interval."
+        case .noHistory:
+            model.timeline?.truncated == true
+                ? "The history limit omitted some events. There is not enough history to reconstruct monitoring coverage reliably. Retained events still appear in the event log."
+                : "No monitoring history was recorded for this interval. It may be before timeline logging began or before the first recorded monitoring state. Missing history does not establish that the Listener was disconnected or stopped."
+        case .updatesMissing: "The backend stopped receiving expected Listener heartbeats for more than three minutes. The gap starts at the last received heartbeat. Monitoring may have continued locally; a missed update does not confirm that the microphone stopped."
+        case .unavailable: "This Parent iPhone could not get a fresh timeline from the backend. Earlier fetched history remains visible. This interval does not establish whether the Listener lost its connection or stopped monitoring."
+        case .unverified: "The Listener relaunched after an active session. Monitoring after its last recorded audio sample could not be verified. This is separate from a missing-heartbeat report."
+        }
+    }
+
     private func legend(_ title: String, color: Color) -> some View {
         HStack(spacing: 4) { RoundedRectangle(cornerRadius: 2).fill(color).frame(width: 6, height: 6); Text(title).font(.caption2).foregroundStyle(Palette.muted) }
     }
@@ -254,7 +335,7 @@ private extension TimelineEvent {
         case "cry_ended": "Crying-like sound ended"
         case "alert_acknowledged": "Alert acknowledged"
         case "test_acknowledged": "Test acknowledged"
-        case "heartbeat_missing": "Missed heartbeats"
+        case "heartbeat_missing": "Listener updates missing"
         case "connection_restored": "Connection restored"
         case "network_lost": "Listener internet unavailable"
         case "network_restored": "Listener internet restored"
@@ -280,7 +361,7 @@ private extension TimelineEvent {
         case "alert", "test_alert": "\(count ?? 1) \((count ?? 1) == 1 ? "alert" : "alerts, including reminders") · \(destination)"
         case "connection_alert": "Connection notice · \(status ?? "pending")"
         case "alert_acknowledged": endAt.map { "Crying alerts snoozed until \($0.formatted(date: .omitted, time: .standard))" } ?? "Confirmed by parent"
-        case "heartbeat_missing": "Listener status unknown"
+        case "heartbeat_missing": "Expected heartbeats stopped arriving"
         case "connection_restored": "Listener updates resumed"
         case "network_lost": "Alerts may be delayed · Recorded on Listener"
         case "monitoring_unverified": "Previous session could not be verified after relaunch"
@@ -297,7 +378,7 @@ private extension TimelineEvent {
         case "alert_acknowledged": return "The backend recorded an explicit parent acknowledgement. Outstanding crying alerts were acknowledged. \(endAt.map { "Crying alerts were snoozed until \($0.formatted(date: .omitted, time: .standard))." } ?? "") Connection-loss alerts remain independent."
         case "monitoring_observed", "stopped_observed": return "The backend received this monitoring state at the displayed time. It does not establish the exact time the Listener started or stopped."
         case "test_acknowledged": return "A parent acknowledged this test notification. It did not snooze real crying alerts."
-        case "heartbeat_missing": return "No heartbeat arrived for more than three minutes. \(endAt.map { "Last update: \($0.formatted(date: .omitted, time: .standard))." } ?? "") Monitoring may have continued locally, but its status could not be verified. The overview marks the interval since that last update as unknown."
+        case "heartbeat_missing": return "No heartbeat arrived for more than three minutes. \(endAt.map { "Last update: \($0.formatted(date: .omitted, time: .standard))." } ?? "") Monitoring may have continued locally, but its status could not be verified. The overview marks the interval since that last update as Listener updates missing."
         case "connection_restored": return "Fresh Listener updates resumed. \(endAt.map { "The previous update was at \($0.formatted(date: .omitted, time: .standard))." } ?? "") This records when the backend observed recovery."
         case "cry_started": return "Sustained sound was confirmed on the Listener. This records crying-like sound activity; it does not identify every cry or distinguish all other room sounds. Audio remains on the Listener."
         case "cry_ended": return "The recorded sound episode ended after quiet was confirmed or capture stopped. This is sound activity, not a sleep state."

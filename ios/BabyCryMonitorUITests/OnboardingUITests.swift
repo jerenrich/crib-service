@@ -8,6 +8,19 @@ final class OnboardingUITests: XCTestCase {
         XCTAssertTrue(timeline.waitForExistence(timeout: 5)); timeline.tap()
         XCTAssertTrue(app.navigationBars["Timeline"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.staticTexts["Last 12 hours"].exists)
+        XCTAssertTrue(app.staticTexts["No history recorded"].exists)
+        XCTAssertTrue(app.staticTexts["Listener updates missing"].exists)
+        XCTAssertTrue(app.staticTexts["Status unavailable"].exists)
+        let overview = XCTAttachment(screenshot: app.screenshot())
+        overview.name = "Timeline coverage distinctions"; overview.lifetime = .keepAlways; add(overview)
+        let gap = app.buttons.matching(identifier: "timelineCoverage_updatesMissing").firstMatch
+        XCTAssertTrue(gap.exists); gap.tap()
+        XCTAssertTrue(app.navigationBars["Timeline status"].waitForExistence(timeout: 3))
+        XCTAssertTrue(app.staticTexts.containing(NSPredicate(format: "label BEGINSWITH %@", "Last Listener update:")).firstMatch.exists)
+        XCTAssertTrue(app.staticTexts.containing(NSPredicate(format: "label BEGINSWITH %@", "Updates resumed:")).firstMatch.exists)
+        let gapDetail = XCTAttachment(screenshot: app.screenshot())
+        gapDetail.name = "Missing Listener updates detail"; gapDetail.lifetime = .keepAlways; add(gapDetail)
+        app.buttons["Done"].tap()
         let filter = app.buttons["timelineFilter"]
         for _ in 0..<4 { if filter.isHittable { break }; app.swipeUp() }
         XCTAssertTrue(filter.isHittable); filter.tap()
