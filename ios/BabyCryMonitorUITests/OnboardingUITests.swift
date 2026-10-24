@@ -1,37 +1,46 @@
 import XCTest
 final class OnboardingUITests: XCTestCase {
-    @MainActor func testActiveAlertIsAboveChartAndSnoozeActionIsExplicit() {
+    @MainActor func testActiveAlertUsesFixedNoticeAndSnoozeActionIsExplicit() {
         let app = XCUIApplication()
         app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", "--uitesting-active-alert"]
         app.launch()
+        let chart = app.descendants(matching: .any)["soundLevelChart"].firstMatch
+        let review = app.buttons["nightstandDetails"]
+        XCTAssertTrue(review.waitForExistence(timeout: 5))
+        XCTAssertTrue(review.isHittable)
+        XCTAssertFalse(app.buttons["activeAlertAction"].exists)
+        let chartFrame = chart.frame
+        let controlFrame = app.buttons["nightstandMonitoringControl"].frame
+        let shot = XCTAttachment(screenshot: app.screenshot()); shot.name = "Compact alert notice"; shot.lifetime = .keepAlways; add(shot)
+        review.tap()
         let action = app.buttons["activeAlertAction"]
         XCTAssertTrue(action.waitForExistence(timeout: 5))
         XCTAssertTrue(action.isHittable)
         XCTAssertEqual(action.label, "Snooze alerts for 1 min")
-        let chart = app.descendants(matching: .any)["soundLevelChart"].firstMatch
-        XCTAssertLessThan(action.frame.maxY, chart.frame.minY)
-        let shot = XCTAttachment(screenshot: app.screenshot()); shot.name = "Alert first"; shot.lifetime = .keepAlways; add(shot)
+        app.buttons["Done"].tap()
+        XCTAssertEqual(chart.frame, chartFrame)
+        XCTAssertEqual(app.buttons["nightstandMonitoringControl"].frame, controlFrame)
     }
 
     @MainActor func testSnoozeAndChartRecoveryAreProminent() {
         let app = XCUIApplication()
         app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", "--uitesting-snoozed", "--uitesting-chart-paused"]
         app.launch()
+        let details = app.buttons["nightstandDetails"]
+        XCTAssertTrue(details.waitForExistence(timeout: 5))
+        XCTAssertTrue(details.isHittable)
+        XCTAssertTrue(app.staticTexts["Crying alerts snoozed"].exists)
+        XCTAssertTrue(app.staticTexts["nightstandState"].label == "Live chart paused")
+        XCTAssertEqual(app.scrollViews.count, 0)
+        details.tap()
         XCTAssertTrue(app.buttons["resumeAlerts"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.buttons["resumeAlerts"].isHittable)
         let retry = app.buttons["retryConnection"]
-        let timing = app.buttons["editAlertTiming"]
         for _ in 0..<6 {
-            if retry.isHittable && retry.frame.maxY < timing.frame.minY { break }
-            // The scroll view's accessibility frame includes the fixed footer.
-            // Start the gesture inside the visible content above that footer.
-            let origin = app.coordinate(withNormalizedOffset: .zero)
-            origin.withOffset(CGVector(dx: app.frame.midX, dy: timing.frame.minY - 30))
-                .press(forDuration: 0.05, thenDragTo: origin.withOffset(CGVector(dx: app.frame.midX, dy: app.scrollViews.firstMatch.frame.minY + 40)))
+            if retry.isHittable { break }
+            app.scrollViews.firstMatch.swipeUp()
         }
         XCTAssertTrue(retry.isHittable, app.debugDescription)
-        XCTAssertLessThan(retry.frame.maxY, timing.frame.minY)
-        XCTAssertTrue(app.staticTexts["Live chart paused"].firstMatch.exists)
         let shot = XCTAttachment(screenshot: app.screenshot()); shot.name = "Snooze and connection recovery"; shot.lifetime = .keepAlways; add(shot)
     }
 
@@ -48,11 +57,46 @@ final class OnboardingUITests: XCTestCase {
         app.buttons["Done"].tap()
         XCTAssertTrue(NSPredicate(format: "label CONTAINS %@", "00:30").evaluate(with: timing) || app.staticTexts["Requested 30 sec · Waiting for nursery confirmation"].exists)
         XCTAssertFalse(app.descendants(matching: .any)["pairedDevice_listener"].exists)
-        let summary = app.buttons["deviceSummary"]
-        for _ in 0..<4 { if summary.exists && summary.isHittable && summary.frame.maxY < timing.frame.minY { break }; app.scrollViews.firstMatch.swipeUp() }
-        XCTAssertTrue(summary.exists)
-        summary.tap()
+        XCTAssertFalse(app.buttons["deviceSummary"].exists)
+        app.tabBars.buttons["Devices"].tap()
         XCTAssertTrue(app.navigationBars["Devices"].waitForExistence(timeout: 5))
+    }
+
+    @MainActor func testCompactMonitorDoesNotScrollOrMoveAcrossStates() {
+        let app = XCUIApplication()
+        var baseline: [CGRect]?
+        let scenarios: [[String]] = [[], ["--uitesting-active-alert"], ["--uitesting-snoozed"],
+            ["--uitesting-chart-paused"], ["--uitesting-standby"]]
+        for scenario in scenarios {
+            app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound"] + scenario
+            app.launch()
+            let state = app.staticTexts["nightstandState"]
+            XCTAssertTrue(state.waitForExistence(timeout: 5))
+            XCTAssertEqual(app.scrollViews.count, 0)
+            let chart = app.descendants(matching: .any)["soundLevelChart"].firstMatch
+            let details = app.buttons["nightstandDetails"]
+            let control = app.buttons["nightstandMonitoringControl"]
+            let timing = app.buttons["editAlertTiming"]
+            let ready = app.buttons["Ready for tonight?"]
+            for action in [details, control, timing, ready] { XCTAssertTrue(action.isHittable, action.debugDescription) }
+            XCTAssertGreaterThan(chart.frame.height, 30)
+            XCTAssertLessThanOrEqual(state.frame.maxY, chart.frame.minY)
+            XCTAssertLessThanOrEqual(chart.frame.maxY, details.frame.minY)
+            XCTAssertLessThanOrEqual(details.frame.maxY, timing.frame.minY)
+            XCTAssertLessThanOrEqual(ready.frame.maxY, app.tabBars.firstMatch.frame.minY)
+            let frames = [state.frame, chart.frame, details.frame, control.frame, timing.frame, ready.frame, app.tabBars.firstMatch.frame]
+            if let baseline {
+                for (actual, expected) in zip(frames, baseline) {
+                    XCTAssertEqual(actual.minX, expected.minX, accuracy: 1)
+                    XCTAssertEqual(actual.minY, expected.minY, accuracy: 1)
+                    XCTAssertEqual(actual.width, expected.width, accuracy: 1)
+                    XCTAssertEqual(actual.height, expected.height, accuracy: 1)
+                }
+            } else { baseline = frames }
+            let shot = XCTAttachment(screenshot: app.screenshot())
+            shot.name = "Compact \(scenario.first ?? "quiet")"; shot.lifetime = .keepAlways; add(shot)
+            app.terminate()
+        }
     }
 
     @MainActor func testGuidedSetupRequiresWatchChecksAndReceiptBeforeMonitoring() {
@@ -133,7 +177,7 @@ final class OnboardingUITests: XCTestCase {
             let chart = app.descendants(matching: .any)["soundLevelChart"].firstMatch
             XCTAssertTrue(chart.waitForExistence(timeout: 5))
             XCTAssertTrue(app.staticTexts["nightstandState"].exists)
-            XCTAssertGreaterThan(chart.frame.height, 150)
+            XCTAssertGreaterThan(chart.frame.height, 30)
             XCTAssertTrue(app.tabBars.buttons["Monitor"].exists)
             XCTAssertTrue(app.tabBars.buttons["Activity"].exists)
             XCTAssertTrue(app.tabBars.buttons["Devices"].exists)

@@ -9,6 +9,7 @@ struct NightstandView: View {
     @State private var readiness = false
     @State private var detailsPresented = false
     @State private var timing = false
+    @ScaledMetric(relativeTo: .caption) private var chartChrome: CGFloat = 96
 
     private var listener: Bool { role == .listener }
     private var soundLive: Bool { listener ? model.monitoring : model.remoteSound.isLive(at: model.now) && !(confirmedParentState && model.parentStatus?.monitoring == false) }
@@ -68,29 +69,31 @@ struct NightstandView: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                if !listener, let alert = model.activeAlert { alertPanel(alert) }
-                if !listener, let until = model.parentStatus?.alertsMutedUntil, until > model.now { snoozePanel(until: until) }
-                statusHeader
-                soundPanel
-                statusNotice
-                if !listener, model.paired, !standby, (!soundLive || model.monitoringControlError != nil), model.pendingMonitoringCommand == nil { connectionRecovery }
-                deviceSummary
-                // At accessibility sizes, let every action scroll into view rather
-                // than letting a tall fixed footer consume the reading area.
-                if typeSize.isAccessibilitySize { controlPanel }
-            }
-            .padding(.horizontal, 20)
-            .padding(.vertical, 12)
-        }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            if !typeSize.isAccessibilitySize {
-                controlPanel
+        Group {
+            if typeSize.isAccessibilitySize {
+                // Large accessibility text needs its full reading height.
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        statusHeader
+                        soundPanel(plotHeight: 100)
+                        statusNotice
+                        controlPanel
+                    }
                     .padding(.horizontal, 20)
-                    .padding(.top, 12)
-                    .padding(.bottom, 8)
-                    .background(Palette.background)
+                    .padding(.vertical, 8)
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 10) {
+                    statusHeader
+                    GeometryReader { geometry in
+                        soundPanel(plotHeight: max(8, geometry.size.height - chartChrome))
+                    }
+                    .frame(maxHeight: 240)
+                    statusNotice
+                    controlPanel
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 8)
             }
         }
         .sheet(isPresented: $timing) { AlertTimingView() }
@@ -102,31 +105,37 @@ struct NightstandView: View {
     }
 
     private var controlPanel: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 4) {
             Button { timing = true } label: {
-                ViewThatFits(in: .horizontal) {
+                VStack(alignment: .leading, spacing: 2) {
                     HStack {
                         Text("Alert after sustained sound").foregroundStyle(Palette.muted)
                         Spacer(minLength: 12)
                         Text(durationText(alertDuration)).monospacedDigit()
                         Image(systemName: "chevron.right").font(.caption)
-                    }
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Alert after sustained sound").foregroundStyle(Palette.muted)
-                        Label(durationText(alertDuration), systemImage: "chevron.right")
-                    }
-                }.font(.subheadline).frame(minHeight: 44).contentShape(Rectangle())
+                    }.font(.caption)
+                    // Settings confirmation occupies this slot even when empty.
+                    Text("Requested \(spokenDuration(model.configuration.alertDuration)) · Waiting for nursery confirmation")
+                        .font(.caption2).foregroundStyle(Palette.amber)
+                        .modifier(NightstandStatusLines(lines: 1))
+                        .opacity(timingPending ? 1 : 0)
+                        .accessibilityHidden(!timingPending)
+                }.frame(minHeight: 44).contentShape(Rectangle())
             }.buttonStyle(.plain).accessibilityIdentifier("editAlertTiming")
-            if !listener && model.configuration.alertDuration != alertDuration {
-                Text("Requested \(spokenDuration(model.configuration.alertDuration)) · Waiting for nursery confirmation")
-                    .font(.footnote).foregroundStyle(Palette.amber)
-            }
             monitoringControls
         }
     }
 
+    private var timingPending: Bool { !listener && model.configuration.alertDuration != alertDuration }
+
     private var statusHeader: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .firstTextBaseline) {
+                Label(listener ? "Listener · Nursery" : "Parent · With you", systemImage: listener ? "mic" : "bell")
+                Spacer(minLength: 8)
+                Text(model.now, style: .time).monospacedDigit()
+                    .accessibilityIdentifier("nightstandClock")
+            }.font(.caption).foregroundStyle(Palette.muted)
             // Reserve the same number of lines for every state, including Quiet.
             Text(title)
                 .font(.system(.title2, design: .rounded).weight(.medium))
@@ -134,19 +143,13 @@ struct NightstandView: View {
                 .modifier(NightstandStatusLines())
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .accessibilityIdentifier("nightstandState")
-            Text(subtitle).font(.subheadline).foregroundStyle(Palette.muted)
+            Text(subtitle).font(.caption).foregroundStyle(Palette.muted)
                 .modifier(NightstandStatusLines(lines: 1))
-            HStack(alignment: .firstTextBaseline) {
-                Label(listener ? "Listener · Nursery" : "Parent · With you", systemImage: listener ? "mic" : "bell")
-                Spacer(minLength: 8)
-                Text(model.now, style: .time).monospacedDigit()
-                    .accessibilityIdentifier("nightstandClock")
-            }.font(.caption).foregroundStyle(Palette.muted)
         }
     }
 
-    private var soundPanel: some View {
-        VStack(alignment: .leading, spacing: 12) {
+    private func soundPanel(plotHeight: CGFloat) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
             if typeSize.isAccessibilitySize {
                 VStack(alignment: .leading, spacing: 6) {
                     liveStatus
@@ -162,7 +165,7 @@ struct NightstandView: View {
             }
             SoundLevelChart(levels: levels, trigger: threshold,
                 currentLevel: listener ? model.currentDBFS : levels.last ?? -100,
-                monitoring: soundLive, height: 160, color: Palette.lavender)
+                monitoring: soundLive, height: plotHeight, color: Palette.lavender)
             // Keep the episode row in the layout when the nursery becomes quiet.
             HStack(spacing: 12) {
                 Text("\(durationText(elapsed ?? 0)) / \(durationText(alertDuration))")
@@ -174,7 +177,7 @@ struct NightstandView: View {
             .opacity(elapsed != nil && soundLive ? 1 : 0)
             .accessibilityHidden(elapsed == nil || !soundLive)
         }
-        .padding(16)
+        .padding(12)
         .background(Palette.panel, in: RoundedRectangle(cornerRadius: 20))
     }
 
@@ -191,7 +194,7 @@ struct NightstandView: View {
         }
         if !listener, model.activeAlert != nil {
             return Notice(title: model.activeAlert?.isTest == true ? "Test notification" : "Check on your baby",
-                summary: "Use the alert above to confirm receipt or snooze crying alerts.", icon: "bell.badge")
+                summary: "Review the alert to confirm receipt or snooze crying alerts.", icon: "bell.badge")
         }
         if listener, listenerAlertFailed {
             return Notice(title: "Alert delivery failed", summary: "Check delivery details. This alert will not retry.", icon: "exclamationmark.triangle.fill")
@@ -239,15 +242,17 @@ struct NightstandView: View {
                     detailsButton
                 }
             }
-            Text(notice.summary).font(.subheadline).foregroundStyle(Palette.muted)
+            Text(notice.summary).font(.caption).foregroundStyle(Palette.muted)
                 .modifier(NightstandStatusLines())
             if typeSize.isAccessibilitySize { detailsButton }
         }
+        .padding(.top, 8)
+        .overlay(alignment: .top) { Rectangle().fill(Palette.muted.opacity(0.2)).frame(height: 1) }
     }
 
     private var noticeHeading: some View {
         Label(notice.title, systemImage: notice.icon)
-            .font(.headline).foregroundStyle(notice.caution ? Palette.amber : Palette.lavender)
+            .font(.subheadline.weight(.medium)).foregroundStyle(notice.caution ? Palette.amber : Palette.lavender)
             .modifier(NightstandStatusLines())
             .accessibilityIdentifier(!listener && model.monitoringControlError != nil ? "monitoringControlWarning" : "nightstandNotice")
     }
@@ -258,8 +263,8 @@ struct NightstandView: View {
                 Text(!listener && model.activeAlert != nil ? "Review alert" : "Details")
                 Image(systemName: "chevron.right")
             }
-            .font(.subheadline)
-            .fixedSize(horizontal: !typeSize.isAccessibilitySize, vertical: true)
+            .font(.caption)
+            .frame(width: typeSize.isAccessibilitySize ? nil : 96, alignment: .trailing)
             .frame(minHeight: 44)
         }
         .accessibilityLabel(!listener && model.activeAlert != nil ? "Review alert" : "View details")
@@ -275,6 +280,8 @@ struct NightstandView: View {
                         Text(subtitle).font(.subheadline).foregroundStyle(Palette.muted)
                     }
                     if !listener, let alert = model.activeAlert { alertPanel(alert) }
+                    if !listener, let until = model.parentStatus?.alertsMutedUntil, until > model.now { snoozePanel(until: until) }
+                    if needsConnectionRecovery { connectionRecovery }
                     if !listener, let error = model.monitoringControlError {
                         VStack(alignment: .leading, spacing: 8) {
                             Label("Monitoring not confirmed", systemImage: "exclamationmark.triangle.fill").font(.headline)
@@ -310,6 +317,11 @@ struct NightstandView: View {
                         Label(powerReadiness.title, systemImage: "battery.25percent").foregroundStyle(Palette.amber)
                         Text(powerReadiness.detail).font(.subheadline)
                     }
+                    if timingPending {
+                        Text("Requested \(spokenDuration(model.configuration.alertDuration)) · Waiting for nursery confirmation")
+                            .font(.footnote).foregroundStyle(Palette.amber)
+                    }
+                    deviceSummary
                     monitoringDetails
                     NightstandDevicesPanel()
                 }.padding(20)
@@ -350,6 +362,10 @@ struct NightstandView: View {
         }.foregroundStyle(Palette.amber)
     }
 
+    private var needsConnectionRecovery: Bool {
+        !listener && model.paired && !standby && (!soundLive || model.monitoringControlError != nil) && model.pendingMonitoringCommand == nil
+    }
+
     private var deviceSummary: some View {
         NavigationLink { NightstandDevicesView() } label: {
             HStack(alignment: .top, spacing: 10) {
@@ -371,25 +387,25 @@ struct NightstandView: View {
         HStack(spacing: 6) {
             Circle().fill(soundLive ? Palette.lavender : Palette.muted).frame(width: 6, height: 6).accessibilityHidden(true)
             Text(liveLabel).font(.caption).foregroundStyle(soundLive ? Palette.lavender : Palette.muted)
-                .modifier(NightstandStatusLines())
+                .modifier(NightstandStatusLines(lines: 1))
         }.accessibilityIdentifier("nightstandSoundStatus")
     }
 
     private var monitoringControls: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            if !model.paired {
-                PrimaryButton(title: listener ? "Pair with Parent" : "Set up for tonight") { if listener { pairing = true } else { readiness = true } }
-            }
+        VStack(alignment: .leading, spacing: 4) {
             Button(action: toggleMonitoring) {
                 Label(controlTitle, systemImage: monitoringActive ? (listener ? "stop" : "pause") : "play")
                     .font(.headline).fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity).padding(.vertical, 16)
+                    .frame(maxWidth: .infinity, minHeight: 52)
                     .foregroundStyle(Palette.lavender).background(Palette.panel, in: RoundedRectangle(cornerRadius: 18))
             }
             .disabled(!model.paired || busy || model.managingDevice)
             .accessibilityIdentifier("nightstandMonitoringControl")
             HStack(alignment: .top, spacing: 16) {
-                if listener && (standby || model.recoveringAudio) {
+                if !model.paired {
+                    Button(listener ? "Pair with Parent" : "Set up for tonight") { if listener { pairing = true } else { readiness = true } }
+                        .frame(minHeight: 44, alignment: .leading)
+                } else if listener && (standby || model.recoveringAudio) {
                     Button("Stop microphone") { model.stop() }
                         .frame(minHeight: 44, alignment: .leading)
                         .disabled(model.starting || model.managingDevice)
@@ -408,11 +424,10 @@ struct NightstandView: View {
                 }
                 Spacer(minLength: 0)
                 Button { readiness = true } label: { Text("Ready for tonight?").frame(minHeight: 44, alignment: .trailing) }
-            }.font(.subheadline).foregroundStyle(Palette.muted)
-                .fixedSize(horizontal: false, vertical: true)
+            }.font(.caption).foregroundStyle(Palette.muted)
             Text("Sound detection only · Adult supervision required")
                 .font(.caption2).foregroundStyle(Palette.muted)
-                .fixedSize(horizontal: false, vertical: true)
+                .modifier(NightstandStatusLines())
                 .frame(maxWidth: .infinity)
         }
     }
