@@ -1,5 +1,46 @@
 import XCTest
 final class OnboardingUITests: XCTestCase {
+    @MainActor func testParentWarningAndScreenPreferencesDefaultOffAndPersist() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline"]
+        app.launch()
+        let proceed = app.buttons["I understand · Continue"]
+        XCTAssertTrue(proceed.waitForExistence(timeout: 5))
+        if !proceed.isHittable { app.swipeUp() }; proceed.tap()
+        let parent = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Parent Mode")).firstMatch
+        XCTAssertTrue(parent.waitForExistence(timeout: 5)); parent.tap()
+        XCTAssertTrue(app.buttons["Settings"].waitForExistence(timeout: 5))
+        app.buttons["Settings"].tap()
+        let form = app.descendants(matching: .any)["settingsForm"]
+        let local = app.switches["localConnectionWarning"]
+        let awake = app.switches["keepScreenAwake"]
+        func reveal(_ toggle: XCUIElement) {
+            for _ in 0..<16 {
+                if toggle.exists && toggle.isHittable && toggle.frame.maxY < form.frame.maxY - 80 { return }
+                scrollDown(in: form)
+            }
+        }
+        reveal(local)
+        XCTAssertTrue(local.exists && local.isHittable)
+        XCTAssertEqual(local.value as? String, "0")
+        local.coordinate(withNormalizedOffset: CGVector(dx: 0.92, dy: 0.5)).tap()
+        XCTAssertTrue(NSPredicate(format: "value == '1'").evaluate(with: local))
+        reveal(awake)
+        XCTAssertEqual(awake.value as? String, "0")
+        awake.coordinate(withNormalizedOffset: CGVector(dx: 0.92, dy: 0.5)).tap()
+        XCTAssertTrue(NSPredicate(format: "value == '1'").evaluate(with: awake))
+        app.terminate(); app.launchArguments = ["--uitesting-offline"]; app.launch()
+        XCTAssertTrue(app.buttons["Settings"].waitForExistence(timeout: 5)); app.buttons["Settings"].tap()
+        reveal(local)
+        XCTAssertEqual(local.value as? String, "1")
+        local.coordinate(withNormalizedOffset: CGVector(dx: 0.92, dy: 0.5)).tap()
+        reveal(awake)
+        XCTAssertEqual(awake.value as? String, "1")
+        awake.coordinate(withNormalizedOffset: CGVector(dx: 0.92, dy: 0.5)).tap()
+    }
+
+
     @MainActor func testParentMonitoringFailureIsProminentAndRemainsVisible() {
         let app = XCUIApplication()
         app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-timeline", "--uitesting-monitoring-rejected"]

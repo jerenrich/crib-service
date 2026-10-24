@@ -1,7 +1,7 @@
 import Foundation
 import UserNotifications
 
-@MainActor enum ConnectionWarningNotification {
+enum ConnectionWarningNotification {
     static let timeout: TimeInterval = 180
     static let identifier = "parent-connection-check"
 
@@ -18,6 +18,8 @@ import UserNotifications
     }
 
     static func apply(deadline: Date?, watch: Bool = false) async throws {
+        // Notification cancellation makes synchronous system-service calls.
+        // Keep those off the UI actor so a stalled service cannot freeze the app.
         let center = UNUserNotificationCenter.current()
         guard let deadline else {
             center.removePendingNotificationRequests(withIdentifiers: [identifier])

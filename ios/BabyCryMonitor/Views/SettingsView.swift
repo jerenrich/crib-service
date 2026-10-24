@@ -75,10 +75,37 @@ struct SettingsView: View {
                 if model.role == .parent {
                     Section {
                         Button("Ready for tonight?") { readiness = true }
-                        Toggle("Connection-loss alerts", isOn: Binding(get: { model.parentStatus?.connectionAlertsEnabled == true }, set: { value in Task { await model.setConnectionAlerts(value) } }))
-                            .disabled(model.changingConnectionAlerts || model.parentStatus == nil || !model.paired)
+                        if let enabled = model.parentStatus?.connectionAlertsEnabled {
+                            Toggle("Server connection alerts", isOn: Binding(get: { model.parentStatus?.connectionAlertsEnabled ?? enabled }, set: { value in Task { await model.setConnectionAlerts(value) } }))
+                                .disabled(model.changingConnectionAlerts || !model.paired)
+                                .accessibilityIdentifier("serverConnectionAlerts")
+                        } else {
+                            LabeledContent("Server connection alerts", value: model.paired ? "Status unavailable" : "On by default")
+                        }
                     } header: { Text("Monitoring connection") } footer: {
-                        Text("When enabled, the server reports a stopped Listener or missing updates after 3–4 minutes. During monitoring, Parent and Watch also arm a local warning for 3 minutes without a verified Parent server check. That warning needs no internet once armed. Keep Parent Mode open: locking or leaving the app may pause checks and trigger it. Notification, Focus and haptic settings still apply.")
+                        Text("On by default for new registrations. The server reports a stopped Listener or missing updates after 3–4 minutes, even while Parent Mode is closed or the phone is locked. Receiving these alerts requires internet and allowed notifications.")
+                    }
+                    Section {
+                        Toggle("Local overdue-check warning", isOn: Binding(get: { model.localConnectionWarningEnabled }, set: { model.setLocalConnectionWarning($0) }))
+                            .accessibilityIdentifier("localConnectionWarning")
+                        if model.localConnectionWarningEnabled {
+                            if let failure = model.parentConnectionWarningError {
+                                Text("Warning unavailable: \(failure)").foregroundStyle(.orange)
+                            } else if let deadline = model.parentConnectionDeadline {
+                                Text(model.now >= deadline ? "Server check overdue. Open Parent Mode to check." : "Armed · Warns after 3 minutes without a successful server check.")
+                                    .foregroundStyle(model.now >= deadline ? .orange : .secondary)
+                            } else {
+                                Text("Waiting for a successful server check with monitoring active.").foregroundStyle(.secondary)
+                            }
+                        }
+                    } footer: {
+                        Text("Optional · Off by default. During monitoring, warns on this iPhone and its Watch after 3 minutes without a successful Parent server check. Works without internet once armed. Locking the phone or leaving the app can pause checks and trigger it on a healthy network. Independent of server connection alerts. Notification, Focus and haptic settings still apply.")
+                    }
+                    Section {
+                        Toggle("Keep screen awake", isOn: Binding(get: { model.keepScreenAwake }, set: { model.setKeepScreenAwake($0) }))
+                            .accessibilityIdentifier("keepScreenAwake")
+                    } footer: {
+                        Text("Prevents automatic screen locking while Parent Mode is open. Uses more battery; connect power for extended use. You can still lock the phone manually, which may pause checks.")
                     }
                 }
                 Section {
@@ -92,7 +119,7 @@ struct SettingsView: View {
                     Text("Sound detection only. Cannot detect breathing problems, movement problems, silent distress, medical emergencies, or unsafe sleep conditions. Adult supervision is required; this is not a medical monitor.").font(.footnote).foregroundStyle(.secondary)
                 }
                 Section { NavigationLink("Diagnostics & simulation") { DebugView() } }
-            }.navigationTitle("Settings")
+            }.accessibilityIdentifier("settingsForm").navigationTitle("Settings")
                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
                 .sheet(isPresented: $pairing) { PairingView() }
                 .sheet(isPresented: $readiness) { ReadinessView() }

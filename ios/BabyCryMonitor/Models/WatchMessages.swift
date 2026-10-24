@@ -26,10 +26,12 @@ struct WatchSnapshot: Codable, Equatable, Sendable {
     // An absolute deadline from a successful Parent server check. An unrelated
     // snapshot, Bluetooth reconnection or failed refresh must not postpone it.
     var connectionWarningSupported: Bool?
+    // Missing on older phones/cached snapshots: require explicit opt-in.
+    var localConnectionWarningEnabled: Bool?
     var connectionWarningDeadline: Date?
 
     var localConnectionDeadline: Date? {
-        guard connectionWarningSupported == true, parentMode, paired else { return nil }
+        guard connectionWarningSupported == true, localConnectionWarningEnabled == true, parentMode, paired else { return nil }
         return connectionWarningDeadline
     }
 
