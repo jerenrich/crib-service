@@ -4,7 +4,7 @@ import {beforeAll,afterEach,beforeEach,describe,it,expect,vi} from 'vitest';
 import worker from '../src/index';
 import {defaultConfiguration,type Env,type Alert} from '../src/types';
 import {payload,apnsToken} from '../src/apns';
-import {encryptToken,decryptToken} from '../src/security';
+import {encryptToken,decryptToken,sha256} from '../src/security';
 import {flushPending} from '../src/alerts';
 import {eventReference,recordDiagnostic} from '../src/diagnostics';
 import {flushConnections} from '../src/connections';
@@ -226,6 +226,18 @@ describe('devices and secure pairing',()=>{
   for(let i=0;i<5;i++)await call('pairing/claim',listener,{code:'999999'});
   expect((await call('pairing/claim',listener,{code:'999999'})).status).toBe(429);
  });
+ it('keeps crying alerts outside shared-address and per-device polling budgets',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  const exhaust=async(scope:string,identifier:string,attempts:number)=>env.DB.prepare('INSERT OR REPLACE INTO rate_limits(key,window,attempts) VALUES(?,?,?)')
+   .bind(await sha256(`${testEnv.PAIRING_PEPPER}|${scope}|${identifier}`),Math.floor(Date.now()/1000/600),attempts).run();
+  await exhaust('device',listener.deviceId,600);
+  expect((await call('listener/status',listener,undefined,'GET')).status).toBe(429);
+  expect((await call('listener/status',parent,undefined,'GET')).status).toBe(200); // The Parent has its own budget.
+  await exhaust('api','127.0.0.1',3000);
+  expect((await call('listener/status',parent,undefined,'GET')).status).toBe(429);
+  mockPush();
+  expect(await (await call('listener/event',listener,alert(listener))).json()).toEqual({status:'sent'});
+ });
  it('encrypts APNs tokens at rest and uses distinct random IVs',async()=>{
   const {parent}=await paired();const token='ab'.repeat(32);
   expect((await call('device/push-token',parent,{token})).status).toBe(200);
@@ -427,6 +439,10 @@ describe('APNs and durable idempotent alerts',()=>{
   const notification=payload(alert(device('listener')));expect(notification.aps).not.toHaveProperty('sound');
   expect(notification.aps.alert.title).toBe('Baby is crying');
   expect(notification).not.toHaveProperty('isTest');
+  const timed=(durationSeconds:number)=>payload({...alert(device('listener')),durationSeconds}).aps.alert.body;
+  expect(timed(1)).toContain('continued for 1 second.');
+  expect(timed(61)).toContain('continued for 1 minute 1 second.');
+  expect(timed(125)).toContain('continued for 2 minutes 5 seconds.');
   const token=await apnsToken(testEnv);expect(token.split('.')).toHaveLength(3);
   const header=JSON.parse(atob(token.split('.')[0]));expect(header.alg).toBe('ES256');
  });

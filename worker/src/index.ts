@@ -29,13 +29,19 @@ export default {
    if(!env.PAIRING_PEPPER||env.PAIRING_PEPPER.length<32)throw new Error('Pairing configuration missing');
    const route=`${request.method} ${url.pathname}`;
    const ip=request.headers.get('CF-Connecting-IP')??'local';
+   const alertUpload=route==='POST /v1/listener/event';
    stage='rate_limit';
-   await rateLimit(env,'api',ip,600,600);
+   // Both phones usually share one address (carrier NAT shares it more widely), so the
+   // address bucket is only a flood ceiling. Crying alerts never depend on it.
+   if(!alertUpload)await rateLimit(env,'api',ip,3000,600);
    let result:unknown;
    if(route==='POST /v1/device/register'){stage='handler';result=await register(env,await body(request),ip);}
    else{
     stage='authentication';
     const device=await authenticate(env,request);
+    stage='rate_limit';
+    // Separate budgets: a device's own polling must never delay a crying alert.
+    await rateLimit(env,alertUpload?'alert':'device',device.id,600,600);
     stage='handler';
     switch(route){
      case 'POST /v1/pairing/create':result=await createPairing(env,device);break;

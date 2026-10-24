@@ -161,7 +161,7 @@ private final class RMSReducer: @unchecked Sendable {
             sum += energy / Double(channelCount); count += 1
             if count >= windowFrames {
                 let rms = sqrt(sum / Double(count))
-                continuation.yield(AudioLevelSample(timestamp: Date(), dbFS: max(-100, 20 * log10(max(rms, 0.00001)))))
+                continuation.yield(AudioLevelSample(timestamp: Date(), dbFS: min(0, max(-100, 20 * log10(max(rms, 0.00001))))))
                 count = 0; sum = 0
             }
         }

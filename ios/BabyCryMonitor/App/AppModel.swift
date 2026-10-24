@@ -37,6 +37,8 @@ import UIKit
     @ObservationIgnored private var monitoringControlDeadline: Date?
     @ObservationIgnored private var controlGeneration = 0
     @ObservationIgnored private var localMonitoringReport: (id: UUID, enabled: Bool)?
+    @ObservationIgnored private var reportingLocalMonitoring = false
+    @ObservationIgnored private var nextLocalReportAt = Date.distantPast
     var managingDevice = false
     var changingConnectionAlerts = false
     private(set) var localConnectionWarningEnabled: Bool
@@ -195,8 +197,10 @@ import UIKit
             }
         }
         loadCredential()
-        if role == .listener, paired, needsRestart || defaults.string(forKey: localMonitoringReportKey) != nil {
-            queueLocalMonitoringReport(false)
+        // Resend only an unsent local action, unchanged. A relaunch is not a Stop:
+        // reporting one would retire unacknowledged crying alerts and end reminders.
+        if role == .listener, paired, let id = defaults.string(forKey: localMonitoringReportKey).flatMap(UUID.init(uuidString:)) {
+            localMonitoringReport = (id, defaults.object(forKey: localMonitoringReportKey + "|enabled") as? Bool ?? false)
         }
         if role == .parent { monitoringControlError = defaults.string(forKey: monitoringControlPendingKey + "|error") }
         if role == .parent, let data = defaults.data(forKey: monitoringControlPendingKey),
@@ -377,7 +381,10 @@ import UIKit
         starting = true
         defer {
             starting = false
-            if !remote, revision == environmentRevision, control == controlGeneration { queueLocalMonitoringReport(monitoring) }
+            // A failed Start is not a Stop request; the server keeps the actual prior state.
+            if !remote, monitoring || recoveringAudio, revision == environmentRevision, control == controlGeneration {
+                queueLocalMonitoringReport(true)
+            }
         }
         guard safetyAccepted else {
             log.record("monitoring_start_blocked_safety")
@@ -425,6 +432,11 @@ import UIKit
     func stop(remote: Bool = false) {
         if !remote { controlGeneration += 1 }
         if !remote, role == .listener, paired { queueLocalMonitoringReport(false) }
+        haltMonitoring()
+    }
+    /// Ends capture without reporting a Stop. Only a person's Stop may retire
+    /// crying alerts; a stall or lost pairing must leave reminders running.
+    private func haltMonitoring() {
         let wasActive = monitoring || recoveringAudio
         audio.stop(); engine.suspend(); persist()
         if wasActive { log.record("monitoring_stopped") }
@@ -440,7 +452,29 @@ import UIKit
     private func queueLocalMonitoringReport(_ enabled: Bool) {
         localMonitoringReport = (UUID(), enabled)
         defaults.set(localMonitoringReport?.id.uuidString, forKey: localMonitoringReportKey)
-        lastRefreshAt = .distantPast
+        defaults.set(enabled, forKey: localMonitoringReportKey + "|enabled")
+        lastRefreshAt = .distantPast; nextLocalReportAt = .distantPast
+    }
+    private func clearLocalMonitoringReport() {
+        localMonitoringReport = nil
+        defaults.removeObject(forKey: localMonitoringReportKey)
+        defaults.removeObject(forKey: localMonitoringReportKey + "|enabled")
+    }
+    /// Record a local Start/Stop before uploading alerts, so the server never
+    /// judges a new alert against an older remote Stop.
+    private func flushLocalMonitoringReport(using client: any BackendServing) async {
+        guard paired, let report = localMonitoringReport, !reportingLocalMonitoring,
+              currentTime() >= nextLocalReportAt else { return }
+        reportingLocalMonitoring = true; defer { reportingLocalMonitoring = false }
+        let revision = environmentRevision
+        do {
+            _ = try await client.setMonitoring(report.enabled, id: report.id)
+            guard revision == environmentRevision, localMonitoringReport?.id == report.id else { return }
+            clearLocalMonitoringReport()
+        } catch {
+            nextLocalReportAt = currentTime().addingTimeInterval(3)
+            log.record("monitoring_control_failed", error: error)
+        }
     }
     private func resetMonitoringControl() {
         controlGeneration += 1
@@ -613,8 +647,9 @@ import UIKit
             if calibrationPhase != "waiting" { calibration.record(sample.dbFS, background: calibrationPhase == "background") }
             return
         }
-        guard monitoring, let credential, storageHealthy, sample.dbFS.isFinite,
-              (-100...0).contains(sample.dbFS) else { return }
+        guard monitoring, let credential, storageHealthy, sample.dbFS.isFinite else { return }
+        // Full-scale clipping is the loudest sound, not an invalid reading.
+        let sample = AudioLevelSample(timestamp: sample.timestamp, dbFS: min(0, max(-100, sample.dbFS)))
         lastSampleAt = sample.timestamp; currentDBFS = sample.dbFS
         meter.append(sample.dbFS); meter = Array(meter.suffix(SoundLevelFrame.barCount))
         let before = state; let quietBefore = engine.detector.quietSince
@@ -688,7 +723,7 @@ import UIKit
         }
         powerConnected = powered
         if monitoring, let lastSampleAt, now.timeIntervalSince(lastSampleAt) > 3 {
-            stop(); error = "Monitoring stopped: microphone samples stopped arriving."; needsRestart = true; log.record("audio_stalled")
+            haltMonitoring(); error = "Monitoring stopped: microphone samples stopped arriving."; needsRestart = true; log.record("audio_stalled")
         }
         synchronizeLiveSound()
         recordBatterySample()
@@ -786,6 +821,8 @@ import UIKit
                 }
                 if currentTime() >= nextParentRefreshAt { await refreshParent() }
             } else if role == .listener {
+                await flushLocalMonitoringReport(using: client)
+                guard revision == environmentRevision, role == .listener else { return }
                 refreshListenerPairing(using: client)
                 guard paired else { return }
                 scheduleHeartbeatIfDue()
@@ -982,7 +1019,9 @@ import UIKit
         let previous = defaults.string(forKey: identityKey)
         if (!status.paired && paired) || (previous != nil && status.pairingID != nil && previous != status.pairingID) {
             clearLiveSound()
-            stop(); pendingHeartbeats.removeAll(); timeline = nil; timelineError = nil
+            // The old pairing is gone: discard its unsent report rather than retrying it.
+            resetMonitoringControl(); clearLocalMonitoringReport()
+            haltMonitoring(); pendingHeartbeats.removeAll(); timeline = nil; timelineError = nil
             engine = CrySessionManager(); configuration = engine.snapshot.configuration; persist()
             settingsDirty = false; defaults.set(false, forKey: "settingsDirty")
             needsRestart = false
@@ -999,15 +1038,6 @@ import UIKit
             defer { self?.listenerStatusTask = nil }
             do {
                 guard let self else { return }
-                if let report = self.localMonitoringReport {
-                    do {
-                        _ = try await client.setMonitoring(report.enabled, id: report.id)
-                        guard revision == self.environmentRevision, control == self.controlGeneration else { return }
-                        if self.localMonitoringReport?.id == report.id {
-                            self.localMonitoringReport = nil; self.defaults.removeObject(forKey: self.localMonitoringReportKey)
-                        }
-                    } catch { self.log.record("monitoring_control_failed", error: error) }
-                }
                 let fetchedAt = self.currentTime()
                 let status = try await client.status()
                 guard revision == self.environmentRevision, control == self.controlGeneration, self.role == .listener else { return }
@@ -1136,7 +1166,7 @@ import UIKit
                 credential = replacement
             }
             for key in watchKeys { defaults.removeObject(forKey: key) }
-            defaults.removeObject(forKey: localMonitoringReportKey)
+            clearLocalMonitoringReport()
             defaults.removeObject(forKey: monitoringControlPendingKey)
             defaults.removeObject(forKey: monitoringControlPendingKey + "|deadline")
             defaults.removeObject(forKey: monitoringControlPendingKey + "|error")
