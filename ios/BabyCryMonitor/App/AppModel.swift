@@ -293,6 +293,9 @@ import UIKit
     }
     private func client() throws -> any BackendServing {
         #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--uitesting-monitoring-rejected") {
+            throw BackendError.response(409, "Monitoring request rejected by the test service.")
+        }
         if ProcessInfo.processInfo.arguments.contains("--uitesting-offline") { throw URLError(.notConnectedToInternet) }
         #endif
         guard let credential, let url = URL(string: backendURL), !backendURL.isEmpty else {
@@ -430,9 +433,12 @@ import UIKit
             Task { await refreshParent() }
         } catch {
             guard revision == environmentRevision else { return }
-            monitoringControlError = enabled
-                ? "Could not verify that monitoring started. Check internet access on both phones and open Crib Service on the nursery phone before relying on alerts."
-                : "Could not verify that monitoring stopped. Check internet access on both phones. The nursery phone may still be listening."
+            // A lost response can follow a successful request. Keep checking the
+            // microphone until the deadline instead of presenting a false failure.
+            monitoringControlMessage = "Connection interrupted · Checking nursery monitoring…"
+            if case BackendError.response(let code, _) = error, (400..<500).contains(code) {
+                monitoringControlDeadline = .distantPast
+            }
             log.record("monitoring_control_failed", error: error)
             persistMonitoringControl()
         }
@@ -447,7 +453,14 @@ import UIKit
         persistMonitoringControl()
     }
     private func reconcileMonitoringControl(_ status: ParentStatus) {
-        guard let pending = pendingMonitoringCommand else { return }
+        guard let pending = pendingMonitoringCommand else {
+            // A heartbeat may arrive after an earlier timeout or startup failure.
+            // Recover persisted warnings as soon as the actual state is verified.
+            if monitoringControlError != nil, let command = status.monitoringCommand {
+                _ = confirmMonitoringControl(command, status: status)
+            }
+            return
+        }
         guard status.paired else {
             monitoringControlError = "Monitoring could not be changed because the phones are no longer paired."
             pendingMonitoringCommand = nil; monitoringControlDeadline = nil; monitoringControlMessage = nil
@@ -457,16 +470,19 @@ import UIKit
         guard let command = status.monitoringCommand, command.id == pending.id else {
             checkMonitoringControlDeadline(); return
         }
-        if command.status == "failed" || command.status == "expired" {
-            monitoringControlDeadline = .distantPast
-            checkMonitoringControlDeadline()
-        } else if command.status == "applied", status.monitoring == command.enabled,
-                  let heartbeat = status.lastHeartbeat, let serverTime = status.serverTime,
-                  heartbeat >= command.createdAt, (0...30).contains(serverTime.timeIntervalSince(heartbeat)) {
-            monitoringControlMessage = command.enabled ? "Monitoring confirmed on nursery phone" : "Monitoring stopped on nursery phone"
-            monitoringControlError = nil; pendingMonitoringCommand = nil; monitoringControlDeadline = nil
-            persistMonitoringControl()
-        } else { checkMonitoringControlDeadline() }
+        // Audio-route recovery can outlive the initial command callback. A fresh
+        // post-request heartbeat proves the requested state even if that callback
+        // reported failure or its acknowledgement was lost.
+        if !confirmMonitoringControl(command, status: status) { checkMonitoringControlDeadline() }
+    }
+    @discardableResult private func confirmMonitoringControl(_ command: MonitoringCommand, status: ParentStatus) -> Bool {
+        guard status.paired, status.monitoring == command.enabled,
+              let heartbeat = status.lastHeartbeat, let serverTime = status.serverTime,
+              heartbeat >= command.createdAt, (0...30).contains(serverTime.timeIntervalSince(heartbeat)) else { return false }
+        monitoringControlMessage = command.enabled ? "Monitoring confirmed on nursery phone" : "Monitoring stopped on nursery phone"
+        monitoringControlError = nil; pendingMonitoringCommand = nil; monitoringControlDeadline = nil
+        persistMonitoringControl()
+        return true
     }
     private func applyMonitoringCommand(_ command: MonitoringCommand?, serverTime: Date?, fetchedAt: Date, using client: any BackendServing) async {
         guard let command, command.status == "pending", !starting, !managingDevice, localMonitoringReport == nil else { return }
@@ -482,6 +498,9 @@ import UIKit
             else { stop(remote: true) }
         }
         guard revision == environmentRevision, control == controlGeneration, role == .listener else { return }
+        // A route change can cancel the original audio.start() while recovery
+        // continues. Leave this command pending and confirm on the next poll.
+        guard !recoveringAudio else { return }
         let succeeded = command.enabled ? monitoring : !monitoring && !recoveringAudio
         do {
             try await client.completeMonitoring(command.id, succeeded: succeeded)
@@ -872,11 +891,7 @@ import UIKit
         } catch {
             guard revision == environmentRevision, role == .parent else { return }
             deliveryStatus = "Status unavailable: \(error.localizedDescription)"; parentStatus = nil
-            nextParentRefreshAt = currentTime().addingTimeInterval(15)
-            if pendingMonitoringCommand != nil {
-                monitoringControlError = "Monitoring could not be verified. Check both phones and their internet connection."
-                persistMonitoringControl()
-            }
+            nextParentRefreshAt = currentTime().addingTimeInterval(pendingMonitoringCommand == nil ? 15 : 1)
             checkMonitoringControlDeadline()
             log.record("parent_status_failed", error: error)
             publishWatch()

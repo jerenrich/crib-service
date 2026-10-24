@@ -88,8 +88,8 @@ struct ParentView: View {
             Panel { Caption(text: "Connection"); Text(model.deliveryStatus).font(.subheadline).foregroundStyle(Palette.muted); Text(model.notifications.status).font(.subheadline).foregroundStyle(Palette.muted) }
         }.onAppear { showMonitoringError = model.monitoringControlError != nil }
             .onChange(of: model.monitoringControlError) { _, failure in
-            if failure != nil { showMonitoringError = true }
-        }
+                showMonitoringError = failure != nil
+            }
             .alert("Monitoring not confirmed", isPresented: $showMonitoringError) {
                 Button("OK", role: .cancel) { }
             } message: { Text(model.monitoringControlError ?? "Check the nursery phone before relying on monitoring.") }
