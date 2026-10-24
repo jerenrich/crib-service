@@ -117,6 +117,30 @@ App icon rollout on 23 October 2026: the iPhone and Watch icons now use the orig
 
 ## Cloudflare deployment
 
+### Manual GitHub deployment
+
+The [Deploy Cloudflare workflow](../.github/workflows/deploy-cloudflare.yml) releases the existing `baby-cry-monitor` backend on demand. Pushes and pull requests do not trigger a deployment. It accepts `main` only, deploys the commit selected for the run, and allows one active deployment at a time so migrations and deployments cannot overlap.
+
+One-time setup:
+
+1. Create a Cloudflare API token scoped to the account in `worker/wrangler.toml`. Start with the **Edit Cloudflare Workers** template and add **Account → D1 → Edit** for remote migrations. See [Cloudflare's GitHub Actions setup](https://developers.cloudflare.com/workers/ci-cd/external-cicd/github-actions/).
+2. In this repository's **Settings → Secrets and variables → Actions**, add `CLOUDFLARE_API_TOKEN` as a repository secret. The account ID is already in `wrangler.toml`; no account-ID secret is needed. The workflow uses the `cloudflare-production` GitHub environment, which GitHub creates on its first run. Alternatively, create that environment first and store the token there. Optional environment branch protection can restrict deployments to `main`.
+3. Merge the workflow into `main` so GitHub shows its **Run workflow** button.
+
+To release, open **Actions → Deploy Cloudflare → Run workflow**, select **main**, and run it. The equivalent CLI command is:
+
+```sh
+gh workflow run deploy-cloudflare.yml --ref main
+```
+
+The workflow installs the locked dependencies with Node 24, runs TypeScript and Worker integration checks, and builds a Wrangler dry run without deployment credentials. Only after those pass does it apply pending remote D1 migrations and deploy Worker code, `wrangler.toml` configuration, Durable Object migrations, and Cron Triggers. The existing APNs, encryption, and pairing secrets stay in Cloudflare; do not copy or regenerate them for GitHub. The environment name refers to the live service; `APNS_ENVIRONMENT` remains the value in `wrangler.toml`, currently `development` for the installed Debug apps.
+
+After deployment, an unauthenticated status request must return HTTP 401 and confirm successful D1 diagnostic storage. This check creates no devices or push notifications. The run summary records the commit and service URL. Physical iPhone/Watch alert delivery still needs the device checklist.
+
+Keep D1 migrations compatible with the previously deployed Worker: migrations run before the new code, and successful migrations are not undone if a later migration, deploy, or health check fails. Inspect the failed step before rerunning; already-applied migrations are skipped. The workflow does not provision new databases, rotate secrets, or deploy iPhone/Watch builds. If Cloudflare Workers Builds is enabled separately, disable its automatic production deployments to keep releases manual.
+
+### Deployment history and local setup
+
 Monitoring controls rollout on 24 October 2026: merged and pushed to `main` as `a3b9bf4`. Applied the additive `0009_monitoring_commands.sql` migration to the existing D1 database and deployed Worker version `68c592f2-8a94-483e-9e03-8f9b19d5f7fa`. The existing database, five secrets, development APNs topics, minute cron and disabled automatic observability were preserved. Live version inspection and migration status checks passed.
 
 Live temporary-pair checks verified pending Start, Listener-only confirmation, failed Start visibility, confirmed Stop with a stopped heartbeat, local controls, idempotent retry ordering and cleanup. All temporary devices and metadata were deleted through the API; no push tokens were registered by these checks and no test notification was sent. Subsequent production diagnostics showed successful status, heartbeat, push-token registration and scheduled maintenance requests on the new Worker version.
