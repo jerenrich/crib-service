@@ -74,8 +74,8 @@ struct ParentView: View {
                         Text(status.batteryLevel.map { "\(Int($0 * 100))%" } ?? "Battery unknown")
                     }.font(.subheadline)
                     if !model.parentOnline { Text("Power and battery information is from the last update.").font(.caption).foregroundStyle(Palette.muted) }
-                    if model.parentOnline, status.powerConnected != true, let level = status.batteryLevel, level < 0.2 {
-                        Label("Listener battery low · Connect power", systemImage: "exclamationmark.triangle").foregroundStyle(Palette.amber)
+                    if model.listenerPowerReadiness.needsPower {
+                        Label(model.listenerPowerReadiness.title, systemImage: "exclamationmark.triangle").foregroundStyle(Palette.amber)
                     }
                 }
                 if let episode = model.parentStatus?.currentEpisode, model.parentOnline {

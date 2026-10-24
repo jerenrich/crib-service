@@ -67,7 +67,8 @@ struct DebugView: View {
                 Text("Contains app/build details, operational timestamps, request references and redacted exception details. No audio, tokens or pairing codes. Review before sharing.").font(.footnote)
                 Button("Copy log") { UIPasteboard.general.string = model.log.export }
                 ShareLink("Export diagnostic log", item: model.log.export)
-                Text(model.log.export.isEmpty ? "No events yet." : model.log.export).font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
+                Text("The export also includes up to 30 days of Listener battery-drain samples for calibration.").font(.footnote)
+                Text(model.log.recentExport).font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
             }
         }.accessibilityIdentifier("diagnosticsForm").navigationTitle("Diagnostics")
     }
