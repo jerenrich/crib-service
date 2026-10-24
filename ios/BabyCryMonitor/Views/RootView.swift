@@ -47,24 +47,24 @@ struct RootView: View {
     private var monitorHome: some View {
         ZStack {
             Palette.background.ignoresSafeArea()
-            ScrollView {
-                VStack(alignment: .leading, spacing: 24) {
-                    HStack {
-                        Label {
-                            Text("Crib Service")
-                        } icon: {
-                            Image(systemName: "moon.stars").foregroundStyle(Palette.lavender)
-                        }.font(.title3.weight(.medium))
-                        Spacer()
-                        Button { settings = true } label: {
-                            Image(systemName: "slider.horizontal.3").font(.body)
-                                .frame(width: 44, height: 44).background(Palette.panel, in: Circle())
-                        }.accessibilityLabel("Settings")
-                    }
-                    if model.role == .listener { ListenerView() } else { ParentView() }
-                    Text("Sound detection only · Adult supervision required")
-                        .font(.caption2).foregroundStyle(Palette.muted).frame(maxWidth: .infinity)
-                }.padding(20)
+            VStack(spacing: 0) {
+                HStack {
+                    Label {
+                        Text("Crib Service")
+                    } icon: {
+                        Image(systemName: "moon.stars").foregroundStyle(Palette.lavender)
+                    }.font(.title3.weight(.medium))
+                    Spacer()
+                    Button { settings = true } label: {
+                        Image(systemName: "slider.horizontal.3").font(.body)
+                            .frame(width: 44, height: 44).background(Palette.panel, in: Circle())
+                    }.accessibilityLabel("Settings")
+                }
+                .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
+                .padding(.horizontal, 20)
+                .padding(.top, 8)
+                .padding(.bottom, 4)
+                if model.role == .listener { ListenerView() } else { ParentView() }
             }
         }.navigationTitle("Crib Service").toolbar(.hidden, for: .navigationBar)
     }

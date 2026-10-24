@@ -3,11 +3,11 @@ import SwiftUI
 /// Both roles share this hierarchy; only the source of sound and actions changes.
 struct NightstandView: View {
     @Environment(AppModel.self) private var model
-    @ScaledMetric(relativeTo: .largeTitle) private var stateSize = 52.0
+    @Environment(\.dynamicTypeSize) private var typeSize
     let role: DeviceRole
     @State private var pairing = false
     @State private var readiness = false
-    @State private var detailsExpanded = false
+    @State private var detailsPresented = false
 
     private var listener: Bool { role == .listener }
     private var soundLive: Bool { listener ? model.monitoring : model.remoteSound.isLive(at: model.now) }
@@ -61,63 +61,36 @@ struct NightstandView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 22) {
-            VStack(spacing: 10) {
-                Text(model.now, style: .time).font(.subheadline.monospacedDigit()).foregroundStyle(Palette.muted)
-                    .accessibilityIdentifier("nightstandClock")
-                Text(title).font(.system(size: stateSize, weight: .medium, design: .rounded))
-                    .foregroundStyle(warning ? Palette.amber : soundLive ? Palette.lavender : Palette.muted)
-                    .multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
-                    .accessibilityIdentifier("nightstandState")
-                Text(subtitle).font(.subheadline).foregroundStyle(Palette.muted).multilineTextAlignment(.center)
-                Label(listener ? "Listener · Nursery" : "Parent · With you", systemImage: listener ? "mic" : "bell")
-                    .font(.caption).foregroundStyle(Palette.muted)
-            }.frame(maxWidth: .infinity).padding(.top, 4)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                statusHeader
+                soundPanel
+                statusNotice
+                // At accessibility sizes, let every action scroll into view rather
+                // than letting a tall fixed footer consume the reading area.
+                if typeSize.isAccessibilitySize { controlPanel }
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 12)
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if !typeSize.isAccessibilitySize {
+                controlPanel
+                    .padding(.horizontal, 20)
+                    .padding(.top, 12)
+                    .padding(.bottom, 8)
+                    .background(Palette.background)
+            }
+        }
+        .sheet(isPresented: $pairing) { PairingView() }
+        .sheet(isPresented: $readiness) {
+            if listener { ListenerTonightView() } else { ReadinessView() }
+        }
+        .sheet(isPresented: $detailsPresented) { detailsSheet }
+    }
 
-            VStack(alignment: .leading, spacing: 16) {
-                ViewThatFits(in: .horizontal) {
-                    HStack {
-                        liveStatus
-                        Spacer(minLength: 8)
-                        Text("Sound level").font(.caption).foregroundStyle(Palette.muted)
-                    }
-                    liveStatus
-                }
-                SoundLevelChart(levels: levels, trigger: threshold,
-                    currentLevel: listener ? model.currentDBFS : levels.last ?? -100,
-                    monitoring: soundLive, height: 160, color: Palette.lavender)
-                if let elapsed, soundLive {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("\(durationText(elapsed)) / \(durationText(alertDuration))")
-                            .font(.title3.monospacedDigit()).contentTransition(.numericText())
-                        ProgressView(value: min(1, elapsed / max(1, alertDuration))).tint(Palette.amber)
-                        if listener, let episode = model.snapshot.current {
-                            Text(ListenerView.alertMessage(for: episode, snapshot: model.snapshot, now: model.now))
-                                .font(.footnote).foregroundStyle(Palette.muted)
-                        }
-                    }
-                }
-            }
-
-            if !listener, let alert = model.activeAlert { alertPanel(alert) }
-            if !listener, let until = model.parentStatus?.alertsMutedUntil, until > model.now {
-                Label("Crying alerts snoozed until \(until.formatted(date: .omitted, time: .shortened))", systemImage: "bell.slash")
-                    .font(.subheadline).foregroundStyle(Palette.amber)
-            }
-            if !listener, let error = model.monitoringControlError {
-                VStack(alignment: .leading, spacing: 8) {
-                    Label("Monitoring not confirmed", systemImage: "exclamationmark.triangle.fill").font(.headline)
-                    Text(error).font(.subheadline)
-                }.foregroundStyle(Palette.amber).accessibilityIdentifier("monitoringControlWarning")
-            }
-            if listener && model.needsRestart && !model.monitoring {
-                Label("Monitoring needs to be restarted", systemImage: "exclamationmark.triangle").foregroundStyle(Palette.amber)
-            }
-            if listener && model.paired && model.connectivity.checked && !model.connectivity.available {
-                Label("Internet unavailable · Alerts cannot currently be delivered", systemImage: "wifi.slash")
-                    .font(.subheadline).foregroundStyle(Palette.amber)
-            }
-
+    private var controlPanel: some View {
+        VStack(spacing: 12) {
             ViewThatFits(in: .horizontal) {
                 HStack {
                     Text("Alert after sustained sound").foregroundStyle(Palette.muted)
@@ -127,27 +100,211 @@ struct NightstandView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Alert after sustained sound").foregroundStyle(Palette.muted)
                     Text(durationText(alertDuration)).monospacedDigit()
-                }
+                }.frame(maxWidth: .infinity, alignment: .leading)
             }.font(.subheadline)
-
             monitoringControls
-            NightstandDevicesPanel()
-            if powerReadiness.needsPower {
-                Label(powerReadiness.title, systemImage: "battery.25percent").font(.subheadline).foregroundStyle(Palette.amber)
+        }
+    }
+
+    private var statusHeader: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            // Reserve the same number of lines for every state, including Quiet.
+            Text(title)
+                .font(.system(.title2, design: .rounded).weight(.medium))
+                .foregroundStyle(warning ? Palette.amber : soundLive ? Palette.lavender : Palette.muted)
+                .modifier(NightstandStatusLines())
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityIdentifier("nightstandState")
+            Text(subtitle).font(.subheadline).foregroundStyle(Palette.muted)
+                .modifier(NightstandStatusLines(lines: 1))
+            HStack(alignment: .firstTextBaseline) {
+                Label(listener ? "Listener · Nursery" : "Parent · With you", systemImage: listener ? "mic" : "bell")
+                Spacer(minLength: 8)
+                Text(model.now, style: .time).monospacedDigit()
+                    .accessibilityIdentifier("nightstandClock")
+            }.font(.caption).foregroundStyle(Palette.muted)
+        }
+    }
+
+    private var soundPanel: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if typeSize.isAccessibilitySize {
+                VStack(alignment: .leading, spacing: 6) {
+                    liveStatus
+                    Text("Sound level").font(.caption).foregroundStyle(Palette.muted)
+                }
+            } else {
+                HStack(alignment: .top) {
+                    liveStatus
+                    Spacer(minLength: 8)
+                    Text("Sound level").font(.caption).foregroundStyle(Palette.muted)
+                        .fixedSize()
+                }
             }
-            DisclosureGroup("Monitoring details", isExpanded: $detailsExpanded) { monitoringDetails.padding(.top, 12) }
-                .font(.subheadline).tint(Palette.lavender)
+            SoundLevelChart(levels: levels, trigger: threshold,
+                currentLevel: listener ? model.currentDBFS : levels.last ?? -100,
+                monitoring: soundLive, height: 160, color: Palette.lavender)
+            // Keep the episode row in the layout when the nursery becomes quiet.
+            HStack(spacing: 12) {
+                Text("\(durationText(elapsed ?? 0)) / \(durationText(alertDuration))")
+                    .font(.caption.monospacedDigit())
+                    .contentTransition(.numericText())
+                ProgressView(value: min(1, (elapsed ?? 0) / max(1, alertDuration)))
+                    .tint(Palette.amber)
+            }
+            .opacity(elapsed != nil && soundLive ? 1 : 0)
+            .accessibilityHidden(elapsed == nil || !soundLive)
         }
-        .sheet(isPresented: $pairing) { PairingView() }
-        .sheet(isPresented: $readiness) {
-            if listener { ListenerTonightView() } else { ReadinessView() }
+        .padding(16)
+        .background(Palette.panel, in: RoundedRectangle(cornerRadius: 20))
+    }
+
+    private struct Notice {
+        let title: String
+        let summary: String
+        let icon: String
+        var caution = true
+    }
+
+    private var notice: Notice {
+        if !listener, model.monitoringControlError != nil {
+            return Notice(title: "Monitoring not confirmed", summary: "Check the nursery phone. Do not rely on alerts.", icon: "exclamationmark.triangle.fill")
         }
+        if !listener, model.activeAlert != nil {
+            return Notice(title: model.activeAlert?.isTest == true ? "Test notification" : "Check on your baby",
+                summary: "Review the alert and acknowledge it in details.", icon: "bell.badge")
+        }
+        if listener, listenerAlertFailed {
+            return Notice(title: "Alert delivery failed", summary: "Check delivery details. This alert will not retry.", icon: "exclamationmark.triangle.fill")
+        }
+        if listener, model.recoveringAudio || (model.needsRestart && !model.monitoring) {
+            return Notice(title: "Monitoring paused", summary: "Check the microphone before relying on alerts.", icon: "mic.slash")
+        }
+        if listener, model.paired, model.connectivity.checked, !model.connectivity.available {
+            return Notice(title: "Internet unavailable", summary: "Alerts cannot currently be delivered.", icon: "wifi.slash")
+        }
+        if !listener, model.nurseryConnection == "Connection lost" {
+            return Notice(title: "Connection interrupted", summary: "Check the nursery phone. Do not rely on alerts.", icon: "wifi.slash")
+        }
+        if !listener, let until = model.parentStatus?.alertsMutedUntil, until > model.now {
+            return Notice(title: "Crying alerts snoozed", summary: "Snoozed until \(until.formatted(date: .omitted, time: .shortened)).", icon: "bell.slash")
+        }
+        if !model.paired {
+            return Notice(title: "Pair your iPhones", summary: "Connect the nursery and Parent phones to begin.", icon: "link", caution: false)
+        }
+        if busy {
+            return Notice(title: "Waiting for confirmation", summary: "Check the nursery phone before relying on alerts.", icon: "clock")
+        }
+        if powerReadiness.needsPower {
+            return Notice(title: powerReadiness.title, summary: "Check nursery power before overnight monitoring.", icon: "battery.25percent")
+        }
+        if soundLive {
+            return Notice(title: currentState == .crying ? "Check on your baby" : "Monitoring sound",
+                summary: "Sound detection only. Adult supervision required.", icon: currentState == .crying ? "bell.badge" : "waveform", caution: currentState == .crying)
+        }
+        return Notice(title: monitoringActive ? "Waiting for sound" : "Monitoring inactive",
+            summary: "Confirm the nursery is listening before relying on alerts.", icon: "mic.slash", caution: false)
+    }
+
+    private var statusNotice: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if typeSize.isAccessibilitySize {
+                noticeHeading
+            } else {
+                HStack(alignment: .top, spacing: 12) {
+                    noticeHeading
+                    Spacer(minLength: 0)
+                    detailsButton
+                }
+            }
+            Text(notice.summary).font(.subheadline).foregroundStyle(Palette.muted)
+                .modifier(NightstandStatusLines())
+            if typeSize.isAccessibilitySize { detailsButton }
+        }
+    }
+
+    private var noticeHeading: some View {
+        Label(notice.title, systemImage: notice.icon)
+            .font(.headline).foregroundStyle(notice.caution ? Palette.amber : Palette.lavender)
+            .modifier(NightstandStatusLines())
+            .accessibilityIdentifier(!listener && model.monitoringControlError != nil ? "monitoringControlWarning" : "nightstandNotice")
+    }
+
+    private var detailsButton: some View {
+        Button { detailsPresented = true } label: {
+            HStack(spacing: 4) {
+                Text(!listener && model.activeAlert != nil ? "Review alert" : "Details")
+                Image(systemName: "chevron.right")
+            }
+            .font(.subheadline)
+            .fixedSize(horizontal: !typeSize.isAccessibilitySize, vertical: true)
+            .frame(minHeight: 44)
+        }
+        .accessibilityLabel(!listener && model.activeAlert != nil ? "Review alert" : "View details")
+        .accessibilityIdentifier("nightstandDetails")
+    }
+
+    private var detailsSheet: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 22) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(title).font(.title2)
+                        Text(subtitle).font(.subheadline).foregroundStyle(Palette.muted)
+                    }
+                    if !listener, let alert = model.activeAlert { alertPanel(alert) }
+                    if !listener, let error = model.monitoringControlError {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Label("Monitoring not confirmed", systemImage: "exclamationmark.triangle.fill").font(.headline)
+                            Text(error).font(.subheadline)
+                        }.foregroundStyle(Palette.amber)
+                    }
+                    if listener {
+                        Text(model.audioStatus).font(.subheadline)
+                        if model.needsRestart && !model.monitoring {
+                            Label("Monitoring needs to be restarted", systemImage: "exclamationmark.triangle")
+                                .foregroundStyle(Palette.amber)
+                        }
+                        if model.paired && model.connectivity.checked && !model.connectivity.available {
+                            Label("Internet unavailable · Alerts cannot currently be delivered", systemImage: "wifi.slash")
+                                .foregroundStyle(Palette.amber)
+                        }
+                        if let episode = model.snapshot.current {
+                            Text(ListenerView.alertMessage(for: episode, snapshot: model.snapshot, now: model.now))
+                                .font(.subheadline).foregroundStyle(Palette.amber)
+                        }
+                    }
+                    if !listener, let until = model.parentStatus?.alertsMutedUntil, until > model.now {
+                        Label("Crying alerts snoozed until \(until.formatted(date: .omitted, time: .shortened))", systemImage: "bell.slash")
+                            .font(.subheadline).foregroundStyle(Palette.amber)
+                    }
+                    if let message = model.monitoringControlMessage { Text(message).font(.subheadline) }
+                    Button(model.sendingTestPush ? "Sending…" : "Test alert", action: sendTestAlert)
+                        .frame(minHeight: 44)
+                        .disabled(!model.paired || model.sendingTestPush || model.managingDevice)
+                        .accessibilityLabel(listener ? "Send test push" : "Test alert")
+                    if let status = model.testPushStatus { Text(status).font(.subheadline) }
+                    if powerReadiness.needsPower {
+                        Label(powerReadiness.title, systemImage: "battery.25percent").foregroundStyle(Palette.amber)
+                        Text(powerReadiness.detail).font(.subheadline)
+                    }
+                    monitoringDetails
+                    NightstandDevicesPanel()
+                }.padding(20)
+            }
+            .background(Palette.background)
+            .navigationTitle("Monitoring details")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { detailsPresented = false } } }
+        }
+        .foregroundStyle(.white).tint(Palette.lavender).preferredColorScheme(.dark)
     }
 
     private var liveStatus: some View {
         HStack(spacing: 6) {
             Circle().fill(soundLive ? Palette.lavender : Palette.muted).frame(width: 6, height: 6).accessibilityHidden(true)
             Text(liveLabel).font(.caption).foregroundStyle(soundLive ? Palette.lavender : Palette.muted)
+                .modifier(NightstandStatusLines())
         }.accessibilityIdentifier("nightstandSoundStatus")
     }
 
@@ -158,30 +315,33 @@ struct NightstandView: View {
             }
             Button(action: toggleMonitoring) {
                 Label(controlTitle, systemImage: monitoringActive ? "stop" : "play")
-                    .font(.headline).frame(maxWidth: .infinity).padding(.vertical, 16)
+                    .font(.headline).fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity).padding(.vertical, 16)
                     .foregroundStyle(Palette.lavender).background(Palette.panel, in: RoundedRectangle(cornerRadius: 18))
             }
             .disabled(!model.paired || busy || model.managingDevice)
             .accessibilityIdentifier("nightstandMonitoringControl")
-            // With an unknown state, Stop must remain available to cancel reminders.
-            if !listener && model.paired && !confirmedParentState && model.pendingMonitoringCommand == nil {
-                Button("Stop Monitoring") { Task { await model.requestMonitoring(false) } }
-                    .font(.subheadline).foregroundStyle(Palette.lavender).frame(maxWidth: .infinity, minHeight: 44)
-                    .disabled(model.requestingMonitoring || model.managingDevice)
-            }
-            if !listener, let message = model.monitoringControlMessage {
-                Text(message).font(.footnote).foregroundStyle(Palette.muted)
-            }
             HStack(alignment: .top, spacing: 16) {
-                Button { Task { if listener { await model.sendTestPush() } else { await model.requestParentTest() } } } label: {
-                    Text(model.sendingTestPush ? "Sending…" : "Test alert").frame(minHeight: 44, alignment: .leading)
+                if !listener && model.paired && !confirmedParentState && model.pendingMonitoringCommand == nil {
+                    // An unknown state must still allow cancelling repeating alerts.
+                    Button("Stop Monitoring") { Task { await model.requestMonitoring(false) } }
+                        .frame(minHeight: 44, alignment: .leading)
+                        .disabled(model.requestingMonitoring || model.managingDevice)
+                } else {
+                    Button(action: sendTestAlert) {
+                        Text(model.sendingTestPush ? "Sending…" : "Test alert").frame(minHeight: 44, alignment: .leading)
+                    }
+                    .disabled(!model.paired || model.sendingTestPush || model.managingDevice)
+                    .accessibilityLabel(listener ? "Send test push" : "Test alert")
                 }
-                .disabled(!model.paired || model.sendingTestPush || model.managingDevice)
-                .accessibilityLabel(listener ? "Send test push" : "Test alert")
                 Spacer(minLength: 0)
                 Button { readiness = true } label: { Text("Ready for tonight?").frame(minHeight: 44, alignment: .trailing) }
             }.font(.subheadline).foregroundStyle(Palette.muted)
-            if let status = model.testPushStatus { Text(status).font(.footnote).foregroundStyle(Palette.muted) }
+                .fixedSize(horizontal: false, vertical: true)
+            Text("Sound detection only · Adult supervision required")
+                .font(.caption2).foregroundStyle(Palette.muted)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity)
         }
     }
 
@@ -189,6 +349,11 @@ struct NightstandView: View {
         if listener && model.starting { return "Starting…" }
         if let command = model.pendingMonitoringCommand, !listener { return command.enabled ? "Starting…" : "Stopping…" }
         return monitoringActive ? "Stop Monitoring" : "Start Monitoring"
+    }
+
+    private func sendTestAlert() {
+        detailsPresented = true
+        Task { if listener { await model.sendTestPush() } else { await model.requestParentTest() } }
     }
 
     private func toggleMonitoring() {
@@ -233,6 +398,20 @@ struct NightstandView: View {
                     .font(.footnote).foregroundStyle(Palette.muted)
             }
             PrimaryButton(title: "Acknowledge") { Task { await model.acknowledge(alert.eventId) } }
+        }
+    }
+}
+
+/// Keep regular-size status slots stable; never truncate accessibility text.
+private struct NightstandStatusLines: ViewModifier {
+    @Environment(\.dynamicTypeSize) private var typeSize
+    var lines = 2
+
+    @ViewBuilder func body(content: Content) -> some View {
+        if typeSize.isAccessibilitySize {
+            content.fixedSize(horizontal: false, vertical: true)
+        } else {
+            content.lineLimit(lines, reservesSpace: true)
         }
     }
 }

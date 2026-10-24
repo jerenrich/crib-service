@@ -82,6 +82,10 @@ final class OnboardingUITests: XCTestCase {
         app.launch()
         let start = app.buttons["Start Monitoring"]
         XCTAssertTrue(start.waitForExistence(timeout: 5))
+        let chart = app.descendants(matching: .any)["soundLevelChart"].firstMatch
+        let initialChartFrame = chart.frame
+        let initialControlFrame = start.frame
+        let initialTabFrame = app.tabBars.firstMatch.frame
         start.tap()
         let warning = app.alerts["Monitoring not confirmed"]
         XCTAssertTrue(warning.waitForExistence(timeout: 5))
@@ -91,6 +95,44 @@ final class OnboardingUITests: XCTestCase {
         warning.buttons["OK"].tap()
         XCTAssertTrue(app.staticTexts["Monitoring not confirmed"].exists)
         XCTAssertTrue(app.buttons["Stop Monitoring"].isEnabled)
+        XCTAssertEqual(chart.frame.minY, initialChartFrame.minY, accuracy: 1)
+        XCTAssertEqual(chart.frame.height, initialChartFrame.height, accuracy: 1)
+        XCTAssertEqual(start.frame.minY, initialControlFrame.minY, accuracy: 1)
+        XCTAssertEqual(app.tabBars.firstMatch.frame.minY, initialTabFrame.minY, accuracy: 1)
+        let details = app.buttons["nightstandDetails"]
+        for _ in 0..<4 {
+            if details.isHittable && details.frame.maxY < start.frame.minY { break }
+            app.scrollViews.firstMatch.swipeUp()
+        }
+        XCTAssertTrue(details.isHittable)
+        XCTAssertLessThan(details.frame.maxY, start.frame.minY)
+        details.tap()
+        XCTAssertTrue(app.navigationBars["Monitoring details"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "could not be started or verified")).firstMatch.exists)
+        app.buttons["Done"].tap()
+        XCTAssertTrue(app.buttons["Stop Monitoring"].isEnabled)
+        let stableScreen = XCTAttachment(screenshot: app.screenshot())
+        stableScreen.name = "Compact monitoring warning"; stableScreen.lifetime = .keepAlways; add(stableScreen)
+    }
+    @MainActor func testMonitorSupportsAccessibilityTextAndScrollableDetails() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound",
+            "-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"]
+        app.launch()
+        XCTAssertTrue(app.staticTexts["nightstandState"].waitForExistence(timeout: 5))
+        let control = app.buttons["nightstandMonitoringControl"]
+        let details = app.buttons["nightstandDetails"]
+        for _ in 0..<12 { if details.isHittable { break }; app.scrollViews.firstMatch.swipeUp() }
+        XCTAssertTrue(details.isHittable)
+        details.tap()
+        XCTAssertTrue(app.navigationBars["Monitoring details"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["Done"].isHittable)
+        app.buttons["Done"].tap()
+        for _ in 0..<12 { if control.isHittable { break }; app.scrollViews.firstMatch.swipeUp() }
+        XCTAssertTrue(control.isHittable)
+        XCTAssertLessThanOrEqual(control.frame.maxY, app.tabBars.firstMatch.frame.minY)
+        let largeText = XCTAttachment(screenshot: app.screenshot())
+        largeText.name = "Compact monitor with accessibility text"; largeText.lifetime = .keepAlways; add(largeText)
     }
     @MainActor func testTimelineOverviewFilteringAndDetails() {
         let app = XCUIApplication()
