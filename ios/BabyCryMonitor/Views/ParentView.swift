@@ -7,10 +7,9 @@ struct ParentView: View {
     var body: some View {
         NightstandView(role: .parent)
             .onAppear {
-                model.setParentSoundVisible(true)
                 showMonitoringError = model.monitoringControlError != nil
             }
-            .onDisappear { model.setParentSoundVisible(false) }
+            .task { await model.refreshParent() }
             .onChange(of: model.monitoringControlError) { _, failure in
                 showMonitoringError = failure != nil
             }

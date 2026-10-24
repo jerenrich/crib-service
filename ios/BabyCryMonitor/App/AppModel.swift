@@ -68,7 +68,6 @@ import UIKit
     @ObservationIgnored private var store: MetadataStore?
     @ObservationIgnored private let audio: any AudioLevelProviding
     @ObservationIgnored private let liveSound: any LiveSoundStreaming
-    @ObservationIgnored private var parentSoundVisible = false
     @ObservationIgnored private var appActive = true
     @ObservationIgnored private let alerts = AlertCoordinator()
     @ObservationIgnored private var credential: DeviceCredential?
@@ -166,7 +165,7 @@ import UIKit
         UIDevice.current.isBatteryMonitoringEnabled = true
         audio.onStatus = { [weak self] status in self?.audioChanged(status) }
         self.liveSound.onFrame = { [weak self] frame in
-            guard let self, self.role == .parent, self.paired, self.parentSoundVisible, self.appActive else { return }
+            guard let self, self.role == .parent, self.paired, self.appActive else { return }
             self.now = self.currentTime()
             self.remoteSound.receive(frame, at: self.now)
         }
@@ -769,9 +768,6 @@ import UIKit
                 alertDuration: configuration.alertDuration))
         }
     }
-    func setParentSoundVisible(_ visible: Bool) {
-        parentSoundVisible = visible; synchronizeLiveSound()
-    }
     func setAppActive(_ active: Bool) {
         appActive = active; synchronizeLiveSound()
     }
@@ -782,7 +778,9 @@ import UIKit
         #if DEBUG
         if ProcessInfo.processInfo.arguments.contains("--uitesting-offline") { return }
         #endif
-        let needed = role == .listener ? monitoring : role == .parent && parentSoundVisible && appActive
+        // Keep the Parent's current chart ready across tab changes. Backgrounding
+        // still closes the display channel and invalidates the last live reading.
+        let needed = role == .listener ? monitoring : role == .parent && appActive
         guard needed, paired, !managingDevice, connectivity.available,
               let credential, credential.registered, let url = URL(string: backendURL) else {
             liveSound.disconnect(); return
@@ -1076,7 +1074,7 @@ import UIKit
     }
     func refreshParent() async {
         #if DEBUG
-        if ProcessInfo.processInfo.arguments.contains("--uitesting-live-sound") { return }
+        if ProcessInfo.processInfo.arguments.contains("--uitesting-live-sound") || ProcessInfo.processInfo.arguments.contains("--uitesting-timeline") { return }
         #endif
         guard role == .parent else { return }
         if let task = parentRefreshTask { await task.value; return }
