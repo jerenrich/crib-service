@@ -8,7 +8,7 @@ import {body,rateLimit} from './security';
 import {authenticate,register,savePushToken,saveWatchPushToken,removeDeviceData,pairFor} from './devices';
 import {connectionPreferences,flushConnections} from './connections';
 import {createPairing,claimPairing} from './pairing';
-import {receiveAlert,acknowledge,flushPending} from './alerts';
+import {receiveAlert,acknowledge,resumeAlerts,flushPending} from './alerts';
 import {saveHeartbeat,listenerStatus,saveSettings} from './status';
 import {operationFor,recordDiagnostic,type Stage} from './diagnostics';
 
@@ -69,6 +69,7 @@ export default {
      case 'POST /v1/monitoring':result=await requestMonitoring(env,device,await body(request));break;
      case 'POST /v1/monitoring/complete':result=await completeMonitoring(env,device,await body(request));break;
      case 'POST /v1/settings':result=await saveSettings(env,device,await body(request));break;
+     case 'POST /v1/alert/resume':result=await resumeAlerts(env,device,await body(request));break;
      case 'POST /v1/alert/acknowledge':result=await acknowledge(env,device,await body(request));break;
      default:throw new APIError(404,'Endpoint not found.');
     }

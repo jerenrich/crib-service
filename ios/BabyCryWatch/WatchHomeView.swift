@@ -18,7 +18,11 @@ struct WatchHomeView: View {
                             Text("Acknowledgement queued for iPhone. The snooze starts when it syncs.").font(.caption2).foregroundStyle(.orange)
                         }
                         if let until = model.snapshot.alertsMutedUntil, until > context.date {
-                            Text("Crying alerts snoozed. Resume at \(until.formatted(date: .omitted, time: .shortened)).").font(.caption2).foregroundStyle(.secondary)
+                            VStack(spacing: 4) {
+                                Text("Crying alerts resume in")
+                                Text(timerInterval: context.date...until, countsDown: true).monospacedDigit()
+                                Button("Resume alerts") { model.resumeAlerts() }.disabled(model.refreshing)
+                            }.font(.caption2).foregroundStyle(.secondary)
                         }
                         NavigationLink { WatchSetupView() } label: {
                             Label("Wrist alerts", systemImage: "applewatch.radiowaves.left.and.right")

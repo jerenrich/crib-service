@@ -11,6 +11,11 @@ enum Palette {
 func durationText(_ seconds: Double) -> String {
     let value = max(0, Int(seconds)); return String(format: "%02d:%02d", value / 60, value % 60)
 }
+func spokenDuration(_ seconds: Double) -> String {
+    let value = max(0, Int(seconds))
+    if value < 60 { return "\(value) sec" }
+    return value % 60 == 0 ? "\(value / 60) min" : "\(value / 60) min \(value % 60) sec"
+}
 struct Panel<Content: View>: View {
     @ViewBuilder var content: Content
     var body: some View { VStack(alignment: .leading, spacing: 16) { content }.padding(22).frame(maxWidth: .infinity, alignment: .leading).background(Palette.panel, in: RoundedRectangle(cornerRadius: 24)) }

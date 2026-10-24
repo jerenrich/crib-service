@@ -130,6 +130,31 @@ export async function acknowledge(env:Env,device:Device,value:Record<string,unkn
  }
  return {ok:true};
 }
+// End only the snooze the user saw. A delayed retry must not cancel a newer snooze.
+export async function resumeAlerts(env:Env,device:Device,value:Record<string,unknown>) {
+ requireRole(device,'parent');
+ const expected=value.expectedUntil;
+ if(typeof expected!=='number'||!Number.isSafeInteger(expected)||expected<=0)throw new APIError(400,'A valid snooze deadline is required.');
+ const pair=await pairFor(env,device);if(!pair)throw new APIError(409,'Pair a Listener first.');
+ const now=Date.now();
+ const guardSQL=`EXISTS(SELECT 1 FROM devices d JOIN pairs p ON p.parent_id=d.id
+  WHERE d.id=? AND d.alerts_muted_until=? AND p.listener_id=? AND p.created_at=?)`;
+ const scope=[device.id,expected,pair.listener_id,pair.created_at];
+ await env.DB.batch([
+  // Retain the actual muted interval so delayed uploads from that interval stay silent.
+  env.DB.prepare(`UPDATE timeline_events SET payload=json_set(payload,'$.endAt',?)
+   WHERE parent_id=? AND listener_id=? AND pair_created_at=? AND kind='alert_acknowledged'
+   AND id IN (SELECT 'ack:'||event_id FROM alert_snoozes WHERE parent_id=? AND until_at>?)
+   AND ${guardSQL}`).bind(new Date(now).toISOString(),device.id,pair.listener_id,pair.created_at,device.id,now,...scope),
+  env.DB.prepare(`UPDATE alert_snoozes SET until_at=? WHERE parent_id=? AND listener_id=? AND pair_created_at=? AND until_at>?
+   AND ${guardSQL}`).bind(now,device.id,pair.listener_id,pair.created_at,now,...scope),
+  // Keep a nonzero deadline: the reminder loop can resume a freshly confirmed ongoing cry.
+  env.DB.prepare(`UPDATE devices SET alerts_muted_until=? WHERE id=? AND alerts_muted_until>? AND ${guardSQL}`)
+   .bind(now,device.id,now,...scope)
+ ]);
+ await scheduleReminders(env,device.id);
+ return {ok:true};
+}
 export async function flushPending(env:Env,requestId=crypto.randomUUID()) {
  // Expire diagnostic data before delivery work so a broken push path cannot defer expiry.
  try { await env.DB.prepare('DELETE FROM diagnostics WHERE recorded_at<?').bind(Date.now()-7*86400000).run(); }

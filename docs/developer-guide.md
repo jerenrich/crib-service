@@ -72,6 +72,20 @@ An inactive iOS app cannot reliably reactivate its microphone remotely. Standby 
 
 For rollout, apply `0009_monitoring_commands.sql`, deploy the updated Worker, then update both iPhones. These source changes do not deploy the service or install device builds automatically. Validate physical locked-screen Pause/Resume, local microphone Stop, and suspended-app Start failure before relying on the feature.
 
+## Usability update (24 October 2026)
+
+Monitor places the active alert and explicit snooze action first, with a countdown and early resume on iPhone and Watch. Watch resume requires a reachable Parent iPhone and waits for its confirmed status. The device list lives in Devices, with a compact summary on Monitor; tapping alert timing opens a focused picker. Sound sensitivity and calibration are unchanged.
+
+The bedtime guide now walks through pairing, Watch/Focus/haptic checks, a user-confirmed wrist test, and confirmed monitoring. Completion is saved for that pairing; subsequent visits use the shorter nightly check. Connection recovery distinguishes a paused live chart from unconfirmed microphone status and offers a retry that reconnects the stream and refreshes the status.
+
+Early resume adds authenticated `POST /v1/alert/resume` with the observed snooze deadline in epoch milliseconds (`expectedUntil`). The service shortens the current mute and retained snooze intervals transactionally. Delayed uploads from the actual muted interval remain suppressed; a delayed resume request cannot end a newer snooze. A fresh crying heartbeat is still required to restart reminders for an acknowledged episode. Existing monitoring Stop behavior takes precedence.
+
+Deployed on 24 October 2026 through the existing local Wrangler login, without GitHub Actions: source `f5db6893660bce4624031c4ca1da14be0b69f977`, Worker version `ecd8a198-c756-42bc-a64e-57a6e1aa3832` at `https://baby-cry-monitor.jordan-erenrich.workers.dev`. This integrates main's Standby behavior and compact monitor layout. The previous version was `2a5b8da0-ca07-440d-97d0-0950f7c226a2`. No database migrations were pending; the existing D1 database, five secrets, Durable Object bindings, development APNs settings and minute cron were preserved.
+
+Live temporary-device checks passed for early resume, stale-request protection, Parent-only authorization, standby microphone status and the existing pairing/settings/monitoring/timeline APIs. All temporary devices and shared metadata were deleted through the authenticated API; no push tokens were registered or notifications sent. The unauthenticated health check returned HTTP 401 with successful D1 diagnostics. This rollout did not install app builds on physical phones or Watch. Scheduled maintenance for the new version completed successfully.
+
+Validation passed TypeScript checks, 107 Worker integration tests, 98 shared Swift tests, 203 iOS unit tests and all 13 UI scenarios across the combined run and a targeted rerun. The rerun corrected a test scroll gesture that began over the fixed footer; no app change was needed. The iPhone and embedded Watch simulator builds passed. Local logs and deployment details are retained under `.local/usability-rollout-2026-10-24/`.
+
 ## Xcode and iPhone setup
 
 Requirements: current Xcode (verified with Xcode 27 / Swift 6.4), an iOS 17+ device, and an Apple Developer team with push notification entitlement for remote alerts. Two physical iPhones and a paired Apple Watch are required to verify the overnight acceptance scenario.
@@ -227,6 +241,7 @@ All authenticated calls use `Authorization: Bearer <device UUID>.<random secret>
 | `GET /v1/listener/status` | Paired device | Paired listener freshness, episodes, alerts, settings |
 | `POST /v1/settings` | Paired device | Update shared configuration |
 | `POST /v1/alert/acknowledge` | Parent | Acknowledge episode alerts |
+| `POST /v1/alert/resume` | Parent | End the observed snooze early using `expectedUntil` in epoch milliseconds |
 | `POST /v1/test-push` | Parent | Request a marked real test through the paired Listener's alert path |
 | `POST /v1/connection-alerts` | Parent | Opt in/out of Listener connection notices |
 | `POST /v1/pairing/remove` | Paired device | Revoke pairing and clear shared server history |

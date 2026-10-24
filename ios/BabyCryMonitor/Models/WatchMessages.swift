@@ -54,9 +54,10 @@ struct WatchCryAlert: Codable, Equatable, Identifiable, Sendable {
 }
 
 struct WatchCommand: Codable, Sendable {
-    enum Kind: String, Codable, Sendable { case refresh, registerToken, acknowledge }
+    enum Kind: String, Codable, Sendable { case refresh, registerToken, acknowledge, resumeAlerts }
     let kind: Kind
     var issuedAt = Date()
     var token: String?
     var eventId: UUID?
+    var snoozeDeadline: Date?
 }

@@ -153,3 +153,30 @@ struct SettingsView: View {
         return "\(seconds.formatted()) seconds"
     }
 }
+
+/// A focused editor shared by both Monitor roles. Existing synchronization applies on selection.
+struct AlertTimingView: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    private let durations: [Double] = [5, 30, 60, 120, 180, 300, 600]
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Picker("Alert after", selection: Binding(get: { model.configuration.alertDuration }, set: { value in
+                        var settings = model.configuration; settings.alertDuration = value; model.saveSettings(settings)
+                    })) {
+                        ForEach(durations, id: \.self) { Text(spokenDuration($0)).tag($0) }
+                        if !durations.contains(model.configuration.alertDuration) {
+                            Text(spokenDuration(model.configuration.alertDuration)).tag(model.configuration.alertDuration)
+                        }
+                    }.pickerStyle(.inline).accessibilityIdentifier("quickAlertDuration")
+                } footer: {
+                    Text("The timer starts after a few seconds of confirmed crying-like sound.")
+                }
+                Section { Text(model.settingsSyncStatus) }
+            }.navigationTitle("Alert timing")
+                .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+        }.tint(Palette.lavender)
+    }
+}

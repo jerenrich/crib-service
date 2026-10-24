@@ -751,6 +751,47 @@ describe('5-second reminders and acknowledgement mute',()=>{
   expect(Date.parse(status.alertsMutedUntil)).toBe(mute!.alerts_muted_until);
   expect(pushRequests).toHaveLength(1);
  });
+ it('resumes early, keeps muted uploads silent, and permits fresh ongoing-cry reminders',async()=>{
+  const {parent,listener,event}=await ready();await call('alert/acknowledge',parent,{eventId:event.eventId});
+  const status=await (await call('listener/status',parent,undefined,'GET')).json() as {alertsMutedUntil:string};
+  const expectedUntil=Date.parse(status.alertsMutedUntil),mutedAt=Date.now();
+  advance(15);
+  expect((await call('alert/resume',parent,{expectedUntil})).status).toBe(200);
+  const resumed=Date.now();
+  const window=await env.DB.prepare('SELECT until_at FROM alert_snoozes WHERE event_id=?').bind(event.eventId).first<{until_at:number}>();
+  expect(window?.until_at).toBe(resumed);
+  const late={...alert(listener),createdAt:new Date(mutedAt+5000).toISOString(),cryStartedAt:new Date(mutedAt+5000-300000).toISOString()};
+  expect(await (await call('listener/event',listener,late)).json()).toEqual({status:'acknowledged'});
+  advance(5);await heartbeat(listener,event);mockPush();await runReminder(testEnv,parent.deviceId);
+  expect(pushRequests).toHaveLength(2);
+  const reminder=JSON.parse(String(pushRequests[1].init?.body));
+  await call('alert/acknowledge',parent,{eventId:reminder.eventId});
+  const newer=await (await call('listener/status',parent,undefined,'GET')).json() as {alertsMutedUntil:string};
+  // A lost response/retry for the earlier snooze cannot cancel this new one.
+  await call('alert/resume',parent,{expectedUntil});
+  const afterRetry=await (await call('listener/status',parent,undefined,'GET')).json() as {alertsMutedUntil:string};
+  expect(afterRetry.alertsMutedUntil).toBe(newer.alertsMutedUntil);
+ });
+ it('restricts resume to the current parent and validates the expected deadline',async()=>{
+  const {parent,listener,event}=await ready();await call('alert/acknowledge',parent,{eventId:event.eventId});
+  const status=await (await call('listener/status',parent,undefined,'GET')).json() as {alertsMutedUntil:string};
+  const expectedUntil=Date.parse(status.alertsMutedUntil);
+  expect((await call('alert/resume',listener,{expectedUntil})).status).toBe(403);
+  expect((await call('alert/resume',parent,{})).status).toBe(400);
+  const other=await paired();
+  await call('alert/resume',other.parent,{expectedUntil});
+  const unchanged=await (await call('listener/status',parent,undefined,'GET')).json() as {alertsMutedUntil:string};
+  expect(unchanged.alertsMutedUntil).toBe(status.alertsMutedUntil);
+ });
+ it('does not restart reminders when monitoring stopped during a snooze',async()=>{
+  const {parent,listener,event}=await ready();await call('alert/acknowledge',parent,{eventId:event.eventId});
+  const status=await (await call('listener/status',parent,undefined,'GET')).json() as {alertsMutedUntil:string};
+  await call('monitoring',parent,{id:crypto.randomUUID(),enabled:false});advance(5);
+  await call('alert/resume',parent,{expectedUntil:Date.parse(status.alertsMutedUntil)});
+  await heartbeat(listener,event);
+  expect(await runReminder(testEnv,parent.deviceId)).toBe(false);
+  expect(pushRequests).toHaveLength(1);
+ });
  it('does not replay delayed offline alerts created during the mute after it expires',async()=>{
   const {parent,listener,event}=await ready();await call('alert/acknowledge',parent,{eventId:event.eventId});
   const created=Date.now()+30000;

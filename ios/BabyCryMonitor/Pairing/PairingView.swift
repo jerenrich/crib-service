@@ -22,12 +22,12 @@ struct PairingView: View {
                         Button("Pair with Parent") { run { await model.claimPairing(code); if model.paired { dismiss() } } }.disabled(busy || code.count != 6)
                     }
                     if busy { ProgressView() }
-                    if let error = model.error { Text(error).foregroundStyle(.orange) }
+                    if let error = model.pairingError { Text(error).foregroundStyle(.orange) }
                     if model.paired { Label("Paired successfully", systemImage: "checkmark.circle").foregroundStyle(Palette.mint) }
                 }
                 Section { Text("A code expires after 10 minutes and works once. Each iPhone has its own secret stored in Keychain.").font(.footnote) }
             }.navigationTitle("Pair iPhones").toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
-                .task { if model.role == .parent && !model.paired { run { await model.createPairing() } } }
+                .task { model.pairingError = nil; if model.role == .parent && !model.paired { run { await model.createPairing() } } }
         }.tint(Palette.mint)
     }
     private func run(_ work: @escaping @MainActor () async -> Void) {

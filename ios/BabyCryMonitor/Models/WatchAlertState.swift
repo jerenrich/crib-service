@@ -70,7 +70,7 @@ import Observation
         snoozeDuration = value.snoozeDuration ?? 60
         if value.statusAvailable {
             mutedUntil = value.alertsMutedUntil
-            if let until = mutedUntil, until > currentTime() {
+            if let until = mutedUntil, until > currentTime() || pendingAcknowledgements.isEmpty {
                 for id in acknowledgedEpisodes { acknowledgedUntil[id.uuidString] = until.timeIntervalSince1970 }
             }
         }

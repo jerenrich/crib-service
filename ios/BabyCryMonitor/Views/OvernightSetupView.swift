@@ -3,80 +3,133 @@ import UIKit
 
 struct OvernightSetupView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    @State private var step = 0
+    @State private var pairing = false
     @State private var focusChecked = false
     @State private var wristChecked = false
-    @State private var awaitingConfirmation = false
+    @State private var testRequestedAt: Date?
     @State private var confirmedAt: Date?
     @State private var needsTroubleshooting = false
+    private let steps = ["Pair phones", "Enable Watch alerts", "Test your wrist alert", "Start monitoring"]
 
     var body: some View {
         Form {
             Section {
-                Text("Follow these steps with the Watch and Sleep Focus settings you plan to use tonight. Repeat the test after changing them.")
-                Text("Focus and haptic settings are checked by you. The app cannot read or change them.").font(.footnote).foregroundStyle(.secondary)
+                Text("Step \(step + 1) of 4 · \(steps[step])").font(.headline)
+                ProgressView(value: Double(step + 1), total: 4).tint(Palette.mint)
             }
-            Section("1. Enable Watch alerts") {
-                Label(model.parentStatus?.watchPushRegistered == true ? "Direct Watch alerts registered" : "Watch registration needs checking",
-                      systemImage: model.parentStatus?.watchPushRegistered == true ? "checkmark.circle" : "exclamationmark.circle")
-                Text("Open Crib Service on your Apple Watch → Wrist alerts → Enable alerts or Retry setup. Keep this iPhone in Parent Mode with internet access.")
-                Text("On this iPhone, also check Watch → Notifications → Crib Service and allow notifications.")
-                Button("Refresh Watch registration") { Task { await model.refreshParent() } }
-                Link("Open app notification settings", destination: URL(string: UIApplication.openNotificationSettingsURLString)!)
-                Text("This link opens iPhone notification settings. Watch permissions are managed separately in the Watch app.").font(.footnote).foregroundStyle(.secondary)
+            switch step {
+            case 0: pairStep
+            case 1: watchStep
+            case 2: testStep
+            default: monitoringStep
             }
-            Section("2. Allow alerts during Sleep Focus") {
-                Text("On your iPhone, open Settings → Focus → Sleep → Apps. Choose Allow Notifications From and add Crib Service. If you use Silence Notifications From, make sure Crib Service is not listed.")
-                Text("Your Watch uses the Focus preferences set up on its paired iPhone. Check that Sleep Focus is active on the Watch too; direct Watch notifications still follow Focus rules.")
-                Text("Allow Time Sensitive Notifications in Sleep Focus and for Crib Service on your Watch, where available. Check any other Focus you use overnight too.")
-                Toggle("I've checked my Focus settings", isOn: $focusChecked)
-                    .disabled(model.sendingTestPush)
-                    .accessibilityIdentifier("overnightFocusChecked")
-                Text("User-checked for this setup session.").font(.footnote).foregroundStyle(.secondary)
-            }
-            Section("3. Prepare your Watch") {
-                Text("On your Watch, open Settings → Sounds & Haptics. Enable haptics and choose Prominent. Turn on Silent Mode if you want vibration only.")
-                Text("Wear your Watch snugly and unlocked, with enough battery and an internet connection for the night.")
-                Toggle("My Watch is ready on my wrist", isOn: $wristChecked)
-                    .disabled(model.sendingTestPush)
-                    .accessibilityIdentifier("overnightWristChecked")
-            }
-            Section("4. Test with Sleep Focus on") {
-                Text("Turn on your intended Sleep Focus. Leave the Watch app on its clock face. Tap Test watch alert, then lock this iPhone and wait for a clearly labelled test notification and wrist tap.")
-                Button(model.sendingTestPush ? "Sending…" : "Test watch alert") {
-                    awaitingConfirmation = false; confirmedAt = nil; needsTroubleshooting = false
-                    Task { awaitingConfirmation = await model.requestParentTest(requiresWatch: true) }
-                }
-                .disabled(!model.canTestWatchAlert || !focusChecked || !wristChecked)
-                .accessibilityIdentifier("testWatchAlert")
-                if !model.paired { Text("Pair a Listener first in Tonight's check.").font(.footnote) }
-                else if model.parentStatus?.watchPushRegistered != true { Text("Complete step 1 and refresh Watch registration to enable the test.").font(.footnote) }
-                if !focusChecked || !wristChecked { Text("Confirm steps 2 and 3 to enable the test.").font(.footnote) }
-                if let status = model.testPushStatus { Text(status).font(.footnote) }
-                if awaitingConfirmation {
-                    Button("I felt the test on my Watch") {
-                        confirmedAt = Date(); awaitingConfirmation = false; needsTroubleshooting = false
-                    }.accessibilityIdentifier("confirmWatchAlert")
-                    Button("I didn't feel it") { awaitingConfirmation = false; needsTroubleshooting = true }
-                }
-                if let confirmedAt {
-                    Label("Wrist tap confirmed by you at \(confirmedAt.formatted(date: .omitted, time: .shortened))", systemImage: "checkmark.circle")
-                    Text("This confirms this test only. Repeat after changing your Focus, Watch or connection settings.").font(.footnote)
-                }
-                if needsTroubleshooting {
-                    Text("Check Watch notification permission, Sleep Focus exceptions, haptics, wrist lock, battery and internet. Refresh Watch registration, then try again. Seeing a notification without feeling a tap does not confirm vibration.").font(.footnote)
-                }
-                Text("This sends a real test through the notification service to your registered Watch. Also send a test from the nursery Listener to check its upload connection. A successful test cannot guarantee later delivery or that an alert will wake you.").font(.footnote).foregroundStyle(.secondary)
+            if step > 0 {
+                Section { Button("Back") { step -= 1 } }
             }
         }
+        .id(step)
         .navigationTitle("Overnight setup")
+        .sheet(isPresented: $pairing) { PairingView() }
+        .task { await model.refreshParent() }
         .onChange(of: focusChecked) { _, _ in resetConfirmation() }
         .onChange(of: wristChecked) { _, _ in resetConfirmation() }
-        .onChange(of: model.paired) { _, _ in resetConfirmation() }
-        .onChange(of: model.parentStatus?.watchPushRegistered) { _, _ in resetConfirmation() }
-        .task { await model.refreshParent() }
+        .onChange(of: model.parentStatus?.pairingID) { _, _ in resetConfirmation(); step = 0 }
+        .onChange(of: model.parentStatus?.watchPushRegistered) { _, _ in resetConfirmation(); if step > 1 { step = 1 } }
     }
 
-    private func resetConfirmation() {
-        awaitingConfirmation = false; confirmedAt = nil; needsTroubleshooting = false
+    private var pairStep: some View {
+        Section {
+            Text("Keep this Parent iPhone with you. On the nursery iPhone, choose Listen to Baby and enter the code shown here.")
+            if model.paired {
+                Label("iPhones paired", systemImage: "checkmark.circle.fill").foregroundStyle(Palette.mint)
+            } else {
+                Button("Pair phones") { pairing = true }
+            }
+            Button("Continue to Watch setup") { step = 1 }.disabled(!model.paired)
+        }
     }
+
+    private var watchStep: some View {
+        Group {
+            Section("Enable notifications") {
+                Label(model.parentStatus?.watchPushRegistered == true ? "Watch alerts registered" : "Watch alerts need setup",
+                      systemImage: model.parentStatus?.watchPushRegistered == true ? "checkmark.circle" : "applewatch")
+                Text("Open Crib Service on your Watch → Wrist alerts → Enable alerts. Keep this iPhone connected to the internet.")
+                Button("Check notification setup") { Task { await model.notifications.register(); await model.refreshParent() } }
+                Link("Open iPhone notification settings", destination: URL(string: UIApplication.openNotificationSettingsURLString)!)
+                Text("Watch permissions are separate: check Watch → Notifications → Crib Service on this iPhone.").font(.footnote)
+            }
+            Section("Prepare for tonight") {
+                Text("In iPhone Settings → Focus → Sleep → Apps, allow Crib Service. Allow Time Sensitive Notifications where available. Check the same Focus is active on your Watch.")
+                Toggle("I've checked my Focus settings", isOn: $focusChecked).accessibilityIdentifier("overnightFocusChecked")
+                Text("On Watch, open Settings → Sounds & Haptics, enable haptics and choose Prominent. For vibration only, enable Silent Mode. Wear it snugly, unlocked, charged and connected.")
+                Toggle("My Watch is ready on my wrist", isOn: $wristChecked).accessibilityIdentifier("overnightWristChecked")
+                Text("The app cannot read Focus or haptic settings. You confirm these checks.").font(.footnote).foregroundStyle(.secondary)
+                Button("Continue to test") { step = 2 }
+                    .disabled(!model.paired || model.parentStatus?.watchPushRegistered != true || !focusChecked || !wristChecked)
+            }
+        }
+    }
+
+    private var testStep: some View {
+        Section {
+            Text("Turn on tonight's Sleep Focus and leave your Watch on its clock face. Send a test, lock this iPhone, and wait for a test notification and wrist tap.")
+            Button(model.sendingTestPush ? "Sending…" : "Test watch alert") {
+                resetConfirmation(); needsTroubleshooting = false
+                let requested = Date()
+                Task { if await model.requestParentTest(requiresWatch: true) { testRequestedAt = requested } }
+            }.disabled(!model.canTestWatchAlert || !focusChecked || !wristChecked)
+                .accessibilityIdentifier("testWatchAlert")
+            if let status = model.testPushStatus { Text(status).font(.footnote) }
+            if testRequestedAt != nil && confirmedAt == nil {
+                Button(model.acknowledgingAlert ? "Confirming…" : "I felt the test on my Watch") {
+                    Task {
+                        await model.refreshParent()
+                        guard let requested = testRequestedAt,
+                              let test = model.parentStatus?.alerts?.first(where: { $0.isTest == true && $0.createdAt >= requested.addingTimeInterval(-1) }) else {
+                            model.testPushStatus = "Test status is not available yet. Check the connection and try confirming again."
+                            return
+                        }
+                        if await model.acknowledge(test.eventId) { confirmedAt = Date(); needsTroubleshooting = false }
+                    }
+                }.disabled(model.acknowledgingAlert).accessibilityIdentifier("confirmWatchAlert")
+                Button("I didn't feel it") { needsTroubleshooting = true }
+            }
+            if let confirmedAt {
+                Label("Wrist tap confirmed by you at \(confirmedAt.formatted(date: .omitted, time: .shortened))", systemImage: "checkmark.circle")
+            }
+            if needsTroubleshooting {
+                Text("Check Watch notification permissions, Focus exceptions, haptics, wrist lock, battery and internet. Go Back to review setup, then send another test. Seeing a notification without feeling a tap does not confirm vibration.").font(.footnote)
+            }
+            Text("This tests delivery to your Watch. Send a test from the nursery iPhone too to verify its upload connection. Repeat after changing Focus, Watch or connection settings.").font(.footnote).foregroundStyle(.secondary)
+            Button("Continue to monitoring") { step = 3 }.disabled(confirmedAt == nil)
+        }
+    }
+
+    private var monitoringStep: some View {
+        Section {
+            let power = model.listenerPowerReadiness
+            Label(power.title, systemImage: power.needsPower ? "battery.25percent" : "battery.100percent")
+            Text(power.detail).font(.footnote)
+            Text("Leave the nursery iPhone plugged in with Crib Service open, then start monitoring. Wait for its microphone to be confirmed.")
+            if model.parentOnline {
+                Label("Nursery microphone confirmed active", systemImage: "checkmark.circle.fill").foregroundStyle(Palette.mint)
+                Text(model.settingsSyncStatus).font(.footnote)
+                Button("Finish setup") { model.completeBedtimeSetup(); dismiss() }
+                    .accessibilityIdentifier("finishBedtimeSetup")
+            } else {
+                Button(model.pendingMonitoringCommand != nil || model.requestingMonitoring ? "Starting…" : "Start monitoring") {
+                    Task { await model.requestMonitoring(true) }
+                }.disabled(!model.paired || model.pendingMonitoringCommand != nil || model.requestingMonitoring)
+                if let error = model.monitoringControlError { Text(error).foregroundStyle(Palette.amber) }
+                Button(model.retryingConnection ? "Checking…" : "Retry connection") { Task { await model.retryConnection() } }
+                    .disabled(model.retryingConnection)
+            }
+            Text("Sound detection only. Continue adult supervision. A successful test cannot guarantee later delivery or that an alert will wake you.").font(.footnote).foregroundStyle(.secondary)
+        }
+    }
+
+    private func resetConfirmation() { testRequestedAt = nil; confirmedAt = nil; needsTroubleshooting = false }
 }
