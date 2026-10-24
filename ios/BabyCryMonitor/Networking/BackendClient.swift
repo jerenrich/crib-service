@@ -6,9 +6,12 @@ struct ParentStatus: Codable, Sendable {
     var watchPushRegistered: Bool?
     var phonePushRegistered: Bool?
     var connectionAlertsEnabled: Bool?
+    var alertsMutedUntil: Date?
     var listenerConfiguration: MonitoringConfiguration?
     var listenerId: UUID?
     var lastHeartbeat: Date?
+    var serverTime: Date?
+    var nextHeartbeatExpectedAt: Date?
     var monitoring: Bool?
     var batteryLevel: Double?
     var powerConnected: Bool?
@@ -17,6 +20,16 @@ struct ParentStatus: Codable, Sendable {
     var episodes: [RemoteEpisode]?
     var alerts: [RemoteAlert]?
     var configuration: MonitoringConfiguration
+
+    /// Compare two server timestamps so the Parent's clock cannot shift polling.
+    func refreshDelay() -> TimeInterval {
+        guard paired, monitoring == true, let serverTime, let nextHeartbeatExpectedAt else { return 15 }
+        let remaining = nextHeartbeatExpectedAt.timeIntervalSince(serverTime)
+        // Stop the one-second burst after 15 seconds of lateness. A new heartbeat
+        // restores the schedule; a stopped/missing Listener uses ordinary polling.
+        guard remaining.isFinite, remaining >= -15 else { return 15 }
+        return min(15, max(1, remaining))
+    }
 }
 struct RemoteEpisode: Identifiable, Codable, Sendable {
     let id: UUID

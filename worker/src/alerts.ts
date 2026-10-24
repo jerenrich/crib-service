@@ -1,5 +1,6 @@
+import {scheduleReminders} from './reminders';
 import {APIError,requireRole,type Alert,type Device,type Env,type StoredEvent} from './types';
-import {alert as validateAlert,uuid} from './security';
+import {alert as validateAlert,uuid,configuration} from './security';
 import {pairFor} from './devices';
 import {sendPush,type PushResult} from './apns';
 import {eventReference,recordDiagnostic,PushPreparationError,type Outcome,type Stage} from './diagnostics';
@@ -22,6 +23,8 @@ export async function receiveAlert(env:Env,device:Device,value:Record<string,unk
   record=await env.DB.prepare('SELECT * FROM events WHERE listener_id=? AND episode_id=? AND is_repeat=0').bind(device.id,alert.episodeId).first<StoredEvent>();
  }
  if(!record)throw new APIError(409,'Event conflict.');
+ // Older Listeners also use server reminders.
+ if(!alert.isTest)await scheduleReminders(env,pair.parent_id);
  await dispatchEvent(env,record.event_id,requestId);
  const result=await env.DB.prepare('SELECT status,acknowledged_at FROM events WHERE event_id=?').bind(record.event_id).first<{status:string;acknowledged_at:string|null}>();
  return {status:result?.acknowledged_at?'acknowledged':result?.status??'pending'};
@@ -33,6 +36,13 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  try {
  // Diagnostic computation is best effort, just like journal writes.
  try { eventRef=await eventReference(env,eventId); } catch { /* No diagnostic identity available. */ }
+ // Suppress uploads during a mute, including delayed offline outbox entries.
+ await env.DB.prepare(`UPDATE events SET acknowledged_at=COALESCE(acknowledged_at,?) WHERE event_id=?
+ AND COALESCE(json_extract(payload,'$.isTest'),0)=0 AND (
+ EXISTS(SELECT 1 FROM devices d WHERE d.id=events.parent_id AND d.alerts_muted_until>0
+ AND (d.alerts_muted_until>? OR CAST((julianday(json_extract(events.payload,'$.createdAt'))-2440587.5)*86400000 AS INTEGER) BETWEEN d.alerts_muted_at AND d.alerts_muted_until))
+ OR (is_repeat=1 AND EXISTS(SELECT 1 FROM events prior WHERE prior.parent_id=events.parent_id AND prior.episode_id=events.episode_id AND prior.acknowledged_at IS NOT NULL AND prior.created_at>=events.created_at))
+ )`).bind(new Date(now).toISOString(),eventId,now).run();
  const event=await env.DB.prepare("UPDATE events SET status='sending',lease_until=?,attempts=attempts+1,push_target=COALESCE(push_target,CASE WHEN (SELECT watch_push_token FROM devices WHERE id=events.parent_id) IS NOT NULL THEN 'watch' ELSE 'phone' END) WHERE event_id=? AND status='pending' AND acknowledged_at IS NULL AND next_attempt<=? RETURNING *").bind(now+30000,eventId,now).first<StoredEvent>();
  if(!event)return;
  attempt=event.attempts;target=event.push_target??'phone';stage='storage';
@@ -72,8 +82,24 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
 }
 export async function acknowledge(env:Env,device:Device,value:Record<string,unknown>) {
  requireRole(device,'parent');const id=uuid(value.eventId);
- const result=await env.DB.prepare('UPDATE events SET acknowledged_at=COALESCE(acknowledged_at,?) WHERE episode_id=(SELECT episode_id FROM events WHERE event_id=? AND parent_id=?) AND parent_id=?').bind(new Date().toISOString(),id,device.id,device.id).run();
- if(!result.meta.changes)throw new APIError(404,'Alert not found.');return {ok:true};
+ const event=await env.DB.prepare('SELECT * FROM events WHERE event_id=? AND parent_id=?').bind(id,device.id).first<StoredEvent>();
+ if(!event)throw new APIError(404,'Alert not found.');
+ if(event.acknowledged_at){
+  if(!(JSON.parse(event.payload) as Alert).isTest)await scheduleReminders(env,device.id);
+  return {ok:true};
+ }
+ const now=Date.now(),timestamp=new Date(now).toISOString();
+ if((JSON.parse(event.payload) as Alert).isTest) {
+  await env.DB.prepare('UPDATE events SET acknowledged_at=COALESCE(acknowledged_at,?) WHERE episode_id=? AND parent_id=?').bind(timestamp,event.episode_id,device.id).run();
+ }else{
+  await env.DB.batch([
+   // Retrying the same acknowledgement must not extend the mute.
+   env.DB.prepare('UPDATE devices SET alerts_muted_until=?,alerts_muted_at=? WHERE id=? AND (SELECT acknowledged_at FROM events WHERE event_id=?) IS NULL').bind(now+configuration(JSON.parse(device.config)).snoozeDuration*1000,now,device.id,id),
+   env.DB.prepare("UPDATE events SET acknowledged_at=COALESCE(acknowledged_at,?) WHERE parent_id=? AND COALESCE(json_extract(payload,'$.isTest'),0)=0").bind(timestamp,device.id)
+  ]);
+  await scheduleReminders(env,device.id);
+ }
+ return {ok:true};
 }
 export async function flushPending(env:Env,requestId=crypto.randomUUID()) {
  // Expire diagnostic data before delivery work so a broken push path cannot defer expiry.

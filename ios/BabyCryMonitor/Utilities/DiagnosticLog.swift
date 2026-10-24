@@ -20,7 +20,11 @@ import Observation
         "settings_sync_failed", "parent_status_failed", "parent_status_recovered", "backend_unavailable",
         "network_available", "network_unavailable", "push_token_received", "push_token_uploaded", "push_received",
         "notification_permission_allowed", "notification_permission_denied", "notification_permission_failed",
+        "notification_sound_permission_before_request", "notification_alert_permission", "notification_sound_permission", "notification_time_sensitive_permission",
+        "parent_connection_warning_armed", "parent_connection_warning_cancelled", "parent_connection_warning_failed",
         "push_registration_failed", "local_notification_scheduled", "local_notification_failed", "watch_sync_failed", "watch_token_synced",
+        "watch_notification_authorization", "watch_alert_permission", "watch_sound_permission", "watch_time_sensitive_permission",
+        "watch_foreground_notification", "watch_haptic_started", "watch_haptic_requested", "watch_haptic_stopped", "watch_haptic_inactive", "watch_acknowledgement_requested",
         "watch_acknowledged", "watch_activation_failed", "watch_activated", "watch_reachable", "watch_unreachable",
         "watch_snapshot_failed", "watch_snapshot_received", "watch_command_queued", "watch_command_failed", "watch_push_received",
         "monitoring_start_blocked_safety", "monitoring_start_blocked_storage", "test_push_failed",
@@ -45,7 +49,8 @@ import Observation
         let repetitive: Set<String> = ["alert_retry_scheduled", "alert_uncertain", "alert_blocked", "alert_server_pending",
                                       "heartbeat_retry_scheduled", "settings_sync_failed", "parent_status_failed",
                                       "backend_unavailable", "watch_sync_failed", "watch_snapshot_failed", "watch_snapshot_received",
-                                      "listener_status_failed", "monitoring_start_blocked_storage", "monitoring_start_blocked_safety"]
+                                      "listener_status_failed", "monitoring_start_blocked_storage", "monitoring_start_blocked_safety",
+                                      "parent_connection_warning_armed", "parent_connection_warning_failed"]
         let details = error.map { Self.errorDetails($0) } ?? ""
         let fingerprint = "event_\(event)_\(code ?? 0)_\(details)"
         if repetitive.contains(event), let last = recent[fingerprint], Date().timeIntervalSince(last) < 60 { return }
@@ -135,7 +140,7 @@ import Observation
             "id", "startedAt", "endedAt", "alertQueuedAt", "alertSentAt", "lastAlertQueuedAt", "maximumDBFS", "averageDBFS", "sampleCount",
             "alert", "attempts", "nextAttemptAt", "failedAt", "eventId", "episodeId", "listenerId", "type", "cryStartedAt",
             "durationSeconds", "createdAt", "isRepeat", "isTest", "paired", "pairingID", "watchPushRegistered", "phonePushRegistered",
-            "connectionAlertsEnabled", "listenerConfiguration", "lastHeartbeat", "monitoring", "batteryLevel", "powerConnected",
+            "connectionAlertsEnabled", "listenerConfiguration", "lastHeartbeat", "serverTime", "nextHeartbeatExpectedAt", "monitoring", "batteryLevel", "powerConnected",
             "state", "currentEpisode", "episodes", "alerts", "status", "acknowledgedAt", "deliveryTarget", "ok", "expiresAt",
             "deviceId", "role", "registered", "updatedAt", "parentMode", "message", "acknowledgedEventId", "kind"
         ]

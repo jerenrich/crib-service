@@ -56,7 +56,7 @@ struct RoleSelectionView: View {
             Text("How will this\niPhone be used?").font(.system(.largeTitle, design: .rounded).weight(.bold))
             Text("Two iPhones. One peaceful connection.").foregroundStyle(Palette.muted)
             roleButton("Listen to Baby", subtitle: "Leave this iPhone in the nursery", icon: "waveform", role: .listener)
-            roleButton("Parent Alerts", subtitle: "Receive a quiet nudge when it's time", icon: "bell.badge", role: .parent)
+            roleButton("Parent Mode", subtitle: "Receive a quiet nudge when it's time", icon: "bell.badge", role: .parent)
             Text("You can change this later in Settings.").font(.footnote).foregroundStyle(Palette.muted)
         }.padding(28)
     }

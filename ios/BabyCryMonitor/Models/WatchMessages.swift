@@ -14,11 +14,22 @@ struct WatchSnapshot: Codable, Equatable, Sendable {
     var lastHeartbeat: Date?
     var monitoring = false
     var state: CryState?
-    var alertDuration: Double = 300
+    var alertDuration: Double = 5
     var watchPushRegistered = false
+    var snoozeDuration: Double?
+    var alertsMutedUntil: Date?
     var acknowledgedEventId: UUID?
     var alert: WatchCryAlert?
     var message: String?
+    // An absolute deadline from a successful Parent server check. An unrelated
+    // snapshot, Bluetooth reconnection or failed refresh must not postpone it.
+    var connectionWarningSupported: Bool?
+    var connectionWarningDeadline: Date?
+
+    var localConnectionDeadline: Date? {
+        guard connectionWarningSupported == true, parentMode, paired else { return nil }
+        return connectionWarningDeadline
+    }
 
     func nurseryOnline(at now: Date) -> Bool {
         guard parentMode, paired, monitoring, let lastHeartbeat else { return false }

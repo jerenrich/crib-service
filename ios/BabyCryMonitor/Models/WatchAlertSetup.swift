@@ -70,7 +70,7 @@ import Observation
         registrationCommand = WatchCommand(kind: .registerToken, token: token)
         awaitingPushToken = false
         phase = .syncing
-        detail = "Open Crib Service in Parent Alerts mode on your paired iPhone to finish registration."
+        detail = "Open Crib Service in Parent Mode on your paired iPhone to finish registration."
         retryRegistration()
     }
 
@@ -89,7 +89,7 @@ import Observation
             phase = .registered
             detail = "Setup complete. Send a test push from your nursery Listener to check delivery."
         } else if !snapshot.parentMode {
-            fail("Choose Parent Alerts in Crib Service on your paired iPhone, then tap Retry setup.")
+            fail("Choose Parent Mode in Crib Service on your paired iPhone, then tap Retry setup.")
         } else if let message = snapshot.message {
             fail(message)
         } else if phase != .blocked {

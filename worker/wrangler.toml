@@ -24,3 +24,11 @@ enabled = false
 # Only the allowlisted, seven-day D1 journal in diagnostics.ts is persisted.
 [version_metadata]
 binding = "CF_VERSION_METADATA"
+
+[[durable_objects.bindings]]
+name = "ALERT_REMINDERS"
+class_name = "AlertReminders"
+
+[[migrations]]
+tag = "v1-alert-reminders"
+new_sqlite_classes = ["AlertReminders"]

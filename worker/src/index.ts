@@ -1,3 +1,4 @@
+export {AlertReminders} from './reminders';
 import {APIError,type Env} from './types';
 import {body,rateLimit} from './security';
 import {authenticate,register,savePushToken,saveWatchPushToken,removeDeviceData,pairFor} from './devices';

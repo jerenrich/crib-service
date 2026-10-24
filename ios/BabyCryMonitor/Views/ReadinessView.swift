@@ -8,6 +8,10 @@ struct ReadinessView: View {
     var body: some View {
         NavigationStack {
             Form {
+                Section {
+                    NavigationLink("Guided overnight setup") { OvernightSetupView() }
+                    Text("Set up Sleep Focus and Watch haptics, then test a real wrist alert.").font(.footnote)
+                }
                 Section("Ready for tonight") {
                     check("iPhones paired", passed: model.paired)
                     check("Listener microphone reporting active", passed: model.parentOnline)
