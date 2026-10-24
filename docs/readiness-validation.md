@@ -24,14 +24,18 @@ Physical regression validation on 24 October 2026, 06:59:29–06:59:52 UTC: a te
 
 | Check | Expected observation |
 | --- | --- |
-| Stop from Parent with nursery screen locked | Requests Stop, nursery microphone stops, Parent confirms stopped, existing crying reminders end |
+| Pause from Parent with nursery screen locked | Detection stops, existing crying reminders end, microphone stays active, and Parent confirms Standby |
+| Loud sound during Standby | Samples are discarded; no episodes, new crying alerts or live chart updates |
+| Resume from Parent while Listener is locked in Standby | Existing capture is reused; Parent confirms monitoring and detection starts a fresh confirmation window |
+| Stop microphone on Listener while in Standby | Microphone is released; Parent confirms Stopped after a fresh heartbeat |
+| Audio interruption during Standby | Recovery preserves paused detection; failed recovery requires attention without claiming Standby remains available |
 | Start from Parent with nursery app open | Nursery microphone becomes active; Parent confirms after a fresh post-request heartbeat proves it is active, including when audio recovery outlives the command callback |
 | Start with nursery app suspended or force-quit | Parent shows a prominent failure/unverified alert and persistent red warning within 30 seconds; reopening the nursery app after expiry does not replay Start |
 | Denied permission or unavailable microphone | Listener reports failure; Parent shows a prominent warning and never claims monitoring was confirmed |
 | Network loss while changing monitoring | Parent shows that the action could not be verified; local nursery controls still work |
 | Local Stop while a remote Start is pending | Local Stop wins over an older status response; no delayed restart |
-| Stop during repeating Watch alerts | Outstanding crying alerts are retired; already submitted APNs notifications may still arrive |
-| Nursery microphone stalls, or the nursery app is terminated and reopened, during repeating alerts | Reminders continue until acknowledged; only a person's Stop retires crying alerts |
+| Parent Pause or Listener Stop during repeating Watch alerts | Outstanding crying alerts are retired; already submitted APNs notifications may still arrive |
+| Nursery microphone stalls, or the nursery app is terminated and reopened, during repeating alerts | Reminders continue until acknowledged; only an explicit Pause/Stop or acknowledgement retires crying alerts |
 
 ## Fixed threshold integration
 

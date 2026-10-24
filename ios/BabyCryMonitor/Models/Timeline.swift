@@ -23,10 +23,11 @@ public struct TimelineEvent: Codable, Identifiable, Equatable, Sendable {
         default: .monitoring
         }
     }
-    public var isObservation: Bool { kind == "coverage_active" || kind == "coverage_stopped" }
+    public var isObservation: Bool { kind == "coverage_active" || kind == "coverage_stopped" || kind == "coverage_standby" }
     public var coverageState: TimelineCoverage.State? {
         switch kind {
         case "monitoring_started", "audio_resumed", "monitoring_observed", "coverage_active": .monitoring
+        case "monitoring_paused", "standby_observed", "coverage_standby": .standby
         case "monitoring_stopped", "audio_interrupted", "stopped_observed", "coverage_stopped": .stopped
         case "heartbeat_missing": .updatesMissing
         case "monitoring_unverified": .unverified
@@ -48,11 +49,12 @@ public struct TimelineResponse: Codable, Sendable {
 }
 public struct TimelineCoverage: Identifiable, Equatable, Sendable {
     public enum State: String, CaseIterable, Sendable {
-        case monitoring, stopped, noHistory, updatesMissing, unavailable, unverified
+        case monitoring, standby, stopped, noHistory, updatesMissing, unavailable, unverified
 
         public var title: String {
             switch self {
             case .monitoring: "Monitoring reported"
+            case .standby: "Standby"
             case .stopped: "Stopped"
             case .noHistory: "No history recorded"
             case .updatesMissing: "Listener updates missing"
@@ -86,10 +88,11 @@ public struct TimelineCoverage: Identifiable, Equatable, Sendable {
                 switch state {
                 case .noHistory: 0
                 case .monitoring: 1
-                case .stopped: 2
-                case .unverified: 3
-                case .updatesMissing: 4
-                case .unavailable: 5
+                case .standby: 2
+                case .stopped: 3
+                case .unverified: 4
+                case .updatesMissing: 5
+                case .unavailable: 6
                 }
             }
             if $0.1 != $1.1 { return priority($0.1) < priority($1.1) }

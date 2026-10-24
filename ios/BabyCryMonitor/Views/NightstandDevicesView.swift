@@ -18,15 +18,15 @@ extension AppModel {
         if listener {
             devices.append(NightstandDevice(id: "listener", name: "Nursery iPhone", icon: "iphone",
                 detail: "Listener · This iPhone\n\(Self.devicePower(batteryLevel, powerConnected))",
-                status: recoveringAudio ? "Recovering" : monitoring ? "Listening" : "Stopped",
-                tone: recoveringAudio ? .warning : monitoring ? .active : .unavailable))
+                status: recoveringAudio ? "Recovering" : monitoring ? "Listening" : standby ? "Standby · Microphone active" : "Stopped",
+                tone: recoveringAudio ? .warning : monitoring || standby ? .active : .unavailable))
         } else if paired {
             let fresh = parentStatus?.lastHeartbeat.map { (-5...150).contains(now.timeIntervalSince($0)) } == true
             let power = Self.devicePower(parentStatus?.batteryLevel, parentStatus?.powerConnected)
             let detail = "Listener · Nursery\n" + (parentStatus?.lastHeartbeat == nil ? "Battery unavailable" : fresh ? power : "Last known · \(power)")
             devices.append(NightstandDevice(id: "listener", name: "Nursery iPhone", icon: "iphone",
                 detail: detail, status: nurseryConnection,
-                tone: nurseryConnection == "Monitoring" ? .active : nurseryConnection == "Stopped" ? .unavailable : .warning))
+                tone: ["Monitoring", "Standby"].contains(nurseryConnection) ? .active : nurseryConnection == "Stopped" ? .unavailable : .warning))
         }
 
         if !listener {

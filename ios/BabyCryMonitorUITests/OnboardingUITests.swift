@@ -1,5 +1,33 @@
 import XCTest
 final class OnboardingUITests: XCTestCase {
+    @MainActor func testStandbyShowsActiveMicrophoneAndOffersResumeInBothModes() {
+        let app = XCUIApplication()
+        for listener in [false, true] {
+            app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", "--uitesting-standby"]
+            if listener { app.launchArguments.append("--uitesting-listener") }
+            app.launch()
+            let state = app.staticTexts["nightstandState"]
+            XCTAssertTrue(state.waitForExistence(timeout: 5))
+            XCTAssertEqual(state.label, "Standby")
+            XCTAssertTrue(app.staticTexts["Microphone active · Detection paused"].exists)
+            let chart = app.descendants(matching: .any)["soundLevelChart"].firstMatch
+            XCTAssertTrue((chart.value as? String)?.contains("Inactive") == true)
+            let resume = app.buttons["Resume monitoring"]
+            for _ in 0..<3 { if resume.isHittable { break }; app.swipeUp() }
+            XCTAssertTrue(resume.isEnabled)
+            if listener {
+                let stop = app.buttons["nightstandStopMicrophone"]
+                XCTAssertTrue(stop.exists)
+                for _ in 0..<3 { if stop.isHittable { break }; app.swipeUp() }
+                stop.tap()
+                XCTAssertEqual(state.label, "Stopped")
+            }
+            let shot = XCTAttachment(screenshot: app.screenshot())
+            shot.name = listener ? "Listener microphone stopped" : "Parent standby"
+            shot.lifetime = .keepAlways; add(shot)
+            app.terminate()
+        }
+    }
     @MainActor func testBothModesUseSameLiveSoundChart() {
         let app = XCUIApplication()
         var parentValue: String?
@@ -90,7 +118,7 @@ final class OnboardingUITests: XCTestCase {
         screenshot.name = "Parent monitoring failure"; screenshot.lifetime = .keepAlways; add(screenshot)
         warning.buttons["OK"].tap()
         XCTAssertTrue(app.staticTexts["Monitoring not confirmed"].exists)
-        XCTAssertTrue(app.buttons["Stop Monitoring"].isEnabled)
+        XCTAssertTrue(app.buttons["Pause monitoring"].isEnabled)
     }
     @MainActor func testTimelineOverviewFilteringAndDetails() {
         let app = XCUIApplication()

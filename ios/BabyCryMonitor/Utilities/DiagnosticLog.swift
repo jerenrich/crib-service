@@ -11,7 +11,7 @@ import Observation
     private static let events: Set<String> = [
         "app_launched", "foreground", "background", "monitoring_recovered_after_relaunch",
         "paired_successfully", "pairing_created", "pairing_failed", "credential_failed", "metadata_load_failed",
-        "monitoring_started", "monitoring_stopped", "monitoring_start_failed", "microphone_permission_denied",
+        "monitoring_started", "monitoring_stopped", "monitoring_paused", "monitoring_start_failed", "microphone_permission_denied",
         "test_push_queued", "audio_active", "audio_recovering", "audio_interrupted", "audio_stalled",
         "audio_interruption_began", "audio_interruption_ended", "audio_route_changed", "audio_services_reset", "audio_engine_changed",
         "crying_started", "possible_cry", "crying_ended", "crying_resumed", "quiet_gap_started",
