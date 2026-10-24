@@ -15,6 +15,7 @@ const parent = {deviceId: randomUUID(), role: 'parent', secret: randomBytes(32).
 const listener = {deviceId: randomUUID(), role: 'listener', secret: randomBytes(32).toString('base64')};
 const ids = `'${parent.deviceId}','${listener.deviceId}'`;
 const cleanup = [
+    `DELETE FROM monitoring_commands WHERE parent_id IN (${ids}) OR listener_id IN (${ids});`,
     `DELETE FROM alert_snoozes WHERE parent_id IN (${ids}) OR listener_id IN (${ids});`,
     `DELETE FROM timeline_events WHERE parent_id IN (${ids}) OR listener_id IN (${ids});`,
     `DELETE FROM connection_notices WHERE parent_id IN (${ids}) OR listener_id IN (${ids});`,
@@ -103,6 +104,23 @@ try {
     check((await request('alert/acknowledge', parent, {eventId: testStatus.body.alerts[0].eventId})).status === 200, 'test acknowledgement accepted');
     const afterTest = await request('listener/status', parent, null, 'GET');
     check(afterTest.body.alertsMutedUntil === snoozed.body.alertsMutedUntil, 'test acknowledgement does not extend the real snooze');
+    const startID = randomUUID();
+    const startRequest = await request('monitoring', parent, {id: startID, enabled: true});
+    check(startRequest.status === 200 && startRequest.body.status === 'pending', 'remote Start waits for Listener confirmation');
+    check((await request('listener/status', listener, null, 'GET')).body.monitoringCommand?.id === startID, 'paired Listener receives monitoring request');
+    check((await request('monitoring/complete', parent, {id: startID, succeeded: true})).status === 403, 'Parent cannot impersonate Listener confirmation');
+    check((await request('monitoring/complete', listener, {id: startID, succeeded: false})).status === 200, 'Listener can report a failed start');
+    check((await request('listener/status', parent, null, 'GET')).body.monitoringCommand?.status === 'failed', 'failed remote Start is visible to Parent');
+    const stopID = randomUUID();
+    check((await request('monitoring', parent, {id: stopID, enabled: false})).body.status === 'pending', 'remote Stop is accepted');
+    check((await request('monitoring/complete', listener, {id: stopID, succeeded: true})).status === 200, 'Listener confirms Stop');
+    check((await request('listener/heartbeat', listener, {...beat, monitoring: false})).status === 200, 'Listener reports stopped microphone');
+    const stopped = await request('listener/status', parent, null, 'GET');
+    check(stopped.body.monitoring === false && stopped.body.monitoringCommand?.status === 'applied', 'Parent sees confirmed Stop and truthful microphone state');
+    const localStartID = randomUUID();
+    check((await request('monitoring', listener, {id: localStartID, enabled: true})).body.status === 'applied', 'local Listener controls remain supported');
+    await request('monitoring', parent, {id: stopID, enabled: false});
+    check((await request('listener/status', parent, null, 'GET')).body.monitoringCommand?.id === localStartID, 'retried Stop cannot override a newer local action');
     check((await request('pairing/remove', parent)).status === 200, 'authenticated unpair and shared-history cleanup');
     check((await request('listener/status', listener, null, 'GET')).body.paired === false, 'counterpart observes revoked pairing');
     check((await request('listener/heartbeat', listener, beat)).status === 409, 'revoked Listener cannot update old pair');

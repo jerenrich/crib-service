@@ -28,6 +28,13 @@ import UIKit
     var powerConnected = false
     var now = Date()
     var needsRestart = false
+    var requestingMonitoring = false
+    var monitoringControlError: String?
+    var monitoringControlMessage: String?
+    private(set) var pendingMonitoringCommand: MonitoringCommand?
+    @ObservationIgnored private var monitoringControlDeadline: Date?
+    @ObservationIgnored private var controlGeneration = 0
+    @ObservationIgnored private var localMonitoringReport: (id: UUID, enabled: Bool)?
     var managingDevice = false
     var changingConnectionAlerts = false
     private(set) var parentConnectionDeadline: Date?
@@ -167,6 +174,17 @@ import UIKit
             }
         }
         loadCredential()
+        if role == .listener, paired, needsRestart || defaults.string(forKey: localMonitoringReportKey) != nil {
+            queueLocalMonitoringReport(false)
+        }
+        if role == .parent { monitoringControlError = defaults.string(forKey: monitoringControlPendingKey + "|error") }
+        if role == .parent, let data = defaults.data(forKey: monitoringControlPendingKey),
+           let command = try? JSONDecoder().decode(MonitoringCommand.self, from: data) {
+            pendingMonitoringCommand = command
+            monitoringControlDeadline = defaults.object(forKey: monitoringControlPendingKey + "|deadline") as? Date ?? .distantPast
+            monitoringControlMessage = "Waiting for nursery monitoring confirmation…"
+            checkMonitoringControlDeadline()
+        }
         if needsRestart, role == .listener {
             engine.recordTimeline("monitoring_unverified", at: interruptedMonitoringAt ?? currentTime()); persist()
         }
@@ -182,7 +200,7 @@ import UIKit
             if deadline > currentTime() || defaults.object(forKey: Self.parentWarningScheduledKey) as? Date != deadline {
                 setParentConnectionDeadline(deadline, force: true)
             }
-        } else {
+        } else if defaults.object(forKey: Self.parentWarningDeadlineKey) != nil || defaults.object(forKey: Self.parentWarningScheduledKey) != nil {
             setParentConnectionDeadline(nil, force: true)
         }
     }
@@ -196,11 +214,14 @@ import UIKit
     var threshold: Double { configuration.absoluteThreshold }
     var listenerID: String { credential?.deviceId.uuidString ?? "Not registered" }
     var parentOnline: Bool {
+        guard pendingMonitoringCommand == nil, monitoringControlError == nil else { return false }
         guard let status = parentStatus, status.monitoring == true, let last = status.lastHeartbeat else { return false }
         return (-5...150).contains(now.timeIntervalSince(last))
     }
     var nurseryConnection: String {
         guard paired else { return "Not paired" }
+        if let command = pendingMonitoringCommand { return command.enabled ? "Starting…" : "Stopping…" }
+        if monitoringControlError != nil { return "Monitoring unverified" }
         guard let status = parentStatus, let last = status.lastHeartbeat else { return "Status unavailable" }
         guard (-5...150).contains(now.timeIntervalSince(last)) else { return "Connection lost" }
         return status.monitoring == true ? "Monitoring" : "Stopped"
@@ -231,6 +252,7 @@ import UIKit
         setParentConnectionDeadline(nil)
         cancelCalibration()
         stop(); environmentRevision += 1; role = value; defaults.set(value.rawValue, forKey: "role")
+        resetMonitoringControl()
         timeline = nil; timelineError = nil
         parentStatus = nil; pairingCode = nil; credential = nil; uploadedToken = nil; loadCredential()
         nextParentRefreshAt = .distantPast
@@ -245,6 +267,7 @@ import UIKit
               url.host != nil, url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
               url.path.isEmpty || url.path == "/" else { error = "Enter the HTTPS origin of your deployed Worker."; return }
         setParentConnectionDeadline(nil)
+        resetMonitoringControl()
         environmentRevision += 1; backendURL = url.absoluteString
         defaults.set(backendURL, forKey: "backendURL")
         timeline = nil; timelineError = nil
@@ -309,10 +332,16 @@ import UIKit
             log.record("paired_successfully"); error = nil
         } catch { self.error = error.localizedDescription; log.record("pairing_failed", error: error) }
     }
-    func start() async {
+    func start(remote: Bool = false, deadline: Date? = nil, commandID: UUID? = nil) async {
         guard !starting, !monitoring, !recoveringAudio, !calibrationActive, !managingDevice, role == .listener else { return }
+        if !remote { controlGeneration += 1 }
+        let control = controlGeneration
         let revision = environmentRevision, generation = settingsGeneration
-        starting = true; defer { starting = false }
+        starting = true
+        defer {
+            starting = false
+            if !remote, revision == environmentRevision, control == controlGeneration { queueLocalMonitoringReport(monitoring) }
+        }
         guard safetyAccepted else {
             log.record("monitoring_start_blocked_safety")
             error = "Review and accept the safety information before monitoring."; return
@@ -323,16 +352,17 @@ import UIKit
         }
         guard paired else { error = "Pair this Listener with a Parent before monitoring."; return }
         guard await audio.requestPermission() else { error = "Microphone permission denied. Enable Microphone in iPhone Settings → Crib Service."; log.record("microphone_permission_denied"); return }
-        guard revision == environmentRevision, role == .listener else { return }
+        guard revision == environmentRevision, control == controlGeneration, role == .listener else { return }
         do {
             if connectivity.available {
                 do {
                     let client = try await registeredClient(); let status = try await client.status()
-                    guard revision == environmentRevision else { return }
+                    guard revision == environmentRevision, control == controlGeneration else { return }
                     observePairing(status)
                     guard status.paired else {
                         throw BackendError.message("Pairing no longer exists. Pair again before monitoring.")
                     }
+                    if let commandID, status.monitoringCommand?.id != commandID { return }
                     if !settingsDirty, generation == settingsGeneration { applyRemote(status.configuration) }
                 } catch let failure as BackendError {
                     if case .response(let status, _) = failure, status >= 500 {
@@ -342,8 +372,12 @@ import UIKit
                     deliveryStatus = "Monitoring locally. Internet unavailable (\(failure.code.rawValue)); alerts will retry."
                 }
             }
-            guard revision == environmentRevision, role == .listener, storageHealthy else { return }
-            try await audio.start(); engine.markMonitoring(true); persist()
+            guard revision == environmentRevision, control == controlGeneration, role == .listener, storageHealthy else { return }
+            guard deadline.map({ currentTime() < $0 }) ?? true else { return }
+            try await audio.start()
+            guard revision == environmentRevision, control == controlGeneration,
+                  deadline.map({ currentTime() < $0 }) ?? true else { audio.stop(); return }
+            engine.markMonitoring(true); persist()
             guard storageHealthy else { return }
             lastSampleAt = currentTime(); needsRestart = false; error = nil
             log.record("monitoring_started")
@@ -351,11 +385,109 @@ import UIKit
         } catch is CancellationError { return }
         catch { self.error = error.localizedDescription; log.record("monitoring_start_failed", error: error) }
     }
-    func stop() {
+    func stop(remote: Bool = false) {
+        if !remote { controlGeneration += 1 }
+        if !remote, role == .listener, paired { queueLocalMonitoringReport(false) }
         let wasActive = monitoring || recoveringAudio
         audio.stop(); engine.suspend(); persist()
         if wasActive { log.record("monitoring_stopped") }
         recordBatterySample()
+    }
+    private var localMonitoringReportKey: String { pairingKey + "|localMonitoringReport" }
+    private var monitoringControlPendingKey: String { pairingKey + "|pendingMonitoringCommand" }
+    private func persistMonitoringControl() {
+        defaults.set(pendingMonitoringCommand.flatMap { try? JSONEncoder().encode($0) }, forKey: monitoringControlPendingKey)
+        defaults.set(monitoringControlDeadline, forKey: monitoringControlPendingKey + "|deadline")
+        defaults.set(monitoringControlError, forKey: monitoringControlPendingKey + "|error")
+    }
+    private func queueLocalMonitoringReport(_ enabled: Bool) {
+        localMonitoringReport = (UUID(), enabled)
+        defaults.set(localMonitoringReport?.id.uuidString, forKey: localMonitoringReportKey)
+        lastRefreshAt = .distantPast
+    }
+    private func resetMonitoringControl() {
+        controlGeneration += 1
+        localMonitoringReport = nil; pendingMonitoringCommand = nil
+        monitoringControlDeadline = nil; monitoringControlError = nil; monitoringControlMessage = nil
+    }
+    func requestMonitoring(_ enabled: Bool) async {
+        guard role == .parent, paired, !requestingMonitoring, !managingDevice else { return }
+        requestingMonitoring = true; defer { requestingMonitoring = false }
+        let revision = environmentRevision, id = UUID()
+        pendingMonitoringCommand = MonitoringCommand(id: id, enabled: enabled, status: "pending",
+            createdAt: currentTime(), expiresAt: currentTime().addingTimeInterval(30))
+        monitoringControlDeadline = currentTime().addingTimeInterval(30)
+        monitoringControlError = nil
+        persistMonitoringControl()
+        monitoringControlMessage = enabled ? "Start requested · Waiting for the nursery microphone…" : "Stop requested · Waiting for nursery confirmation…"
+        do {
+            let client = try await registeredClient()
+            let command = try await client.setMonitoring(enabled, id: id)
+            guard revision == environmentRevision, pendingMonitoringCommand?.id == id else { return }
+            pendingMonitoringCommand = command
+            persistMonitoringControl()
+            nextParentRefreshAt = .distantPast
+            Task { await refreshParent() }
+        } catch {
+            guard revision == environmentRevision else { return }
+            monitoringControlError = enabled
+                ? "Could not verify that monitoring started. Check internet access on both phones and open Crib Service on the nursery phone before relying on alerts."
+                : "Could not verify that monitoring stopped. Check internet access on both phones. The nursery phone may still be listening."
+            log.record("monitoring_control_failed", error: error)
+            persistMonitoringControl()
+        }
+        checkMonitoringControlDeadline()
+    }
+    private func checkMonitoringControlDeadline() {
+        guard let command = pendingMonitoringCommand, let deadline = monitoringControlDeadline, currentTime() >= deadline else { return }
+        monitoringControlError = command.enabled
+            ? "Monitoring could not be started or verified. Open Crib Service on the nursery phone, check microphone permission and internet access, then try again. Do not rely on alerts until Monitoring is confirmed."
+            : "Monitoring stop could not be verified. Check the nursery phone. It may still be listening; repeating crying alerts were cancelled if the service received your request."
+        monitoringControlMessage = nil; pendingMonitoringCommand = nil; monitoringControlDeadline = nil
+        persistMonitoringControl()
+    }
+    private func reconcileMonitoringControl(_ status: ParentStatus) {
+        guard let pending = pendingMonitoringCommand else { return }
+        guard status.paired else {
+            monitoringControlError = "Monitoring could not be changed because the phones are no longer paired."
+            pendingMonitoringCommand = nil; monitoringControlDeadline = nil; monitoringControlMessage = nil
+            persistMonitoringControl()
+            return
+        }
+        guard let command = status.monitoringCommand, command.id == pending.id else {
+            checkMonitoringControlDeadline(); return
+        }
+        if command.status == "failed" || command.status == "expired" {
+            monitoringControlDeadline = .distantPast
+            checkMonitoringControlDeadline()
+        } else if command.status == "applied", status.monitoring == command.enabled,
+                  let heartbeat = status.lastHeartbeat, let serverTime = status.serverTime,
+                  heartbeat >= command.createdAt, (0...30).contains(serverTime.timeIntervalSince(heartbeat)) {
+            monitoringControlMessage = command.enabled ? "Monitoring confirmed on nursery phone" : "Monitoring stopped on nursery phone"
+            monitoringControlError = nil; pendingMonitoringCommand = nil; monitoringControlDeadline = nil
+            persistMonitoringControl()
+        } else { checkMonitoringControlDeadline() }
+    }
+    private func applyMonitoringCommand(_ command: MonitoringCommand?, serverTime: Date?, fetchedAt: Date, using client: any BackendServing) async {
+        guard let command, command.status == "pending", !starting, !managingDevice, localMonitoringReport == nil else { return }
+        let remaining = command.expiresAt.timeIntervalSince(serverTime ?? command.expiresAt)
+        let deadline = fetchedAt.addingTimeInterval(remaining)
+        guard currentTime() < deadline else { return }
+        let revision = environmentRevision, control = controlGeneration
+        let handledKey = pairingKey + "|handledMonitoringCommand"
+        // Persist before execution so a lost acknowledgement never replays a Start.
+        if defaults.string(forKey: handledKey) != command.id.uuidString {
+            defaults.set(command.id.uuidString, forKey: handledKey)
+            if command.enabled { await start(remote: true, deadline: deadline, commandID: command.id) }
+            else { stop(remote: true) }
+        }
+        guard revision == environmentRevision, control == controlGeneration, role == .listener else { return }
+        let succeeded = command.enabled ? monitoring : !monitoring && !recoveringAudio
+        do {
+            try await client.completeMonitoring(command.id, succeeded: succeeded)
+            guard revision == environmentRevision, control == controlGeneration else { return }
+            queueHeartbeat()
+        } catch { log.record("monitoring_control_failed", error: error) }
     }
     func sendTestPush() async {
         guard !sendingTestPush, role == .listener, paired else { return }
@@ -473,6 +605,7 @@ import UIKit
         }
         recordBatterySample()
         scheduleHeartbeatIfDue()
+        checkMonitoringControlDeadline()
         if let retry = parentWarningRetryAt, now >= retry, parentWarningTask == nil {
             parentWarningUpdatePending = true
             dispatchParentConnectionWarning()
@@ -533,6 +666,7 @@ import UIKit
         if ProcessInfo.processInfo.arguments.contains("--uitesting-offline") { return }
         #endif
         guard !managingDevice else { return }
+        checkMonitoringControlDeadline()
         scheduleHeartbeatIfDue()
         guard connectivity.available else {
             deliveryStatus = connectivity.checked ? "Internet unavailable. Alerts cannot currently be delivered." : "Checking connectivity…"
@@ -726,18 +860,24 @@ import UIKit
             guard revision == environmentRevision, role == .parent else { return }
             if !status.paired || (parentStatus?.pairingID != nil && parentStatus?.pairingID != status.pairingID) { timeline = nil; timelineError = nil }
             parentStatus = status; paired = status.paired; defaults.set(paired, forKey: pairingKey)
+            reconcileMonitoringControl(status)
             // Only a successful server response renews the local warning. A failed
             // or suspended request leaves the previous OS notification untouched.
             let warn = status.paired && status.monitoring == true && status.connectionAlertsEnabled != false
             setParentConnectionDeadline(warn ? currentTime().addingTimeInterval(ConnectionWarningNotification.timeout) : nil)
             if !settingsDirty, generation == settingsGeneration { applyRemote(status.configuration) }
-            nextParentRefreshAt = currentTime().addingTimeInterval(status.refreshDelay())
+            nextParentRefreshAt = currentTime().addingTimeInterval(pendingMonitoringCommand != nil ? 1 : status.refreshDelay())
             deliveryStatus = "Connected"; error = nil
             publishWatch()
         } catch {
             guard revision == environmentRevision, role == .parent else { return }
             deliveryStatus = "Status unavailable: \(error.localizedDescription)"; parentStatus = nil
             nextParentRefreshAt = currentTime().addingTimeInterval(15)
+            if pendingMonitoringCommand != nil {
+                monitoringControlError = "Monitoring could not be verified. Check both phones and their internet connection."
+                persistMonitoringControl()
+            }
+            checkMonitoringControlDeadline()
             log.record("parent_status_failed", error: error)
             publishWatch()
         }
@@ -756,15 +896,27 @@ import UIKit
         else { defaults.removeObject(forKey: identityKey) }
     }
     private func refreshListenerPairing(using client: any BackendServing) {
-        guard listenerStatusTask == nil, now.timeIntervalSince(lastRefreshAt) >= 15 else { return }
+        guard listenerStatusTask == nil, currentTime().timeIntervalSince(lastRefreshAt) >= 3 else { return }
         lastRefreshAt = currentTime()
-        let revision = environmentRevision
+        let revision = environmentRevision, control = controlGeneration
         listenerStatusTask = Task { [weak self] in
             defer { self?.listenerStatusTask = nil }
             do {
+                guard let self else { return }
+                if let report = self.localMonitoringReport {
+                    do {
+                        _ = try await client.setMonitoring(report.enabled, id: report.id)
+                        guard revision == self.environmentRevision, control == self.controlGeneration else { return }
+                        if self.localMonitoringReport?.id == report.id {
+                            self.localMonitoringReport = nil; self.defaults.removeObject(forKey: self.localMonitoringReportKey)
+                        }
+                    } catch { self.log.record("monitoring_control_failed", error: error) }
+                }
+                let fetchedAt = self.currentTime()
                 let status = try await client.status()
-                guard let self, revision == self.environmentRevision, self.role == .listener else { return }
+                guard revision == self.environmentRevision, control == self.controlGeneration, self.role == .listener else { return }
                 self.observePairing(status)
+                if status.paired { await self.applyMonitoringCommand(status.monitoringCommand, serverTime: status.serverTime, fetchedAt: fetchedAt, using: client) }
             } catch {
                 guard let self, revision == self.environmentRevision else { return }
                 self.log.record("listener_status_failed", error: error)
@@ -875,6 +1027,12 @@ import UIKit
                 credential = replacement
             }
             for key in watchKeys { defaults.removeObject(forKey: key) }
+            defaults.removeObject(forKey: localMonitoringReportKey)
+            defaults.removeObject(forKey: monitoringControlPendingKey)
+            defaults.removeObject(forKey: monitoringControlPendingKey + "|deadline")
+            defaults.removeObject(forKey: monitoringControlPendingKey + "|error")
+            defaults.removeObject(forKey: pairingKey + "|handledMonitoringCommand")
+            resetMonitoringControl()
             defaults.removeObject(forKey: pairingKey + "|identity")
             paired = false; defaults.set(false, forKey: pairingKey)
             setParentConnectionDeadline(nil)

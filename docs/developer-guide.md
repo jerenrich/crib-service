@@ -60,6 +60,16 @@ The iPhone and Watch display name is **Crib Service**. The bundle identifiers ar
 
 The new iPhone and Watch App IDs were registered on 23 October 2026 under Apple Developer team `9PG633BF3R`, with Push Notifications enabled for both and Time Sensitive Notifications enabled for Watch. Critical Alerts requests were submitted for both new IDs: iPhone `73693T6553` and Watch `HK2ZB58GJZ`; both were shown as Submitted on 23 October 2026. Approval remains pending, so builds continue to use ordinary iPhone notifications and Time Sensitive Watch notifications. For a bundle-ID migration, ensure the APNs key covers both new topics before the coordinated rollout. Coordinate the Worker deployment (`APNS_BUNDLE_ID = com.jordanerenrich.cribservice`) with installation on both iPhones and Watch. These builds install as new apps, so existing app-container data and pairing do not automatically migrate; pair the new apps and enable notifications/direct Watch alerts again. The Critical Alerts requests above use the new identifiers. Earlier rollout notes below describe the previous bundle IDs and in-place installations.
 
+## Monitoring controls on both iPhones
+
+Baby monitor keeps its local Start/Stop controls. Parent Mode can request either action through authenticated `POST /v1/monitoring`; the paired Listener checks commands every three seconds while its app is running. Requests expire after 30 seconds, are scoped to the pairing, and use UUIDs for idempotency. The Listener records a command before executing it so a lost confirmation cannot replay Start, then reports success/failure through `POST /v1/monitoring/complete` and sends an immediate heartbeat. Local actions supersede older commands; offline local actions are reported on reconnection. After a Listener relaunch, pending local state is reported as stopped, with no automatic restart.
+
+Parent Mode keeps the request pending until both the command result and a fresh, matching heartbeat confirm it. A failed/expired request, a transport error or an unverified 30-second deadline produces an alert dialog and a persistent red warning. Pending Parent requests survive relaunch. Stopping cancels outstanding crying reminders at the service immediately and suppresses delayed cry uploads, while observed microphone status remains based on the Listener heartbeat. Notifications already handed to APNs may still arrive. Test notifications remain independent.
+
+An inactive iOS app cannot reliably reactivate its microphone remotely. After Stop, iOS may suspend the nursery app; Parent Mode then reports an unverified Start and directs the user to reopen the nursery app. Microphone permission, audio interruptions, and storage failures also prevent confirmation.
+
+For rollout, apply `0009_monitoring_commands.sql`, deploy the updated Worker, then update both iPhones. These source changes do not deploy the service or install device builds automatically. Validate physical locked-screen Stop and suspended-app Start failure before relying on the feature.
+
 ## Xcode and iPhone setup
 
 Requirements: current Xcode (verified with Xcode 27 / Swift 6.4), an iOS 17+ device, and an Apple Developer team with push notification entitlement for remote alerts. Two physical iPhones and a paired Apple Watch are required to verify the overnight acceptance scenario.
