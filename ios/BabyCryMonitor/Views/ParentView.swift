@@ -11,17 +11,21 @@ struct ParentView: View {
             PrimaryButton(title: "Ready for tonight?") { readiness = true }
             if model.paired {
                 Panel {
-                    Label("Local connection warning", systemImage: "wifi.exclamationmark").font(.headline)
-                    if let failure = model.parentConnectionWarningError {
+                    Label("Local overdue-check warning", systemImage: "wifi.exclamationmark").font(.headline)
+                    if !model.localConnectionWarningEnabled {
+                        Text("Off · Optional in Settings. Server connection alerts are controlled separately.").foregroundStyle(Palette.muted)
+                    } else if let failure = model.parentConnectionWarningError {
                         Text("Warning unavailable: \(failure)").foregroundStyle(Palette.amber)
                     } else if let deadline = model.parentConnectionDeadline {
                         Text(model.now >= deadline ? "Server check overdue. Check both phones and your internet connection." : "Armed · Warns after 3 minutes without a successful server check.")
                             .foregroundStyle(model.now >= deadline ? Palette.amber : Palette.mint)
                     } else {
-                        Text("Starts when monitoring is active and connection-loss alerts are enabled.").foregroundStyle(Palette.muted)
+                        Text("Waiting for a successful server check with monitoring active.").foregroundStyle(Palette.muted)
                     }
-                    Text("Once armed, this iPhone can warn without internet. Keep Parent Mode open for ongoing checks. Locking the phone or leaving the app may pause checks and also trigger the warning. iPhone Silent Mode and Focus can silence it.")
-                        .font(.footnote).foregroundStyle(Palette.muted)
+                    if model.localConnectionWarningEnabled {
+                        Text("Once armed, this iPhone can warn without internet. Keep Parent Mode open for ongoing checks. Enable Keep screen awake in Settings to prevent automatic locking. Locking the phone or leaving the app may pause checks and trigger the warning. iPhone Silent Mode and Focus can silence it.")
+                            .font(.footnote).foregroundStyle(Palette.muted)
+                    }
                 }
             }
             if let alert = model.activeAlert {

@@ -1,5 +1,36 @@
 import XCTest
 final class OnboardingUITests: XCTestCase {
+    @MainActor func testParentWarningAndScreenPreferencesDefaultOffAndPersist() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline"]
+        app.launch()
+        let proceed = app.buttons["I understand · Continue"]
+        XCTAssertTrue(proceed.waitForExistence(timeout: 5))
+        if !proceed.isHittable { app.swipeUp() }; proceed.tap()
+        let parent = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Parent Mode")).firstMatch
+        XCTAssertTrue(parent.waitForExistence(timeout: 5)); parent.tap()
+        XCTAssertTrue(app.buttons["Settings"].waitForExistence(timeout: 5))
+        app.buttons["Settings"].tap()
+        let form = app.descendants(matching: .any)["settingsForm"]
+        let local = app.switches["localConnectionWarning"]
+        let awake = app.switches["keepScreenAwake"]
+        for _ in 0..<12 { if local.exists && local.isHittable { break }; scrollDown(in: form) }
+        XCTAssertTrue(local.exists && local.isHittable)
+        XCTAssertEqual(local.value as? String, "0")
+        local.tap()
+        for _ in 0..<5 { if awake.exists && awake.isHittable { break }; scrollDown(in: form) }
+        XCTAssertEqual(awake.value as? String, "0")
+        awake.tap()
+        app.terminate(); app.launchArguments = ["--uitesting-offline"]; app.launch()
+        XCTAssertTrue(app.buttons["Settings"].waitForExistence(timeout: 5)); app.buttons["Settings"].tap()
+        for _ in 0..<12 { if local.exists && local.isHittable { break }; scrollDown(in: form) }
+        XCTAssertEqual(local.value as? String, "1")
+        local.tap()
+        for _ in 0..<5 { if awake.exists && awake.isHittable { break }; scrollDown(in: form) }
+        XCTAssertEqual(awake.value as? String, "1")
+        awake.tap()
+    }
+
     @MainActor func testTimelineOverviewFilteringAndDetails() {
         let app = XCUIApplication()
         app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-timeline"]

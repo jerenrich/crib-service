@@ -30,6 +30,8 @@ import UIKit
     var needsRestart = false
     var managingDevice = false
     var changingConnectionAlerts = false
+    private(set) var localConnectionWarningEnabled: Bool
+    private(set) var keepScreenAwake: Bool
     private(set) var parentConnectionDeadline: Date?
     private(set) var parentConnectionWarningError: String?
     var calibration = SoundCalibration()
@@ -115,6 +117,8 @@ import UIKit
         #endif
         role = defaults.string(forKey: "role").flatMap(DeviceRole.init)
         safetyAccepted = defaults.bool(forKey: "safetyAccepted")
+        localConnectionWarningEnabled = defaults.bool(forKey: "localConnectionWarningEnabled")
+        keepScreenAwake = defaults.bool(forKey: "keepScreenAwake")
         backendURL = defaults.string(forKey: "backendURL") ?? (Bundle.main.object(forInfoDictionaryKey: "BackendURL") as? String ?? "")
         var interruptedMonitoringAt: Date?
         do {
@@ -173,9 +177,9 @@ import UIKit
         #if DEBUG
         if ProcessInfo.processInfo.arguments.contains("--uitesting-timeline") { seedTimelineForUITest() }
         #endif
-        // Keep an already scheduled warning across relaunch; never postpone it just
-        // because the app starts or a network path becomes available.
-        if role == .parent, paired,
+        // Restore a warning only after explicit opt-in; clear legacy deadlines on
+        // upgrade. Relaunch/network availability must never postpone a deadline.
+        if localConnectionWarningEnabled, role == .parent, paired,
            defaults.string(forKey: Self.parentWarningScopeKey) == parentWarningScope,
            let deadline = defaults.object(forKey: Self.parentWarningDeadlineKey) as? Date {
             parentConnectionDeadline = deadline
@@ -185,6 +189,7 @@ import UIKit
         } else {
             setParentConnectionDeadline(nil, force: true)
         }
+        publishWatch()
     }
     deinit {
         loopTask?.cancel(); networkTask?.cancel(); audioTask?.cancel()
@@ -195,6 +200,7 @@ import UIKit
     var state: CryState { engine.detector.state }
     var threshold: Double { configuration.absoluteThreshold }
     var listenerID: String { credential?.deviceId.uuidString ?? "Not registered" }
+    var shouldKeepScreenAwake: Bool { safetyAccepted && role == .parent && keepScreenAwake }
     var parentOnline: Bool {
         guard let status = parentStatus, status.monitoring == true, let last = status.lastHeartbeat else { return false }
         return (-5...150).contains(now.timeIntervalSince(last))
@@ -712,7 +718,7 @@ import UIKit
             parentStatus = status; paired = status.paired; defaults.set(paired, forKey: pairingKey)
             // Only a successful server response renews the local warning. A failed
             // or suspended request leaves the previous OS notification untouched.
-            let warn = status.paired && status.monitoring == true && status.connectionAlertsEnabled != false
+            let warn = localConnectionWarningEnabled && status.paired && status.monitoring == true
             setParentConnectionDeadline(warn ? currentTime().addingTimeInterval(ConnectionWarningNotification.timeout) : nil)
             if !settingsDirty, generation == settingsGeneration { applyRemote(status.configuration) }
             nextParentRefreshAt = currentTime().addingTimeInterval(status.refreshDelay())
@@ -829,6 +835,19 @@ import UIKit
             return false
         }
     }
+    func setLocalConnectionWarning(_ enabled: Bool) {
+        guard enabled != localConnectionWarningEnabled else { return }
+        localConnectionWarningEnabled = enabled
+        defaults.set(enabled, forKey: "localConnectionWarningEnabled")
+        if !enabled { setParentConnectionDeadline(nil, force: true) }
+        publishWatch()
+        // Enabling requires a fresh successful check before either device arms.
+        if enabled, role == .parent { Task { await refreshParent() } }
+    }
+    func setKeepScreenAwake(_ enabled: Bool) {
+        keepScreenAwake = enabled
+        defaults.set(enabled, forKey: "keepScreenAwake")
+    }
     func setConnectionAlerts(_ enabled: Bool) async {
         guard role == .parent, !changingConnectionAlerts else { return }
         changingConnectionAlerts = true; defer { changingConnectionAlerts = false }
@@ -836,7 +855,6 @@ import UIKit
         do {
             let client = try await registeredClient(); try await client.connectionAlerts(enabled)
             guard revision == environmentRevision, role == .parent else { return }
-            if !enabled { setParentConnectionDeadline(nil) }
             await refreshParent()
         }
         catch { self.error = error.localizedDescription; log.record("connection_preferences_failed", error: error) }
@@ -930,6 +948,7 @@ import UIKit
         value.lastHeartbeat = value.parentMode ? parentStatus?.lastHeartbeat : nil
         value.monitoring = value.parentMode && parentStatus?.monitoring == true
         value.connectionWarningSupported = true
+        value.localConnectionWarningEnabled = localConnectionWarningEnabled
         value.connectionWarningDeadline = value.parentMode && paired ? parentConnectionDeadline : nil
         value.state = value.parentMode ? parentStatus?.state : nil
         value.alertDuration = configuration.alertDuration

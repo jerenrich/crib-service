@@ -11,6 +11,7 @@ final class WatchConnectionWarningTests: XCTestCase {
         var snapshot = WatchSnapshot()
         snapshot.parentMode = true; snapshot.paired = true
         snapshot.connectionWarningSupported = true
+        snapshot.localConnectionWarningEnabled = true
         snapshot.connectionWarningDeadline = Date(timeIntervalSince1970: 1_180)
         snapshot.updatedAt = Date(timeIntervalSince1970: 1_000)
         snapshot.statusAvailable = true; snapshot.monitoring = true
@@ -28,14 +29,29 @@ final class WatchConnectionWarningTests: XCTestCase {
         var snapshot = WatchSnapshot()
         snapshot.parentMode = true; snapshot.paired = true
         snapshot.connectionWarningSupported = true
+        snapshot.localConnectionWarningEnabled = true
         snapshot.connectionWarningDeadline = Date(timeIntervalSince1970: 1_180)
         let data = try JSONEncoder().encode(snapshot)
         XCTAssertEqual(try JSONDecoder().decode(WatchSnapshot.self, from: data).localConnectionDeadline,
                        snapshot.connectionWarningDeadline)
         var old = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        old.removeValue(forKey: "localConnectionWarningEnabled")
+        let previousPhone = try JSONDecoder().decode(WatchSnapshot.self, from: JSONSerialization.data(withJSONObject: old))
+        XCTAssertNil(previousPhone.localConnectionDeadline, "Old cached deadlines do not imply opt-in")
         old.removeValue(forKey: "connectionWarningSupported")
         old.removeValue(forKey: "connectionWarningDeadline")
         let decoded = try JSONDecoder().decode(WatchSnapshot.self, from: JSONSerialization.data(withJSONObject: old))
         XCTAssertNil(decoded.localConnectionDeadline)
+    }
+
+    func testDisabledLocalWarningIgnoresStaleDeadline() {
+        var snapshot = WatchSnapshot()
+        snapshot.parentMode = true; snapshot.paired = true
+        snapshot.connectionWarningSupported = true
+        snapshot.connectionWarningDeadline = Date().addingTimeInterval(180)
+        snapshot.localConnectionWarningEnabled = false
+        XCTAssertNil(snapshot.localConnectionDeadline)
+        snapshot.localConnectionWarningEnabled = true
+        XCTAssertEqual(snapshot.localConnectionDeadline, snapshot.connectionWarningDeadline)
     }
 }

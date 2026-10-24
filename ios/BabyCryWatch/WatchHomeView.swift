@@ -24,7 +24,7 @@ struct WatchHomeView: View {
                             Label("Wrist alerts", systemImage: "applewatch.radiowaves.left.and.right")
                         }.font(.footnote)
                         if let failure = model.connectionWarningError {
-                            Text("Local connection warning unavailable: \(failure)").font(.caption2).foregroundStyle(.orange)
+                            Text("Local overdue-check warning unavailable: \(failure)").font(.caption2).foregroundStyle(.orange)
                         } else if let deadline = model.connectionWarningDeadline {
                             Text(context.date >= deadline ? "Connection check overdue · Check both phones" : "Offline warning armed · 3 minute timeout")
                                 .font(.caption2).foregroundStyle(context.date >= deadline ? .orange : mint)
@@ -153,7 +153,7 @@ struct WatchSetupView: View {
                     .disabled(model.alertSetup.phase == .requestingPermission)
                 Text("The wrist test checks this Watch only. Send a test push from the nursery Listener to verify the full connection before sleeping.")
                     .font(.caption2).foregroundStyle(.secondary)
-                Text("The local connection warning works without internet once armed. It warns 3 minutes after the last verified Parent server check. Keep Parent Mode open: iOS may pause checks when the phone is locked or backgrounded, which also triggers this warning. Watch notification, Focus and haptic settings still apply.")
+                Text("The optional local overdue-check warning is off by default. Enable it in Parent iPhone Settings, separately from server connection alerts. Once armed, it works without internet and warns 3 minutes after the last verified Parent server check. Keep Parent Mode open; Keep screen awake prevents automatic locking. Locking or leaving the app can pause checks and trigger the warning. Watch notification, Focus and haptic settings still apply.")
                     .font(.caption2).foregroundStyle(.secondary)
                 Text("While the app is active, recent alerts repeat three-tap bursts for up to 3 minutes. Tap Acknowledge to stop. watchOS controls background vibration; use Prominent Haptics for a more noticeable wrist alert.")
                     .font(.caption2).foregroundStyle(.secondary)

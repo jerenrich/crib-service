@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct RootView: View {
     @Environment(AppModel.self) private var model
@@ -24,6 +25,10 @@ struct RootView: View {
                 .sheet(isPresented: $settings) { SettingsView() }
                 .alert("Attention needed", isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) { Button("OK") { model.error = nil } } message: { Text(model.error ?? "") }
         }.tint(Palette.mint).preferredColorScheme(.dark)
+            .onChange(of: phase == .active && model.shouldKeepScreenAwake, initial: true) { _, keepAwake in
+                UIApplication.shared.isIdleTimerDisabled = keepAwake
+            }
+            .onDisappear { UIApplication.shared.isIdleTimerDisabled = false }
             .task { await model.foreground() }
             .onChange(of: phase) { _, value in
                 if value == .active { Task { await model.foreground() } }
