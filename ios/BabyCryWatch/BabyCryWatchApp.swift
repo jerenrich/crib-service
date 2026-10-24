@@ -15,7 +15,7 @@ import UserNotifications
 @MainActor final class WatchAppDelegate: NSObject, WKApplicationDelegate, UNUserNotificationCenterDelegate {
     func applicationDidFinishLaunching() {
         UNUserNotificationCenter.current().delegate = self
-        let action = UNNotificationAction(identifier: WatchNotification.acknowledge, title: "I'm checking", options: [.foreground])
+        let action = UNNotificationAction(identifier: WatchNotification.acknowledge, title: "Acknowledge", options: [.foreground])
         UNUserNotificationCenter.current().setNotificationCategories([
             UNNotificationCategory(identifier: WatchNotification.category, actions: [action], intentIdentifiers: [], options: [])
         ])
@@ -66,21 +66,38 @@ extension WatchCryAlert {
 final class CryNotificationController: WKUserNotificationHostingController<CryNotificationView> {
     private var alert: WatchCryAlert?
     private var text = "Open the app for nursery status."
-    override var body: CryNotificationView { CryNotificationView(alert: alert, text: text) }
+    override class var isInteractive: Bool { true }
+    override var body: CryNotificationView {
+        CryNotificationView(alert: alert, text: text) { [weak self, alert] in
+            guard let alert else { return }
+            WatchModel.shared.handleNotification(alert, acknowledging: true)
+            self?.performDismissAction()
+        }
+    }
     override func didReceive(_ notification: UNNotification) {
         alert = WatchCryAlert.notification(notification.request.content)
         text = notification.request.content.body
-        if let alert { WatchModel.shared.receive(alert) }
+        if let alert {
+            WatchModel.shared.receive(alert)
+            // The inline action appears immediately, above the notification details.
+            notificationActions = []
+        }
     }
 }
 
 struct CryNotificationView: View {
     let alert: WatchCryAlert?
     let text: String
+    let acknowledge: () -> Void
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Image(systemName: "waveform").font(.largeTitle).foregroundStyle(.orange)
-            Text(alert?.isTest == true ? "Test alert" : "Check on baby").font(.headline)
+            if alert != nil {
+                Button("Acknowledge", action: acknowledge)
+                    .buttonStyle(.borderedProminent).tint(Color(red: 0.62, green: 0.90, blue: 0.79)).foregroundStyle(.black)
+                    .frame(maxWidth: .infinity)
+            }
+            Label(alert?.isTest == true ? "Test alert" : "Check on baby", systemImage: "waveform")
+                .font(.headline).foregroundStyle(.orange)
             Text(text).font(.footnote)
             if let alert { Text(alert.createdAt, style: .time).font(.caption).foregroundStyle(.secondary) }
         }.padding(.vertical, 8)

@@ -25,6 +25,13 @@ struct WatchHomeView: View {
                         }
                     }.padding(.horizontal, 4)
                 }
+                .safeAreaInset(edge: .top, spacing: 4) {
+                    if model.alert != nil {
+                        Button("Acknowledge") { model.acknowledge() }
+                            .buttonStyle(.borderedProminent).tint(mint).foregroundStyle(.black)
+                            .frame(maxWidth: .infinity)
+                    }
+                }
             }
             .navigationTitle("Crib Service")
             .toolbar { ToolbarItem(placement: .topBarTrailing) {
@@ -85,7 +92,6 @@ struct WatchHomeView: View {
             Text(alert.isTest ? "A test from your Listener." : "Crying-like sound continued for \(duration(alert.duration)).").font(.footnote).multilineTextAlignment(.center)
             Text("Sent \(alert.createdAt.formatted(date: .omitted, time: .shortened))").font(.caption2).foregroundStyle(.secondary)
             if !alert.isRecent(at: now) { Text("Earlier alert · Check current nursery status.").font(.caption2).foregroundStyle(.orange) }
-            Button("I'm checking") { model.acknowledge() }.buttonStyle(.borderedProminent).tint(mint).foregroundStyle(.black)
         }.padding(.vertical, 8)
     }
     private func stateTitle(online: Bool) -> String {
@@ -128,7 +134,7 @@ struct WatchSetupView: View {
                     .disabled(model.alertSetup.phase == .requestingPermission)
                 Text("The wrist test checks this Watch only. Send a test push from the nursery Listener to verify the full connection before sleeping.")
                     .font(.caption2).foregroundStyle(.secondary)
-                Text("While the app is active, recent alerts repeat three-tap bursts for up to 3 minutes. Tap I'm checking to stop. watchOS controls background vibration; use Prominent Haptics for a more noticeable wrist alert.")
+                Text("While the app is active, recent alerts repeat three-tap bursts for up to 3 minutes. Tap Acknowledge to stop. watchOS controls background vibration; use Prominent Haptics for a more noticeable wrist alert.")
                     .font(.caption2).foregroundStyle(.secondary)
                 if let notice = model.notice { Text(notice).font(.caption2).foregroundStyle(.orange) }
                 NavigationLink("Diagnostics") {
