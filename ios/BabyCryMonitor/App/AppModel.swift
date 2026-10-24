@@ -23,7 +23,9 @@ import UIKit
     var timelineError: String?
     var loadingTimeline = false
     var currentDBFS: Double = -100
-    var meter: [Double] = Array(repeating: -100, count: 32)
+    var meter: [Double] = Array(repeating: -100, count: SoundLevelFrame.barCount)
+    private(set) var remoteSound = RemoteSoundState()
+    private(set) var liveSoundConnected = false
     var batteryLevel: Double?
     var powerConnected = false
     var now = Date()
@@ -52,6 +54,9 @@ import UIKit
     private var engine = CrySessionManager()
     @ObservationIgnored private var store: MetadataStore?
     @ObservationIgnored private let audio: any AudioLevelProviding
+    @ObservationIgnored private let liveSound: any LiveSoundStreaming
+    @ObservationIgnored private var parentSoundVisible = false
+    @ObservationIgnored private var appActive = true
     @ObservationIgnored private let alerts = AlertCoordinator()
     @ObservationIgnored private var credential: DeviceCredential?
     @ObservationIgnored private var loopTask: Task<Void, Never>?
@@ -106,6 +111,7 @@ import UIKit
     init(defaults: UserDefaults = .standard, metadataStore: MetadataStore? = nil,
          log: DiagnosticLog = DiagnosticLog(),
          audio: any AudioLevelProviding = AudioLevelMonitor(),
+         liveSound: (any LiveSoundStreaming)? = nil,
          connectivity: any ConnectivityProviding = ConnectivityMonitor(),
          notifications: any NotificationProviding = NotificationService(),
          keychain: any CredentialStoring = KeychainStore(),
@@ -113,6 +119,7 @@ import UIKit
          currentTime: @escaping () -> Date = Date.init,
           heartbeatJitter: @escaping () -> Double = { Double.random(in: 0.9...1.1) }, automaticallyStart: Bool = true) {
         self.defaults = defaults; self.audio = audio; self.connectivity = connectivity; self.log = log
+        self.liveSound = liveSound ?? LiveSoundStream(enabled: automaticallyStart)
         self.notifications = notifications; self.keychain = keychain; self.makeClient = makeClient
         self.watch = PhoneWatchBridge(enabled: automaticallyStart)
         self.currentTime = currentTime; self.heartbeatJitter = heartbeatJitter
@@ -145,6 +152,16 @@ import UIKit
         settingsDirty = defaults.bool(forKey: "settingsDirty")
         UIDevice.current.isBatteryMonitoringEnabled = true
         audio.onStatus = { [weak self] status in self?.audioChanged(status) }
+        self.liveSound.onFrame = { [weak self] frame in
+            guard let self, self.role == .parent, self.paired, self.parentSoundVisible, self.appActive else { return }
+            self.now = self.currentTime()
+            self.remoteSound.receive(frame, at: self.now)
+        }
+        self.liveSound.onConnectionChange = { [weak self] connected in
+            self?.liveSoundConnected = connected
+            if connected { self?.remoteSound = RemoteSoundState() }
+            else { self?.remoteSound.disconnected() }
+        }
         (notifications as? NotificationService)?.log = log
         watch.log = log
         (audio as? AudioLevelMonitor)?.log = log
@@ -194,6 +211,15 @@ import UIKit
         }
         #if DEBUG
         if ProcessInfo.processInfo.arguments.contains("--uitesting-timeline") { seedTimelineForUITest() }
+        if ProcessInfo.processInfo.arguments.contains("--uitesting-live-sound") {
+            safetyAccepted = true; paired = true
+            role = ProcessInfo.processInfo.arguments.contains("--uitesting-listener") ? .listener : .parent
+            configuration.absoluteThreshold = -45
+            meter = (0..<SoundLevelFrame.barCount).map { -80 + Double(($0 * 17) % 65) }
+            currentDBFS = meter.last ?? -100
+            monitoring = role == .listener
+            seedLiveSoundFrameForUITest()
+        }
         #endif
         // Restore a warning only after explicit opt-in; clear legacy deadlines on
         // upgrade. Relaunch/network availability must never postpone a deadline.
@@ -255,6 +281,7 @@ import UIKit
     func acceptSafety() { safetyAccepted = true; defaults.set(true, forKey: "safetyAccepted") }
     func selectRole(_ value: DeviceRole) {
         guard !managingDevice else { return }
+        clearLiveSound()
         setParentConnectionDeadline(nil)
         cancelCalibration()
         stop(); environmentRevision += 1; role = value; defaults.set(value.rawValue, forKey: "role")
@@ -275,6 +302,7 @@ import UIKit
         setParentConnectionDeadline(nil)
         resetMonitoringControl()
         environmentRevision += 1; backendURL = url.absoluteString
+        clearLiveSound()
         defaults.set(backendURL, forKey: "backendURL")
         timeline = nil; timelineError = nil
         credential = nil; parentStatus = nil; pairingCode = nil; uploadedToken = nil
@@ -551,6 +579,7 @@ import UIKit
         switch status {
         case .active:
             log.record("audio_active")
+            meter = Array(repeating: -100, count: SoundLevelFrame.barCount); currentDBFS = -100
             monitoring = true; audioStatus = "Microphone active"
             engine.markMonitoring(true); lastSampleAt = currentTime(); lastHeartbeatAt = .distantPast
             needsRestart = false; error = nil
@@ -575,6 +604,7 @@ import UIKit
             error = message; needsRestart = true
             log.record("audio_interrupted"); queueHeartbeat()
         }
+        synchronizeLiveSound()
     }
     private func consume(_ sample: AudioLevelSample) {
         if calibrationActive {
@@ -583,9 +613,10 @@ import UIKit
             if calibrationPhase != "waiting" { calibration.record(sample.dbFS, background: calibrationPhase == "background") }
             return
         }
-        guard monitoring, let credential, storageHealthy else { return }
+        guard monitoring, let credential, storageHealthy, sample.dbFS.isFinite,
+              (-100...0).contains(sample.dbFS) else { return }
         lastSampleAt = sample.timestamp; currentDBFS = sample.dbFS
-        meter.append(sample.dbFS); meter = Array(meter.suffix(32))
+        meter.append(sample.dbFS); meter = Array(meter.suffix(SoundLevelFrame.barCount))
         let before = state; let quietBefore = engine.detector.quietSince
         let events = engine.consume(sample, listenerId: credential.deviceId)
         if state != before {
@@ -596,6 +627,34 @@ import UIKit
         }
         if !events.isEmpty { log.record("alert_threshold_reached") }
         if !events.isEmpty || before != state || sample.timestamp.timeIntervalSince(lastSavedAt) >= 5 { persist(); lastSavedAt = sample.timestamp }
+        // Publish the actual chart window and applied threshold, rather than
+        // rebuilding or interpolating a different chart on the Parent.
+        if monitoring, (0...1).contains(currentTime().timeIntervalSince(sample.timestamp)) {
+            liveSound.publish(SoundLevelFrame(sampledAt: sample.timestamp.timeIntervalSince1970, levels: meter,
+                threshold: threshold, state: state,
+                episodeStartedAt: snapshot.current?.startedAt.timeIntervalSince1970,
+                alertDuration: configuration.alertDuration))
+        }
+    }
+    func setParentSoundVisible(_ visible: Bool) {
+        parentSoundVisible = visible; synchronizeLiveSound()
+    }
+    func setAppActive(_ active: Bool) {
+        appActive = active; synchronizeLiveSound()
+    }
+    private func clearLiveSound() {
+        liveSound.disconnect(); remoteSound = RemoteSoundState(); liveSoundConnected = false
+    }
+    private func synchronizeLiveSound() {
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--uitesting-offline") { return }
+        #endif
+        let needed = role == .listener ? monitoring : role == .parent && parentSoundVisible && appActive
+        guard needed, paired, !managingDevice, connectivity.available,
+              let credential, credential.registered, let url = URL(string: backendURL) else {
+            liveSound.disconnect(); return
+        }
+        liveSound.connect(baseURL: url, credential: credential)
     }
     private func persist() {
         guard let store, storageHealthy else { return }
@@ -619,6 +678,9 @@ import UIKit
     }
     private func updateLocalState() {
         now = currentTime(); let device = UIDevice.current
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--uitesting-live-sound") { seedLiveSoundFrameForUITest() }
+        #endif
         batteryLevel = device.batteryLevel >= 0 ? Double(device.batteryLevel) : nil
         let powered = device.batteryState == .charging || device.batteryState == .full
         if powerConnected != powered, role == .listener, paired {
@@ -628,6 +690,7 @@ import UIKit
         if monitoring, let lastSampleAt, now.timeIntervalSince(lastSampleAt) > 3 {
             stop(); error = "Monitoring stopped: microphone samples stopped arriving."; needsRestart = true; log.record("audio_stalled")
         }
+        synchronizeLiveSound()
         recordBatterySample()
         scheduleHeartbeatIfDue()
         checkMonitoringControlDeadline()
@@ -636,6 +699,14 @@ import UIKit
             dispatchParentConnectionWarning()
         }
     }
+    #if DEBUG
+    private func seedLiveSoundFrameForUITest() {
+        if role == .parent {
+            remoteSound.receive(SoundLevelFrame(sampledAt: now.timeIntervalSince1970, levels: meter,
+                threshold: threshold, state: .quiet, alertDuration: configuration.alertDuration), at: now)
+        }
+    }
+    #endif
     private func recordBatterySample() {
         guard role == .listener else { return }
         let device = UIDevice.current
@@ -883,8 +954,11 @@ import UIKit
         do {
             let client = try await registeredClient(); let status = try await client.status()
             guard revision == environmentRevision, role == .parent else { return }
-            if !status.paired || (parentStatus?.pairingID != nil && parentStatus?.pairingID != status.pairingID) { timeline = nil; timelineError = nil }
+            if !status.paired || (parentStatus?.pairingID != nil && parentStatus?.pairingID != status.pairingID) {
+                timeline = nil; timelineError = nil; clearLiveSound()
+            }
             parentStatus = status; paired = status.paired; defaults.set(paired, forKey: pairingKey)
+            synchronizeLiveSound()
             reconcileMonitoringControl(status)
             // Only a successful server response renews the local warning. A failed
             // or suspended request leaves the previous OS notification untouched.
@@ -907,6 +981,7 @@ import UIKit
         let identityKey = pairingKey + "|identity"
         let previous = defaults.string(forKey: identityKey)
         if (!status.paired && paired) || (previous != nil && status.pairingID != nil && previous != status.pairingID) {
+            clearLiveSound()
             stop(); pendingHeartbeats.removeAll(); timeline = nil; timelineError = nil
             engine = CrySessionManager(); configuration = engine.snapshot.configuration; persist()
             settingsDirty = false; defaults.set(false, forKey: "settingsDirty")
@@ -1045,6 +1120,7 @@ import UIKit
     func removePairing(deleteDevice: Bool) async {
         guard !managingDevice else { return }
         managingDevice = true
+        clearLiveSound()
         defer { managingDevice = false }
         cancelCalibration(); stop()
         environmentRevision += 1

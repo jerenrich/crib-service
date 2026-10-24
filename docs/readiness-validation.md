@@ -4,6 +4,12 @@ The readiness release is deployed to the configured backend and installed on bot
 
 Record device/OS versions, build and Worker revision, timestamps, Focus settings and observed outcomes. Use a dedicated test pair for destructive checks. Never erase the family's active pairing as a test without the user's explicit intent.
 
+## Live sound integration — 24 October 2026
+
+The shared live sound chart is integrated on top of `c0d652b`, retaining the separate server/local warning preferences, Keep screen awake, battery readiness, monitoring controls, audio-route recovery confirmation, transient-error retries, and late warning recovery. Existing unit and UI tests are retained. Live readings are display data: they cannot confirm a monitoring command or arm/renew connection-warning deadlines. Unpairing and device deletion still succeed if the live relay is unavailable; D1 revocation remains authoritative and active sockets recheck their pairing.
+
+Validation passed 96 Foundation core tests, 100 Worker/D1 integration tests, TypeScript source/test checks, 182 iOS unit tests, and all six simulator UI tests (shared chart, onboarding/settings persistence, monitoring failure, readiness/deletion confirmation, warning/screen preferences, and timeline). The combined unsigned iPhone/Watch device build and Worker deployment dry run passed. Simulator UI execution requires ad hoc signing (`CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual`); an unsigned app cannot access Keychain and produces an unrelated onboarding alert. This integration performs no backend deployment, physical-device installation, or real notification test. Physical live-chart, locked-nursery and mixed-network checks remain as described in the developer guide.
+
 ## Separate warning settings — 24 October 2026
 
 The current source separates server connection alerts (on by default for new registrations, preserving existing preferences) from the optional local overdue-check warning (off by default, including upgrades). The local preference controls both Parent and Watch and clears legacy deadlines unless explicitly enabled. Keep screen awake is a separate, persisted Parent-only option, off by default. Manual locking can still pause checks. These app changes have not been installed on physical devices and require no backend deployment or migration.

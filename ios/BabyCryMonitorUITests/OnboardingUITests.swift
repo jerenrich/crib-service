@@ -1,5 +1,28 @@
 import XCTest
 final class OnboardingUITests: XCTestCase {
+    @MainActor func testBothModesUseSameLiveSoundChart() {
+        let app = XCUIApplication()
+        var parentValue: String?
+        var parentSize: CGSize?
+        for listener in [false, true] {
+            app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound"]
+            if listener { app.launchArguments.append("--uitesting-listener") }
+            app.launch()
+            let chart = app.descendants(matching: .any)["soundLevelChart"].firstMatch
+            XCTAssertTrue(chart.waitForExistence(timeout: 5))
+            let value = chart.value as? String
+            XCTAssertTrue(value?.contains("Trigger -45 dBFS") == true)
+            XCTAssertFalse(value?.contains("Inactive") == true)
+            if listener {
+                XCTAssertEqual(value, parentValue)
+                XCTAssertEqual(chart.frame.size, parentSize)
+            } else { parentValue = value; parentSize = chart.frame.size }
+            let image = XCTAttachment(screenshot: app.screenshot())
+            image.name = listener ? "Nursery shared sound chart" : "Parent shared sound chart"
+            image.lifetime = .keepAlways; add(image)
+            app.terminate()
+        }
+    }
     @MainActor func testParentWarningAndScreenPreferencesDefaultOffAndPersist() {
         continueAfterFailure = false
         let app = XCUIApplication()

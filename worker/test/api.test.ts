@@ -8,6 +8,7 @@ import {encryptToken,decryptToken} from '../src/security';
 import {flushPending} from '../src/alerts';
 import {eventReference,recordDiagnostic} from '../src/diagnostics';
 import {flushConnections} from '../src/connections';
+import {soundFrame} from '../src/live-sound';
 
 let testEnv:Env;
 const secret=btoa('0123456789abcdef0123456789abcdef');
@@ -990,6 +991,102 @@ describe('alert delivery regressions',()=>{
   const delayed={...alert(listener),createdAt:new Date(created).toISOString(),cryStartedAt:new Date(created-300000).toISOString()};
   expect(await (await call('listener/event',listener,delayed)).json()).toEqual({status:'acknowledged'});
   expect(pushRequests).toHaveLength(0);
+ });
+});
+
+describe('live sound relay',()=>{
+ const sockets:WebSocket[]=[];
+ const frame=()=>({type:'levels' as const,sampledAt:Date.now()/1000,levels:Array.from({length:32},(_,i)=>-80+i),threshold:-45,state:'quiet' as const,alertDuration:30});
+ class Reader {
+  private queued:Record<string,unknown>[]=[];
+  private waiting:((v:Record<string,unknown>)=>void)[]=[];
+  constructor(readonly socket:WebSocket){
+   socket.addEventListener('message',event=>{
+    const value=JSON.parse(String(event.data)) as Record<string,unknown>;
+    const next=this.waiting.shift();if(next)next(value);else this.queued.push(value);
+   });
+  }
+  async next():Promise<Record<string,unknown>> {
+   const value=this.queued.shift();if(value)return value;
+   return new Promise((resolve,reject)=>{
+    const timer=setTimeout(()=>reject(new Error('Live sound response timed out.')),2000);
+    this.waiting.push(value=>{clearTimeout(timer);resolve(value);});
+   });
+  }
+ }
+ async function open(d:TestDevice){
+  const response=await worker.fetch(new Request('https://monitor.test/v1/live-sound',{headers:{upgrade:'websocket',authorization:`Bearer ${d.deviceId}.${d.secret}`}}),testEnv);
+  expect(response.status).toBe(101);
+  const socket=response.webSocket!;sockets.push(socket);
+  const reader=new Reader(socket);socket.accept();
+  expect(await reader.next()).toEqual({type:'ready'});
+  return reader;
+ }
+ afterEach(()=>{for(const socket of sockets.splice(0))socket.close(1000);});
+ it('requires an authenticated pairing and a WebSocket upgrade',async()=>{
+  const outsider=device('parent');await register(outsider);
+  expect((await call('live-sound',undefined,undefined,'GET')).status).toBe(401);
+  expect((await call('live-sound',outsider,undefined,'GET')).status).toBe(426);
+  expect((await worker.fetch(new Request('https://monitor.test/v1/live-sound',{headers:{upgrade:'websocket',authorization:`Bearer ${outsider.deviceId}.${outsider.secret}`}}),testEnv)).status).toBe(409);
+ });
+ it('relays the exact nursery chart only to its paired Parent and signals viewing demand',async()=>{
+  const a=await paired(),b=await paired();
+  const listener=await open(a.listener);
+  expect(await listener.next()).toEqual({type:'viewing',active:false});
+  const parent=await open(a.parent),other=await open(b.parent);
+  expect(await listener.next()).toEqual({type:'viewing',active:true});
+  const value=frame();listener.socket.send(JSON.stringify(value));
+  expect(await parent.next()).toEqual(value);
+  other.socket.send(JSON.stringify({type:'ping'}));
+  expect(await other.next()).toEqual({type:'pong'});
+  // Numeric sound is not added to heartbeat/history or diagnostic storage.
+  expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM heartbeats').first('n')).toBe(0);
+  const rows=await env.DB.prepare('SELECT * FROM diagnostics').all();
+  expect(JSON.stringify(rows.results)).not.toContain('levels');
+  parent.socket.close(1000);
+  expect(await listener.next()).toEqual({type:'viewing',active:false});
+ });
+ it.each([false,true])('closes an existing stream immediately on removal (delete=%s)',async(removeDevice)=>{
+  const pair=await paired();const listener=await open(pair.listener);
+  await listener.next();const parent=await open(pair.parent);await listener.next();
+  const closed=new Promise<number>(resolve=>parent.socket.addEventListener('close',event=>resolve(event.code)));
+  expect((await call(removeDevice?'device/delete':'pairing/remove',pair.parent)).status).toBe(200);
+  expect(await closed).toBe(1008);
+ });
+ it('rejects Parent attempts to publish sound',async()=>{
+  const pair=await paired();const parent=await open(pair.parent);
+  const closed=new Promise<number>(resolve=>parent.socket.addEventListener('close',event=>resolve(event.code)));
+  parent.socket.send(JSON.stringify(frame()));expect(await closed).toBe(1008);
+ });
+ it.each([false,true])('preserves device removal when the live relay is unavailable (delete=%s)',async(removeDevice)=>{
+  const pair=await paired();
+  vi.spyOn(testEnv.LIVE_SOUND,'get').mockImplementation(()=>{throw new Error('Relay unavailable');});
+  expect((await call(removeDevice?'device/delete':'pairing/remove',pair.parent)).status).toBe(200);
+  expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM pairs').first('n')).toBe(0);
+  expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM devices WHERE id=?').bind(pair.parent.deviceId).first('n')).toBe(removeDevice?0:1);
+ });
+ it('allows a keepalive alongside a frame without treating it as a burst',async()=>{
+  const pair=await paired();const listener=await open(pair.listener);await listener.next();
+  const parent=await open(pair.parent);await listener.next();
+  const value=frame();listener.socket.send(JSON.stringify(value));
+  listener.socket.send(JSON.stringify({type:'ping'}));
+  expect(await parent.next()).toEqual(value);
+  expect(await listener.next()).toEqual({type:'pong'});
+ });
+ it('carries Parent freshness challenges through the Listener without changing chart values',async()=>{
+  const pair=await paired();const listener=await open(pair.listener);await listener.next();
+  const parent=await open(pair.parent);await listener.next();
+  const requestID=crypto.randomUUID();parent.socket.send(JSON.stringify({type:'ping',requestID}));
+  expect(await listener.next()).toEqual({type:'viewing',active:true,requestID});
+  expect(await parent.next()).toEqual({type:'pong'});
+  const value={...frame(),requestID};listener.socket.send(JSON.stringify(value));
+  expect(await parent.next()).toEqual(value);
+ });
+ it('rejects recordings, extra fields, invalid scales, and oversized windows',()=>{
+  expect(soundFrame(frame()).levels).toHaveLength(32);
+  for(const value of [{...frame(),audio:'recording'},{...frame(),levels:[0]},
+   {...frame(),levels:Array(32).fill(-101)},{...frame(),levels:Array(32).fill(NaN)},
+   {...frame(),threshold:-90},{...frame(),episodeStartedAt:Date.now()/1000+100}])expect(()=>soundFrame(value)).toThrow();
  });
 });
 

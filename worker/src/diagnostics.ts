@@ -8,7 +8,8 @@ const routes = {
  'POST /v1/monitoring':'monitoring', 'POST /v1/monitoring/complete':'monitoring_complete',
  'POST /v1/settings':'settings', 'POST /v1/alert/acknowledge':'acknowledge',
  'POST /v1/pairing/remove':'unpair','POST /v1/device/delete':'delete_device',
- 'POST /v1/connection-alerts':'connection_preferences','POST /v1/test-push':'test_push'
+ 'POST /v1/connection-alerts':'connection_preferences','POST /v1/test-push':'test_push',
+ 'GET /v1/live-sound':'live_sound'
 } as const;
 export type Operation = typeof routes[keyof typeof routes] | 'unknown_route' | 'dispatch' | 'maintenance';
 export type Stage = 'validation' | 'rate_limit' | 'authentication' | 'handler' | 'claim' | 'push' | 'storage' | 'cleanup';

@@ -20,8 +20,8 @@ Crib Service is designed to wake Mom or Dad with an **Apple Watch alert when the
 - **Your timing, your settings.** Adjust the sound threshold, how long to wait, and how much quiet resets the timer.
 - **A check before bed.** Guided setup helps you configure Watch notifications and send a real test alert.
 - **Control from either iPhone.** Start or stop from Baby monitor or Parent Mode. Parent Mode confirms the nursery microphone state and shows a prominent warning if a request fails or cannot be verified. Remote start may require reopening the nursery app.
-- **Nursery status at a glance.** Check monitoring, battery, and connection status from the Parent phone or Watch.
-- **Private audio.** Sound is processed on the nursery iPhone. Audio is never recorded or uploaded. No accounts, ads, or analytics SDKs.
+- **Nursery status at a glance.** Parent shows the same live sound-level chart as the nursery iPhone, with a short network delay. Check monitoring, battery, and connection status from the Parent phone or Watch.
+- **Private audio.** Sound is processed on the nursery iPhone. Audio is never recorded or uploaded. Numeric levels are relayed for the live chart without being saved by the connection service. No accounts, ads, or analytics SDKs.
 
 ### What you need
 

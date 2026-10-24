@@ -32,3 +32,11 @@ class_name = "AlertReminders"
 [[migrations]]
 tag = "v1-alert-reminders"
 new_sqlite_classes = ["AlertReminders"]
+
+[[durable_objects.bindings]]
+name = "LIVE_SOUND"
+class_name = "LiveSound"
+
+[[migrations]]
+tag = "v2-live-sound"
+new_sqlite_classes = ["LiveSound"]

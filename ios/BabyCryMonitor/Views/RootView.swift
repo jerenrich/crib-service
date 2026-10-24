@@ -29,8 +29,9 @@ struct RootView: View {
                 UIApplication.shared.isIdleTimerDisabled = keepAwake
             }
             .onDisappear { UIApplication.shared.isIdleTimerDisabled = false }
-            .task { await model.foreground() }
+            .task { model.setAppActive(phase == .active); await model.foreground() }
             .onChange(of: phase) { _, value in
+                model.setAppActive(value == .active)
                 if value == .active { Task { await model.foreground() } }
                 else if value == .background { model.log.record("background") }
             }
@@ -45,7 +46,7 @@ struct OnboardingView: View {
             Text("Get an alert when loud sound continues beyond the time you choose. Give settling a moment, and stay informed.").foregroundStyle(Palette.muted)
             Panel {
                 Label("Private by design", systemImage: "lock.shield").font(.headline)
-                Text("Audio never leaves the Listener iPhone. Only episode timestamps and monitoring status are shared.").font(.subheadline).foregroundStyle(Palette.muted)
+                Text("Audio never leaves the Listener iPhone. Sound-level readings are shared for the live chart, alongside episode timestamps and monitoring status.").font(.subheadline).foregroundStyle(Palette.muted)
             }
             Text("Crib Service detects sound only.").font(.headline)
             Text("It cannot detect breathing problems, movement problems, silent distress, medical emergencies, or unsafe sleep conditions.\n\nDo not rely on this app as a substitute for appropriate adult supervision or a medical monitoring device.").font(.subheadline).foregroundStyle(Palette.muted)

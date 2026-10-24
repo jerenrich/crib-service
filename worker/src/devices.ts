@@ -1,5 +1,6 @@
 import {APIError, defaultConfiguration, requireRole, type Device, type Env} from './types';
 import {constantTimeEqual, encryptToken, rateLimit, sha256, uuid} from './security';
+import {revokeLiveSound} from './live-sound';
 export async function register(env:Env,value:Record<string,unknown>,ip:string) {
  await rateLimit(env,'register',ip,10,600);
  const id=uuid(value.deviceId);const {role,secret}=value;
@@ -51,6 +52,12 @@ export async function removeDeviceData(env:Env,device:Device,deleteDevice=false)
   env.DB.prepare('DELETE FROM pairs WHERE parent_id=? OR listener_id=?').bind(parent,listener),
   ...(deleteDevice?[env.DB.prepare('DELETE FROM devices WHERE id=?').bind(device.id)]:[])
  ]);
+ if(pair){
+  try{await revokeLiveSound(env,pair);}catch{
+   // Removal already committed in D1. A display-channel outage must not turn
+   // successful unpairing/deletion into a failure; sockets recheck the pairing.
+  }
+ }
  return {ok:true};
 }
 export async function saveWatchPushToken(env:Env,device:Device,value:Record<string,unknown>) {

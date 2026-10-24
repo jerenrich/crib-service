@@ -9,6 +9,21 @@ struct ParentView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
             HStack { Caption(text: "Parent Mode"); Spacer(); StatusPill(text: model.nurseryConnection, active: model.parentOnline) }
+            Panel {
+                Caption(text: "Current state")
+                Text(currentState).font(.system(size: 40, weight: .medium, design: .rounded))
+                    .foregroundStyle(soundLive ? (model.remoteSound.frame?.state == .crying ? Palette.amber : Palette.mint) : Palette.muted)
+                if soundLive, let frame = model.remoteSound.frame, let elapsed = frame.episodeDuration {
+                    Text("\(durationText(elapsed)) / \(durationText(frame.alertDuration))")
+                        .font(.system(.title, design: .monospaced)).contentTransition(.numericText())
+                    ProgressView(value: min(1, elapsed / frame.alertDuration)).tint(Palette.amber)
+                }
+                SoundLevelChart(levels: model.remoteSound.frame?.levels ?? Array(repeating: -100, count: SoundLevelFrame.barCount),
+                    trigger: model.remoteSound.frame?.threshold ?? model.parentStatus?.listenerConfiguration?.absoluteThreshold ?? model.threshold,
+                    currentLevel: model.remoteSound.frame?.levels.last ?? -100, monitoring: soundLive)
+                Caption(text: "Sound level · Processed on the nursery iPhone")
+                Text(soundStatus).font(.footnote).foregroundStyle(soundLive ? Palette.muted : Palette.amber)
+            }
             PrimaryButton(title: "Ready for tonight?") { readiness = true }
             if model.paired {
                 Panel {
@@ -86,7 +101,8 @@ struct ParentView: View {
                 Text("Use Ready for tonight? → Guided overnight setup to check Sleep Focus and test a wrist alert before sleeping.").font(.footnote).foregroundStyle(Palette.muted)
             }
             Panel { Caption(text: "Connection"); Text(model.deliveryStatus).font(.subheadline).foregroundStyle(Palette.muted); Text(model.notifications.status).font(.subheadline).foregroundStyle(Palette.muted) }
-        }.onAppear { showMonitoringError = model.monitoringControlError != nil }
+        }.onAppear { model.setParentSoundVisible(true); showMonitoringError = model.monitoringControlError != nil }
+            .onDisappear { model.setParentSoundVisible(false) }
             .onChange(of: model.monitoringControlError) { _, failure in
                 showMonitoringError = failure != nil
             }
@@ -101,6 +117,18 @@ struct ParentView: View {
                         .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { overnightSetup = false } } }
                 }.tint(Palette.mint)
             }
+    }
+    private var soundLive: Bool { model.remoteSound.isLive(at: model.now) }
+    private var currentState: String {
+        guard soundLive, let frame = model.remoteSound.frame else { return babyState }
+        return switch frame.state { case .crying: "Crying-like sound"; case .possibleCry: "Sound detected"; case .quiet: "Quiet" }
+    }
+    private var soundStatus: String {
+        if !model.paired { return "Pair a Listener to see live sound levels." }
+        if soundLive { return "Live · Same readings as the nursery chart, with a short network delay." }
+        if model.remoteSound.frame != nil { return "Live sound updates paused · Chart shows the last received readings." }
+        if !model.connectivity.available { return "Live sound unavailable · Check this iPhone’s internet connection." }
+        return model.liveSoundConnected ? "Waiting for live sound · Start monitoring on the nursery iPhone." : "Connecting to live sound… Both iPhones need internet access."
     }
     private var babyState: String {
         guard model.parentOnline else { return model.nurseryConnection }

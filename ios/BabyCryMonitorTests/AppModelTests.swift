@@ -52,6 +52,15 @@ final class AppModelTests: XCTestCase {
         var available = true
         var checked = true
     }
+    @MainActor final class LiveSound: LiveSoundStreaming {
+        var onFrame: ((SoundLevelFrame) -> Void)?
+        var onConnectionChange: ((Bool) -> Void)?
+        var connectedDevice: UUID?
+        var frames: [SoundLevelFrame] = []
+        func connect(baseURL: URL, credential: DeviceCredential) { connectedDevice = credential.deviceId }
+        func disconnect() { connectedDevice = nil; onConnectionChange?(false) }
+        func publish(_ frame: SoundLevelFrame) { frames.append(frame) }
+    }
     @MainActor final class Notifications: NotificationProviding {
         var status = "Test notifications"
         var onToken: ((String) -> Void)?
@@ -168,6 +177,7 @@ final class AppModelTests: XCTestCase {
     @MainActor final class Fixture {
         let model: AppModel
         let audio = Audio()
+        let liveSound = LiveSound()
         let connectivity = Connectivity()
         let notifications = Notifications()
         let backend: Backend
@@ -203,7 +213,7 @@ final class AppModelTests: XCTestCase {
             let time = Time(); self.time = time
             let log = DiagnosticLog(directory: directory)
             for event in logEvents { log.record(event) }
-            model = AppModel(defaults: defaults, metadataStore: store, log: log, audio: audio, connectivity: connectivity,
+            model = AppModel(defaults: defaults, metadataStore: store, log: log, audio: audio, liveSound: liveSound, connectivity: connectivity,
                              notifications: notifications, keychain: Credentials(listener: listener, parent: parent),
                              makeClient: { _, _ in backend }, currentTime: { time.now }, heartbeatJitter: heartbeatJitter, automaticallyStart: automaticallyStart)
         }
@@ -211,6 +221,64 @@ final class AppModelTests: XCTestCase {
             UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite)
             try? FileManager.default.removeItem(at: directory)
         }
+    }
+    @MainActor func testLiveSoundPublishesExactNurseryWindowAndStopsWithMicrophone() async throws {
+        let fixture = try Fixture()
+        await fixture.model.start()
+        XCTAssertEqual(fixture.liveSound.connectedDevice, fixture.listener.deviceId)
+        for i in 0..<40 {
+            fixture.time.now = fixture.time.now.addingTimeInterval(0.25)
+            fixture.audio.emit(AudioLevelSample(timestamp: fixture.time.now, dbFS: -80 + Double(i)))
+        }
+        for _ in 0..<100 { await Task.yield() }
+        let frame = try XCTUnwrap(fixture.liveSound.frames.last)
+        XCTAssertEqual(frame.levels, fixture.model.meter)
+        XCTAssertEqual(frame.levels, (8..<40).map { -80 + Double($0) })
+        XCTAssertEqual(frame.threshold, fixture.model.threshold)
+        XCTAssertEqual(frame.state, fixture.model.state)
+        XCTAssertTrue(frame.isValid)
+        fixture.model.stop()
+        XCTAssertNil(fixture.liveSound.connectedDevice)
+    }
+    @MainActor func testParentSoundSubscriptionRequiresVisibleActiveScreenAndClearsOnUnpairing() async throws {
+        let fixture = try Fixture()
+        fixture.model.selectRole(.parent)
+        await fixture.model.refreshParent()
+        XCTAssertNil(fixture.liveSound.connectedDevice)
+        fixture.model.setParentSoundVisible(true)
+        XCTAssertEqual(fixture.liveSound.connectedDevice, fixture.parent.deviceId)
+        let frame = SoundLevelFrame(sampledAt: 100, levels: Array(repeating: -40, count: 32),
+                                   threshold: -45, state: .quiet, alertDuration: 30)
+        fixture.liveSound.onFrame?(frame)
+        XCTAssertTrue(fixture.model.remoteSound.isLive(at: fixture.time.now))
+        fixture.model.setAppActive(false)
+        XCTAssertNil(fixture.liveSound.connectedDevice)
+        XCTAssertFalse(fixture.model.remoteSound.isLive(at: fixture.time.now))
+        fixture.model.setAppActive(true)
+        XCTAssertEqual(fixture.liveSound.connectedDevice, fixture.parent.deviceId)
+        fixture.model.setParentSoundVisible(false)
+        XCTAssertNil(fixture.liveSound.connectedDevice)
+        fixture.model.setParentSoundVisible(true)
+        await fixture.model.removePairing(deleteDevice: false)
+        XCTAssertNil(fixture.liveSound.connectedDevice)
+        XCTAssertNil(fixture.model.remoteSound.frame)
+    }
+    @MainActor func testLiveSoundCannotConfirmMonitoringOrArmConnectionWarnings() async throws {
+        let fixture = try Fixture(localWarnings: true)
+        fixture.model.selectRole(.parent)
+        await fixture.model.refreshParent()
+        fixture.model.setParentSoundVisible(true)
+        await fixture.model.requestMonitoring(true)
+        let pending = try XCTUnwrap(fixture.model.pendingMonitoringCommand)
+        fixture.liveSound.onFrame?(SoundLevelFrame(sampledAt: 100, levels: Array(repeating: -40, count: 32),
+            threshold: -45, state: .crying, episodeStartedAt: 95, alertDuration: 30))
+        XCTAssertTrue(fixture.model.remoteSound.isLive(at: fixture.time.now))
+        XCTAssertEqual(fixture.model.pendingMonitoringCommand?.id, pending.id)
+        XCTAssertFalse(fixture.model.parentOnline)
+        XCTAssertNil(fixture.model.parentConnectionDeadline)
+        fixture.liveSound.onConnectionChange?(false)
+        XCTAssertEqual(fixture.model.pendingMonitoringCommand?.id, pending.id)
+        XCTAssertNil(fixture.model.monitoringControlError)
     }
     @MainActor func testParentRequestRequiresMicrophoneConfirmationAndTimesOutProminently() async throws {
         let fixture = try Fixture(); fixture.model.selectRole(.parent)

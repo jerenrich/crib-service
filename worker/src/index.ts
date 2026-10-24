@@ -1,6 +1,8 @@
 import {requestMonitoring,completeMonitoring} from './monitoring';
 import {timeline} from './timeline';
 export {AlertReminders} from './reminders';
+export {LiveSound} from './live-sound';
+import {openLiveSound} from './live-sound';
 import {APIError,type Env} from './types';
 import {body,rateLimit} from './security';
 import {authenticate,register,savePushToken,saveWatchPushToken,removeDeviceData,pairFor} from './devices';
@@ -57,6 +59,7 @@ export default {
      case 'POST /v1/listener/event':result=await receiveAlert(env,device,await body(request),requestId);break;
      case 'GET /v1/timeline':result=await timeline(env,device);break;
      case 'GET /v1/listener/status':result=await listenerStatus(env,device);break;
+     case 'GET /v1/live-sound':return await openLiveSound(env,device,request);
      case 'POST /v1/monitoring':result=await requestMonitoring(env,device,await body(request));break;
      case 'POST /v1/monitoring/complete':result=await completeMonitoring(env,device,await body(request));break;
      case 'POST /v1/settings':result=await saveSettings(env,device,await body(request));break;
