@@ -194,6 +194,14 @@ final class OnboardingUITests: XCTestCase {
             let image = XCTAttachment(screenshot: app.screenshot())
             image.name = listener ? "Nursery shared sound chart" : "Parent shared sound chart"
             image.lifetime = .keepAlways; add(image)
+            if !listener {
+                app.tabBars.buttons["Activity"].tap()
+                XCTAssertTrue(app.navigationBars["Timeline"].waitForExistence(timeout: 5))
+                app.tabBars.buttons["Monitor"].tap()
+                XCTAssertEqual(chart.value as? String, parentValue)
+                XCTAssertTrue(app.staticTexts["Live · From Listener"].exists)
+                XCTAssertFalse(app.staticTexts["Waiting for live readings"].exists)
+            }
             app.tabBars.buttons["Devices"].tap()
             XCTAssertTrue(app.navigationBars["Devices"].waitForExistence(timeout: 5))
             XCTAssertTrue(app.descendants(matching: .any)["pairedDevice_listener"].exists)

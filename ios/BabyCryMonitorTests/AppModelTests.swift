@@ -287,25 +287,35 @@ final class AppModelTests: XCTestCase {
         fixture.model.stop()
         XCTAssertNil(fixture.liveSound.connectedDevice)
     }
-    @MainActor func testParentSoundSubscriptionRequiresVisibleActiveScreenAndClearsOnUnpairing() async throws {
+    @MainActor func testParentSoundStaysCurrentWithoutMonitorVisibilityAndClearsOnUnpairing() async throws {
         let fixture = try Fixture()
         fixture.model.selectRole(.parent)
         await fixture.model.refreshParent()
-        XCTAssertNil(fixture.liveSound.connectedDevice)
-        fixture.model.setParentSoundVisible(true)
         XCTAssertEqual(fixture.liveSound.connectedDevice, fixture.parent.deviceId)
         let frame = SoundLevelFrame(sampledAt: 100, levels: Array(repeating: -40, count: 32),
                                    threshold: -45, state: .quiet, alertDuration: 30)
         fixture.liveSound.onFrame?(frame)
         XCTAssertTrue(fixture.model.remoteSound.isLive(at: fixture.time.now))
+        // Time spent in Activity must still replace the chart with current data.
+        fixture.time.now = fixture.time.now.addingTimeInterval(10)
+        XCTAssertFalse(fixture.model.remoteSound.isLive(at: fixture.time.now))
+        var latest = frame
+        latest.sampledAt += 10; latest.levels = Array(repeating: -30, count: 32)
+        fixture.liveSound.onFrame?(latest)
+        XCTAssertEqual(fixture.model.remoteSound.frame, latest)
+        XCTAssertTrue(fixture.model.remoteSound.isLive(at: fixture.time.now))
         fixture.model.setAppActive(false)
         XCTAssertNil(fixture.liveSound.connectedDevice)
         XCTAssertFalse(fixture.model.remoteSound.isLive(at: fixture.time.now))
+        latest.sampledAt += 1
+        fixture.liveSound.onFrame?(latest)
+        XCTAssertFalse(fixture.model.remoteSound.isLive(at: fixture.time.now))
         fixture.model.setAppActive(true)
         XCTAssertEqual(fixture.liveSound.connectedDevice, fixture.parent.deviceId)
-        fixture.model.setParentSoundVisible(false)
-        XCTAssertNil(fixture.liveSound.connectedDevice)
-        fixture.model.setParentSoundVisible(true)
+        XCTAssertFalse(fixture.model.remoteSound.isLive(at: fixture.time.now))
+        fixture.liveSound.onFrame?(latest)
+        XCTAssertEqual(fixture.model.remoteSound.frame, latest)
+        XCTAssertTrue(fixture.model.remoteSound.isLive(at: fixture.time.now))
         await fixture.model.removePairing(deleteDevice: false)
         XCTAssertNil(fixture.liveSound.connectedDevice)
         XCTAssertNil(fixture.model.remoteSound.frame)
@@ -314,7 +324,6 @@ final class AppModelTests: XCTestCase {
         let fixture = try Fixture(localWarnings: true)
         fixture.model.selectRole(.parent)
         await fixture.model.refreshParent()
-        fixture.model.setParentSoundVisible(true)
         await fixture.model.requestMonitoring(true)
         let pending = try XCTUnwrap(fixture.model.pendingMonitoringCommand)
         fixture.liveSound.onFrame?(SoundLevelFrame(sampledAt: 100, levels: Array(repeating: -40, count: 32),
