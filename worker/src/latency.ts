@@ -3,7 +3,7 @@ export const spans = ['rate_limit_ms','authentication_ms','handler_ms','alert_pr
  'token_decrypt_ms','provider_sign_ms','apns_fetch_ms','apns_body_ms','outcome_storage_ms','reminder_prepare_ms',
  'reminder_schedule_ms','reminder_snapshot_ms','reminder_pair_ms','reminder_control_ms','reminder_latest_ms','reminder_heartbeat_ms','reminder_original_ms','reminder_insert_ms','alarm_lag_ms','generated_to_dispatch_ms',
  'pair_ms','event_lookup_ms','event_insert_ms','event_reload_ms','event_episode_ms','response_read_ms','claim_observe_ms',
- 'alarm_state_ms','alarm_arm_ms','alarm_finalize_ms','schedule_read_ms','schedule_state_ms',
+ 'alarm_state_ms','alarm_arm_ms','alarm_finalize_ms','schedule_read_ms','schedule_state_ms','journal_ms','outcome_queue_ms',
  'maintenance_expiry_ms','maintenance_recovery_ms','maintenance_pending_ms','maintenance_dispatch_ms','maintenance_schedule_ms','maintenance_cleanup_ms','maintenance_connections_ms'] as const;
 export type Span = typeof spans[number];
 export const appleReasons = ['BadCollapseId','BadDeviceToken','BadExpirationDate','BadMessageId','BadPriority','BadTopic',
@@ -13,8 +13,10 @@ export const appleReasons = ['BadCollapseId','BadDeviceToken','BadExpirationDate
  'MethodNotAllowed','ExpiredToken','Unregistered','PayloadTooLarge','TooManyProviderTokenUpdates','TooManyRequests',
  'InternalServerError','ServiceUnavailable','Shutdown','unknown','unreadable'] as const;
 export type AppleReason = typeof appleReasons[number];
-const databaseMetrics=['calls','completed','errors','statements','sql_ms','rows_read','rows_written','attempts','hedges','hedge_wins','unfinished'] as const;
-type DatabaseMetrics=Partial<Record<typeof databaseMetrics[number],number>>;
+const databaseMetrics=['calls','completed','errors','statements','sql_ms','rows_read','rows_written','attempts','retries','hedges','hedge_wins','unfinished'] as const;
+interface StatementMetrics {index:number;sql_ms?:number;attempts?:number;colo?:string;region?:string;primary?:boolean}
+type DatabaseMetrics=Partial<Record<typeof databaseMetrics[number],number>> & {statement_meta?:StatementMetrics[]};
+const regions=['WNAM','ENAM','WEUR','EEUR','APAC','OC'];
 export interface TimingDetails {
  spans?:Partial<Record<Span,number>>;
  db_stages?:Partial<Record<Span,DatabaseMetrics>>;
@@ -31,6 +33,7 @@ export interface TimingDetails {
  observed_attempts?:number; next_attempt_at_ms?:number;
  preparation_started_at_ms?:number; preparation_finished_at_ms?:number;
  journal_failures_before_write?:number;
+ durable_outcome?:boolean;outcome_recovery?:boolean;outcome_queue_age_ms?:number;
 }
 export class Latency {
  readonly details:TimingDetails={spans:{}};
@@ -64,14 +67,27 @@ export class Latency {
  }
  private databaseCompleted<T>(name:Span,results:D1Result<T>[]) {
   this.metric(name,'completed');this.metric(name,'statements',results.length);
-  for(const result of results){
+  for(const [index,result] of results.entries()){
    // Missing/malformed optional metrics must never turn a successful DB call into a failure.
-   const meta=result.meta as (Partial<D1Meta> & {total_attempts?:number})|undefined;
+   const meta=result.meta as (Partial<D1Meta> & {total_attempts?:number;served_by_colo?:string;served_by_region?:string;served_by_primary?:boolean;timings?:{sql_duration_ms?:number}})|undefined;
    const add=(aggregate:'db_sql_ms'|'db_rows_read'|'db_rows_written'|'db_attempts',key:'sql_ms'|'rows_read'|'rows_written'|'attempts',n:unknown)=>{
     if(typeof n==='number'&&Number.isFinite(n)&&n>=0){this.details[aggregate]=(this.details[aggregate]??0)+n;this.metric(name,key,n);}
    };
    add('db_sql_ms','sql_ms',meta?.duration);add('db_rows_read','rows_read',meta?.rows_read);add('db_rows_written','rows_written',meta?.rows_written);
    add('db_attempts','attempts',meta?.total_attempts);
+   if(typeof meta?.total_attempts==='number'&&Number.isFinite(meta.total_attempts)&&meta.total_attempts>=1)this.metric(name,'retries',Math.max(0,meta.total_attempts-1));
+   const statement:StatementMetrics={index};
+   if(typeof meta?.duration==='number'&&Number.isFinite(meta.duration)&&meta.duration>=0)statement.sql_ms=meta.duration;
+   if(typeof meta?.total_attempts==='number'&&Number.isSafeInteger(meta.total_attempts)&&meta.total_attempts>=1)statement.attempts=meta.total_attempts;
+   if(typeof meta?.served_by_colo==='string'&&/^[A-Z]{3}$/.test(meta.served_by_colo))statement.colo=meta.served_by_colo;
+   if(regions.includes(meta?.served_by_region??''))statement.region=meta!.served_by_region;
+   if(typeof meta?.served_by_primary==='boolean')statement.primary=meta.served_by_primary;
+   // Only add this object when location/retry metadata exists. Old providers and
+   // malformed metrics remain optional; never retain arbitrary metadata keys.
+   if(Object.keys(statement).length>1){
+    const stage=this.details.db_stages![name]!;const statements=stage.statement_meta??=[];
+    if(statements.length<16)statements.push(statement);
+   }
   }
  }
  // Only SELECT work belongs here. D1 cannot cancel a losing call: never use this
@@ -115,17 +131,32 @@ export function safeTimingDetails(value:TimingDetails|undefined):string|null {
  const times:Record<string,number>={};
  for(const name of spans){const n=value.spans?.[name];if(number(n))times[name]=Math.round(n!*1000)/1000;}
  if(Object.keys(times).length)safe.spans=times;
- const stages:Record<string,Record<string,number>>={};
+ const stages:Record<string,Record<string,unknown>>={};
  for(const name of spans){
   const source=value.db_stages?.[name];if(!source)continue;
-  const metrics:Record<string,number>={};
+  const metrics:Record<string,unknown>={};
   for(const key of databaseMetrics){const n=source[key];if(number(n))metrics[key]=Math.round(n!*1000)/1000;}
+  if(Array.isArray(source.statement_meta)){
+   const statements:StatementMetrics[]=[];
+   for(const item of source.statement_meta.slice(0,16)){
+    if(!item||!Number.isInteger(item.index)||item.index<0||item.index>=1000)continue;
+    const safe:StatementMetrics={index:item.index};
+    if(number(item.sql_ms))safe.sql_ms=Math.round(item.sql_ms!*1000)/1000;
+    if(Number.isSafeInteger(item.attempts)&&item.attempts!>=1&&item.attempts!<=1000)safe.attempts=item.attempts;
+    if(typeof item.colo==='string'&&/^[A-Z]{3}$/.test(item.colo))safe.colo=item.colo;
+    if(regions.includes(item.region??''))safe.region=item.region;
+    if(typeof item.primary==='boolean')safe.primary=item.primary;
+    statements.push(safe);
+   }
+   if(statements.length)metrics.statement_meta=statements;
+  }
   if(Object.keys(metrics).length)stages[name]=metrics;
  }
  if(Object.keys(stages).length)safe.db_stages=stages;
- for(const name of ['db_calls','db_sql_ms','db_rows_read','db_rows_written','db_attempts','provider_token_age_s','apns_started_at_ms','apns_response_at_ms','observed_attempts','next_attempt_at_ms','preparation_started_at_ms','preparation_finished_at_ms','journal_failures_before_write'] as const){
+ for(const name of ['db_calls','db_sql_ms','db_rows_read','db_rows_written','db_attempts','provider_token_age_s','apns_started_at_ms','apns_response_at_ms','observed_attempts','next_attempt_at_ms','preparation_started_at_ms','preparation_finished_at_ms','journal_failures_before_write','outcome_queue_age_ms'] as const){
   if(number(value[name]))safe[name]=value[name];
  }
+ for(const name of ['durable_outcome','outcome_recovery'] as const)if(typeof value[name]==='boolean')safe[name]=value[name];
  if(appleReasons.includes(value.apns_reason!))safe.apns_reason=value.apns_reason;
  if(['development','production'].includes(value.apns_environment!))safe.apns_environment=value.apns_environment;
  if(['timeout','network'].includes(value.transport!))safe.transport=value.transport;

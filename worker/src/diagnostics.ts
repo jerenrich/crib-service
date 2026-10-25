@@ -15,7 +15,7 @@ const routes = {
  'POST /v1/connection-alerts':'connection_preferences','POST /v1/test-push':'test_push',
  'GET /v1/live-sound':'live_sound'
 } as const;
-export type Operation = typeof routes[keyof typeof routes] | 'unknown_route' | 'dispatch' | 'dispatch_skip' | 'reminder_prepare' | 'maintenance' | 'reminder_schedule' | 'reminder_alarm' | 'watch_test_dispatch';
+export type Operation = typeof routes[keyof typeof routes] | 'unknown_route' | 'dispatch' | 'dispatch_outcome' | 'dispatch_skip' | 'reminder_prepare' | 'maintenance' | 'reminder_schedule' | 'reminder_alarm' | 'watch_test_dispatch';
 export type Stage = 'validation' | 'rate_limit' | 'authentication' | 'handler' | 'claim' | 'push' | 'storage' | 'cleanup';
 export type Outcome = 'ok' | 'rejected' | 'internal_error' | 'sent' | 'retry' | 'blocked' | 'uncertain' | 'failed'
  | 'expired_event' | 'no_push_token' | 'transport_unknown' | 'invalid_device_token' | 'provider_configuration'

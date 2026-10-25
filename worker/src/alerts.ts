@@ -1,3 +1,4 @@
+import {acceptedDelivery,queueAcceptedDelivery,type AcceptedDelivery} from './accepted-delivery';
 import {stoppedMonitoringSQL} from './monitoring';
 import {scheduleReminders} from './reminders';
 import {Latency} from './latency';
@@ -33,7 +34,8 @@ export async function receiveAlert(env:Env,device:Device,value:Record<string,unk
  });
  // Start durable scheduling independently of push delivery. The minute recovery
  // job repairs an interrupted or failed scheduling request from stored events.
- try {await dispatchEvent(env,record.event_id,requestId,latency);}
+ try {await dispatchEvent(env,record.event_id,requestId,latency,
+  background&&!alert.isTest?{accepted:delivery=>queueAcceptedDelivery(env,delivery)}:{});}
  finally {
   if(!alert.isTest){
    const scheduling=scheduleRemindersSafely(env,pair.parent_id,requestId);
@@ -41,7 +43,8 @@ export async function receiveAlert(env:Env,device:Device,value:Record<string,unk
   }
  }
  const result=await latency.read<{status:string;acknowledged_at:string|null;resolved_at:string|null}>('response_read_ms',env.DB.prepare('SELECT status,acknowledged_at,resolved_at FROM events WHERE event_id=?').bind(record.event_id));
- return {status:result?.acknowledged_at?'acknowledged':result?.resolved_at?'resolved':result?.status??'pending'};
+ return {status:result?.acknowledged_at?'acknowledged':result?.resolved_at?'resolved':
+  result?.status==='sending'&&latency.details.push_outcome==='sent'?'sent':result?.status??'pending'};
 }
 async function scheduleRemindersSafely(env:Env,parentId:string,requestId:string):Promise<void> {
  const started=Date.now(),latency=new Latency();
@@ -51,7 +54,11 @@ async function scheduleRemindersSafely(env:Env,parentId:string,requestId:string)
  }
  catch {await recordDiagnostic(env,{requestId,started,operation:'reminder_schedule',stage:'handler',outcome:'internal_error',details:latency.details});}
 }
-export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.randomUUID(),latency=new Latency()):Promise<void> {
+export interface DispatchOptions {
+ insert?:D1PreparedStatement;
+ accepted?:(delivery:AcceptedDelivery)=>Promise<void>;
+}
+export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.randomUUID(),latency=new Latency(),options:DispatchOptions={}):Promise<void> {
  const now=Date.now();
  let stage:Stage='claim',eventRef:string|undefined,attempt:number|undefined,target:'phone'|'watch'|undefined;
  let pushResult:PushResult|undefined;
@@ -60,7 +67,7 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  // Diagnostic computation is best effort, just like journal writes.
  try { eventRef=latency.eventRef??await eventReference(env,eventId);latency.eventRef=eventRef; } catch { /* No diagnostic identity available. */ }
  // Tombstones also suppress an offline outbox upload after its episode settled.
- const claims=await latency.db<StoredEvent|{token:string|null}>('claim_ms',()=>env.DB.batch<StoredEvent|{token:string|null}>([env.DB.prepare(`UPDATE events SET resolved_at=COALESCE(resolved_at,(SELECT r.resolved_at FROM resolved_episodes r
+ const claims=await latency.db<StoredEvent|{token:string|null}>('claim_ms',()=>env.DB.batch<StoredEvent|{token:string|null}>([...(options.insert?[options.insert]:[]),env.DB.prepare(`UPDATE events SET resolved_at=COALESCE(resolved_at,(SELECT r.resolved_at FROM resolved_episodes r
   JOIN pairs p ON p.parent_id=r.parent_id AND p.listener_id=r.listener_id AND p.created_at=r.pair_created_at
   WHERE r.parent_id=events.parent_id AND r.listener_id=events.listener_id AND r.episode_id=events.episode_id))
   WHERE event_id=? AND COALESCE(json_extract(payload,'$.isTest'),0)=0`).bind(eventId),
@@ -83,7 +90,11 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  // round trip. A losing claimant must still return before using this result.
  env.DB.prepare(`SELECT CASE e.push_target WHEN 'watch' THEN d.watch_push_token ELSE d.push_token END AS token
   FROM events e JOIN devices d ON d.id=e.parent_id WHERE e.event_id=? AND e.status='sending'`).bind(eventId)]));
- const event=claims[2].results[0] as StoredEvent|undefined;
+ const offset=options.insert?1:0;
+ if(options.insert&&!claims[0].meta.changes){
+  latency.details.exit_reason='not_created';await record('claim_skipped',undefined,'dispatch_skip');return;
+ }
+ const event=claims[offset+2].results[0] as StoredEvent|undefined;
  if(!event){
   // Losing a claim is a diagnostic outcome too: retain this caller's preparation
   // spans, especially if cron saw an insert before the alarm's D1 reply arrived.
@@ -104,7 +115,7 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
   await latency.db('outcome_storage_ms',()=>env.DB.prepare("UPDATE events SET status='failed',last_error='expired_event',lease_until=NULL WHERE event_id=?").bind(eventId).run());await record('expired_event');return;
  }
  const column=target==='watch'?'watch_push_token':'push_token';
- const parent=claims[3].results[0] as {token:string|null}|undefined;
+ const parent=claims[offset+3].results[0] as {token:string|null}|undefined;
  if(!parent?.token){
   // A token upload can race with this read. Decide blocked/pending in the same
   // database statement that releases the claim, so either ordering can recover.
@@ -118,6 +129,11 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  const status=result.status==='retry'?'pending':result.status;
  const next=now+Math.min(300000,2000*2**Math.min(event.attempts,8));
  stage='storage';
+ if(result.status==='sent'&&options.accepted){
+  await latency.measure('outcome_queue_ms',()=>options.accepted!(acceptedDelivery(eventId,event.parent_id,event.attempts,next,
+   {requestId,started:now,operation:'dispatch',stage,outcome:'sent',eventRef,attempt,target,httpStatus:result.httpStatus,details:latency.details})));
+  return;
+ }
  if(result.reason==='invalid_device_token'){
   // Atomically invalidate only the rejected token and release the event. A
   // replacement uploaded during APNs dispatch must remain eligible for retry.

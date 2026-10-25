@@ -51,7 +51,9 @@ extension NotificationProviding {
             let center = UNUserNotificationCenter.current()
             let previous = await center.notificationSettings()
             log?.record("notification_sound_permission_before_request", code: previous.soundSetting.rawValue)
-            // Watch notification settings can mirror this authorization. Request sound
+            // Watch notification settings can mirror this authorization. The iOS target
+            // also needs the Time Sensitive entitlement; the Watch entitlement alone
+            // does not enable that setting on the companion. Request sound
             // permission even though our iPhone payloads deliberately omit sound.
             let allowed = try await center.requestAuthorization(options: [.alert, .badge, .sound])
             let settings = await center.notificationSettings()
