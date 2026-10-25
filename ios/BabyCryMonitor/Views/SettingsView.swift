@@ -77,6 +77,13 @@ struct SettingsView: View {
                     if model.role == .parent { Button("Enable notifications") { Task { await model.notifications.register() } } }
                 }
                 if model.role == .parent {
+                    if #available(iOS 26.0, *) {
+                        AlarmTestSection()
+                    } else {
+                        Section("System alarm test") {
+                            Text("Requires iOS 26 or later.").foregroundStyle(.secondary)
+                        }
+                    }
                     Section {
                         LabeledContent("Send every", value: "\(Int(model.watchTestInterval)) \(Int(model.watchTestInterval) == 1 ? "second" : "seconds")")
                         Slider(value: Binding(get: { model.watchTestInterval }, set: { model.setWatchTestInterval($0) }), in: 1...10, step: 1)
