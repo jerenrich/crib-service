@@ -53,6 +53,7 @@ final class OnboardingUITests: XCTestCase {
         for _ in 0..<4 { if timing.isHittable { break }; app.swipeUp() }
         timing.tap()
         XCTAssertTrue(app.navigationBars["Alert timing"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["The timer counts from the start of sustained loud sound, including the initial sound check. Brief noises are filtered out."].exists)
         app.buttons["30 sec"].tap()
         app.buttons["Done"].tap()
         XCTAssertTrue(NSPredicate(format: "label CONTAINS %@", "00:30").evaluate(with: timing) || app.staticTexts["Requested 30 sec · Waiting for nursery confirmation"].exists)
@@ -141,6 +142,91 @@ final class OnboardingUITests: XCTestCase {
         let shot = XCTAttachment(screenshot: app.screenshot()); shot.name = "Short nightly check"; shot.lifetime = .keepAlways; add(shot)
     }
 
+    @MainActor func testLiveStartStaysConsistentAcrossParentScreensAfterChartGap() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound",
+            "--uitesting-listener-started", "--uitesting-standby", "--uitesting-live-once", "--uitesting-setup-complete"]
+        app.launch()
+        let control = app.buttons["nightstandMonitoringControl"]
+        XCTAssertTrue(control.waitForExistence(timeout: 5))
+        XCTAssertEqual(control.label, "Pause Monitoring")
+        app.tabBars.buttons["Devices"].tap()
+        let nursery = app.descendants(matching: .any)["pairedDevice_listener"].firstMatch
+        XCTAssertTrue(nursery.waitForExistence(timeout: 5))
+        XCTAssertTrue(nursery.label.contains("Monitoring"))
+        XCTAssertFalse(nursery.label.contains("Standby"))
+        app.tabBars.buttons["Activity"].tap()
+        XCTAssertTrue(app.staticTexts["Monitoring"].waitForExistence(timeout: 5))
+        app.tabBars.buttons["Monitor"].tap()
+        XCTAssertEqual(control.label, "Pause Monitoring", "An expired chart frame must not restore the old Standby control")
+        let ready = app.buttons["Ready for tonight?"]
+        for _ in 0..<3 { if ready.isHittable { break }; app.swipeUp() }
+        ready.tap()
+        XCTAssertTrue(app.navigationBars["Tonight's check"].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.buttons["Start Monitoring"].exists)
+        XCTAssertFalse(app.descendants(matching: .any)["nurseryMonitoringInstruction"].exists)
+    }
+
+    @MainActor func testLiveReadingsOfferPauseBeforeListenerStatusRefreshes() {
+        let app = XCUIApplication()
+        for status in ["--uitesting-standby", "--uitesting-microphone-off", "--uitesting-listener-stale"] {
+            app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound",
+                "--uitesting-listener-started", status]
+            app.launch()
+            let control = app.buttons["nightstandMonitoringControl"]
+            XCTAssertTrue(control.waitForExistence(timeout: 5))
+            XCTAssertEqual(control.label, "Pause Monitoring")
+            XCTAssertTrue(control.isEnabled)
+            XCTAssertEqual(app.staticTexts["nightstandState"].label, "Quiet")
+            app.terminate()
+        }
+    }
+
+    @MainActor func testParentStartIsDisabledUnlessListenerHasRecentStandbyHeartbeat() {
+        let app = XCUIApplication()
+        for state in ["--uitesting-standby", "--uitesting-microphone-off", "--uitesting-listener-stale"] {
+            app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", state]
+            app.launch()
+            let control = app.buttons["nightstandMonitoringControl"]
+            if state == "--uitesting-standby" {
+                XCTAssertTrue(control.waitForExistence(timeout: 5))
+                XCTAssertEqual(control.label, "Start Monitoring")
+                XCTAssertTrue(control.isEnabled)
+            } else {
+                let instruction = app.descendants(matching: .any)["nurseryMonitoringInstruction"].firstMatch
+                XCTAssertTrue(instruction.waitForExistence(timeout: 5))
+                XCTAssertTrue(instruction.label.contains("Use the nursery iPhone"))
+                XCTAssertTrue(instruction.label.contains("Open Crib Service and tap Start Monitoring."))
+                XCTAssertFalse(control.exists)
+                XCTAssertFalse(app.buttons["nurseryMonitoringInstruction"].exists)
+            }
+            if state == "--uitesting-listener-stale" {
+                XCTAssertTrue(app.buttons["Pause Monitoring"].isEnabled, "Cancelling alerts must remain available")
+            }
+            app.terminate()
+        }
+    }
+
+    @MainActor func testBothModesShowPauseAndListenerPauseKeepsMicrophoneInStandby() {
+        let app = XCUIApplication()
+        for listener in [false, true] {
+            app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound"]
+            if listener { app.launchArguments.append("--uitesting-listener") }
+            app.launch()
+            let control = app.buttons["nightstandMonitoringControl"]
+            XCTAssertTrue(control.waitForExistence(timeout: 5))
+            XCTAssertEqual(control.label, "Pause Monitoring")
+            if listener {
+                control.tap()
+                XCTAssertEqual(app.staticTexts["nightstandState"].label, "Standby")
+                XCTAssertEqual(control.label, "Start Monitoring")
+                XCTAssertTrue(app.staticTexts["Microphone active · Detection paused"].exists)
+                XCTAssertTrue(app.buttons["nightstandStopMicrophone"].exists)
+            }
+            app.terminate()
+        }
+    }
+
     @MainActor func testStandbyShowsActiveMicrophoneAndOffersResumeInBothModes() {
         let app = XCUIApplication()
         for listener in [false, true] {
@@ -153,7 +239,7 @@ final class OnboardingUITests: XCTestCase {
             XCTAssertTrue(app.staticTexts["Microphone active · Detection paused"].exists)
             let chart = app.descendants(matching: .any)["soundLevelChart"].firstMatch
             XCTAssertTrue((chart.value as? String)?.contains("Inactive") == true)
-            let resume = app.buttons["Resume monitoring"]
+            let resume = app.buttons["Start Monitoring"]
             for _ in 0..<3 { if resume.isHittable { break }; app.swipeUp() }
             XCTAssertTrue(resume.isEnabled)
             if listener {
@@ -161,6 +247,11 @@ final class OnboardingUITests: XCTestCase {
                 XCTAssertTrue(stop.exists)
                 for _ in 0..<3 { if stop.isHittable { break }; app.swipeUp() }
                 stop.tap()
+                XCTAssertTrue(app.buttons["Cancel"].waitForExistence(timeout: 3))
+                app.buttons["Cancel"].tap()
+                XCTAssertEqual(state.label, "Standby")
+                stop.tap()
+                app.buttons.matching(identifier: "Stop microphone").firstMatch.tap()
                 XCTAssertEqual(state.label, "Stopped")
             }
             let shot = XCTAttachment(screenshot: app.screenshot())
@@ -257,7 +348,7 @@ final class OnboardingUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-timeline", "--uitesting-monitoring-rejected"]
         app.launch()
-        let start = app.buttons["Start Monitoring"]
+        let start = app.buttons["nightstandMonitoringControl"]
         XCTAssertTrue(start.waitForExistence(timeout: 5))
         let chart = app.descendants(matching: .any)["soundLevelChart"].firstMatch
         let initialChartFrame = chart.frame
@@ -271,23 +362,24 @@ final class OnboardingUITests: XCTestCase {
         screenshot.name = "Parent monitoring failure"; screenshot.lifetime = .keepAlways; add(screenshot)
         warning.buttons["OK"].tap()
         XCTAssertTrue(app.staticTexts["Monitoring not confirmed"].exists)
-        XCTAssertTrue(app.buttons["Pause monitoring"].isEnabled)
+        XCTAssertTrue(app.buttons["Pause Monitoring"].isEnabled)
         XCTAssertEqual(chart.frame.minY, initialChartFrame.minY, accuracy: 1)
         XCTAssertEqual(chart.frame.height, initialChartFrame.height, accuracy: 1)
-        XCTAssertEqual(start.frame.minY, initialControlFrame.minY, accuracy: 1)
+        let instruction = app.descendants(matching: .any)["nurseryMonitoringInstruction"].firstMatch
+        XCTAssertEqual(instruction.frame.midY, initialControlFrame.midY, accuracy: 1)
         XCTAssertEqual(app.tabBars.firstMatch.frame.minY, initialTabFrame.minY, accuracy: 1)
         let details = app.buttons["nightstandDetails"]
         for _ in 0..<4 {
-            if details.isHittable && details.frame.maxY < start.frame.minY { break }
+            if details.isHittable && details.frame.maxY < instruction.frame.minY { break }
             app.scrollViews.firstMatch.swipeUp()
         }
         XCTAssertTrue(details.isHittable)
-        XCTAssertLessThan(details.frame.maxY, start.frame.minY)
+        XCTAssertLessThan(details.frame.maxY, instruction.frame.minY)
         details.tap()
         XCTAssertTrue(app.navigationBars["Monitoring details"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "could not be started or verified")).firstMatch.exists)
         app.buttons["Done"].tap()
-        XCTAssertTrue(app.buttons["Pause monitoring"].isEnabled)
+        XCTAssertTrue(app.buttons["Pause Monitoring"].isEnabled)
         let stableScreen = XCTAttachment(screenshot: app.screenshot())
         stableScreen.name = "Compact monitoring warning"; stableScreen.lifetime = .keepAlways; add(stableScreen)
     }

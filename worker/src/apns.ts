@@ -73,7 +73,12 @@ async function sendNotification(env:Env,encryptedToken:string,id:string,content:
   latency.details.apns_unique_id=response.headers.get('apns-unique-id')??undefined;
  }catch{latency.details.transport=signal.aborted?'timeout':'network';return {status:'uncertain',reason:'transport_unknown'};}
  const httpStatus=response.status;
- if(response.status===200)return {status:'sent',httpStatus};
+ if(response.status===200){
+  // Acceptance is final. Release an unused response stream without letting
+  // cleanup failure/delay change it into an ambiguous send or hold the alarm.
+  try{void response.body?.cancel().catch(()=>{});}catch{/* Cleanup is best effort. */}
+  return {status:'sent',httpStatus};
+ }
  const reason=await latency.measure('apns_body_ms',()=>appleReason(response));
  latency.details.apns_reason=reason;
  if(response.status===429)return {status:'retry',reason:'apns_429',httpStatus};

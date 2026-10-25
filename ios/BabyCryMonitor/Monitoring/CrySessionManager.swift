@@ -34,7 +34,7 @@ public struct CrySessionManager: Sendable {
         let state = detector.consume(sample, configuration: snapshot.configuration)
         snapshot.lastObservedAt = sample.timestamp
         if state == .crying && previous != .crying {
-            snapshot.current = CryEpisode(startedAt: sample.timestamp)
+            snapshot.current = CryEpisode(startedAt: detector.cryStartedAt ?? sample.timestamp)
             if let episode = snapshot.current {
                 appendTimeline(TimelineEvent(id: "cry:\(episode.id.uuidString.lowercased())", kind: "cry_started",
                                              occurredAt: episode.startedAt, episodeID: episode.id.uuidString.lowercased()))

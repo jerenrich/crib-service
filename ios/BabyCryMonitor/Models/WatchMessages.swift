@@ -13,6 +13,9 @@ struct WatchSnapshot: Codable, Equatable, Sendable {
     var statusAvailable = false
     var lastHeartbeat: Date?
     var monitoring = false
+    // Presentation evidence never changes warning deadlines or command confirmation.
+    var monitoringDisplayState: String? = nil
+    var monitoringObservedAt: Date? = nil
     var state: CryState?
     var alertDuration: Double = 5
     var watchPushRegistered = false
@@ -38,9 +41,19 @@ struct WatchSnapshot: Codable, Equatable, Sendable {
         return connectionWarningDeadline
     }
 
+    func nurseryDisplayState(at now: Date) -> String? {
+        guard parentMode, paired, let monitoringDisplayState,
+              let observation = monitoringObservedAt,
+              (-5...150).contains(now.timeIntervalSince(observation)),
+              (-5...45).contains(now.timeIntervalSince(updatedAt)) else { return nil }
+        return monitoringDisplayState
+    }
+
     func nurseryOnline(at now: Date) -> Bool {
-        guard parentMode, paired, monitoring, let lastHeartbeat else { return false }
-        return (-5...150).contains(now.timeIntervalSince(lastHeartbeat))
+        let active = monitoringDisplayState.map { $0 == "Monitoring" } ?? monitoring
+        let observation = monitoringObservedAt ?? lastHeartbeat
+        guard parentMode, paired, active, let observation else { return false }
+        return (-5...150).contains(now.timeIntervalSince(observation))
             && (-5...45).contains(now.timeIntervalSince(updatedAt))
     }
 }

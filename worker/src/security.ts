@@ -1,3 +1,4 @@
+import {Latency,type Span} from './latency';
 import {validateTimelineEvents} from './timeline';
 import {APIError, type Env, type Configuration, type Episode, type Alert, type Heartbeat} from './types';
 export const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -69,9 +70,10 @@ export function rateLimitStatement(env:Env,key:string,window:number,credential?:
  ON CONFLICT(key) DO UPDATE SET attempts=CASE WHEN window=excluded.window THEN attempts+1 ELSE 1 END, window=excluded.window RETURNING attempts`)
   .bind(key,window,...(credential?[credential.id,credential.hash]:[]));
 }
-export async function rateLimit(env:Env, scope:string, identifier:string, limit:number, windowSeconds:number):Promise<void> {
+export async function rateLimit(env:Env, scope:string, identifier:string, limit:number, windowSeconds:number,latency?:Latency,span:Span='device_rate_limit_ms'):Promise<void> {
  const key=await sha256(`${env.PAIRING_PEPPER}|${scope}|${identifier}`);const window=Math.floor(Date.now()/1000/windowSeconds);
- const row=await env.DB.prepare('INSERT INTO rate_limits(key,window,attempts) VALUES (?,?,1) ON CONFLICT(key) DO UPDATE SET attempts=CASE WHEN window=excluded.window THEN attempts+1 ELSE 1 END, window=excluded.window RETURNING attempts').bind(key,window).first<{attempts:number}>();
+ const statement=()=>env.DB.prepare('INSERT INTO rate_limits(key,window,attempts) VALUES (?,?,1) ON CONFLICT(key) DO UPDATE SET attempts=CASE WHEN window=excluded.window THEN attempts+1 ELSE 1 END, window=excluded.window RETURNING attempts').bind(key,window).all<{attempts:number}>();
+ const [result]=latency?await latency.db<{attempts:number}>(span,statement):[await statement()];const row=result.results[0];
  if((row?.attempts??limit+1)>limit)throw new APIError(429,'Too many requests. Try again later.');
 }
 function fromBase64(value:string):Uint8Array {return Uint8Array.from(atob(value),c=>c.charCodeAt(0));}

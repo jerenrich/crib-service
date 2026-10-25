@@ -1,5 +1,5 @@
 // Bounded numeric spans only. No SQL, exception text, tokens or payloads.
-export const spans = ['rate_limit_ms','authentication_ms','authentication_hash_ms','alert_admission_ms','alert_snapshot_ms','body_read_ms','handler_ms','alert_prepare_ms','claim_ms','destination_ms',
+export const spans = ['rate_limit_ms','authentication_ms','authentication_hash_ms','authentication_lookup_ms','ip_rate_limit_ms','device_rate_limit_ms','status_pair_ms','status_snapshot_ms','alert_admission_ms','alert_snapshot_ms','body_read_ms','handler_ms','alert_prepare_ms','claim_ms','claim_receipt_ms','destination_ms',
  'token_decrypt_ms','provider_sign_ms','apns_fetch_ms','apns_body_ms','outcome_storage_ms','reminder_prepare_ms',
  'reminder_schedule_ms','reminder_snapshot_ms','reminder_pair_ms','reminder_control_ms','reminder_latest_ms','reminder_heartbeat_ms','reminder_original_ms','reminder_insert_ms','alarm_lag_ms','generated_to_dispatch_ms',
  'pair_ms','event_lookup_ms','event_insert_ms','event_reload_ms','event_episode_ms','response_read_ms','claim_observe_ms',
@@ -13,7 +13,7 @@ export const appleReasons = ['BadCollapseId','BadDeviceToken','BadExpirationDate
  'MethodNotAllowed','ExpiredToken','Unregistered','PayloadTooLarge','TooManyProviderTokenUpdates','TooManyRequests',
  'InternalServerError','ServiceUnavailable','Shutdown','unknown','unreadable'] as const;
 export type AppleReason = typeof appleReasons[number];
-const databaseMetrics=['calls','completed','errors','statements','sql_ms','rows_read','rows_written','attempts','retries','hedges','hedge_wins','unfinished'] as const;
+const databaseMetrics=['calls','completed','errors','statements','sql_ms','rows_read','rows_written','attempts','retries','hedges','hedge_wins','unfinished','hedge_after_ms','hedge_timer_lag_ms'] as const;
 interface StatementMetrics {index:number;sql_ms?:number;attempts?:number;colo?:string;region?:string;primary?:boolean}
 type DatabaseMetrics=Partial<Record<typeof databaseMetrics[number],number>> & {statement_meta?:StatementMetrics[]};
 const regions=['WNAM','ENAM','WEUR','EEUR','APAC','OC'];
@@ -26,6 +26,7 @@ export interface TimingDetails {
  apns_started_at_ms?:number; apns_response_at_ms?:number; apns_unique_id?:string; colo?:string;
  error_kind?:'d1_overloaded'|'d1_timeout'|'d1_error'|'other';
  failed_span?:Span;
+ claim_result_source?:'reply'|'receipt';claim_receipt_outcome?:'matched'|'missing'|'error';
  client_request_id?:string;in_flight_span?:Span;in_flight_ms?:number;
  dispatch_source?:'upload'|'reminder'|'maintenance'|'connection'|'watch_test';
  observed_status?:'pending'|'sending'|'sent'|'blocked'|'uncertain'|'failed';
@@ -33,7 +34,7 @@ export interface TimingDetails {
  push_outcome?:'sent'|'retry'|'blocked'|'uncertain'|'failed';
  observed_attempts?:number; next_attempt_at_ms?:number;
  preparation_started_at_ms?:number; preparation_finished_at_ms?:number;
- journal_failures_before_write?:number;
+ journal_failures_before_write?:number;status_successes_sampled?:number;
  durable_outcome?:boolean;outcome_recovery?:boolean;outcome_queue_age_ms?:number;
 }
 export class Latency {
@@ -100,6 +101,55 @@ export class Latency {
    }
   }
  }
+ // Exactly one mutation and at most one ownership-receipt SELECT. This is
+ // not a write retry: only a row bearing this invocation's unique claim ID may
+ // replace the original reply. Ignore late results without changing the trace.
+ async confirmedClaim<T,P>(write:()=>Promise<D1Result<T>[]>,receipt:()=>Promise<D1Result<P>>,afterMs=250):Promise<
+  {source:'reply';results:D1Result<T>[]} | {source:'receipt';receipt:P}> {
+  return this.measure('claim_ms',()=>new Promise((resolve,reject)=>{
+   let settled=false,proofStarted=false,proofDone=false,writeFailed=false,writeError:unknown;
+   let proofAt=0,timer:ReturnType<typeof setTimeout>|undefined;
+   const clear=()=>{if(timer!==undefined)clearTimeout(timer);};
+   const rejected=()=>{if(!settled){settled=true;clear();reject(writeError);}};
+   const prove=()=>{
+    if(settled||proofStarted)return;
+    clear();proofStarted=true;proofAt=performance.now();this.databaseStarted('claim_receipt_ms');
+    void (async()=>{
+     try {
+      const result=await receipt();if(settled)return;
+      proofDone=true;this.details.spans!.claim_receipt_ms=Math.max(0,performance.now()-proofAt);
+      this.databaseCompleted('claim_receipt_ms',[result]);
+      const row=result.results[0];
+      if(row){
+       this.details.claim_receipt_outcome='matched';this.details.claim_result_source='receipt';
+       if(!writeFailed)this.metric('claim_ms','unfinished');
+       settled=true;clear();resolve({source:'receipt',receipt:row});
+      }else{this.details.claim_receipt_outcome='missing';if(writeFailed)rejected();}
+     }catch{
+      if(settled)return;
+      proofDone=true;this.details.spans!.claim_receipt_ms=Math.max(0,performance.now()-proofAt);
+      this.metric('claim_receipt_ms','errors');this.details.claim_receipt_outcome='error';if(writeFailed)rejected();
+     }
+    })();
+   };
+   this.databaseStarted('claim_ms');
+   timer=setTimeout(prove,afterMs);
+   void (async()=>{
+    try {
+     const results=await write();if(settled)return;
+     this.databaseCompleted('claim_ms',results);this.details.claim_result_source='reply';
+     if(proofStarted&&!proofDone){this.metric('claim_receipt_ms','unfinished');this.details.spans!.claim_receipt_ms=Math.max(0,performance.now()-proofAt);}
+     settled=true;clear();resolve({source:'reply',results});
+    }catch(error){
+     if(settled)return;
+     writeFailed=true;writeError=error;this.metric('claim_ms','errors');
+     // A transport failure need not imply rollback. Check this request's own
+     // committed ownership once; absence/error still fails closed.
+     if(proofDone)rejected();else prove();
+    }
+   })();
+  }));
+ }
  // Only SELECT work belongs here. D1 cannot cancel a losing call: never use this
  // for writes, claims or APNs. One extra read is the full fallback budget.
  async readOnly<T>(name:Span,work:()=>Promise<D1Result<T>|D1Result<T>[]>,hedgeAfterMs=1500):Promise<D1Result<T>[]> {
@@ -126,7 +176,11 @@ export class Latency {
      else if(failed===2){settled=true;clear();reject(error);}
     }
    };
-   timer=setTimeout(()=>{void attempt();},hedgeAfterMs);void attempt();
+   const timerStarted=performance.now();
+   timer=setTimeout(()=>{
+    if(!settled&&started===1){this.metric(name,'hedge_after_ms',hedgeAfterMs);this.metric(name,'hedge_timer_lag_ms',Math.max(0,performance.now()-timerStarted-hedgeAfterMs));}
+    void attempt();
+   },hedgeAfterMs);void attempt();
   }));
  }
  async read<T>(name:Span,statement:D1PreparedStatement):Promise<T|null> {
@@ -163,10 +217,12 @@ export function safeTimingDetails(value:TimingDetails|undefined):string|null {
   if(Object.keys(metrics).length)stages[name]=metrics;
  }
  if(Object.keys(stages).length)safe.db_stages=stages;
- for(const name of ['db_calls','db_sql_ms','db_rows_read','db_rows_written','db_attempts','provider_token_age_s','apns_started_at_ms','apns_response_at_ms','observed_attempts','next_attempt_at_ms','preparation_started_at_ms','preparation_finished_at_ms','journal_failures_before_write','outcome_queue_age_ms','in_flight_ms'] as const){
+ for(const name of ['db_calls','db_sql_ms','db_rows_read','db_rows_written','db_attempts','provider_token_age_s','apns_started_at_ms','apns_response_at_ms','observed_attempts','next_attempt_at_ms','preparation_started_at_ms','preparation_finished_at_ms','journal_failures_before_write','outcome_queue_age_ms','in_flight_ms','status_successes_sampled'] as const){
   if(number(value[name]))safe[name]=value[name];
  }
  for(const name of ['durable_outcome','outcome_recovery'] as const)if(typeof value[name]==='boolean')safe[name]=value[name];
+ if(['reply','receipt'].includes(value.claim_result_source!))safe.claim_result_source=value.claim_result_source;
+ if(['matched','missing','error'].includes(value.claim_receipt_outcome!))safe.claim_receipt_outcome=value.claim_receipt_outcome;
  if(typeof value.client_request_id==='string'&&/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value.client_request_id))safe.client_request_id=value.client_request_id.toLowerCase();
  if(spans.includes(value.in_flight_span!))safe.in_flight_span=value.in_flight_span;
  if(appleReasons.includes(value.apns_reason!))safe.apns_reason=value.apns_reason;

@@ -19,7 +19,7 @@ export async function receiveAlert(env:Env,device:Device,value:Record<string,unk
  const snapshot=await latency.readOnly<StoredEvent|Pair>('alert_snapshot_ms',()=>env.DB.batch<StoredEvent|Pair>([
   env.DB.prepare('SELECT * FROM events WHERE event_id=?').bind(alert.eventId),
   env.DB.prepare('SELECT * FROM pairs WHERE listener_id=?').bind(device.id)
- ]));
+ ]),250);
  const previous=snapshot[0].results[0] as StoredEvent|undefined;
  const pair=snapshot[1].results[0] as Pair|undefined;if(!pair)throw new APIError(409,'Listener is not paired.');
  if(Date.parse(alert.createdAt)<pair.created_at-2000)throw new APIError(409,'Alert belongs to an earlier pairing.');
@@ -81,7 +81,10 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  // Diagnostic computation is best effort, just like journal writes.
  try { eventRef=latency.eventRef??await eventReference(env,eventId);latency.eventRef=eventRef; } catch { /* No diagnostic identity available. */ }
  // Tombstones also suppress an offline outbox upload after its episode settled.
- const claims=await latency.db<StoredEvent|{token:string|null}>('claim_ms',()=>env.DB.batch<StoredEvent|{token:string|null}>([...(options.insert?[options.insert]:[]),env.DB.prepare(`UPDATE events SET resolved_at=COALESCE(resolved_at,(SELECT r.resolved_at FROM resolved_episodes r
+ const claimId=crypto.randomUUID();
+ type Destination={token:string|null;phone_token:string|null;silent_watch_alarms:number};
+ type Receipt=StoredEvent & Destination & {pair_current:number};
+ const claim=await latency.confirmedClaim<StoredEvent|Destination,Receipt>(()=>env.DB.batch<StoredEvent|Destination>([...(options.insert?[options.insert]:[]),env.DB.prepare(`UPDATE events SET resolved_at=COALESCE(resolved_at,(SELECT r.resolved_at FROM resolved_episodes r
   JOIN pairs p ON p.parent_id=r.parent_id AND p.listener_id=r.listener_id AND p.created_at=r.pair_created_at
   WHERE r.parent_id=events.parent_id AND r.listener_id=events.listener_id AND r.episode_id=events.episode_id))
   WHERE event_id=? AND COALESCE(json_extract(payload,'$.isTest'),0)=0`).bind(eventId),
@@ -99,16 +102,29 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  AND CAST(ROUND((julianday(json_extract(events.payload,'$.createdAt'))-2440587.5)*86400000) AS INTEGER)<=m.created_at)
  OR (is_repeat=1 AND EXISTS(SELECT 1 FROM events prior WHERE prior.parent_id=events.parent_id AND prior.episode_id=events.episode_id AND prior.acknowledged_at IS NOT NULL AND prior.created_at>=events.created_at))
  )`).bind(new Date(now).toISOString(),eventId,now,now),
- env.DB.prepare("UPDATE events SET status='sending',lease_until=?,attempts=attempts+1,push_target=COALESCE(push_target,CASE WHEN (SELECT watch_push_token FROM devices WHERE id=events.parent_id) IS NOT NULL THEN 'watch' ELSE 'phone' END) WHERE event_id=? AND status='pending' AND acknowledged_at IS NULL AND resolved_at IS NULL AND next_attempt<=? RETURNING *").bind(now+30000,eventId,now),
+ env.DB.prepare("UPDATE events SET status='sending',lease_until=?,claim_id=?,attempts=attempts+1,push_target=COALESCE(push_target,CASE WHEN (SELECT watch_push_token FROM devices WHERE id=events.parent_id) IS NOT NULL THEN 'watch' ELSE 'phone' END) WHERE event_id=? AND status='pending' AND acknowledged_at IS NULL AND resolved_at IS NULL AND next_attempt<=? RETURNING *").bind(now+30000,claimId,eventId,now),
  // Read the selected token in the claim transaction, avoiding another remote
  // round trip. A losing claimant must still return before using this result.
  env.DB.prepare(`SELECT CASE e.push_target WHEN 'watch' THEN d.watch_push_token ELSE d.push_token END AS token,d.push_token AS phone_token,d.silent_watch_alarms
-  FROM events e JOIN devices d ON d.id=e.parent_id WHERE e.event_id=? AND e.status='sending'`).bind(eventId)]));
+  FROM events e JOIN devices d ON d.id=e.parent_id WHERE e.event_id=? AND e.status='sending'`).bind(eventId)]),
+ ()=>env.DB.prepare(`SELECT e.*,CASE e.push_target WHEN 'watch' THEN d.watch_push_token ELSE d.push_token END AS token,d.push_token AS phone_token,d.silent_watch_alarms,
+ EXISTS(SELECT 1 FROM pairs p WHERE p.parent_id=e.parent_id AND p.listener_id=e.listener_id) AS pair_current
+ FROM events e JOIN devices d ON d.id=e.parent_id WHERE e.event_id=? AND e.claim_id=?`).bind(eventId,claimId).all<Receipt>());
+ const claims=claim.source==='reply'?claim.results:undefined;
  const offset=options.insert?1:0;
- if(options.insert&&!claims[0].meta.changes){
+ if(options.insert&&claims&&!claims[0].meta.changes){
   latency.details.exit_reason='not_created';await record('claim_skipped',undefined,'dispatch_skip');return;
  }
- const event=claims[offset+2].results[0] as StoredEvent|undefined;
+ const event=claim.source==='receipt'?claim.receipt:claims![offset+2].results[0] as StoredEvent|undefined;
+ if(event){attempt=event.attempts;latency.deliveryAttempt=attempt;target=event.push_target??'phone';}
+ if(claim.source==='receipt'){
+  const current=claim.receipt;
+  if(!current.pair_current||current.status!=='sending'||current.acknowledged_at||current.resolved_at){
+   latency.details.observed_status=current.status as typeof latency.details.observed_status;
+   latency.details.exit_reason=!current.pair_current?'no_pair':current.acknowledged_at?'acknowledged':current.resolved_at?'resolved':'not_pending';
+   await record('claim_skipped',undefined,'dispatch_skip');return;
+  }
+ }
  if(!event){
   // Losing a claim is a diagnostic outcome too: retain this caller's preparation
   // spans, especially if cron saw an insert before the alarm's D1 reply arrived.
@@ -121,15 +137,20 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
   }catch{/* Optional observation must not turn a skipped send into a failure. */}
   await record('claim_skipped',undefined,'dispatch_skip');return;
  }
+ // A delayed original reply cannot revive an already expired delivery lease.
+ if((event.lease_until??0)<=Date.now()){
+  latency.details.observed_status=event.status as typeof latency.details.observed_status;latency.details.exit_reason='not_pending';
+  await record('claim_skipped',undefined,'dispatch_skip');return;
+ }
  latency.details.spans!.generated_to_dispatch_ms=Math.max(0,now-event.created_at);
- attempt=event.attempts;latency.deliveryAttempt=attempt;target=event.push_target??'phone';stage='storage';
+ stage='storage';
  // No replay after uncertain transport or a worker death during APNs dispatch. APNs does
  // not offer an exactly-once receipt transaction with D1. Surface uncertainty explicitly.
  if(now-Date.parse((JSON.parse(event.payload) as Alert).createdAt)>86400000){
   await latency.db('outcome_storage_ms',()=>env.DB.prepare("UPDATE events SET status='failed',last_error='expired_event',lease_until=NULL WHERE event_id=?").bind(eventId).run());await record('expired_event');return;
  }
  const column=target==='watch'?'watch_push_token':'push_token';
- const parent=claims[offset+3].results[0] as {token:string|null;phone_token:string|null;silent_watch_alarms:number}|undefined;
+ const parent=claim.source==='receipt'?claim.receipt:claims![offset+3].results[0] as Destination|undefined;
  if(!parent?.token){
   // A token upload can race with this read. Decide blocked/pending in the same
   // database statement that releases the claim, so either ordering can recover.
@@ -254,8 +275,8 @@ export async function flushPending(env:Env,requestId=crypto.randomUUID(),latency
   await recordDiagnostic(env,{requestId,started:Date.now(),operation:'dispatch',stage:'claim',outcome:'dispatch_interrupted',eventRef,attempt:event.attempts,target:event.push_target??undefined});
  }
  const events=await latency.measure('maintenance_pending_ms',()=>env.DB.prepare("SELECT event_id FROM events WHERE status='pending' AND acknowledged_at IS NULL AND resolved_at IS NULL AND next_attempt<=? ORDER BY created_at LIMIT 25").bind(Date.now()).all<{event_id:string}>());
- // Bounded fan-out; each row has an atomic database claim.
- await latency.measure('maintenance_dispatch_ms',async()=>{for(let index=0;index<events.results.length;index+=5){await Promise.all(events.results.slice(index,index+5).map(event=>{const trace=new Latency();trace.details.dispatch_source='maintenance';return dispatchEvent(env,event.event_id,requestId,trace,{background});}));}});
+ // Bound recovery fan-out to leave capacity for proof reads and connection notices.
+ await latency.measure('maintenance_dispatch_ms',async()=>{for(let index=0;index<events.results.length;index+=2){await Promise.all(events.results.slice(index,index+2).map(event=>{const trace=new Latency();trace.details.dispatch_source='maintenance';return dispatchEvent(env,event.event_id,requestId,trace,{background});}));}});
  // Repair scheduling after a failed background request or worker reset. Bound
  // fan-out; existing alarms are never postponed by these idempotent refreshes.
  await latency.measure('maintenance_schedule_ms',async()=>{

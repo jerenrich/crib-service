@@ -27,20 +27,31 @@ import UserNotifications
     func didFailToRegisterForRemoteNotificationsWithError(_ error: Error) {
         WatchModel.shared.registrationFailed(error)
     }
-    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping @Sendable (UNNotificationPresentationOptions) -> Void) {
+        let observedAt = Date(), started = ContinuousClock.now
+        // Request OS presentation before parsing, model initialization, a main-actor
+        // hop or diagnostic disk I/O. None of those should hold up banner/sound.
+        completionHandler([.banner, .list, .sound])
+        let presentationMS = DiagnosticTiming.elapsedMS(since: started)
         let alert = WatchCryAlert.notification(notification.request.content)
         let hasSound = notification.request.content.sound != nil
-        let deliveredAt = notification.date, observedAt = Date()
-        await MainActor.run {
+        let deliveredAt = notification.date, queued = ContinuousClock.now
+        let interruptionLevel = Int(exactly: notification.request.content.interruptionLevel.rawValue)
+        Task { @MainActor in
+            let actorWaitMS = DiagnosticTiming.elapsedMS(since: queued), handling = ContinuousClock.now
+            let model = WatchModel.shared
             if let alert {
-                WatchModel.shared.log.watchAlert(WatchAlertTrace(alert: alert, phase: .foreground, deliveredAt: deliveredAt, observedAt: observedAt))
-                WatchModel.shared.receive(alert)
+                model.receive(alert)
+                model.log.watchAlert(WatchAlertTrace(alert: alert, phase: .foreground, deliveredAt: deliveredAt, observedAt: observedAt,
+                    applicationState: model.diagnosticApplicationState,
+                    timing: .init(presentationRequestMS: presentationMS, mainActorWaitMS: actorWaitMS, handlingMS: DiagnosticTiming.elapsedMS(since: handling)),
+                    interruptionLevel: interruptionLevel))
             } else {
-                WatchModel.shared.log.record("watch_payload_unrecognized", code: 1)
-                WatchModel.shared.log.record("watch_foreground_notification", code: hasSound ? 1 : 0)
+                model.log.record("watch_payload_unrecognized", code: 1)
+                model.log.record("watch_foreground_notification", code: hasSound ? 1 : 0)
             }
         }
-        return [.banner, .list, .sound]
     }
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
         let alert = WatchCryAlert.notification(response.notification.request.content)
@@ -81,6 +92,7 @@ extension WatchCryAlert {
 final class CryNotificationController: WKUserNotificationHostingController<CryNotificationView> {
     private var alert: WatchCryAlert?
     private var deliveredAt: Date?
+    private var activatedAt: Date?
     private var text = "Open the app for nursery status."
     override class var isInteractive: Bool { true }
     override var body: CryNotificationView {
@@ -92,17 +104,57 @@ final class CryNotificationController: WKUserNotificationHostingController<CryNo
             self?.performDismissAction()
         }
     }
+    override func willActivate() {
+        super.willActivate()
+        let now = Date(); activatedAt = now
+        if let alert, let deliveredAt {
+            Task { @MainActor in
+                await Task.yield()
+                WatchModel.shared.log.watchAlert(WatchAlertTrace(alert: alert, phase: .controllerActivated, deliveredAt: deliveredAt, observedAt: now,
+                    applicationState: WatchModel.shared.diagnosticApplicationState))
+            }
+        }
+    }
+    override func didDeactivate() {
+        super.didDeactivate()
+        let now = Date()
+        if let alert, let deliveredAt {
+            Task { @MainActor in
+                await Task.yield()
+                WatchModel.shared.log.watchAlert(WatchAlertTrace(alert: alert, phase: .controllerDeactivated, deliveredAt: deliveredAt, observedAt: now,
+                    applicationState: WatchModel.shared.diagnosticApplicationState))
+            }
+        }
+        activatedAt = nil
+    }
     override func didReceive(_ notification: UNNotification) {
+        let observedAt = Date(), started = ContinuousClock.now
         alert = WatchCryAlert.notification(notification.request.content)
         deliveredAt = notification.date
         text = notification.request.content.body
         if let alert {
-            WatchModel.shared.log.watchAlert(WatchAlertTrace(alert: alert, phase: .controllerReceived, deliveredAt: notification.date))
-            WatchModel.shared.receive(alert)
-            // The inline action appears immediately, above the notification details.
             notificationActions = []
-        } else { WatchModel.shared.log.record("watch_payload_unrecognized", code: 3) }
+            let deliveredAt = notification.date, activatedAt = self.activatedAt
+            let preparedMS = DiagnosticTiming.elapsedMS(since: started), queued = ContinuousClock.now
+            let level = Int(exactly: notification.request.content.interruptionLevel.rawValue)
+            // Render from the payload alone. No model/disk/phone work is required
+            // to return this controller's notification content to watchOS.
+            Task { @MainActor in
+                await Task.yield()
+                let model = WatchModel.shared
+                model.receive(alert)
+                var traces = [WatchAlertTrace(alert: alert, phase: .controllerReceived, deliveredAt: deliveredAt, observedAt: observedAt,
+                    applicationState: model.diagnosticApplicationState,
+                    timing: .init(mainActorWaitMS: DiagnosticTiming.elapsedMS(since: queued), handlingMS: preparedMS), interruptionLevel: level)]
+                if let activatedAt { traces.append(WatchAlertTrace(alert: alert, phase: .controllerActivated, deliveredAt: deliveredAt, observedAt: activatedAt,
+                    applicationState: model.diagnosticApplicationState)) }
+                model.log.watchAlerts(traces)
+            }
+        } else {
+            Task { @MainActor in await Task.yield(); WatchModel.shared.log.record("watch_payload_unrecognized", code: 3) }
+        }
     }
+
 }
 
 struct CryNotificationView: View {
@@ -122,7 +174,14 @@ struct CryNotificationView: View {
             Text(text).font(.footnote)
             if let alert { Text(alert.createdAt, style: .time).font(.caption).foregroundStyle(.secondary) }
         }.padding(.vertical, 8).onAppear {
-            if let alert { WatchModel.shared.log.watchAlert(WatchAlertTrace(alert: alert, phase: .viewAppeared, deliveredAt: deliveredAt)) }
+            if let alert {
+                let observedAt = Date()
+                Task { @MainActor in
+                    await Task.yield()
+                    WatchModel.shared.log.watchAlert(WatchAlertTrace(alert: alert, phase: .viewAppeared, deliveredAt: deliveredAt, observedAt: observedAt,
+                        applicationState: WatchModel.shared.diagnosticApplicationState))
+                }
+            }
         }
     }
 }

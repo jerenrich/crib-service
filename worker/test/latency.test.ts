@@ -72,3 +72,42 @@ describe('D1 serving and per-statement retry evidence',()=>{
   expect(safe).toMatchObject({durable_outcome:true,outcome_recovery:false,outcome_queue_age_ms:30});expect(JSON.stringify(safe)).not.toMatch(/private|secret|Infinity/);
  });
 });
+
+describe('one-write ownership receipt recovery',()=>{
+ it('keeps fast claims to one mutation and no receipt read',async()=>{
+  const latency=new Latency(),write=vi.fn(async()=>[result(1)]),proof=vi.fn(async()=>result(2));
+  expect(await latency.confirmedClaim(write,proof,5)).toEqual({source:'reply',results:[result(1)]});
+  await new Promise(r=>setTimeout(r,10));expect(write).toHaveBeenCalledOnce();expect(proof).not.toHaveBeenCalled();
+ });
+ it('accepts committed ownership while a reply is delayed and freezes the trace before a late rejection',async()=>{
+  const latency=new Latency(),write=deferred<D1Result<{id:number}>[]>();let writes=0,reads=0;
+  expect(await latency.confirmedClaim(()=>{writes++;return write.promise;},async()=>{reads++;return result(2);},5)).toEqual({source:'receipt',receipt:{id:2}});
+  const frozen=JSON.stringify(latency.details);write.reject(new Error('D1_ERROR: private-late-marker'));await new Promise(r=>setTimeout(r,10));
+  expect(writes).toBe(1);expect(reads).toBe(1);expect(JSON.stringify(latency.details)).toBe(frozen);
+ });
+ it('never treats an absent ownership receipt as permission to send',async()=>{
+  const latency=new Latency(),write=deferred<D1Result<{id:number}>[]>(),read=deferred<void>();let done=false;
+  const running=latency.confirmedClaim(()=>write.promise,async()=>{read.resolve();return {...result(2),results:[]};},5).then(value=>{done=true;return value;});
+  await read.promise;await new Promise(r=>setTimeout(r,5));expect(done).toBe(false);
+  write.resolve([result(1)]);expect(await running).toEqual({source:'reply',results:[result(1)]});
+  expect(latency.details.claim_receipt_outcome).toBe('missing');
+ });
+ it('recovers a lost reply only with an owned committed row, and otherwise preserves the write failure',async()=>{
+  const latency=new Latency();expect(await latency.confirmedClaim(async()=>{throw new Error('D1_ERROR: timeout');},async()=>result(2),5)).toEqual({source:'receipt',receipt:{id:2}});
+  expect(latency.details.error_kind).toBeUndefined();expect(latency.details.db_stages?.claim_ms?.errors).toBe(1);
+  const failed=new Latency();let writes=0,reads=0;
+  await expect(failed.confirmedClaim(async()=>{writes++;throw new Error('D1_ERROR: private-write-marker');},async()=>{reads++;return {...result(2),results:[]};},5)).rejects.toThrow('private-write-marker');
+  expect(writes).toBe(1);expect(reads).toBe(1);expect(failed.details.failed_span).toBe('claim_ms');expect(safeTimingDetails(failed.details)).not.toContain('private-write-marker');
+ });
+ it('ignores a late failing receipt when the original write reply wins',async()=>{
+  const latency=new Latency(),write=deferred<D1Result<{id:number}>[]>(),proof=deferred<D1Result<{id:number}>>(),started=deferred<void>();
+  const running=latency.confirmedClaim(()=>write.promise,()=>{started.resolve();return proof.promise;},5);await started.promise;
+  write.resolve([result(1)]);expect(await running).toEqual({source:'reply',results:[result(1)]});
+  const frozen=JSON.stringify(latency.details);proof.reject(new Error('private-receipt-error'));await new Promise(r=>setTimeout(r,10));expect(JSON.stringify(latency.details)).toBe(frozen);
+ });
+ it('fails closed when both the write and receipt fail',async()=>{
+  const latency=new Latency();let writes=0,reads=0;
+  await expect(latency.confirmedClaim(async()=>{writes++;throw new Error('D1_ERROR: original');},async()=>{reads++;throw new Error('private-receipt-error');},5)).rejects.toThrow('original');
+  expect(writes).toBe(1);expect(reads).toBe(1);expect(latency.details.claim_receipt_outcome).toBe('error');
+ });
+});

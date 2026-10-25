@@ -89,7 +89,7 @@ import Observation
         append("alert_upload phase=started event_id=\(eventID.uuidString.lowercased()) client_request_id=\(clientRequestID.uuidString.lowercased())")
     }
     func network(operation: String, outcome: String, status: Int? = nil, requestID: UUID? = nil,
-                 elapsedMS: Int, storageUnavailable: Bool = false, error: (any Error)? = nil, eventID: UUID? = nil, benchmarkAttempt: UUID? = nil, serverDiagnosticMS: Int? = nil,
+                 elapsedMS: Int, storageUnavailable: Bool = false, error: (any Error)? = nil, eventID: UUID? = nil, benchmarkAttempt: UUID? = nil, serverDiagnosticMS: Int? = nil, diagnosticState: String? = nil,
                  metrics: DiagnosticNetworkTiming? = nil, clock: DiagnosticClockSample? = nil, monotonic: Bool = false, clientRequestID: UUID? = nil) {
         let operations: Set<String> = ["register", "pairing_create", "pairing_claim", "push_token", "watch_token", "heartbeat", "alert", "status", "timeline", "monitoring", "monitoring_complete", "settings", "acknowledge", "test_push", "connection_preferences", "unpair", "delete_device", "resume_alerts"]
         guard operations.contains(operation), ["ok", "http_error", "transport_error", "decode_error", "encode_error", "cancelled", "invalid_response"].contains(outcome) else { return }
@@ -112,6 +112,7 @@ import Observation
         if operation == "alert", let eventID { entry += " event_id=\(eventID.uuidString.lowercased())" }
         if operation == "alert", let clientRequestID { entry += " client_request_id=\(clientRequestID.uuidString.lowercased())" }
         if storageUnavailable { entry += " server_diagnostics=unavailable" }
+        else if let diagnosticState, ["queued", "sampled"].contains(diagnosticState) { entry += " server_diagnostics=\(diagnosticState)" }
         if let serverDiagnosticMS, (0...3_600_000).contains(serverDiagnosticMS) { entry += " server_diagnostic_ms=\(serverDiagnosticMS)" }
         if monotonic { entry += " elapsed_source=monotonic" }
         if let clock, clock.isValid { entry += clock.fields }

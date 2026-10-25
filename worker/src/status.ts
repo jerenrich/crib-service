@@ -1,4 +1,5 @@
-import {latestMonitoringCommand} from './monitoring';
+import {monitoringCommandRepresentation} from './monitoring';
+import {Latency} from './latency';
 import {heartbeatTimeline} from './timeline';
 import {scheduleReminders} from './reminders';
 import {APIError,defaultConfiguration,requireRole,type Device,type Env,type Heartbeat} from './types';
@@ -34,18 +35,29 @@ export async function saveHeartbeat(env:Env,device:Device,value:Record<string,un
  if(parent?.alerts_muted_until&&heartbeat.monitoring&&heartbeat.state==='crying'&&heartbeat.currentEpisode)await scheduleReminders(env,pair.parent_id);
  return parent?configuration(JSON.parse(parent.config)):defaultConfiguration;
 }
-export async function listenerStatus(env:Env,device:Device) {
- const pair=await pairFor(env,device);
- if(!pair)return {paired:false,watchPushRegistered:false,serverTime:new Date().toISOString(),nextHeartbeatExpectedAt:null,notificationRelevance:{cryEpisodeIDs:[],testEventIDs:[]},configuration:configuration(JSON.parse(device.config))};
- const [last,parent,events,monitoringCommand,relevant]=await Promise.all([
-  env.DB.prepare('SELECT * FROM heartbeats WHERE listener_id=?').bind(pair.listener_id).first<{received_at:string;metadata:string}>(),
-  env.DB.prepare('SELECT config,push_token,watch_push_token,connection_alerts,alerts_muted_until,silent_watch_alarms FROM devices WHERE id=?').bind(pair.parent_id).first<{config:string;push_token:string|null;watch_push_token:string|null;connection_alerts:number;alerts_muted_until:number;silent_watch_alarms:number}>(),
-  env.DB.prepare('SELECT payload,status,sent_at,acknowledged_at,resolved_at,push_target FROM events WHERE parent_id=? ORDER BY created_at DESC LIMIT 100').bind(pair.parent_id).all<{payload:string;status:string;sent_at:string|null;acknowledged_at:string|null;resolved_at:string|null;push_target:string|null}>(),
-  latestMonitoringCommand(env,pair),
+export async function listenerStatus(env:Env,device:Device,latency=new Latency()) {
+ const pair=await latency.read<{parent_id:string;listener_id:string;created_at:number}>('status_pair_ms',env.DB.prepare(`SELECT * FROM pairs WHERE ${device.role==='parent'?'parent_id':'listener_id'}=?`).bind(device.id));
+ const unpaired=()=>({paired:false,watchPushRegistered:false,serverTime:new Date().toISOString(),nextHeartbeatExpectedAt:null,notificationRelevance:{cryEpisodeIDs:[],testEventIDs:[]},configuration:configuration(JSON.parse(device.config))});
+ if(!pair)return unpaired();
+ // One consistent snapshot instead of five concurrent binding calls. This
+ // reduces database/connection pressure from ordinary status polling.
+ const snapshot=await latency.db<unknown>('status_snapshot_ms',()=>env.DB.batch([
+  env.DB.prepare('SELECT * FROM heartbeats WHERE listener_id=?').bind(pair.listener_id),
+  env.DB.prepare('SELECT d.config,d.push_token,d.watch_push_token,d.connection_alerts,d.alerts_muted_until,d.silent_watch_alarms FROM devices d JOIN pairs p ON p.parent_id=d.id WHERE p.parent_id=? AND p.listener_id=? AND p.created_at=?').bind(pair.parent_id,pair.listener_id,pair.created_at),
+  env.DB.prepare('SELECT payload,status,sent_at,acknowledged_at,resolved_at,push_target FROM events WHERE parent_id=? ORDER BY created_at DESC LIMIT 100').bind(pair.parent_id),
+  env.DB.prepare('SELECT * FROM monitoring_commands WHERE parent_id=? AND listener_id=? AND pair_created_at=? ORDER BY sequence DESC LIMIT 1').bind(pair.parent_id,pair.listener_id,pair.created_at),
   env.DB.prepare(`SELECT DISTINCT CASE WHEN COALESCE(json_extract(payload,'$.isTest'),0)=1 THEN event_id ELSE episode_id END AS id,
    COALESCE(json_extract(payload,'$.isTest'),0) AS test FROM events WHERE parent_id=? AND listener_id=? AND acknowledged_at IS NULL AND resolved_at IS NULL LIMIT 1001`)
-   .bind(pair.parent_id,pair.listener_id).all<{id:string;test:number}>()
- ]);
+   .bind(pair.parent_id,pair.listener_id)
+ ]));
+ const last=snapshot[0].results[0] as {received_at:string;metadata:string}|undefined;
+ const parent=snapshot[1].results[0] as {config:string;push_token:string|null;watch_push_token:string|null;connection_alerts:number;alerts_muted_until:number;silent_watch_alarms:number}|undefined;
+ // Reject a pairing changed between lookup and this consistent snapshot.
+ if(!parent)return unpaired();
+ const events=snapshot[2] as D1Result<{payload:string;status:string;sent_at:string|null;acknowledged_at:string|null;resolved_at:string|null;push_target:string|null}>;
+ const command=snapshot[3].results[0] as {id:string;enabled:number;status:'pending'|'applied'|'failed';created_at:number;expires_at:number}|undefined;
+ const monitoringCommand=command?monitoringCommandRepresentation(command):null;
+ const relevant=snapshot[4] as D1Result<{id:string;test:number}>;
  const metadata=last?JSON.parse(last.metadata) as Heartbeat:null;
  // An estimate, not a deadline: the Listener waits 15 seconds after its response.
  // Keep this anchored to the stored heartbeat so repeated reads cannot postpone it.

@@ -12,6 +12,7 @@ import {createPairing,claimPairing} from './pairing';
 import {receiveAlert,acknowledge,resumeAlerts,flushPending} from './alerts';
 import {saveHeartbeat,listenerStatus,saveSettings} from './status';
 import {operationFor,recordDiagnostic,type Stage} from './diagnostics';
+import {queueStatusDiagnostic} from './status-diagnostics';
 import {startAlertProgress} from './alert-progress';
 import {Latency} from './latency';
 
@@ -21,6 +22,11 @@ export default {
   latency.details.colo=typeof request.cf?.colo==='string'?request.cf.colo:undefined;
   let operation=operationFor('', ''),stage:Stage='validation',stopProgress:(()=>void)|undefined;
   const respond=async(result:unknown,status:number,outcome:'ok'|'rejected'|'internal_error')=>{
+   if(operation==='status'&&outcome==='ok'&&ctx){
+    const state=queueStatusDiagnostic(env,ctx,{requestId,started,operation,stage,outcome,httpStatus:status,details:latency.progressDetails()});
+    return Response.json(result,{status,headers:{'cache-control':'no-store','x-content-type-options':'nosniff','x-request-id':requestId,
+     'x-diagnostics-status':state,'x-diagnostics-elapsed-ms':'0','x-server-received-at-ms':String(started),'x-server-sent-at-ms':String(Date.now())}});
+   }
    const journalStarted=performance.now();
    const saved=await latency.measure('journal_ms',()=>recordDiagnostic(env,{requestId,started,operation,stage,outcome,httpStatus:status,eventRef:latency.eventRef,details:latency.details}));
    return Response.json(result,{status,headers:{'cache-control':'no-store','x-content-type-options':'nosniff',
@@ -44,16 +50,16 @@ export default {
    stage='rate_limit';
    // Both phones usually share one address (carrier NAT shares it more widely), so the
    // address bucket is only a flood ceiling. Crying alerts never depend on it.
-   if(!alertUpload)await latency.measure('rate_limit_ms',()=>rateLimit(env,'api',ip,3000,600));
+   if(!alertUpload)await latency.measure('rate_limit_ms',()=>rateLimit(env,'api',ip,3000,600,latency,'ip_rate_limit_ms'));
    let result:unknown;
    if(route==='POST /v1/device/register'){stage='handler';result=await latency.measure('handler_ms',async()=>register(env,await body(request),ip));}
    else{
     stage='authentication';
-    const device=alertUpload?await admitAlert(env,request,latency):await latency.measure('authentication_ms',()=>authenticate(env,request));
+    const device=alertUpload?await admitAlert(env,request,latency):await latency.measure('authentication_ms',()=>authenticate(env,request,latency));
     stage='rate_limit';
     // Separate budgets: a device's own polling must never delay a crying alert.
     const watchTestPush=route==='POST /v1/watch-test/push';
-    if(!alertUpload)await latency.measure('rate_limit_ms',()=>rateLimit(env,watchTestPush?'watch-test-push':'device',device.id,watchTestPush?660:600,600));
+    if(!alertUpload)await latency.measure('rate_limit_ms',()=>rateLimit(env,watchTestPush?'watch-test-push':'device',device.id,watchTestPush?660:600,600,latency,'device_rate_limit_ms'));
     stage='handler';
     const special=await latency.measure('handler_ms',async()=>{switch(route){
      case 'POST /v1/pairing/create':result=await createPairing(env,device);break;
@@ -85,7 +91,7 @@ export default {
      case 'POST /v1/listener/heartbeat':result=await saveHeartbeat(env,device,await body(request));break;
      case 'POST /v1/listener/event':result=await receiveAlert(env,device,await latency.measure('body_read_ms',()=>body(request)),requestId,latency,ctx);break;
      case 'GET /v1/timeline':result=await timeline(env,device);break;
-     case 'GET /v1/listener/status':result=await listenerStatus(env,device);break;
+     case 'GET /v1/listener/status':result=await listenerStatus(env,device,latency);break;
      case 'GET /v1/live-sound':return await openLiveSound(env,device,request);
      case 'POST /v1/monitoring':result=await requestMonitoring(env,device,await body(request));break;
      case 'POST /v1/monitoring/complete':result=await completeMonitoring(env,device,await body(request));break;

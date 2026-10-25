@@ -87,7 +87,7 @@ Physical regression validation on 24 October 2026, 06:59:29–06:59:52 UTC: a te
 | Denied permission or unavailable microphone | Listener reports failure; Parent shows a prominent warning and never claims monitoring was confirmed |
 | Network loss while changing monitoring | Parent shows that the action could not be verified; local nursery controls still work |
 | Local Stop while a remote Start is pending | Local Stop wins over an older status response; no delayed restart |
-| Parent Pause or Listener Stop during repeating Watch alerts | Outstanding crying alerts are retired; already submitted APNs notifications may still arrive |
+| Pause Monitoring on either phone, or confirmed Listener Stop microphone, during repeating Watch alerts | Outstanding crying alerts are retired; already submitted APNs notifications may still arrive |
 | Nursery microphone stalls, or the nursery app is terminated and reopened, during repeating alerts | Reminders continue until acknowledged; only an explicit Pause/Stop or acknowledgement retires crying alerts |
 
 ## Fixed threshold integration

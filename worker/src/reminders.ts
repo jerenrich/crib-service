@@ -61,7 +61,8 @@ export class AlertReminders implements DurableObject {
   // Bound background work and never hold the object's concurrency lock on D1.
   // Slow results can overlap the next alarm, which consults the durable receipt.
   const entries=[...outcomes];
-  for(let index=0;index<entries.length;index+=4)await Promise.all(entries.slice(index,index+4).map(async([key,saved])=>{
+  // Reserve connection capacity for the next snapshot/claim and its proof read.
+  for(let index=0;index<entries.length;index+=2)await Promise.all(entries.slice(index,index+2).map(async([key,saved])=>{
    const delivery=this.recentAccepted.get(saved.eventId)??saved;
    this.rememberAccepted(delivery);
    const recovery=!this.freshOutcomes.delete(delivery.eventId);
@@ -186,7 +187,7 @@ export async function runReminder(env:Env,parentId:string,latency=new Latency(),
   env.DB.prepare(`SELECT e.* FROM events e JOIN pairs p ON p.parent_id=e.parent_id AND p.listener_id=e.listener_id
    WHERE p.parent_id=? AND e.acknowledged_at IS NULL AND e.resolved_at IS NULL AND COALESCE(e.last_error,'')!='expired_event'
    AND COALESCE(json_extract(e.payload,'$.isTest'),0)=0 ORDER BY e.created_at DESC,e.event_id DESC LIMIT 1`).bind(parentId)
- ]));
+ ]),250);
  const pair=snapshot[0].results[0] as {listener_id:string;created_at:number;alerts_muted_until:number;config:string}|undefined;
  if(!pair)return stop('no_pair');
  observed?.(configuration(JSON.parse(pair.config)).repeatInterval===2?2000:5000,pair.alerts_muted_until);
