@@ -72,7 +72,9 @@ extension WatchCryAlert {
             return format.date(from: string)
         }
         guard let startedAt = date(start), let createdAt = date(created) else { return nil }
-        return WatchCryAlert(eventId: id, episodeId: episode, startedAt: startedAt, createdAt: createdAt, duration: duration, isTest: info["isTest"] as? Bool == true)
+        return WatchCryAlert(eventId: id, episodeId: episode, startedAt: startedAt, createdAt: createdAt, duration: duration, isTest: info["isTest"] as? Bool == true,
+                             diagnosticRef: DiagnosticCorrelation.reference(info["diagnosticRef"] as? String),
+                             deliveryAttempt: DiagnosticCorrelation.attempt(info["deliveryAttempt"] as? Int))
     }
 }
 

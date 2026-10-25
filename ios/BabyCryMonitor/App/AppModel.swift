@@ -204,7 +204,8 @@ import UIKit
         }
         if automaticallyStart {
             log.record("app_launched", code: DiagnosticLog.maximumLines)
-            log.record("alert_pipeline_ready", code: 2)
+            log.record("alert_pipeline_ready", code: 3)
+            log.checkpointCoverage()
             if needsRestart { log.record("monitoring_recovered_after_relaunch") }
             // Local health and freshness must advance even while a request is suspended.
             loopTask = Task { [weak self] in
@@ -1498,6 +1499,7 @@ import UIKit
     }
     func foreground() async {
         log.record("foreground")
+        log.checkpointCoverage()
         #if DEBUG
         // These offline UI fixtures supply a complete paired snapshot. Loading
         // real credentials here would replace it with the empty test defaults.
@@ -1516,6 +1518,7 @@ import UIKit
 
     private func watchSnapshot(message: String? = nil) -> WatchSnapshot {
         var value = WatchSnapshot()
+        value.diagnosticClock = log.latestClockSample
         value.updatedAt = currentTime()
         value.parentMode = role == .parent
         value.paired = value.parentMode && paired

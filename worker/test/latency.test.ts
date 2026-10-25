@@ -1,4 +1,4 @@
-import {describe,it,expect} from 'vitest';
+import {describe,it,expect,vi} from 'vitest';
 import {Latency,safeTimingDetails,type TimingDetails} from '../src/latency';
 
 function deferred<T>() {
@@ -8,6 +8,14 @@ function deferred<T>() {
 const result=(id:number)=>({success:true,results:[{id}],meta:{duration:2,rows_read:3,rows_written:0,total_attempts:2}} as unknown as D1Result<{id:number}>);
 
 describe('bounded read fallback and database metrics',()=>{
+ it('keeps local spans stable across a wall-clock adjustment',async()=>{
+  const latency=new Latency(),wall=Date.now();
+  const clock=vi.spyOn(Date,'now').mockReturnValue(wall);
+  try {
+   await latency.measure('claim_ms',async()=>{clock.mockReturnValue(wall+3600000);});
+   expect(latency.details.spans?.claim_ms).toBeLessThan(1000);
+  }finally{clock.mockRestore();}
+ });
  it('keeps fast reads to one call and associates provider metrics with the stage',async()=>{
   const latency=new Latency();let calls=0;
   expect(await latency.readOnly('reminder_snapshot_ms',async()=>{calls++;return result(1);},5)).toEqual([result(1)]);

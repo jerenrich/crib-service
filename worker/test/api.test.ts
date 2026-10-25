@@ -1481,6 +1481,30 @@ function interceptDB(work:(sql:string,args:unknown[],method:string,execute:()=>P
 }
 
 describe('diagnostic gap regressions',()=>{
+ it('carries exact diagnostic references and attempt numbers through rejected and retried pushes',async()=>{
+  const {parent,listener}=await paired();await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
+  const event=alert(listener);mockPush(503);await call('listener/event',listener,event);
+  await env.DB.prepare('UPDATE events SET next_attempt=0').run();mockPush();await flushPending(testEnv);
+  const ref=await eventReference(testEnv,event.eventId);
+  expect(pushRequests.map(r=>JSON.parse(String(r.init?.body))).map(p=>({ref:p.diagnosticRef,attempt:p.deliveryAttempt})))
+   .toEqual([{ref,attempt:1},{ref,attempt:2}]);
+  const rows=await env.DB.prepare("SELECT event_ref,attempt FROM diagnostics WHERE operation='dispatch' ORDER BY sequence").all();
+  expect(rows.results).toEqual([{event_ref:ref,attempt:1},{event_ref:ref,attempt:2}]);
+ });
+ it('returns bounded server clock timestamps on the existing response',async()=>{
+  const {parent}=await paired(),before=Date.now();const response=await call('listener/status',parent,undefined,'GET');
+  const received=Number(response.headers.get('x-server-received-at-ms')),sent=Number(response.headers.get('x-server-sent-at-ms'));
+  expect(received).toBeGreaterThanOrEqual(before);expect(sent).toBeGreaterThanOrEqual(received);expect(sent).toBeLessThanOrEqual(Date.now());
+ });
+ it('reports observed journal write failures on the next successful record',async()=>{
+  const broken=interceptDB(async(sql,_args,_method,execute)=>{if(sql.startsWith('INSERT INTO diagnostics'))throw new Error('private-journal-error');return execute();});
+  expect(await recordDiagnostic({...testEnv,DB:broken},{requestId:crypto.randomUUID(),started:Date.now(),operation:'maintenance',stage:'handler',outcome:'ok'})).toBe(false);
+  const id=crypto.randomUUID();expect(await recordDiagnostic(testEnv,{requestId:id,started:Date.now(),operation:'maintenance',stage:'handler',outcome:'ok'})).toBe(true);
+  const row=await env.DB.prepare('SELECT details FROM diagnostics WHERE request_id=?').bind(id).first<{details:string}>();
+  expect(JSON.parse(row!.details).journal_failures_before_write).toBeGreaterThanOrEqual(1);expect(row!.details).not.toContain('private-journal-error');
+  const next=crypto.randomUUID();await recordDiagnostic(testEnv,{requestId:next,started:Date.now(),operation:'maintenance',stage:'handler',outcome:'ok'});
+  expect((await env.DB.prepare('SELECT details FROM diagnostics WHERE request_id=?').bind(next).first<{details:string|null}>())?.details).toBeNull();
+ });
  it('uses three binding calls before reminder delivery and includes the current Watch token in the claim',async()=>{
   const {parent,listener}=await paired();await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});mockPush();await call('listener/event',listener,alert(listener));
   vi.spyOn(Date,'now').mockReturnValue(Date.now()+10000);let replaced=false;
@@ -1531,7 +1555,7 @@ describe('diagnostic gap regressions',()=>{
  });
  it('retains preparation when maintenance sees an insert before its binding reply returns',async()=>{
   const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});mockPush();await call('listener/event',listener,alert(listener));
-  const clock=Date.now();vi.spyOn(Date,'now').mockReturnValue(clock+10000);
+  const clock=Date.now();vi.spyOn(Date,'now').mockReturnValue(clock+10000);vi.spyOn(performance,'now').mockImplementation(()=>Date.now());
   let release!:()=>void,inserted!:()=>void,eventID='';const gate=new Promise<void>(r=>{release=r;}),ready=new Promise<void>(r=>{inserted=r;});
   const db=interceptDB(async(sql,args,method,execute)=>{const result=await execute();if(sql.startsWith('INSERT INTO events(')&&method==='run'){eventID=String(args[0]);inserted();await gate;}return result;});
   const alarm=runReminder({...testEnv,DB:db},parent.deviceId);await ready;

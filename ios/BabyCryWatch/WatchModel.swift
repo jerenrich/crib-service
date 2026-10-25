@@ -29,6 +29,8 @@ import UserNotifications
     override private init() {
         super.init()
         log.record("app_launched", code: DiagnosticLog.maximumLines)
+        log.record("alert_pipeline_ready", code: 3)
+        log.checkpointCoverage()
         if let data = UserDefaults.standard.data(forKey: "watchSnapshot") {
             do { snapshot = try JSONDecoder().decode(WatchSnapshot.self, from: data) }
             catch { log.record("watch_snapshot_failed", error: error) }
@@ -55,6 +57,7 @@ import UserNotifications
 
     func foreground() async {
         log.record("foreground")
+        log.checkpointCoverage()
         await recoverNotificationHistory()
         alertState.retryPendingAcknowledgement()
         if alertSetup.phase != .requestingPermission {
@@ -137,7 +140,7 @@ import UserNotifications
     func handleNotification(_ value: WatchCryAlert, acknowledging: Bool) {
         alertState.handleNotification(value, acknowledging: acknowledging)
         if acknowledging {
-            Task { [weak self] in await NotificationCleanup.dismissCryingAlerts(testEventID: value.isTest ? value.eventId : nil, beforeRemoving: { self?.recordDeliveredNotifications($0) }) }
+            Task { [weak self] in await NotificationCleanup.dismissCryingAlerts(testEventID: value.isTest ? value.eventId : nil, beforeRemoving: { self?.recordDeliveredNotifications($0) }, log: self?.log) }
         }
     }
     func resumeAlerts() {
@@ -152,7 +155,7 @@ import UserNotifications
     func acknowledge() {
         if let alert {
             log.watchAlert(WatchAlertTrace(alert: alert, phase: .acknowledged))
-            Task { [weak self] in await NotificationCleanup.dismissCryingAlerts(testEventID: alert.isTest ? alert.eventId : nil, beforeRemoving: { self?.recordDeliveredNotifications($0) }) }
+            Task { [weak self] in await NotificationCleanup.dismissCryingAlerts(testEventID: alert.isTest ? alert.eventId : nil, beforeRemoving: { self?.recordDeliveredNotifications($0) }, log: self?.log) }
         }
         log.record("watch_acknowledgement_requested"); alertState.acknowledgeCurrent()
     }
@@ -190,7 +193,7 @@ import UserNotifications
         alertState.acceptAlert(from: value)
         if let alert = alertState.alert { log.watchAlert(WatchAlertTrace(alert: alert, phase: .snapshotReceived)) }
         if value.statusAvailable, let relevance = value.notificationRelevance, let checkedAt = value.notificationsCheckedAt {
-            Task { [weak self] in await NotificationCleanup.removeIrrelevant(using: relevance, deliveredBefore: checkedAt, beforeRemoving: { self?.recordDeliveredNotifications($0) }) }
+            Task { [weak self] in await NotificationCleanup.removeIrrelevant(using: relevance, deliveredBefore: checkedAt, beforeRemoving: { self?.recordDeliveredNotifications($0) }, log: self?.log) }
         }
     }
 
@@ -238,11 +241,23 @@ import UserNotifications
         refreshing = true
         // WatchConnectivity invokes these callbacks on a background queue. Mark
         // them Sendable so Swift does not infer the enclosing MainActor isolation.
+        let sentAt = Date(), clockStarted = ContinuousClock.now
         session.sendMessage(["command": data], replyHandler: { @Sendable reply in
             let data = reply["snapshot"] as? Data
+            let finishedAt = Date(), elapsed = DiagnosticTiming.elapsedMS(since: clockStarted)
+            let relativeClock = DiagnosticClockSample.estimate(localStarted: sentAt, localFinished: finishedAt, monotonicMS: elapsed,
+                remoteReceivedMS: (reply["clockReceivedAtMS"] as? NSNumber)?.int64Value,
+                remoteSentMS: (reply["clockSentAtMS"] as? NSNumber)?.int64Value)
+            let phoneSent = (reply["clockSentAtMS"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue / 1000) }
             Task { @MainActor in
                 self.refreshing = false
-                if let data { self.receiveSnapshot(data) }
+                if let data {
+                    // Only a live round trip can calibrate the Watch; cached
+                    // application contexts carry no phone↔Watch timing bound.
+                    let sample = try? JSONDecoder().decode(WatchSnapshot.self, from: data).diagnosticClock
+                    self.log.observeClock(relativeClock.flatMap { relative in phoneSent.flatMap { sample?.bridged(to: relative, phoneSentAt: $0) } })
+                    self.receiveSnapshot(data)
+                }
             }
         }, errorHandler: { @Sendable error in
             Task { @MainActor in self.refreshing = false; self.notice = "iPhone sync unavailable. Open the Parent app and try again."; self.log.record("watch_sync_failed", error: error) }

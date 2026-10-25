@@ -31,6 +31,7 @@ struct WatchSnapshot: Codable, Equatable, Sendable {
     // Missing on older phones/cached snapshots: require explicit opt-in.
     var localConnectionWarningEnabled: Bool?
     var connectionWarningDeadline: Date?
+    var diagnosticClock: DiagnosticClockSample?
 
     var localConnectionDeadline: Date? {
         guard connectionWarningSupported == true, localConnectionWarningEnabled == true, parentMode, paired else { return nil }
@@ -51,6 +52,8 @@ struct WatchCryAlert: Codable, Equatable, Identifiable, Sendable {
     let createdAt: Date
     let duration: Double
     let isTest: Bool
+    var diagnosticRef: String? = nil
+    var deliveryAttempt: Int? = nil
     var id: UUID { eventId }
     func isRecent(at now: Date) -> Bool { (-5...300).contains(now.timeIntervalSince(createdAt)) }
 }

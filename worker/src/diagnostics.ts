@@ -40,15 +40,20 @@ export async function eventReference(env:Env,eventId:string):Promise<string> {
  const signature=await crypto.subtle.sign('HMAC',key,new TextEncoder().encode(`diagnostics:event:${eventId}`));
  return [...new Uint8Array(signature)].map(byte=>byte.toString(16).padStart(2,'0')).join('');
 }
+// Best-effort isolate-local evidence only. A restart loses unreported failures;
+// concurrent successful rows may report overlapping counts, so do not sum them.
+let journalFailures=0,reportedJournalFailures=0;
 export async function recordDiagnostic(env:Env,value:Diagnostic):Promise<boolean> {
  // Explicit columns prevent accidental object spreading of request/exception data.
  // Fail open: diagnostics must never change delivery or turn acceptance into a retry.
  try {
-  const release=env.CF_VERSION_METADATA?.id;
+  const release=env.CF_VERSION_METADATA?.id,observedFailures=journalFailures;
+  const details=observedFailures>reportedJournalFailures?{...value.details,journal_failures_before_write:observedFailures-reportedJournalFailures}:value.details;
   await env.DB.prepare('INSERT INTO diagnostics(recorded_at,request_id,operation,stage,outcome,http_status,elapsed_ms,event_ref,attempt,target,release,details) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)')
    .bind(Date.now(),value.requestId,value.operation,value.stage,value.outcome,value.httpStatus??null,
     Math.max(0,Date.now()-value.started),value.eventRef??null,value.attempt??null,value.target??null,
-    release && /^[0-9a-f-]{36}$/i.test(release)?release:null,safeTimingDetails(value.details)).run();
+    release && /^[0-9a-f-]{36}$/i.test(release)?release:null,safeTimingDetails(details)).run();
+  reportedJournalFailures=Math.max(reportedJournalFailures,observedFailures);
   return true;
- } catch { return false; }
+ } catch { journalFailures=Math.min(Number.MAX_SAFE_INTEGER,journalFailures+1);return false; }
 }

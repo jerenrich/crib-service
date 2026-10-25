@@ -7,6 +7,15 @@ import Observation
     private(set) var lines: [String] = []
     private(set) var persistenceAvailable = true
     private(set) var persistenceFailure: String?
+    private(set) var latestClockSample: DiagnosticClockSample?
+    private let processID = UUID()
+    @ObservationIgnored private var sampledRecords = 0
+    @ObservationIgnored private var deduplicatedRecords = 0
+    @ObservationIgnored private var evictedRecords = 0
+    @ObservationIgnored private var writeFailures = 0
+    @ObservationIgnored private var readFailures = 0
+    @ObservationIgnored private var writeRecoveries = 0
+    private var recordsSinceCheckpoint = 0
     private let url: URL?
     private let batteryDrain: BatteryDrainLog
     let benchmark: BackgroundBenchmark
@@ -52,9 +61,10 @@ import Observation
                 let saved = text.components(separatedBy: "\n").filter { !$0.isEmpty }
                 persistedLineCount = saved.count
                 lines = Array(saved.suffix(Self.maximumLines))
+                evictedRecords = max(0, saved.count - Self.maximumLines)
                 watchTraceKeys = Set(lines.compactMap(WatchAlertTrace.key(in:)))
             }
-        } catch { persistenceAvailable = false; persistenceFailure = Self.errorDetails(error) }
+        } catch { readFailures += 1; persistenceAvailable = false; persistenceFailure = Self.errorDetails(error) }
     }
     func battery(batteryLevel: Double?, powerConnected: Bool?, monitoring: Bool, audioActive: Bool,
                  lowPowerMode: Bool, appActive: Bool, at now: Date) {
@@ -71,12 +81,13 @@ import Observation
                                       "parent_connection_warning_armed", "parent_connection_warning_failed", "watch_payload_unrecognized"]
         let details = error.map { Self.errorDetails($0) } ?? ""
         let fingerprint = "event_\(event)_\(code ?? 0)_\(details)"
-        if repetitive.contains(event), let last = recent[fingerprint], Date().timeIntervalSince(last) < 60 { return }
+        if repetitive.contains(event), let last = recent[fingerprint], Date().timeIntervalSince(last) < 60 { sampledRecords += 1; return }
         recent[fingerprint] = Date()
         append(event + (code.map { " code=\($0)" } ?? "") + (details.isEmpty ? "" : " " + details))
     }
     func network(operation: String, outcome: String, status: Int? = nil, requestID: UUID? = nil,
-                 elapsedMS: Int, storageUnavailable: Bool = false, error: (any Error)? = nil, eventID: UUID? = nil, benchmarkAttempt: UUID? = nil, serverDiagnosticMS: Int? = nil) {
+                 elapsedMS: Int, storageUnavailable: Bool = false, error: (any Error)? = nil, eventID: UUID? = nil, benchmarkAttempt: UUID? = nil, serverDiagnosticMS: Int? = nil,
+                 metrics: DiagnosticNetworkTiming? = nil, clock: DiagnosticClockSample? = nil, monotonic: Bool = false) {
         let operations: Set<String> = ["register", "pairing_create", "pairing_claim", "push_token", "watch_token", "heartbeat", "alert", "status", "timeline", "monitoring", "monitoring_complete", "settings", "acknowledge", "test_push", "connection_preferences", "unpair", "delete_device", "resume_alerts"]
         guard operations.contains(operation), ["ok", "http_error", "transport_error", "decode_error", "encode_error", "cancelled", "invalid_response"].contains(outcome) else { return }
         if operation == "status" {
@@ -90,7 +101,7 @@ import Observation
         if outcome != "ok" { recent[failureKey] = Date() }
         let routine = ["status", "heartbeat", "timeline"].contains(operation)
         let sample = outcome == "ok" ? routine : operation != "alert"
-        if sample, elapsedMS < 2000, !recovered, !storageUnavailable, (serverDiagnosticMS ?? 0) < 2000, let last = recent[fingerprint], Date().timeIntervalSince(last) < (outcome == "ok" ? 900 : 60) { return }
+        if sample, elapsedMS < 2000, !recovered, !storageUnavailable, (serverDiagnosticMS ?? 0) < 2000, let last = recent[fingerprint], Date().timeIntervalSince(last) < (outcome == "ok" ? 900 : 60) { sampledRecords += 1; return }
         recent[fingerprint] = Date()
         var entry = "network operation=\(operation) outcome=\(outcome) elapsed_ms=\(max(0, elapsedMS))"
         if let status { entry += " status=\(status)" }
@@ -98,8 +109,37 @@ import Observation
         if operation == "alert", let eventID { entry += " event_id=\(eventID.uuidString.lowercased())" }
         if storageUnavailable { entry += " server_diagnostics=unavailable" }
         if let serverDiagnosticMS, (0...3_600_000).contains(serverDiagnosticMS) { entry += " server_diagnostic_ms=\(serverDiagnosticMS)" }
+        if monotonic { entry += " elapsed_source=monotonic" }
+        if let clock, clock.isValid { entry += clock.fields }
+        else if monotonic { entry += " clock_sample=unavailable" }
+        if elapsedMS >= 2000 || outcome != "ok" { entry += metrics?.fields ?? " network_metrics=unavailable" }
         if !details.isEmpty { entry += " " + details }
         append(entry)
+    }
+    func observeClock(_ sample: DiagnosticClockSample?) {
+        latestClockSample = sample?.isValid == true ? sample : nil
+        // HTTP samples share the network row. The Watch has no such row, so
+        // retain one bridge estimate per 15 minutes using existing exchanges.
+        if let sample = latestClockSample, sample.source == .phoneBridge {
+            let now = Date(),key = "watch_clock_estimate"
+            if recent[key].map({ now.timeIntervalSince($0) >= 900 }) ?? true {
+                recent[key] = now; append("clock_estimate" + sample.fields)
+            }
+        }
+    }
+    func notificationRemovals(_ removals: [DiagnosticNotificationRemoval]) {
+        let now = Date().formatted(Self.timestampStyle)
+        let entries = removals.map { removal in
+            "\(now) notification_cleanup event_id=\(removal.eventID.uuidString.lowercased()) episode_id=\(removal.episodeID.uuidString.lowercased()) reason=\(removal.reason.rawValue) location=\(removal.pending ? "pending" : "delivered") action=removal_requested" + DiagnosticCorrelation.fields(reference: removal.reference, attempt: removal.attempt)
+        }
+        if !entries.isEmpty { appendLines(entries) }
+    }
+    private var coverageFields: String {
+        "scope=process process_id=\(processID.uuidString.lowercased()) sampled_records=\(sampledRecords) deduplicated_records=\(deduplicatedRecords) evicted_records=\(evictedRecords) read_failures=\(readFailures) write_failures=\(writeFailures) write_recoveries=\(writeRecoveries)"
+    }
+    func checkpointCoverage() {
+        recordsSinceCheckpoint = 0
+        append("diagnostic_coverage " + coverageFields)
     }
     func alertPersisted(_ alert: CryAlert, at now: Date, elapsedMS: Int) {
         alertOutbox(alert, phase: "persisted", at: now, extra: " persistence_ms=\(max(0, elapsedMS))")
@@ -119,9 +159,10 @@ import Observation
     func watchAlerts(_ traces: [WatchAlertTrace]) {
         var entries: [String] = []
         for trace in traces {
-            guard !watchTraceKeys.contains(trace.key), let entry = trace.entry else { continue }
+            guard !watchTraceKeys.contains(trace.key) else { deduplicatedRecords += 1; continue }
+            guard let entry = trace.entry else { continue }
             watchTraceKeys.insert(trace.key)
-            entries.append("\(trace.observedAt.formatted(Self.timestampStyle)) \(entry)")
+            entries.append("\(trace.observedAt.formatted(Self.timestampStyle)) \(entry)" + (latestClockSample?.fields(at: trace.observedAt) ?? " clock_sample=unavailable"))
         }
         // A recovered Notification Center history needs only one atomic write.
         if !entries.isEmpty { appendLines(entries) }
@@ -201,15 +242,22 @@ import Observation
         appendLines(["\(Date().formatted(Self.timestampStyle)) \(event)"])
     }
     private func appendLines(_ entries: [String]) {
+        var entries = entries
+        recordsSinceCheckpoint += entries.count
+        if recordsSinceCheckpoint >= 1000 {
+            recordsSinceCheckpoint = 0
+            entries.append("\(Date().formatted(Self.timestampStyle)) diagnostic_coverage " + coverageFields)
+        }
         lines.append(contentsOf: entries)
         if lines.count > Self.maximumLines {
+            evictedRecords += lines.count - Self.maximumLines
             for line in lines.prefix(lines.count - Self.maximumLines) {
                 if let key = WatchAlertTrace.key(in: line) { watchTraceKeys.remove(key) }
             }
             lines = Array(lines.suffix(Self.maximumLines))
         }
         do {
-            guard let url else { persistenceAvailable = false; return }
+            guard let url else { writeFailures += 1; persistenceAvailable = false; return }
             // Append only the new rows. Compact occasionally, rather than rewriting
             // several MB on every notification. The plain-text file stays directly
             // readable; its temporary overlap is bounded to 1,000 older rows.
@@ -233,11 +281,13 @@ import Observation
                 try file.write(contentsOf: Data(((offset > 0 ? "\n" : "") + entries.joined(separator: "\n")).utf8))
                 persistedLineCount += entries.count
             }
+            if !persistenceAvailable { writeRecoveries += 1 }
             persistenceAvailable = true; persistenceFailure = nil
         } catch {
             // A failed append may be partial. Repair from the bounded in-memory
             // snapshot on the next write instead of appending to uncertain data.
             storagePrepared = false
+            writeFailures += 1
             persistenceAvailable = false; persistenceFailure = Self.errorDetails(error)
         }
     }
@@ -246,7 +296,17 @@ import Observation
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
         return "Crib Service diagnostics · app=\(version) build=\(build) os=\(ProcessInfo.processInfo.operatingSystemVersionString)\npersistence=\(persistenceAvailable ? "available" : "unavailable")\n"
             + "retention_limit=\(Self.maximumLines) retained_lines=\(lines.count)\n"
+            + "first_record_at=\(coverageDate(lines.first)) last_record_at=\(coverageDate(lines.last))\n"
+            + "diagnostic_coverage " + coverageFields + "\n"
+            + (latestClockSample?.fields(at: Date()) ?? "clock_sample=unavailable") + "\n"
             + (persistenceFailure.map { "diagnostic_storage_error \($0)\n" } ?? "")
+    }
+    private func coverageDate(_ line: String?) -> String {
+        guard let text = line?.split(separator: " ").first else { return "none" }
+        let formatter = ISO8601DateFormatter(); formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = formatter.date(from: String(text)) { return date.formatted(Self.timestampStyle) }
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: String(text))?.formatted(Self.timestampStyle) ?? "unknown"
     }
     var recentExport: String { exportHeader + lines.joined(separator: "\n") }
     var previewExport: String {

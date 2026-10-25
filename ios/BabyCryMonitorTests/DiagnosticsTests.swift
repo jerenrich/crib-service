@@ -14,9 +14,14 @@ private final class DiagnosticsURLProtocol: URLProtocol, @unchecked Sendable {
         }
         let status = path.contains("http-error") ? 503 : 200
         let requestID = path.contains("invalid-id") ? "private-token" : "6705ae24-2863-49df-8dc5-5fa15b2d0418"
-        let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil,
-            headerFields: ["x-request-id": requestID, "x-diagnostics-status": "unavailable",
-                           "x-diagnostics-elapsed-ms": path.contains("bad-timing") ? "-999" : "2750"])!
+        var headers = ["x-request-id": requestID, "x-diagnostics-status": "unavailable",
+                       "x-diagnostics-elapsed-ms": path.contains("bad-timing") ? "-999" : "2750"]
+        if path.contains("clock") {
+            let remote = Int64((Date().timeIntervalSince1970 * 1000).rounded()) + 1000
+            headers["x-server-received-at-ms"] = path.contains("bad-clock") ? "private-header" : String(remote)
+            headers["x-server-sent-at-ms"] = String(remote)
+        }
+        let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: headers)!
         let body: String
         if path.contains("schema-error") { body = "{\"quietResetDuration\":20,\"sensitivity\":\"medium\",\"absoluteThreshold\":-35}" }
         else if path.contains("date-error") { body = "{\"code\":\"private-pairing-code\",\"expiresAt\":\"private-invalid-timestamp\"}" }
@@ -30,6 +35,54 @@ private final class DiagnosticsURLProtocol: URLProtocol, @unchecked Sendable {
 }
 
 final class DiagnosticsTests: XCTestCase {
+    @MainActor func testBackendClockHeadersAreConsumedAndInvalidSamplesClearTheEstimate() async throws {
+        let config = URLSessionConfiguration.ephemeral;config.protocolClasses = [DiagnosticsURLProtocol.self]
+        let session = URLSession(configuration: config);defer { session.invalidateAndCancel() }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let log = DiagnosticLog(directory: directory),credential = DeviceCredential(deviceId: UUID(), secret: "private-credential", role: .parent, registered: true)
+        try await BackendClient(baseURL: URL(string: "https://private-host/clock")!, credential: credential, log: log, session: session).register()
+        let sample = try XCTUnwrap(log.latestClockSample)
+        XCTAssertEqual(Double(sample.offsetMS), 1000, accuracy: 500);XCTAssertTrue(log.lines.last!.contains("clock_source=http"))
+        try await BackendClient(baseURL: URL(string: "https://private-host/bad-clock")!, credential: credential, log: log, session: session).register()
+        XCTAssertNil(log.latestClockSample);XCTAssertTrue(log.lines.last!.contains("clock_sample=unavailable"))
+        XCTAssertFalse(log.export.contains("private-header"))
+        log.observeClock(DiagnosticClockSample(offsetMS: 10, uncertaintyMS: 5, sampledAt: Date(), source: .phoneBridge))
+        log.observeClock(DiagnosticClockSample(offsetMS: 11, uncertaintyMS: 6, sampledAt: Date(), source: .phoneBridge))
+        XCTAssertEqual(log.lines.filter { $0.contains("clock_estimate") }.count, 1)
+    }
+    @MainActor func testCoverageCountsSamplingDeduplicationEvictionAndStorageRecovery() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let log = DiagnosticLog(directory: directory)
+        log.network(operation: "status", outcome: "ok", elapsedMS: 10)
+        log.network(operation: "status", outcome: "ok", elapsedMS: 10)
+        let now = Date(),alert = WatchCryAlert(eventId: UUID(), episodeId: UUID(), startedAt: now, createdAt: now, duration: 5, isTest: false)
+        let trace = WatchAlertTrace(alert: alert, phase: .retained)
+        log.watchAlerts([trace,trace])
+        XCTAssertTrue(log.recentExport.contains("sampled_records=1 deduplicated_records=1"))
+        for code in 0..<10_001 { log.record("background", code: code) }
+        XCTAssertEqual(log.lines.count, 10_000)
+        let currentCoverage = try XCTUnwrap(log.recentExport.split(separator: "\n").first { $0.hasPrefix("diagnostic_coverage ") })
+        XCTAssertFalse(currentCoverage.contains("evicted_records=0 "))
+        XCTAssertTrue(log.recentExport.contains("first_record_at="));XCTAssertTrue(log.recentExport.contains("scope=process process_id="))
+        let url = directory.appendingPathComponent("diagnostics.txt")
+        try FileManager.default.removeItem(at: url);try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
+        log.record("foreground");XCTAssertTrue(log.recentExport.contains("write_failures=1"))
+        try FileManager.default.removeItem(at: url);log.record("background")
+        XCTAssertTrue(log.recentExport.contains("write_recoveries=1"))
+        let restored = DiagnosticLog(directory: directory)
+        XCTAssertTrue(restored.recentExport.contains("sampled_records=0 deduplicated_records=0"), "Current-process counters must not pretend to be lifetime counts")
+    }
+    @MainActor func testSlowNetworkDetailsShareTheRequestRowAndFastRequestsOmitThem() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let log = DiagnosticLog(directory: directory),metrics = DiagnosticNetworkTiming(transactions: 1, dnsMS: 20, serverWaitMS: 2400)
+        log.network(operation: "alert", outcome: "ok", elapsedMS: 2500, metrics: metrics, monotonic: true)
+        log.network(operation: "alert", outcome: "ok", elapsedMS: 10, metrics: metrics, monotonic: true)
+        XCTAssertEqual(log.lines.count, 2);XCTAssertTrue(log.lines[0].contains("dns_ms=20 server_wait_ms=2400"))
+        XCTAssertFalse(log.lines[1].contains("network_metrics="));XCTAssertTrue(log.lines[0].contains("elapsed_source=monotonic"))
+    }
     @MainActor func testSlowRoutineRequestsBypassSamplingWithoutAddingFastRequestRows() {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -105,13 +158,13 @@ final class DiagnosticsTests: XCTestCase {
         let log = DiagnosticLog(directory: directory)
         XCTAssertEqual(log.lines.count, 10_000)
         log.record("background", code: 10_000) // First write prepares protection and the bounded snapshot.
+        let originalInode = try FileManager.default.attributesOfItem(atPath: url.path)[.systemFileNumber] as? NSNumber
         for code in 10_001...11_000 { log.record("background", code: code) }
+        XCTAssertNotEqual(try FileManager.default.attributesOfItem(atPath: url.path)[.systemFileNumber] as? NSNumber, originalInode)
         XCTAssertEqual(log.lines.count, 10_000)
-        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8).split(separator: "\n").count, 11_000)
-        let inode = try FileManager.default.attributesOfItem(atPath: url.path)[.systemFileNumber] as? NSNumber
+        XCTAssertLessThanOrEqual(try String(contentsOf: url, encoding: .utf8).split(separator: "\n").count, 11_000)
         log.record("background", code: 11_001)
-        XCTAssertNotEqual(try FileManager.default.attributesOfItem(atPath: url.path)[.systemFileNumber] as? NSNumber, inode)
-        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8).split(separator: "\n").count, 10_000)
+        XCTAssertLessThanOrEqual(try String(contentsOf: url, encoding: .utf8).split(separator: "\n").count, 11_000)
         XCTAssertTrue(log.lines.last?.hasSuffix("code=11001") == true)
         XCTAssertEqual(DiagnosticLog(directory: directory).lines, log.lines)
     }

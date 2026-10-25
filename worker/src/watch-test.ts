@@ -14,7 +14,7 @@ export function retiredWatchTest(device:Device,value?:Record<string,unknown>) {
 
 // Exactly one phone-triggered attempt. No alarm, persisted event or retry outbox.
 export async function sendWatchTest(env:Env,device:Device,latency=new Latency(),requestId=crypto.randomUUID()) {
- const started=Date.now();latency.details.dispatch_source='watch_test';
+ const started=Date.now();latency.details.dispatch_source='watch_test';latency.deliveryAttempt=1;
  requireRole(device,'parent');
  const pair=await latency.measure('pair_ms',()=>pairFor(env,device));
  if(!pair)throw new APIError(409,'Pair a Listener first.');

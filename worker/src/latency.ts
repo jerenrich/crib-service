@@ -30,12 +30,14 @@ export interface TimingDetails {
  push_outcome?:'sent'|'retry'|'blocked'|'uncertain'|'failed';
  observed_attempts?:number; next_attempt_at_ms?:number;
  preparation_started_at_ms?:number; preparation_finished_at_ms?:number;
+ journal_failures_before_write?:number;
 }
 export class Latency {
  readonly details:TimingDetails={spans:{}};
  private failureCause:unknown;
  private hasFailure=false;
  eventRef?:string;
+ deliveryAttempt?:number;
  failure(error:unknown,span?:Span):void {
   const message=error instanceof Error?error.message:'';
   this.details.error_kind=/D1/i.test(message)?(/overload/i.test(message)?'d1_overloaded':/timeout|timed out/i.test(message)?'d1_timeout':'d1_error'):'other';
@@ -43,8 +45,8 @@ export class Latency {
   else if(span&&!this.details.failed_span)this.details.failed_span=span;
  }
  async measure<T>(name:Span,work:()=>Promise<T>):Promise<T> {
-  const start=Date.now();
-  try{return await work();}catch(error){this.failure(error,name);throw error;}finally{this.details.spans![name]=(this.details.spans![name]??0)+Math.max(0,Date.now()-start);}
+  const start=performance.now();
+  try{return await work();}catch(error){this.failure(error,name);throw error;}finally{this.details.spans![name]=(this.details.spans![name]??0)+Math.max(0,performance.now()-start);}
  }
  async db<T>(name:Span,work:()=>Promise<D1Result<T>|D1Result<T>[]>):Promise<D1Result<T>[]> {
   this.databaseStarted(name);
@@ -121,7 +123,7 @@ export function safeTimingDetails(value:TimingDetails|undefined):string|null {
   if(Object.keys(metrics).length)stages[name]=metrics;
  }
  if(Object.keys(stages).length)safe.db_stages=stages;
- for(const name of ['db_calls','db_sql_ms','db_rows_read','db_rows_written','db_attempts','provider_token_age_s','apns_started_at_ms','apns_response_at_ms','observed_attempts','next_attempt_at_ms','preparation_started_at_ms','preparation_finished_at_ms'] as const){
+ for(const name of ['db_calls','db_sql_ms','db_rows_read','db_rows_written','db_attempts','provider_token_age_s','apns_started_at_ms','apns_response_at_ms','observed_attempts','next_attempt_at_ms','preparation_started_at_ms','preparation_finished_at_ms','journal_failures_before_write'] as const){
   if(number(value[name]))safe[name]=value[name];
  }
  if(appleReasons.includes(value.apns_reason!))safe.apns_reason=value.apns_reason;

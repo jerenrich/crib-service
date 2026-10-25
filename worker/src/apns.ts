@@ -29,7 +29,9 @@ export function payload(alert:Alert,target:'phone'|'watch'='phone') {
  return {aps:{alert:{title,body},category:'BABY_CRY_ALERT','thread-id':alert.episodeId,...(target==='watch'?{sound:'default','interruption-level':'time-sensitive'}:{})},eventId:alert.eventId,episodeId:alert.episodeId,cryStartedAt:alert.cryStartedAt,createdAt:alert.createdAt,durationSeconds:alert.durationSeconds,...(alert.isTest?{isTest:true}:{})};
 }
 export async function sendPush(env:Env,encryptedToken:string,alert:Alert,target:'phone'|'watch'='phone',latency=new Latency()):Promise<PushResult> {
- return sendNotification(env,encryptedToken,alert.eventId,payload(alert,target),target,alert.isRepeat?5:3600,alert.isRepeat?alert.episodeId:alert.eventId,latency);
+ const diagnosticRef=latency.eventRef,deliveryAttempt=latency.deliveryAttempt;
+ const correlation=diagnosticRef&&/^[0-9a-f]{64}$/.test(diagnosticRef)&&deliveryAttempt!==undefined&&Number.isSafeInteger(deliveryAttempt)&&deliveryAttempt>0&&deliveryAttempt<=1_000_000?{diagnosticRef,deliveryAttempt}:{};
+ return sendNotification(env,encryptedToken,alert.eventId,{...payload(alert,target),...correlation},target,alert.isRepeat?5:3600,alert.isRepeat?alert.episodeId:alert.eventId,latency);
 }
 export async function sendConnectionPush(env:Env,encryptedToken:string,id:string,state:'offline'|'stopped',target:'phone'|'watch',latency=new Latency()):Promise<PushResult> {
  const title=state==='stopped'?'Listener monitoring stopped':'Listener connection lost';

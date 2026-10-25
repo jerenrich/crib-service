@@ -4,29 +4,49 @@ import UserNotifications
 /// Delete only our crying/test category; connection warnings and other notices survive.
 enum NotificationCleanup {
     @MainActor static func removeIrrelevant(using relevance: NotificationRelevance, deliveredBefore: Date,
-                                           beforeRemoving: (([UNNotification]) -> Void)? = nil) async {
+                                           beforeRemoving: (([UNNotification]) -> Void)? = nil, log: DiagnosticLog? = nil) async {
         let center = UNUserNotificationCenter.current()
         let delivered = await center.deliveredNotifications()
         beforeRemoving?(delivered)
+        var removals: [DiagnosticNotificationRemoval] = []
         let identifiers = delivered.compactMap { notification -> String? in
             guard isIrrelevant(notification.request.content, deliveredAt: notification.date,
                                using: relevance, deliveredBefore: deliveredBefore) else { return nil }
+            if let removal = removal(notification.request.content, reason: .noLongerRelevant, pending: false) { removals.append(removal) }
             return notification.request.identifier
         }
         center.removeDeliveredNotifications(withIdentifiers: identifiers)
+        log?.notificationRemovals(removals)
     }
 
     @MainActor static func dismissCryingAlerts(testEventID: UUID? = nil,
-                                              beforeRemoving: (([UNNotification]) -> Void)? = nil) async {
+                                              beforeRemoving: (([UNNotification]) -> Void)? = nil, log: DiagnosticLog? = nil) async {
         let center = UNUserNotificationCenter.current()
         let cutoff = Date()
         let delivered = await center.deliveredNotifications()
         beforeRemoving?(delivered)
         let pending = await center.pendingNotificationRequests()
-        center.removeDeliveredNotifications(withIdentifiers: delivered.filter {
-            $0.date <= cutoff && shouldDismiss($0.request.content, testEventID: testEventID)
-        }.map { $0.request.identifier })
-        center.removePendingNotificationRequests(withIdentifiers: pending.filter { shouldDismiss($0.content, testEventID: testEventID) }.map(\.identifier))
+        let reason: NotificationRemovalReason = testEventID == nil ? .snoozed : .testAcknowledged
+        var removals: [DiagnosticNotificationRemoval] = []
+        let deliveredIDs = delivered.compactMap { notification -> String? in
+            guard notification.date <= cutoff, shouldDismiss(notification.request.content, testEventID: testEventID) else { return nil }
+            if let removal = removal(notification.request.content, reason: reason, pending: false) { removals.append(removal) }
+            return notification.request.identifier
+        }
+        let pendingIDs = pending.compactMap { request -> String? in
+            guard shouldDismiss(request.content, testEventID: testEventID) else { return nil }
+            if let removal = removal(request.content, reason: reason, pending: true) { removals.append(removal) }
+            return request.identifier
+        }
+        center.removeDeliveredNotifications(withIdentifiers: deliveredIDs)
+        center.removePendingNotificationRequests(withIdentifiers: pendingIDs)
+        log?.notificationRemovals(removals)
+    }
+
+    static func removal(_ content: UNNotificationContent, reason: NotificationRemovalReason, pending: Bool) -> DiagnosticNotificationRemoval? {
+        guard let alert = identity(content) else { return nil }
+        return DiagnosticNotificationRemoval(eventID: alert.eventID, episodeID: alert.episodeID,
+            reference: content.userInfo["diagnosticRef"] as? String, attempt: content.userInfo["deliveryAttempt"] as? Int, reason: reason, pending: pending)
     }
 
     static func isIrrelevant(_ content: UNNotificationContent, deliveredAt: Date,

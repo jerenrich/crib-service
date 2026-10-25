@@ -167,33 +167,40 @@ struct BackendClient: BackendServing {
                          "/v1/listener/heartbeat": "heartbeat", "/v1/listener/event": "alert", "/v1/listener/status": "status",
                          "/v1/timeline": "timeline", "/v1/monitoring": "monitoring", "/v1/monitoring/complete": "monitoring_complete", "/v1/settings": "settings", "/v1/alert/acknowledge": "acknowledge", "/v1/test-push": "test_push", "/v1/watch-test": "test_push", "/v1/watch-test/push": "test_push", "/v1/alert/resume": "resume_alerts",
                          "/v1/connection-alerts": "connection_preferences", "/v1/pairing/remove": "unpair", "/v1/device/delete": "delete_device"][path] ?? "unknown"
-        let started = Date()
+        let started = ContinuousClock.now
+        let metricsCollector = BackendMetricsCollector()
         let benchmarkAttempt = operation == "status" && credential.role == .parent ? await log?.benchmark.requestStarted() : nil
         let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
         do { if let body { request.httpBody = try encoder.encode(body) } }
         catch {
             await log?.network(operation: operation, outcome: "encode_error",
-                               elapsedMS: Int(Date().timeIntervalSince(started) * 1000), error: error, eventID: eventID, benchmarkAttempt: benchmarkAttempt)
+                               elapsedMS: DiagnosticTiming.elapsedMS(since: started), error: error, eventID: eventID, benchmarkAttempt: benchmarkAttempt, metrics: metricsCollector.snapshot, monotonic: true)
             throw error
         }
         let data: Data, rawResponse: URLResponse
-        do { (data, rawResponse) = try await session.data(for: request) }
+        let sentAt = Date(), networkStarted = ContinuousClock.now
+        do { (data, rawResponse) = try await session.data(for: request, delegate: metricsCollector) }
         catch {
             let code = (error as? URLError)?.code.rawValue
             await log?.network(operation: operation, outcome: code == URLError.cancelled.rawValue ? "cancelled" : "transport_error",
-                               status: code, elapsedMS: Int(Date().timeIntervalSince(started) * 1000), error: error, eventID: eventID, benchmarkAttempt: benchmarkAttempt)
+                               status: code, elapsedMS: DiagnosticTiming.elapsedMS(since: started), error: error, eventID: eventID, benchmarkAttempt: benchmarkAttempt, metrics: metricsCollector.snapshot, monotonic: true)
             throw error
         }
+        let receivedAt = Date(), networkElapsed = DiagnosticTiming.elapsedMS(since: networkStarted)
         guard let response = rawResponse as? HTTPURLResponse else {
-            await log?.network(operation: operation, outcome: "invalid_response", elapsedMS: Int(Date().timeIntervalSince(started) * 1000), eventID: eventID, benchmarkAttempt: benchmarkAttempt)
+            await log?.network(operation: operation, outcome: "invalid_response", elapsedMS: DiagnosticTiming.elapsedMS(since: started), eventID: eventID, benchmarkAttempt: benchmarkAttempt, metrics: metricsCollector.snapshot, monotonic: true)
             throw BackendError.message("Invalid server response.")
         }
+        let clock = DiagnosticClockSample.estimate(localStarted: sentAt, localFinished: receivedAt, monotonicMS: networkElapsed,
+            remoteReceivedMS: response.value(forHTTPHeaderField: "x-server-received-at-ms").flatMap(Int64.init),
+            remoteSentMS: response.value(forHTTPHeaderField: "x-server-sent-at-ms").flatMap(Int64.init))
+        await log?.observeClock(clock)
         let requestID = response.value(forHTTPHeaderField: "x-request-id").flatMap(UUID.init(uuidString:))
         let storageUnavailable = response.value(forHTTPHeaderField: "x-diagnostics-status") == "unavailable"
         let serverDiagnosticMS = response.value(forHTTPHeaderField: "x-diagnostics-elapsed-ms").flatMap(Int.init).flatMap { (0...3_600_000).contains($0) ? $0 : nil }
         guard (200..<300).contains(response.statusCode) else {
             await log?.network(operation: operation, outcome: "http_error", status: response.statusCode, requestID: requestID,
-                               elapsedMS: Int(Date().timeIntervalSince(started) * 1000), storageUnavailable: storageUnavailable, eventID: eventID, benchmarkAttempt: benchmarkAttempt, serverDiagnosticMS: serverDiagnosticMS)
+                               elapsedMS: DiagnosticTiming.elapsedMS(since: started), storageUnavailable: storageUnavailable, eventID: eventID, benchmarkAttempt: benchmarkAttempt, serverDiagnosticMS: serverDiagnosticMS, metrics: metricsCollector.snapshot, clock: clock, monotonic: true)
             let reason = (try? JSONDecoder().decode(ErrorBody.self, from: data).error) ?? "Backend request failed (\(response.statusCode))."
             throw BackendError.response(response.statusCode, reason)
         }
@@ -211,11 +218,11 @@ struct BackendClient: BackendServing {
         do {
             let result = try decoder.decode(R.self, from: data)
             await log?.network(operation: operation, outcome: "ok", status: response.statusCode, requestID: requestID,
-                               elapsedMS: Int(Date().timeIntervalSince(started) * 1000), storageUnavailable: storageUnavailable, eventID: eventID, benchmarkAttempt: benchmarkAttempt, serverDiagnosticMS: serverDiagnosticMS)
+                               elapsedMS: DiagnosticTiming.elapsedMS(since: started), storageUnavailable: storageUnavailable, eventID: eventID, benchmarkAttempt: benchmarkAttempt, serverDiagnosticMS: serverDiagnosticMS, metrics: metricsCollector.snapshot, clock: clock, monotonic: true)
             return result
         } catch {
             await log?.network(operation: operation, outcome: "decode_error", status: response.statusCode, requestID: requestID,
-                               elapsedMS: Int(Date().timeIntervalSince(started) * 1000), storageUnavailable: storageUnavailable, error: error, eventID: eventID, benchmarkAttempt: benchmarkAttempt, serverDiagnosticMS: serverDiagnosticMS)
+                               elapsedMS: DiagnosticTiming.elapsedMS(since: started), storageUnavailable: storageUnavailable, error: error, eventID: eventID, benchmarkAttempt: benchmarkAttempt, serverDiagnosticMS: serverDiagnosticMS, metrics: metricsCollector.snapshot, clock: clock, monotonic: true)
             throw error
         }
     }
@@ -227,3 +234,33 @@ enum BackendError: LocalizedError {
 }
 
 private struct ErrorBody: Decodable { let error: String }
+
+
+/// Per-task delegate keeps the shared session and its connection pool unchanged.
+/// Retain only a bounded numeric summary; never retain transaction objects.
+private final class BackendMetricsCollector: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: DiagnosticNetworkTiming?
+    var snapshot: DiagnosticNetworkTiming? { lock.withLock { value } }
+    func urlSession(_ session: URLSession, task: URLSessionTask, didFinishCollecting metrics: URLSessionTaskMetrics) {
+        var summary = DiagnosticNetworkTiming(transactions: metrics.transactionMetrics.count, redirects: metrics.redirectCount)
+        func accumulate(_ target: inout Int?, _ start: Date?, _ end: Date?) {
+            guard let start, let end else { return }
+            let elapsed = end.timeIntervalSince(start) * 1000
+            guard elapsed.isFinite, (0...3_600_000).contains(elapsed) else { return }
+            target = min(3_600_000, (target ?? 0) + Int(elapsed.rounded()))
+        }
+        accumulate(&summary.taskMS, metrics.taskInterval.start, metrics.taskInterval.end)
+        accumulate(&summary.taskToFetchMS, metrics.taskInterval.start, metrics.transactionMetrics.first?.fetchStartDate)
+        for transaction in metrics.transactionMetrics.prefix(100) {
+            if transaction.isReusedConnection { summary.reusedConnections += 1 }
+            accumulate(&summary.dnsMS, transaction.domainLookupStartDate, transaction.domainLookupEndDate)
+            accumulate(&summary.connectMS, transaction.connectStartDate, transaction.connectEndDate)
+            accumulate(&summary.tlsMS, transaction.secureConnectionStartDate, transaction.secureConnectionEndDate)
+            accumulate(&summary.requestMS, transaction.requestStartDate, transaction.requestEndDate)
+            accumulate(&summary.serverWaitMS, transaction.requestEndDate, transaction.responseStartDate)
+            accumulate(&summary.responseMS, transaction.responseStartDate, transaction.responseEndDate)
+        }
+        lock.withLock { value = summary }
+    }
+}

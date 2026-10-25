@@ -4,6 +4,19 @@ import UserNotifications
 @testable import BabyCryMonitor
 
 final class NotificationCleanupTests: XCTestCase {
+    @MainActor func testCleanupLogsOnlyValidatedIdentityAndTheActualRemovalRequest() {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let log = DiagnosticLog(directory: directory),event = UUID(),episode = UUID(),notification = content(event: event, episode: episode)
+        notification.userInfo["diagnosticRef"] = String(repeating: "b", count: 64);notification.userInfo["deliveryAttempt"] = 2
+        notification.userInfo["private"] = "private-token";notification.body = "private-body"
+        log.notificationRemovals([NotificationCleanup.removal(notification, reason: .snoozed, pending: false)].compactMap { $0 })
+        XCTAssertTrue(log.lines[0].contains("reason=snoozed location=delivered action=removal_requested"))
+        XCTAssertTrue(log.lines[0].contains("delivery_attempt=2"));XCTAssertFalse(log.export.contains("private-"))
+        notification.categoryIdentifier = "connection-warning"
+        log.notificationRemovals([NotificationCleanup.removal(notification, reason: .noLongerRelevant, pending: false)].compactMap { $0 })
+        XCTAssertEqual(log.lines.count, 1)
+    }
     func content(isTest: Bool = false, event: UUID = UUID(), episode: UUID = UUID()) -> UNMutableNotificationContent {
         let content = UNMutableNotificationContent()
         content.categoryIdentifier = WatchNotification.category

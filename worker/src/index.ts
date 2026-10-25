@@ -20,10 +20,11 @@ export default {
   latency.details.colo=typeof request.cf?.colo==='string'?request.cf.colo:undefined;
   let operation=operationFor('', ''),stage:Stage='validation';
   const respond=async(result:unknown,status:number,outcome:'ok'|'rejected'|'internal_error')=>{
-   const journalStarted=Date.now();
+   const journalStarted=performance.now();
    const saved=await recordDiagnostic(env,{requestId,started,operation,stage,outcome,httpStatus:status,eventRef:latency.eventRef,details:latency.details});
    return Response.json(result,{status,headers:{'cache-control':'no-store','x-content-type-options':'nosniff',
-    'x-request-id':requestId,'x-diagnostics-status':saved?'recorded':'unavailable','x-diagnostics-elapsed-ms':String(Math.max(0,Date.now()-journalStarted))}});
+    'x-request-id':requestId,'x-diagnostics-status':saved?'recorded':'unavailable','x-diagnostics-elapsed-ms':String(Math.round(Math.max(0,performance.now()-journalStarted))),
+    'x-server-received-at-ms':String(started),'x-server-sent-at-ms':String(Date.now())}});
   };
   try {
    const url=new URL(request.url);

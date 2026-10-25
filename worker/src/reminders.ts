@@ -85,9 +85,9 @@ export class AlertReminders implements DurableObject {
 }
 
 export async function runReminder(env:Env,parentId:string,latency=new Latency(),observed?:(interval:number,mutedUntil:number)=>void):Promise<boolean> {
- const now=Date.now();let handedOff=false,failed=false,stopped=false,eventId:string|undefined;
+ const now=Date.now(),startedMono=performance.now();let handedOff=false,failed=false,stopped=false,eventId:string|undefined;
  latency.details.dispatch_source='reminder';latency.details.preparation_started_at_ms=now;
- const preparation=()=>{latency.details.spans!.reminder_prepare_ms=Date.now()-now;latency.details.preparation_finished_at_ms=Date.now();};
+ const preparation=()=>{latency.details.spans!.reminder_prepare_ms=Math.max(0,performance.now()-startedMono);latency.details.preparation_finished_at_ms=Date.now();};
  const stop=(reason:typeof latency.details.exit_reason)=>{stopped=true;latency.details.exit_reason=reason;return false;};
  const send=async(id:string)=>{eventId=id;preparation();handedOff=true;await dispatchEvent(env,id,undefined,latency);};
  try {

@@ -38,10 +38,10 @@ extension NotificationProviding {
         ])
     }
     func cleanUpAlerts(using relevance: NotificationRelevance, deliveredBefore: Date) async {
-        await NotificationCleanup.removeIrrelevant(using: relevance, deliveredBefore: deliveredBefore)
+        await NotificationCleanup.removeIrrelevant(using: relevance, deliveredBefore: deliveredBefore, log: log)
     }
     func dismissCryingAlerts(testEventID: UUID?) async {
-        await NotificationCleanup.dismissCryingAlerts(testEventID: testEventID)
+        await NotificationCleanup.dismissCryingAlerts(testEventID: testEventID, log: log)
     }
     func register() async {
         #if DEBUG
@@ -96,7 +96,7 @@ extension NotificationProviding {
            let rawID = response.notification.request.content.userInfo["eventId"] as? String,
            let id = UUID(uuidString: rawID) {
             let isTest = response.notification.request.content.userInfo["isTest"] as? Bool == true
-            await NotificationCleanup.dismissCryingAlerts(testEventID: isTest ? id : nil)
+            await dismissCryingAlerts(testEventID: isTest ? id : nil)
             await acknowledge(id)
         }
         await refresh()

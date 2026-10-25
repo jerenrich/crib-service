@@ -97,7 +97,7 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
   await record('claim_skipped',undefined,'dispatch_skip');return;
  }
  latency.details.spans!.generated_to_dispatch_ms=Math.max(0,now-event.created_at);
- attempt=event.attempts;target=event.push_target??'phone';stage='storage';
+ attempt=event.attempts;latency.deliveryAttempt=attempt;target=event.push_target??'phone';stage='storage';
  // No replay after uncertain transport or a worker death during APNs dispatch. APNs does
  // not offer an exactly-once receipt transaction with D1. Surface uncertainty explicitly.
  if(now-Date.parse((JSON.parse(event.payload) as Alert).createdAt)>86400000){

@@ -57,13 +57,16 @@ import Observation
         }
     }
     nonisolated func session(_ session: WCSession, didReceiveMessage message: [String: Any], replyHandler: @escaping @Sendable ([String: Any]) -> Void) {
+        let receivedAt = Date()
         guard let data = message["command"] as? Data, let command = decodeCommand(data) else {
             replyHandler([:]); return
         }
         Task { @MainActor in
             let snapshot = await self.onCommand?(command) ?? self.latest
             self.publish(snapshot)
-            do { replyHandler(["snapshot": try JSONEncoder().encode(snapshot)]) }
+            do { replyHandler(["snapshot": try JSONEncoder().encode(snapshot),
+                               "clockReceivedAtMS": DiagnosticTiming.milliseconds(receivedAt) ?? 0,
+                               "clockSentAtMS": DiagnosticTiming.milliseconds(Date()) ?? 0]) }
             catch { self.log?.record("watch_snapshot_failed", error: error); replyHandler([:]) }
         }
     }
