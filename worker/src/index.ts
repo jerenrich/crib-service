@@ -6,22 +6,23 @@ export {LiveSound} from './live-sound';
 import {openLiveSound} from './live-sound';
 import {APIError,type Env} from './types';
 import {body,rateLimit} from './security';
-import {authenticate,register,savePushToken,saveWatchPushToken,removeDeviceData,pairFor} from './devices';
+import {admitAlert,authenticate,register,savePushToken,saveWatchPushToken,removeDeviceData,pairFor} from './devices';
 import {connectionPreferences,flushConnections} from './connections';
 import {createPairing,claimPairing} from './pairing';
 import {receiveAlert,acknowledge,resumeAlerts,flushPending} from './alerts';
 import {saveHeartbeat,listenerStatus,saveSettings} from './status';
 import {operationFor,recordDiagnostic,type Stage} from './diagnostics';
+import {startAlertProgress} from './alert-progress';
 import {Latency} from './latency';
 
 export default {
  async fetch(request:Request,env:Env,ctx?:ExecutionContext):Promise<Response> {
   const requestId=crypto.randomUUID(),started=Date.now(),latency=new Latency();
   latency.details.colo=typeof request.cf?.colo==='string'?request.cf.colo:undefined;
-  let operation=operationFor('', ''),stage:Stage='validation';
+  let operation=operationFor('', ''),stage:Stage='validation',stopProgress:(()=>void)|undefined;
   const respond=async(result:unknown,status:number,outcome:'ok'|'rejected'|'internal_error')=>{
    const journalStarted=performance.now();
-   const saved=await recordDiagnostic(env,{requestId,started,operation,stage,outcome,httpStatus:status,eventRef:latency.eventRef,details:latency.details});
+   const saved=await latency.measure('journal_ms',()=>recordDiagnostic(env,{requestId,started,operation,stage,outcome,httpStatus:status,eventRef:latency.eventRef,details:latency.details}));
    return Response.json(result,{status,headers:{'cache-control':'no-store','x-content-type-options':'nosniff',
     'x-request-id':requestId,'x-diagnostics-status':saved?'recorded':'unavailable','x-diagnostics-elapsed-ms':String(Math.round(Math.max(0,performance.now()-journalStarted))),
     'x-server-received-at-ms':String(started),'x-server-sent-at-ms':String(Date.now())}});
@@ -35,6 +36,11 @@ export default {
    const route=`${request.method} ${url.pathname}`;
    const ip=request.headers.get('CF-Connecting-IP')??'local';
    const alertUpload=route==='POST /v1/listener/event';
+   if(alertUpload){
+    const clientRequestId=request.headers.get('x-client-request-id');
+    if(clientRequestId&&/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(clientRequestId))latency.details.client_request_id=clientRequestId.toLowerCase();
+    stopProgress=startAlertProgress(env,ctx,requestId,started,latency,()=>stage);
+   }
    stage='rate_limit';
    // Both phones usually share one address (carrier NAT shares it more widely), so the
    // address bucket is only a flood ceiling. Crying alerts never depend on it.
@@ -43,11 +49,11 @@ export default {
    if(route==='POST /v1/device/register'){stage='handler';result=await latency.measure('handler_ms',async()=>register(env,await body(request),ip));}
    else{
     stage='authentication';
-    const device=await latency.measure('authentication_ms',()=>authenticate(env,request));
+    const device=alertUpload?await admitAlert(env,request,latency):await latency.measure('authentication_ms',()=>authenticate(env,request));
     stage='rate_limit';
     // Separate budgets: a device's own polling must never delay a crying alert.
     const watchTestPush=route==='POST /v1/watch-test/push';
-    await latency.measure('rate_limit_ms',()=>rateLimit(env,watchTestPush?'watch-test-push':alertUpload?'alert':'device',device.id,watchTestPush?660:600,600));
+    if(!alertUpload)await latency.measure('rate_limit_ms',()=>rateLimit(env,watchTestPush?'watch-test-push':'device',device.id,watchTestPush?660:600,600));
     stage='handler';
     const special=await latency.measure('handler_ms',async()=>{switch(route){
      case 'POST /v1/pairing/create':result=await createPairing(env,device);break;
@@ -71,7 +77,7 @@ export default {
       break;
      }
      case 'POST /v1/listener/heartbeat':result=await saveHeartbeat(env,device,await body(request));break;
-     case 'POST /v1/listener/event':result=await receiveAlert(env,device,await body(request),requestId,latency,ctx);break;
+     case 'POST /v1/listener/event':result=await receiveAlert(env,device,await latency.measure('body_read_ms',()=>body(request)),requestId,latency,ctx);break;
      case 'GET /v1/timeline':result=await timeline(env,device);break;
      case 'GET /v1/listener/status':result=await listenerStatus(env,device);break;
      case 'GET /v1/live-sound':return await openLiveSound(env,device,request);
@@ -89,7 +95,7 @@ export default {
    latency.failure(error);
    const expected=error instanceof APIError;
    return await respond({error:expected?error.message:'Server configuration or storage unavailable.'},expected?error.status:503,expected?'rejected':'internal_error');
-  }
+  }finally{stopProgress?.();}
  },
  async scheduled(_controller:ScheduledController,env:Env):Promise<void> {
   const requestId=crypto.randomUUID(),started=Date.now(),latency=new Latency();

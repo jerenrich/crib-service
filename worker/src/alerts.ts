@@ -13,17 +13,29 @@ export async function receiveAlert(env:Env,device:Device,value:Record<string,unk
  requireRole(device,'listener');const alert=validateAlert(value);
  if(alert.listenerId!==device.id)throw new APIError(403,'Listener identity mismatch.');
  try{latency.eventRef=await eventReference(env,alert.eventId);}catch{/* Best effort. */}
- const pair=await latency.measure('pair_ms',()=>pairFor(env,device));if(!pair)throw new APIError(409,'Listener is not paired.');
+ // Both reads share one consistent snapshot and one remote call. The bounded
+ // fallback is read-only; insertion and delivery claims are never hedged.
+ type Pair={parent_id:string;listener_id:string;created_at:number};
+ const snapshot=await latency.readOnly<StoredEvent|Pair>('alert_snapshot_ms',()=>env.DB.batch<StoredEvent|Pair>([
+  env.DB.prepare('SELECT * FROM events WHERE event_id=?').bind(alert.eventId),
+  env.DB.prepare('SELECT * FROM pairs WHERE listener_id=?').bind(device.id)
+ ]));
+ const previous=snapshot[0].results[0] as StoredEvent|undefined;
+ const pair=snapshot[1].results[0] as Pair|undefined;if(!pair)throw new APIError(409,'Listener is not paired.');
  if(Date.parse(alert.createdAt)<pair.created_at-2000)throw new APIError(409,'Alert belongs to an earlier pairing.');
- const previous=await latency.read<StoredEvent>('event_lookup_ms',env.DB.prepare('SELECT * FROM events WHERE event_id=?').bind(alert.eventId));
+ let record:StoredEvent|null=previous??null;
  if(previous){
   if(previous.listener_id!==device.id||previous.payload!==JSON.stringify(alert))throw new APIError(409,'Event UUID already used for different metadata.');
  }else{
-  // Unique index also prevents a buggy client creating another initial UUID for an episode.
-  await latency.db('event_insert_ms',()=>env.DB.prepare('INSERT INTO events(event_id,episode_id,listener_id,parent_id,is_repeat,payload,created_at) SELECT ?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?) ON CONFLICT DO NOTHING')
-   .bind(alert.eventId,alert.episodeId,device.id,pair.parent_id,Number(alert.isRepeat),JSON.stringify(alert),Date.now(),pair.parent_id,pair.listener_id,pair.created_at).run());
+  // Reload in the insertion transaction, including the winner of an event/episode
+  // conflict. The exact pairing guard still prevents an upload after re-pairing.
+  const inserted=await latency.db<StoredEvent>('event_insert_ms',()=>env.DB.batch<StoredEvent>([
+   env.DB.prepare('INSERT INTO events(event_id,episode_id,listener_id,parent_id,is_repeat,payload,created_at) SELECT ?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?) ON CONFLICT DO NOTHING')
+    .bind(alert.eventId,alert.episodeId,device.id,pair.parent_id,Number(alert.isRepeat),JSON.stringify(alert),Date.now(),pair.parent_id,pair.listener_id,pair.created_at),
+   env.DB.prepare('SELECT * FROM events WHERE event_id=?').bind(alert.eventId)
+  ]));
+  record=inserted[1].results[0]??null;
  }
- let record=await latency.read<StoredEvent>('event_reload_ms',env.DB.prepare('SELECT * FROM events WHERE event_id=?').bind(alert.eventId));
  if(record && (record.listener_id!==device.id || record.payload!==JSON.stringify(alert)))throw new APIError(409,'Event UUID already used for different metadata.');
  if(!record){
   record=await latency.read<StoredEvent>('event_episode_ms',env.DB.prepare('SELECT * FROM events WHERE listener_id=? AND episode_id=? AND is_repeat=0').bind(device.id,alert.episodeId));
