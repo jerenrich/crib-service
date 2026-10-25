@@ -104,26 +104,30 @@ cp -n ios/Config/Local.xcconfig.example ios/Config/Local.xcconfig
 6. Debug builds use `aps-environment = development`; Release uses `production`. Match the Worker environment to the provisioning profile, rather than to whether the physical phone is used for development. TestFlight/App Store builds use production APNs.
 7. Build and install on both iPhones. Use Listener on the nursery phone and Parent on the other.
 
-If Xcode automatic signing is unavailable, the installed development certificate and the manual profiles **Crib Service Development** (J14/J17) and **Crib Service Watch Development** (Watch) can sign a Debug app build. Keep these local overrides in an ignored file; do not commit profiles or signing credentials:
+The current local signing configuration is saved in the main checkout at `.local/cribservice-rollout-2026-10-23/Local.current-signing.xcconfig`. It uses the cached Xcode-managed iPhone profile with Time Sensitive support, and the existing manually managed Watch profile:
 
 ```xcconfig
 DEVELOPMENT_TEAM = 9PG633BF3R
 BACKEND_URL = https:/$()/baby-cry-monitor.jordan-erenrich.workers.dev
-PROVISIONING_PROFILE_SPECIFIER[sdk=iphoneos*] = Crib Service Development
+CODE_SIGN_STYLE[sdk=iphoneos*] = Automatic
+CODE_SIGN_STYLE[sdk=watchos*] = Manual
+PROVISIONING_PROFILE_SPECIFIER[sdk=iphoneos*] =
 PROVISIONING_PROFILE_SPECIFIER[sdk=watchos*] = Crib Service Watch Development
 ```
 
-The cleanup retained the working overrides at `.local/cribservice-rollout-2026-10-23/Local.manual-signing.xcconfig` in the main checkout. Use them explicitly when needed, leaving normal automatic signing unchanged:
+Build with the per-platform settings; do not override the signing style globally:
 
 ```sh
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild \
   -project ios/BabyCryMonitor.xcodeproj -scheme BabyCryMonitor \
   -configuration Debug -destination 'generic/platform=iOS' \
-  -xcconfig .local/cribservice-rollout-2026-10-23/Local.manual-signing.xcconfig \
-  CODE_SIGN_STYLE=Manual build
+  -xcconfig .local/cribservice-rollout-2026-10-23/Local.current-signing.xcconfig \
+  build
 ```
 
-These explicit profiles sign the iPhone and Watch apps; physical test runners need compatible profiles of their own. The temporary UI automation profile used during setup has been retired. Release/TestFlight needs production provisioning and a matching production APNs backend.
+Signing investigation on 25 October 2026: Xcode's account window showed `jordan.erenrich@gmail.com` and the Jordan Erenrich developer team with Admin access. The old **Crib Service Development** iPhone profile remains valid but lacks Time Sensitive support, newly required by the iOS target. The refreshed **iOS Team Provisioning Profile: com.jordanerenrich.cribservice**, created at 12:55:56 UTC, includes that entitlement. Xcode rejects this managed profile under globally forced manual signing. Automatic signing for both targets still reported `No Accounts` for the Watch target despite the visible account; the per-platform configuration above successfully built and deeply verified both apps and their embedded profiles with Time Sensitive support. That command-line error does not establish that the user is signed out of Xcode.
+
+The historical all-manual overrides remain at `.local/cribservice-rollout-2026-10-23/Local.manual-signing.xcconfig`, but its old iPhone profile cannot sign the new entitlement. Keep signing profiles and local overrides out of Git. Physical test runners need compatible profiles of their own. The temporary UI automation profile used during setup has been retired. Release/TestFlight needs production provisioning and a matching production APNs backend.
 
 Start in the foreground, leave the Listener plugged in, and lock its screen. Monitoring continues while iOS keeps the valid recording audio session alive. There is no playback or audio streaming. Do not force quit the Listener. Recovery can require reopening the app if iOS does not allow reactivation in the background.
 
