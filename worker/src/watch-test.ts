@@ -1,6 +1,6 @@
 import {APIError,requireRole,type Device,type Env,type Alert} from './types';
 import {pairFor} from './devices';
-import {sendPush,type PushResult} from './apns';
+import {sendPush,sendSilentAlarmTestPush,type PushResult} from './apns';
 import {Latency} from './latency';
 import {eventReference,recordDiagnostic,PushPreparationError} from './diagnostics';
 
@@ -33,4 +33,25 @@ export async function sendWatchTest(env:Env,device:Device,latency=new Latency(),
  await recordDiagnostic(env,{requestId,started,operation:'watch_test_dispatch',stage:'push',outcome:result.reason??result.status,eventRef,target:'watch',attempt:1,httpStatus:result.httpStatus,details:latency.details});
  if(result.status!=='sent')throw new APIError(503,'Watch test delivery could not be confirmed. The test has stopped; try again.');
  return {ok:true};
+}
+
+// One Listener-originated phone delivery. No real episode, reminder or retry is created.
+export async function sendSilentAlarmTest(env:Env,device:Device,latency=new Latency(),requestId=crypto.randomUUID()) {
+ const started=Date.now();
+ requireRole(device,'listener');
+ const pair=await pairFor(env,device);
+ if(!pair)throw new APIError(409,'Pair a Parent first.');
+ const parent=await env.DB.prepare('SELECT d.push_token FROM devices d JOIN pairs p ON p.parent_id=d.id WHERE p.listener_id=? AND p.created_at=?')
+  .bind(device.id,pair.created_at).first<{push_token:string|null}>();
+ if(!parent?.push_token)throw new APIError(409,'Open the Parent app and enable notifications first.');
+ const now=new Date().toISOString();
+ const alert:Alert={eventId:crypto.randomUUID(),episodeId:crypto.randomUUID(),listenerId:device.id,type:'sustained_cry',
+  cryStartedAt:now,durationSeconds:0,createdAt:now,isRepeat:false,isTest:true};
+ const eventRef=await eventReference(env,alert.eventId);latency.eventRef=eventRef;
+ let result:PushResult;
+ try{result=await sendSilentAlarmTestPush(env,parent.push_token,alert,latency);}
+ catch(error){result={status:'failed',reason:error instanceof PushPreparationError?error.code:'apns_configuration'};}
+ await recordDiagnostic(env,{requestId,started,operation:'silent_alarm_test_dispatch',stage:'push',outcome:result.reason??result.status,eventRef,target:'phone',attempt:1,httpStatus:result.httpStatus,details:latency.details});
+ if(result.status!=='sent')throw new APIError(503,'Test delivery could not be confirmed. An already sent test may still arrive; no automatic retry was scheduled.');
+ return {ok:true,eventId:alert.eventId};
 }

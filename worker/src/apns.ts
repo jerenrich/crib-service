@@ -38,6 +38,15 @@ export async function sendConnectionPush(env:Env,encryptedToken:string,id:string
  const body=state==='stopped'?'The Listener reports that monitoring has stopped. Check the nursery phone.':'No Listener update for at least 3 minutes. Check power, internet, and monitoring.';
  return sendNotification(env,encryptedToken,id,{aps:{alert:{title,body},'thread-id':'listener-connection',...(target==='watch'?{sound:'default','interruption-level':'time-sensitive'}:{})},connectionState:state},target,180,id,latency);
 }
+// A user-visible, soundless notification also requests background execution.
+// It is deliberately separate from ordinary crying and Watch notification routing.
+export async function sendSilentAlarmTestPush(env:Env,encryptedToken:string,alert:Alert,latency=new Latency()):Promise<PushResult> {
+ const content={...payload(alert,'phone'),silentAlarmTest:true,aps:{
+  alert:{title:'Test · Silent alarm delivery',body:'Listener test received. If the Parent experiment is armed, it will try to start a silent alarm on your paired Watch.'},
+  'content-available':1,category:'SILENT_ALARM_TEST','thread-id':alert.episodeId
+ }};
+ return sendNotification(env,encryptedToken,alert.eventId,content,'phone',60,alert.eventId,latency);
+}
 async function sendNotification(env:Env,encryptedToken:string,id:string,content:unknown,target:'phone'|'watch',expiration:number,collapseId=id,latency=new Latency()):Promise<PushResult> {
  // Errors before fetch are known not to have sent a notification and can safely retry.
  let deviceToken:string,jwt:string;

@@ -188,6 +188,7 @@ import UIKit
             else { self?.remoteSound.disconnected() }
         }
         (notifications as? NotificationService)?.log = log
+        if #available(iOS 26.0, *) { SilentAlarmExperiment.shared.log = log }
         watch.log = log
         (audio as? AudioLevelMonitor)?.log = log
         notifications.onToken = { [weak self] token in self?.pushToken = token; self?.uploadedToken = nil; self?.log.record("push_token_received") }
@@ -239,6 +240,15 @@ import UIKit
             engine.recordTimeline("monitoring_unverified", at: interruptedMonitoringAt ?? currentTime()); persist()
         }
         #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--silent-alarm-e2e-arm"), role == .parent {
+            if #available(iOS 26.0, *) { Task { await SilentAlarmExperiment.shared.arm() } }
+        }
+        if ProcessInfo.processInfo.arguments.contains("--silent-alarm-e2e-send"), role == .listener {
+            Task {
+                try? await Task.sleep(for: .seconds(5))
+                await sendSilentAlarmTest()
+            }
+        }
         if ProcessInfo.processInfo.arguments.contains("--refresh-experiment-start"), role == .parent {
             startBackgroundBenchmark()
             Task { await refreshExperiment?.setEnabled(true) }
@@ -694,6 +704,21 @@ import UIKit
             guard revision == environmentRevision, control == controlGeneration else { return }
             queueHeartbeat()
         } catch { log.record("monitoring_control_failed", error: error) }
+    }
+    func sendSilentAlarmTest() async {
+        guard !sendingTestPush, role == .listener, paired, !managingDevice else { return }
+        sendingTestPush = true
+        defer { sendingTestPush = false }
+        log.silentAlarmTest(phase: "send_started", appActive: appActive, protectedDataAvailable: UIApplication.shared.isProtectedDataAvailable)
+        do {
+            let client = try await registeredClient()
+            let id = try await client.sendSilentAlarmTest()
+            testPushStatus = "Apple accepted the silent alarm test. Check Parent diagnostics for background receipt and alarm scheduling."
+            log.silentAlarmTest(phase: "send_accepted", eventID: id, appActive: appActive, protectedDataAvailable: UIApplication.shared.isProtectedDataAvailable)
+        } catch {
+            testPushStatus = "Silent alarm test could not be confirmed: \(error.localizedDescription)"
+            log.silentAlarmTest(phase: "send_failed", appActive: appActive, protectedDataAvailable: UIApplication.shared.isProtectedDataAvailable)
+        }
     }
     func sendTestPush() async {
         guard !sendingTestPush, role == .listener, paired else { return }

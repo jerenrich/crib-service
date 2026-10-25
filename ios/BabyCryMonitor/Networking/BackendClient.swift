@@ -95,10 +95,12 @@ protocol BackendServing: AlertSending {
     func connectionAlerts(_ enabled: Bool) async throws
     func requestTestPush() async throws
     func sendWatchTest() async throws
+    func sendSilentAlarmTest() async throws -> UUID
     func unpair() async throws
     func deleteDevice() async throws
 }
 extension BackendServing {
+    func sendSilentAlarmTest() async throws -> UUID { throw BackendError.message("Silent alarm testing requires an updated connection service.") }
     func sendWatchTest() async throws { throw BackendError.message("Watch test mode requires an updated connection service.") }
     func resumeAlerts(until: Date) async throws { throw BackendError.message("Resume alerts requires an updated connection service.") }
     func setMonitoring(_ enabled: Bool, id: UUID) async throws -> MonitoringCommand { throw BackendError.message("Monitoring controls require an updated connection service.") }
@@ -143,6 +145,11 @@ struct BackendClient: BackendServing {
     func sendWatchTest() async throws {
         let _: EmptyResponse = try await request("/v1/watch-test/push", body: [String:String]())
     }
+    func sendSilentAlarmTest() async throws -> UUID {
+        struct Receipt: Decodable { let eventId: UUID }
+        let receipt: Receipt = try await request("/v1/listener/silent-alarm-test", body: [String:String]())
+        return receipt.eventId
+    }
     func unpair() async throws { let _: EmptyResponse = try await request("/v1/pairing/remove", body: [String:String]()) }
     func deleteDevice() async throws {
         // A lost success response leaves a revoked credential. Retrying deletion is safe.
@@ -165,7 +172,7 @@ struct BackendClient: BackendServing {
         let operation = ["/v1/device/register": "register", "/v1/pairing/create": "pairing_create", "/v1/pairing/claim": "pairing_claim",
                          "/v1/device/push-token": "push_token", "/v1/device/watch-push-token": "watch_token",
                          "/v1/listener/heartbeat": "heartbeat", "/v1/listener/event": "alert", "/v1/listener/status": "status",
-                         "/v1/timeline": "timeline", "/v1/monitoring": "monitoring", "/v1/monitoring/complete": "monitoring_complete", "/v1/settings": "settings", "/v1/alert/acknowledge": "acknowledge", "/v1/test-push": "test_push", "/v1/watch-test": "test_push", "/v1/watch-test/push": "test_push", "/v1/alert/resume": "resume_alerts",
+                         "/v1/timeline": "timeline", "/v1/monitoring": "monitoring", "/v1/monitoring/complete": "monitoring_complete", "/v1/settings": "settings", "/v1/alert/acknowledge": "acknowledge", "/v1/test-push": "test_push", "/v1/watch-test": "test_push", "/v1/watch-test/push": "test_push", "/v1/listener/silent-alarm-test": "test_push", "/v1/alert/resume": "resume_alerts",
                          "/v1/connection-alerts": "connection_preferences", "/v1/pairing/remove": "unpair", "/v1/device/delete": "delete_device"][path] ?? "unknown"
         // Generated for each transport attempt, before receiving any response.
         // It is diagnostic correlation only; the event UUID remains idempotency authority.

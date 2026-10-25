@@ -1782,3 +1782,47 @@ describe('slow initial upload checkpoints',()=>{
   expect(safeTimingDetails({client_request_id:'private-marker',in_flight_span:'private-marker',in_flight_ms:-1} as unknown as import('../src/latency').TimingDetails)).toBeNull();
  });
 });
+
+
+describe('Listener-originated silent alarm experiment',()=>{
+ it('requires a paired Listener and a registered Parent phone token',async()=>{
+  const {parent,listener}=await paired();
+  expect((await call('listener/silent-alarm-test',parent)).status).toBe(403);
+  expect((await call('listener/silent-alarm-test',listener)).status).toBe(409);
+  const unpaired=device('listener');await register(unpaired);
+  expect((await call('listener/silent-alarm-test',unpaired)).status).toBe(409);
+  expect(pushRequests).toHaveLength(0);
+ });
+ it('sends one labelled soundless alert to the phone even when a Watch token exists, without creating episodes or reminders',async()=>{
+  const {parent,listener}=await paired();
+  await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
+  mockPush();const response=await call('listener/silent-alarm-test',listener);
+  expect(response.status).toBe(200);
+  const receipt=await response.json() as {eventId:string};
+  expect(pushRequests).toHaveLength(1);
+  expect(pushRequests[0].url).toContain('ab'.repeat(32));
+  const headers=pushRequests[0].init?.headers as Record<string,string>;
+  expect(headers['apns-topic']).toBe(testEnv.APNS_BUNDLE_ID);
+  expect(headers['apns-push-type']).toBe('alert');
+  expect(headers['apns-priority']).toBe('10');
+  const content=JSON.parse(String(pushRequests[0].init?.body));
+  expect(content.eventId).toBe(receipt.eventId);
+  expect(content.isTest).toBe(true);expect(content.silentAlarmTest).toBe(true);
+  expect(content.aps['content-available']).toBe(1);
+  expect(content.aps.alert.title).toContain('Test');
+  expect(content.aps.sound).toBeUndefined();
+  expect(content.aps.category).toBe('SILENT_ALARM_TEST');
+  expect((await env.DB.prepare('SELECT COUNT(*) AS n FROM events').first<{n:number}>())?.n).toBe(0);
+  const row=await env.DB.prepare("SELECT target,outcome FROM diagnostics WHERE operation='silent_alarm_test_dispatch'").first<{target:string;outcome:string}>();
+  expect(row).toMatchObject({target:'phone',outcome:'sent'});
+ });
+ it('does not retry an ambiguous send or schedule a real reminder',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  pushResponses.push(new Error('network unavailable'));
+  expect((await call('listener/silent-alarm-test',listener)).status).toBe(503);
+  await flushPending(testEnv);
+  expect(pushRequests).toHaveLength(1);
+  expect((await env.DB.prepare('SELECT COUNT(*) AS n FROM events').first<{n:number}>())?.n).toBe(0);
+ });
+});

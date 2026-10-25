@@ -11,7 +11,7 @@
 <key>LSRequiresIPhoneOS</key><true/>
 <key>NSMicrophoneUsageDescription</key><string>Listen for sustained crying-like sound. Audio is processed on this iPhone, never recorded or transmitted.</string>
 <key>NSAlarmKitUsageDescription</key><string>Schedule a test alarm you request to check the alarm sound and alerts on your paired Apple Watch.</string>
-<key>UIBackgroundModes</key><array><string>audio</string><string>fetch</string></array>
+<key>UIBackgroundModes</key><array><string>audio</string><string>fetch</string><string>remote-notification</string></array>
 <key>BGTaskSchedulerPermittedIdentifiers</key><array><string>com.jordanerenrich.cribservice.benchmark.refresh</string></array>
 <key>UILaunchScreen</key><dict/>
 <key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string></array>

@@ -31,6 +31,13 @@ struct DebugView: View {
                 Text("Failed alert deliveries: \(model.snapshot.failedAlerts.count)")
             }
             if model.role == .listener {
+                Section("Silent alarm delivery experiment") {
+                    Button("Send silent alarm test to Parent") { Task { await model.sendSilentAlarmTest() } }
+                        .disabled(!model.paired || model.sendingTestPush)
+                        .accessibilityIdentifier("sendSilentAlarmTest")
+                    Text("First arm the ten-minute experiment in Parent Settings, then lock the Parent iPhone. Sends one labelled test event; real crying alerts are unaffected.").font(.footnote)
+                    if let status = model.testPushStatus { Text(status).font(.footnote) }
+                }
                 Section("Real push test") {
                     Button(model.sendingTestPush ? "Sending test push…" : "Send test push") {
                         Task { await model.sendTestPush() }
