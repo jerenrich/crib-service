@@ -114,7 +114,7 @@ struct OvernightSetupView: View {
             Label(power.title, systemImage: power.needsPower ? "battery.25percent" : "battery.100percent")
             Text(power.detail).font(.footnote)
             Text("Leave the nursery iPhone plugged in and start monitoring in Crib Service on that iPhone. After pausing, you can resume from Parent while its microphone remains active in Standby.")
-            if model.parentOnline {
+            if model.parentDisplaysMonitoring {
                 Label("Nursery microphone confirmed active", systemImage: "checkmark.circle.fill").foregroundStyle(Palette.mint)
                 Text(model.settingsSyncStatus).font(.footnote)
                 Button("Finish setup") { model.completeBedtimeSetup(); dismiss() }

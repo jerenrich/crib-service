@@ -32,7 +32,21 @@ import UIKit
     private(set) var watchTestError: String?
     var pairingError: String?
     var pairingCode: PairingCode?
-    var parentStatus: ParentStatus?
+    var parentStatus: ParentStatus? {
+        didSet {
+            if parentStatus?.paired == false || (oldValue?.pairingID != nil && oldValue?.pairingID != parentStatus?.pairingID && parentStatus != nil) {
+                parentMonitoringEvidence = ParentMonitoringEvidence()
+            }
+            if let status = parentStatus, status.paired, let monitoring = status.monitoring, let heartbeat = status.lastHeartbeat {
+                let observedAt = status.serverTime.map { currentTime().addingTimeInterval(-max(0, $0.timeIntervalSince(heartbeat))) } ?? heartbeat
+                if observedAt <= currentTime().addingTimeInterval(5) {
+                    parentMonitoringEvidence.receiveHeartbeat(monitoring: monitoring, microphoneActive: status.microphoneActive == true,
+                        version: heartbeat, observedAt: observedAt)
+                }
+            }
+        }
+    }
+    private var parentMonitoringEvidence = ParentMonitoringEvidence()
     private(set) var listenerPairStatus: ParentStatus?
     private(set) var listenerPairStatusReceivedAt: Date?
     var timeline: TimelineResponse?
@@ -179,8 +193,17 @@ import UIKit
         audio.onStatus = { [weak self] status in self?.audioChanged(status) }
         self.liveSound.onFrame = { [weak self] frame in
             guard let self, self.role == .parent, self.paired, self.appActive else { return }
+            // A frame already in flight must not undo a requested Pause.
+            guard self.pendingMonitoringCommand?.enabled != false, self.parentMonitoringEvidence.acceptsLive(at: self.currentTime()) else { return }
             self.now = self.currentTime()
+            let previousState = self.remoteSound.frame?.state
+            let previous = self.remoteSound.frame?.sampledAt
             self.remoteSound.receive(frame, at: self.now)
+            if self.remoteSound.frame?.sampledAt != previous {
+                let before = self.parentMonitoringDisplayState
+                self.parentMonitoringEvidence.receiveLive(at: self.now)
+                if before != self.parentMonitoringDisplayState || previousState != frame.state { self.publishWatch() }
+            }
         }
         self.liveSound.onConnectionChange = { [weak self] connected in
             self?.liveSoundConnected = connected
@@ -319,24 +342,22 @@ import UIKit
         guard let status = parentStatus, status.monitoring == true, let last = status.lastHeartbeat else { return false }
         return (-5...150).contains(now.timeIntervalSince(last))
     }
-    /// A recent Standby heartbeat is evidence that capture can be reused while
-    /// the Listener is locked. A stopped or unknown microphone needs local setup.
+    var parentMonitoringDisplayState: ParentMonitoringDisplayState {
+        guard paired else { return .unpaired }
+        if let command = pendingMonitoringCommand { return command.enabled ? .starting : .pausing }
+        if monitoringControlError != nil { return .unverified }
+        return parentMonitoringEvidence.state(at: now, statusAvailable: parentStatus?.lastHeartbeat != nil && parentStatus?.monitoring != nil)
+    }
+    var parentDisplaysMonitoring: Bool { parentMonitoringDisplayState == .monitoring }
+    var parentHasLiveMonitoring: Bool { parentDisplaysMonitoring && remoteSound.isLive(at: now) }
+    var parentDisplaysActiveMicrophone: Bool { [.monitoring, .standby].contains(parentMonitoringDisplayState) }
     var canStartMonitoringRemotely: Bool {
-        guard role == .parent, paired, let status = parentStatus, status.paired,
-              status.monitoring == false, status.microphoneActive == true,
-              let heartbeat = status.lastHeartbeat,
-              !connectivity.checked || connectivity.available else { return false }
-        return (-5...30).contains(now.timeIntervalSince(heartbeat))
+        role == .parent && paired && parentStatus?.paired == true &&
+        (!connectivity.checked || connectivity.available) &&
+        parentMonitoringEvidence.canResume(at: now, statusAvailable: parentStatus?.lastHeartbeat != nil && parentStatus?.monitoring != nil) &&
+        parentMonitoringDisplayState == .standby
     }
-
-    var nurseryConnection: String {
-        guard paired else { return "Not paired" }
-        if let command = pendingMonitoringCommand { return command.enabled ? "Starting…" : "Pausing…" }
-        if monitoringControlError != nil { return "Monitoring unverified" }
-        guard let status = parentStatus, let last = status.lastHeartbeat else { return "Status unavailable" }
-        guard (-5...150).contains(now.timeIntervalSince(last)) else { return "Connection lost" }
-        return status.monitoring == true ? "Monitoring" : status.microphoneActive == true ? "Standby" : "Stopped"
-    }
+    var nurseryConnection: String { parentMonitoringDisplayState.rawValue }
     var settingsSyncStatus: String {
         if !paired { return "Saved on this iPhone · Pair to sync" }
         if settingsDirty { return "Saving settings…" }
@@ -628,6 +649,7 @@ import UIKit
     func requestMonitoring(_ enabled: Bool) async {
         guard role == .parent, paired, !requestingMonitoring, !managingDevice else { return }
         requestingMonitoring = true; defer { requestingMonitoring = false }
+        if !enabled { remoteSound.disconnected(); parentMonitoringEvidence.pause(at: currentTime()) }
         let revision = environmentRevision, id = UUID()
         pendingMonitoringCommand = MonitoringCommand(id: id, enabled: enabled, status: "pending",
             createdAt: currentTime(), expiresAt: currentTime().addingTimeInterval(30))
@@ -692,6 +714,9 @@ import UIKit
               let heartbeat = status.lastHeartbeat, let serverTime = status.serverTime,
               heartbeat >= command.createdAt, (0...30).contains(serverTime.timeIntervalSince(heartbeat)) else { return false }
         monitoringControlMessage = command.enabled ? "Monitoring confirmed on nursery phone" : status.microphoneActive == true ? "Standby confirmed · Nursery microphone remains active" : "Monitoring stopped on nursery phone"
+        if !command.enabled {
+            remoteSound.disconnected(); parentMonitoringEvidence.pause(at: currentTime())
+        }
         monitoringControlError = nil; pendingMonitoringCommand = nil; monitoringControlDeadline = nil
         persistMonitoringControl()
         return true
@@ -862,6 +887,7 @@ import UIKit
     }
     private func clearLiveSound() {
         liveSound.disconnect(); remoteSound = RemoteSoundState(); liveSoundConnected = false
+        parentMonitoringEvidence = ParentMonitoringEvidence()
     }
     private func synchronizeLiveSound() {
         #if DEBUG
@@ -899,9 +925,10 @@ import UIKit
     private func updateLocalState() {
         scheduleWatchTestIfDue()
         observeBackgroundBenchmark()
+        let displayBefore = parentMonitoringDisplayState
         now = currentTime(); let device = UIDevice.current
         #if DEBUG
-        if ProcessInfo.processInfo.arguments.contains("--uitesting-live-sound") && !ProcessInfo.processInfo.arguments.contains("--uitesting-chart-paused") { seedLiveSoundFrameForUITest() }
+        if ProcessInfo.processInfo.arguments.contains("--uitesting-live-sound") && !ProcessInfo.processInfo.arguments.contains("--uitesting-chart-paused") && !ProcessInfo.processInfo.arguments.contains("--uitesting-live-once") { seedLiveSoundFrameForUITest() }
         #endif
         batteryLevel = device.batteryLevel >= 0 ? Double(device.batteryLevel) : nil
         let powered = device.batteryState == .charging || device.batteryState == .full
@@ -916,6 +943,7 @@ import UIKit
         recordBatterySample()
         scheduleHeartbeatIfDue()
         checkMonitoringControlDeadline()
+        if displayBefore != parentMonitoringDisplayState { publishWatch() }
         if let retry = parentWarningRetryAt, now >= retry, parentWarningTask == nil {
             parentWarningUpdatePending = true
             dispatchParentConnectionWarning()
@@ -923,9 +951,12 @@ import UIKit
     }
     #if DEBUG
     private func seedLiveSoundFrameForUITest() {
-        if role == .parent {
+        if role == .parent,
+           ProcessInfo.processInfo.arguments.contains("--uitesting-listener-started") ||
+           (parentStatus?.monitoring == true && !ProcessInfo.processInfo.arguments.contains("--uitesting-listener-stale")) {
             remoteSound.receive(SoundLevelFrame(sampledAt: now.timeIntervalSince1970, levels: meter,
                 threshold: threshold, state: .quiet, alertDuration: configuration.alertDuration), at: now)
+            parentMonitoringEvidence.receiveLive(at: now)
         }
     }
     #endif
@@ -1550,10 +1581,12 @@ import UIKit
         value.statusAvailable = value.parentMode && parentStatus != nil
         value.lastHeartbeat = value.parentMode ? parentStatus?.lastHeartbeat : nil
         value.monitoring = value.parentMode && parentStatus?.monitoring == true
+        value.monitoringDisplayState = value.parentMode ? nurseryConnection : nil
+        value.monitoringObservedAt = value.parentMode ? parentMonitoringEvidence.lastObservationAt : nil
         value.connectionWarningSupported = true
         value.localConnectionWarningEnabled = localConnectionWarningEnabled
         value.connectionWarningDeadline = value.parentMode && paired ? parentConnectionDeadline : nil
-        value.state = value.parentMode ? parentStatus?.state : nil
+        value.state = value.parentMode ? (parentHasLiveMonitoring ? remoteSound.frame?.state : parentStatus?.state) : nil
         value.alertDuration = configuration.alertDuration
         value.snoozeDuration = configuration.snoozeDuration
         value.watchPushRegistered = value.parentMode && parentStatus?.watchPushRegistered == true

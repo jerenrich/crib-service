@@ -13,7 +13,7 @@ struct NightstandView: View {
     @ScaledMetric(relativeTo: .caption) private var chartChrome: CGFloat = 96
 
     private var listener: Bool { role == .listener }
-    private var soundLive: Bool { listener ? model.monitoring : model.remoteSound.isLive(at: model.now) && !(confirmedParentState && model.parentStatus?.monitoring == false) }
+    private var soundLive: Bool { listener ? model.monitoring : model.parentHasLiveMonitoring }
     private var frame: SoundLevelFrame? { model.remoteSound.frame }
     private var levels: [Double] { listener ? model.meter : frame?.levels ?? Array(repeating: -100, count: SoundLevelFrame.barCount) }
     private var notificationPositions: [CGFloat] {
@@ -26,8 +26,8 @@ struct NightstandView: View {
     private var alertDuration: TimeInterval { listener ? model.configuration.alertDuration : frame.flatMap { soundLive ? $0.alertDuration : nil } ?? model.parentStatus?.listenerConfiguration?.alertDuration ?? model.configuration.alertDuration }
     private var elapsed: TimeInterval? { listener ? model.snapshot.current.map { $0.duration(at: model.now) } : soundLive ? frame?.episodeDuration : nil }
     private var confirmedParentState: Bool { ["Monitoring", "Standby", "Stopped"].contains(model.nurseryConnection) }
-    private var standby: Bool { listener ? model.standby : confirmedParentState && model.parentStatus?.monitoring == false && model.parentStatus?.microphoneActive == true }
-    private var monitoringActive: Bool { listener ? model.monitoring || model.recoveringAudio : confirmedParentState && model.parentStatus?.monitoring == true }
+    private var standby: Bool { listener ? model.standby : model.parentMonitoringDisplayState == .standby }
+    private var monitoringActive: Bool { listener ? model.monitoring || model.recoveringAudio : model.parentDisplaysMonitoring }
     private var parentStartUnavailable: Bool { !listener && model.paired && !monitoringActive && !model.canStartMonitoringRemotely && model.pendingMonitoringCommand == nil }
     private var busy: Bool { listener ? model.starting : model.requestingMonitoring || model.pendingMonitoringCommand != nil }
     private var currentState: CryState? { listener ? model.state : soundLive ? frame?.state : nil }
@@ -47,10 +47,10 @@ struct NightstandView: View {
         } else {
             if !model.paired || model.pendingMonitoringCommand != nil || model.monitoringControlError != nil { return model.nurseryConnection }
             if standby { return "Standby" }
-            if confirmedParentState && model.parentStatus?.monitoring == false { return "Stopped" }
+            if model.parentMonitoringDisplayState == .stopped { return "Stopped" }
             // A fresh sound frame can be displayed before the next heartbeat.
             if !soundLive {
-                if !model.parentOnline { return model.nurseryConnection == "Stopped" ? "Stopped" : "Monitoring unconfirmed" }
+                if !model.parentDisplaysMonitoring { return model.nurseryConnection == "Stopped" ? "Stopped" : "Monitoring unconfirmed" }
                 return "Live chart paused"
             }
         }
@@ -65,7 +65,7 @@ struct NightstandView: View {
         }
         if soundLive { return "Listening for sustained sound" }
         if !model.paired { return "Pair with the nursery iPhone to begin" }
-        if let last = model.parentStatus?.lastHeartbeat { return "\(model.parentOnline ? "Monitoring last confirmed" : "Last nursery update") \(last.formatted(.relative(presentation: .numeric)))" }
+        if let last = model.parentStatus?.lastHeartbeat { return "\(model.parentDisplaysMonitoring ? "Monitoring last confirmed" : "Last nursery update") \(last.formatted(.relative(presentation: .numeric)))" }
         return "Waiting for a confirmed Listener update"
     }
 
@@ -364,9 +364,9 @@ struct NightstandView: View {
 
     private var connectionRecovery: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Label(model.monitoringControlError != nil ? "Monitoring not confirmed" : model.parentOnline ? "Live chart paused" : model.nurseryConnection == "Stopped" ? "Nursery monitoring is stopped" : "Monitoring cannot be confirmed",
+            Label(model.monitoringControlError != nil ? "Monitoring not confirmed" : model.parentDisplaysMonitoring ? "Live chart paused" : model.nurseryConnection == "Stopped" ? "Nursery monitoring is stopped" : "Monitoring cannot be confirmed",
                   systemImage: "exclamationmark.triangle.fill").font(.headline).accessibilityIdentifier("connectionRecoveryHeading")
-            Text(model.monitoringControlError ?? (model.parentOnline
+            Text(model.monitoringControlError ?? (model.parentDisplaysMonitoring
                 ? "The nursery microphone was recently confirmed active, but live sound readings have paused. Retry to reconnect the chart."
                 : "Check internet on both phones. Reopen Crib Service on the nursery iPhone and check its microphone status. Then retry here."))
                 .font(.subheadline)

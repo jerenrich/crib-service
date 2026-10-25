@@ -424,6 +424,69 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(fixture.liveSound.connectedDevice)
         XCTAssertNil(fixture.model.remoteSound.frame)
     }
+    @MainActor func testLiveSoundImmediatelyOffersPauseBeforeStoppedHeartbeatRefreshes() async throws {
+        let fixture = try Fixture(localWarnings: true)
+        fixture.model.selectRole(.parent)
+        fixture.model.paired = true
+        fixture.model.parentStatus = ParentStatus(paired: true, lastHeartbeat: fixture.time.now,
+            monitoring: false, configuration: MonitoringConfiguration(), microphoneActive: true)
+        XCTAssertTrue(fixture.model.canStartMonitoringRemotely)
+        XCTAssertFalse(fixture.model.parentDisplaysMonitoring)
+        let frame = SoundLevelFrame(sampledAt: 100, levels: Array(repeating: -40, count: 120),
+            threshold: -45, state: .quiet, alertDuration: 30)
+        fixture.liveSound.onFrame?(frame)
+        XCTAssertTrue(fixture.model.parentDisplaysMonitoring)
+        XCTAssertTrue(fixture.model.parentHasLiveMonitoring)
+        XCTAssertFalse(fixture.model.parentOnline, "Live readings must not confirm a server heartbeat")
+        XCTAssertNil(fixture.model.parentConnectionDeadline)
+        XCTAssertEqual(fixture.model.parentStatus?.monitoring, false)
+        fixture.model.now = fixture.time.now.addingTimeInterval(3)
+        XCTAssertTrue(fixture.model.parentDisplaysMonitoring, "A short stream gap must not restore an older stopped heartbeat")
+        fixture.model.now = fixture.time.now
+        fixture.liveSound.onConnectionChange?(false)
+        XCTAssertTrue(fixture.model.parentDisplaysMonitoring)
+    }
+
+    @MainActor func testAllParentSurfacesShareLiveLatchAndNewerStandbyEvidence() throws {
+        let fixture = try Fixture()
+        fixture.model.selectRole(.parent); fixture.model.paired = true
+        var status = ParentStatus(paired: true, lastHeartbeat: fixture.time.now,
+            monitoring: false, configuration: MonitoringConfiguration(), microphoneActive: true)
+        fixture.model.parentStatus = status
+        fixture.liveSound.onFrame?(SoundLevelFrame(sampledAt: 100, levels: Array(repeating: -40, count: 120),
+            threshold: -45, state: .quiet, alertDuration: 30))
+        fixture.time.now = fixture.time.now.addingTimeInterval(5); fixture.model.now = fixture.time.now
+        fixture.liveSound.onConnectionChange?(false)
+        XCTAssertTrue(fixture.model.parentDisplaysMonitoring)
+        XCTAssertTrue(fixture.model.parentDisplaysActiveMicrophone)
+        XCTAssertEqual(fixture.model.nurseryConnection, "Monitoring")
+        XCTAssertEqual(fixture.model.nightstandDevices.first?.status, "Monitoring")
+        XCTAssertFalse(fixture.model.canStartMonitoringRemotely)
+        status.lastHeartbeat = fixture.time.now
+        fixture.model.parentStatus = status
+        XCTAssertEqual(fixture.model.parentMonitoringDisplayState, .standby)
+        XCTAssertFalse(fixture.model.parentDisplaysMonitoring)
+        XCTAssertTrue(fixture.model.parentDisplaysActiveMicrophone)
+        XCTAssertEqual(fixture.model.nightstandDevices.first?.status, "Standby")
+        XCTAssertTrue(fixture.model.canStartMonitoringRemotely)
+    }
+
+    @MainActor func testPauseDiscardsLiveEvidenceAndIgnoresFramesAlreadyInFlight() async throws {
+        let fixture = try Fixture()
+        fixture.model.selectRole(.parent)
+        await fixture.model.refreshParent()
+        var frame = SoundLevelFrame(sampledAt: 100, levels: Array(repeating: -40, count: 120),
+            threshold: -45, state: .quiet, alertDuration: 30)
+        fixture.liveSound.onFrame?(frame)
+        XCTAssertTrue(fixture.model.parentHasLiveMonitoring)
+        await fixture.model.requestMonitoring(false)
+        XCTAssertFalse(fixture.model.remoteSound.isLive(at: fixture.time.now))
+        frame.sampledAt += 1
+        fixture.liveSound.onFrame?(frame)
+        XCTAssertFalse(fixture.model.remoteSound.isLive(at: fixture.time.now))
+        XCTAssertFalse(fixture.model.parentHasLiveMonitoring)
+    }
+
     @MainActor func testLiveSoundCannotConfirmMonitoringOrArmConnectionWarnings() async throws {
         let fixture = try Fixture(localWarnings: true)
         fixture.model.selectRole(.parent)
@@ -433,6 +496,8 @@ final class AppModelTests: XCTestCase {
         fixture.liveSound.onFrame?(SoundLevelFrame(sampledAt: 100, levels: Array(repeating: -40, count: 120),
             threshold: -45, state: .crying, episodeStartedAt: 95, alertDuration: 30))
         XCTAssertTrue(fixture.model.remoteSound.isLive(at: fixture.time.now))
+        XCTAssertFalse(fixture.model.parentHasLiveMonitoring)
+        XCTAssertFalse(fixture.model.parentDisplaysMonitoring)
         XCTAssertEqual(fixture.model.pendingMonitoringCommand?.id, pending.id)
         XCTAssertFalse(fixture.model.parentOnline)
         XCTAssertNil(fixture.model.parentConnectionDeadline)
@@ -678,41 +743,24 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(fixture.audio.starts, 0)
     }
     @MainActor func testParentRemoteStartRequiresRecentStandbyAndConnectivity() throws {
-        let fixture = try Fixture()
-        fixture.model.selectRole(.parent)
-        fixture.model.paired = true
-        var status = ParentStatus(paired: true, lastHeartbeat: fixture.time.now,
-            monitoring: false, configuration: MonitoringConfiguration(), microphoneActive: true)
-        fixture.model.parentStatus = status
-        XCTAssertTrue(fixture.model.canStartMonitoringRemotely)
-        for microphone in [false, nil] as [Bool?] {
-            status.microphoneActive = microphone
-            fixture.model.parentStatus = status
-            XCTAssertFalse(fixture.model.canStartMonitoringRemotely)
+        @MainActor func ready(age: TimeInterval? = 0, microphone: Bool? = true,
+                              monitoring: Bool = false, network: Bool = true, paired: Bool = true) throws -> Bool {
+            let fixture = try Fixture()
+            fixture.model.selectRole(.parent); fixture.model.paired = paired
+            fixture.connectivity.available = network
+            fixture.model.parentStatus = ParentStatus(paired: paired,
+                lastHeartbeat: age.map { fixture.time.now.addingTimeInterval(-$0) },
+                monitoring: monitoring, configuration: MonitoringConfiguration(), microphoneActive: microphone)
+            return fixture.model.canStartMonitoringRemotely
         }
-        status.microphoneActive = true
-        for age in [31.0, 180, -6] {
-            status.lastHeartbeat = fixture.time.now.addingTimeInterval(-age)
-            fixture.model.parentStatus = status
-            XCTAssertFalse(fixture.model.canStartMonitoringRemotely)
-        }
-        status.lastHeartbeat = nil
-        fixture.model.parentStatus = status
-        XCTAssertFalse(fixture.model.canStartMonitoringRemotely)
-        status.lastHeartbeat = fixture.time.now
-        fixture.model.parentStatus = status
-        fixture.connectivity.available = false
-        XCTAssertFalse(fixture.model.canStartMonitoringRemotely)
-        fixture.connectivity.available = true
-        XCTAssertTrue(fixture.model.canStartMonitoringRemotely)
-        status.monitoring = true
-        fixture.model.parentStatus = status
-        XCTAssertFalse(fixture.model.canStartMonitoringRemotely)
-        status.monitoring = false; status.paired = false
-        fixture.model.parentStatus = status
-        XCTAssertFalse(fixture.model.canStartMonitoringRemotely)
-        fixture.model.parentStatus = nil
-        XCTAssertFalse(fixture.model.canStartMonitoringRemotely)
+        XCTAssertTrue(try ready())
+        XCTAssertFalse(try ready(microphone: false))
+        XCTAssertFalse(try ready(microphone: nil))
+        for age in [31.0, 180, -6] { XCTAssertFalse(try ready(age: age)) }
+        XCTAssertFalse(try ready(age: nil))
+        XCTAssertFalse(try ready(network: false))
+        XCTAssertFalse(try ready(monitoring: true))
+        XCTAssertFalse(try ready(paired: false))
     }
 
     @MainActor func testParentDistinguishesStandbyOffAndStaleListener() async throws {
@@ -725,7 +773,8 @@ final class AppModelTests: XCTestCase {
         status.microphoneActive = false
         await fixture.backend.setStatus(status); await fixture.model.refreshParent()
         XCTAssertEqual(fixture.model.nurseryConnection, "Stopped")
-        status.microphoneActive = true; status.lastHeartbeat = fixture.time.now.addingTimeInterval(-180)
+        fixture.time.now = fixture.time.now.addingTimeInterval(180); fixture.model.now = fixture.time.now
+        status.microphoneActive = true; status.serverTime = fixture.time.now
         await fixture.backend.setStatus(status); await fixture.model.refreshParent()
         XCTAssertEqual(fixture.model.nurseryConnection, "Connection lost")
     }
@@ -998,7 +1047,7 @@ final class AppModelTests: XCTestCase {
         status.monitoring = true; status.listenerConfiguration = MonitoringConfiguration()
         await fixture.backend.setStatus(status); await fixture.model.refreshParent()
         XCTAssertEqual(fixture.model.nurseryConnection, "Monitoring"); XCTAssertEqual(fixture.model.settingsSyncStatus, "Applied on Listener")
-        status.lastHeartbeat = fixture.time.now.addingTimeInterval(-151)
+        fixture.time.now = fixture.time.now.addingTimeInterval(151); fixture.model.now = fixture.time.now
         await fixture.backend.setStatus(status); await fixture.model.refreshParent()
         XCTAssertEqual(fixture.model.nurseryConnection, "Connection lost"); XCTAssertFalse(fixture.model.parentOnline)
         XCTAssertEqual(fixture.model.settingsSyncStatus, "Waiting for Listener")

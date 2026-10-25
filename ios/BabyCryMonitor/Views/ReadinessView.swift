@@ -26,11 +26,11 @@ struct ReadinessView: View {
         Form {
             Section("Tonight's essentials") {
                 check("iPhones paired", passed: model.paired)
-                check("Nursery microphone active", passed: model.parentOnline)
+                check("Nursery microphone active", passed: model.parentDisplaysActiveMicrophone)
                 check("Watch alerts registered", passed: model.parentStatus?.watchPushRegistered == true)
                 check("Settings applied on nursery iPhone", passed: model.parentOnline && model.parentStatus?.listenerConfiguration == model.configuration)
                 powerCheck
-                if !model.parentOnline {
+                if !model.parentDisplaysMonitoring {
                     Button(model.pendingMonitoringCommand != nil || model.requestingMonitoring ? "Starting…" : model.canStartMonitoringRemotely ? "Start Monitoring" : "Start on Nursery iPhone") {
                         Task { await model.requestMonitoring(true) }
                     }.disabled(!model.canStartMonitoringRemotely || model.pendingMonitoringCommand != nil || model.requestingMonitoring)

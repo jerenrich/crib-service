@@ -56,3 +56,62 @@ final class LiveSoundTests: XCTestCase {
         XCTAssertFalse(requests.accepts(value, at: now))
     }
 }
+
+final class ParentMonitoringEvidenceTests: XCTestCase {
+    private let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+    func testLiveStartSupersedesCachedStandbyWithoutFlickerAndEventuallyExpires() {
+        var evidence = ParentMonitoringEvidence()
+        evidence.receiveHeartbeat(monitoring: false, microphoneActive: true, version: now, observedAt: now)
+        evidence.receiveLive(at: now.addingTimeInterval(1))
+        // Re-fetching the same cached heartbeat is not a new pause.
+        evidence.receiveHeartbeat(monitoring: false, microphoneActive: true, version: now, observedAt: now)
+        XCTAssertEqual(evidence.state(at: now.addingTimeInterval(5), statusAvailable: true), .monitoring)
+        XCTAssertEqual(evidence.state(at: now.addingTimeInterval(50), statusAvailable: true), .monitoring)
+        XCTAssertFalse(evidence.canResume(at: now.addingTimeInterval(5), statusAvailable: true))
+        XCTAssertEqual(evidence.state(at: now.addingTimeInterval(152), statusAvailable: true), .connectionLost)
+    }
+    func testNewerStopSupersedesLiveAfterInFlightWindowAndOlderResponsesCannotUndoIt() {
+        var evidence = ParentMonitoringEvidence()
+        evidence.receiveHeartbeat(monitoring: false, microphoneActive: true, version: now, observedAt: now)
+        evidence.receiveLive(at: now.addingTimeInterval(1))
+        evidence.receiveHeartbeat(monitoring: false, microphoneActive: false,
+            version: now.addingTimeInterval(2), observedAt: now.addingTimeInterval(2))
+        XCTAssertEqual(evidence.state(at: now.addingTimeInterval(2), statusAvailable: true), .monitoring)
+        XCTAssertEqual(evidence.state(at: now.addingTimeInterval(4), statusAvailable: true), .stopped)
+        evidence.receiveHeartbeat(monitoring: true, microphoneActive: true, version: now, observedAt: now)
+        XCTAssertEqual(evidence.state(at: now.addingTimeInterval(5), statusAvailable: true), .stopped)
+        XCTAssertEqual(evidence.state(at: now.addingTimeInterval(6), statusAvailable: false), .unavailable)
+    }
+    func testContinuingLiveReadingsSupersedeAnOlderStopAndNewStandbyAllowsResume() {
+        var evidence = ParentMonitoringEvidence()
+        evidence.receiveLive(at: now)
+        evidence.receiveHeartbeat(monitoring: false, microphoneActive: true,
+            version: now.addingTimeInterval(1), observedAt: now.addingTimeInterval(1))
+        evidence.receiveLive(at: now.addingTimeInterval(2))
+        XCTAssertEqual(evidence.state(at: now.addingTimeInterval(6), statusAvailable: true), .monitoring)
+        evidence.receiveHeartbeat(monitoring: false, microphoneActive: true,
+            version: now.addingTimeInterval(7), observedAt: now.addingTimeInterval(7))
+        XCTAssertEqual(evidence.state(at: now.addingTimeInterval(7), statusAvailable: true), .standby)
+        XCTAssertTrue(evidence.canResume(at: now.addingTimeInterval(7), statusAvailable: true))
+        XCTAssertFalse(evidence.canResume(at: now.addingTimeInterval(38), statusAvailable: true))
+    }
+    func testRepeatedCachedHeartbeatNeverRenewsFreshness() {
+        var evidence = ParentMonitoringEvidence()
+        evidence.receiveHeartbeat(monitoring: false, microphoneActive: true, version: now, observedAt: now)
+        evidence.receiveHeartbeat(monitoring: false, microphoneActive: true, version: now, observedAt: now.addingTimeInterval(120))
+        XCTAssertFalse(evidence.canResume(at: now.addingTimeInterval(120), statusAvailable: true))
+        XCTAssertEqual(evidence.state(at: now.addingTimeInterval(151), statusAvailable: true), .connectionLost)
+    }
+    func testPauseBlocksAlreadyIssuedLiveChallengesButAllowsGenuineLaterResume() {
+        var evidence = ParentMonitoringEvidence()
+        evidence.receiveLive(at: now)
+        evidence.receiveHeartbeat(monitoring: false, microphoneActive: true, version: now, observedAt: now)
+        evidence.pause(at: now)
+        evidence.receiveLive(at: now.addingTimeInterval(2.99))
+        XCTAssertEqual(evidence.state(at: now.addingTimeInterval(2.99), statusAvailable: true), .standby)
+        XCTAssertFalse(evidence.acceptsLive(at: now.addingTimeInterval(2.99)))
+        evidence.receiveLive(at: now.addingTimeInterval(3))
+        XCTAssertEqual(evidence.state(at: now.addingTimeInterval(3), statusAvailable: true), .monitoring)
+    }
+}
