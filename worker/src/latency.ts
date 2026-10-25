@@ -1,5 +1,5 @@
 // Bounded numeric spans only. No SQL, exception text, tokens or payloads.
-export const spans = ['rate_limit_ms','authentication_ms','handler_ms','alert_prepare_ms','claim_ms','destination_ms',
+export const spans = ['rate_limit_ms','authentication_ms','authentication_hash_ms','alert_admission_ms','alert_snapshot_ms','body_read_ms','handler_ms','alert_prepare_ms','claim_ms','destination_ms',
  'token_decrypt_ms','provider_sign_ms','apns_fetch_ms','apns_body_ms','outcome_storage_ms','reminder_prepare_ms',
  'reminder_schedule_ms','reminder_snapshot_ms','reminder_pair_ms','reminder_control_ms','reminder_latest_ms','reminder_heartbeat_ms','reminder_original_ms','reminder_insert_ms','alarm_lag_ms','generated_to_dispatch_ms',
  'pair_ms','event_lookup_ms','event_insert_ms','event_reload_ms','event_episode_ms','response_read_ms','claim_observe_ms',
@@ -26,6 +26,7 @@ export interface TimingDetails {
  apns_started_at_ms?:number; apns_response_at_ms?:number; apns_unique_id?:string; colo?:string;
  error_kind?:'d1_overloaded'|'d1_timeout'|'d1_error'|'other';
  failed_span?:Span;
+ client_request_id?:string;in_flight_span?:Span;in_flight_ms?:number;
  dispatch_source?:'upload'|'reminder'|'maintenance'|'connection'|'watch_test';
  observed_status?:'pending'|'sending'|'sent'|'blocked'|'uncertain'|'failed';
  exit_reason?:'acknowledged'|'resolved'|'in_flight'|'already_sent'|'backoff'|'not_pending'|'not_found'|'not_created'|'no_pair'|'monitoring_stopped'|'no_pending_alert'|'stale_heartbeat'|'not_crying'|'below_threshold'|'muted'|'not_due'|'superseded';
@@ -37,6 +38,7 @@ export interface TimingDetails {
 }
 export class Latency {
  readonly details:TimingDetails={spans:{}};
+ private active?:{name:Span;started:number};
  private failureCause:unknown;
  private hasFailure=false;
  eventRef?:string;
@@ -48,8 +50,16 @@ export class Latency {
   else if(span&&!this.details.failed_span)this.details.failed_span=span;
  }
  async measure<T>(name:Span,work:()=>Promise<T>):Promise<T> {
-  const start=performance.now();
-  try{return await work();}catch(error){this.failure(error,name);throw error;}finally{this.details.spans![name]=(this.details.spans![name]??0)+Math.max(0,performance.now()-start);}
+  const start=performance.now(),previous=this.active,current={name,started:start};this.active=current;
+  try{return await work();}catch(error){this.failure(error,name);throw error;}finally{
+   this.details.spans![name]=(this.details.spans![name]??0)+Math.max(0,performance.now()-start);
+   if(this.active===current)this.active=previous;
+  }
+ }
+ progressDetails():TimingDetails {
+  const details:TimingDetails={...this.details,...(this.active?{in_flight_span:this.active.name,in_flight_ms:Math.max(0,performance.now()-this.active.started)}:{})};
+  // Freeze a bounded, sanitized copy before asynchronous journal I/O.
+  return JSON.parse(safeTimingDetails(details)??'{}') as TimingDetails;
  }
  async db<T>(name:Span,work:()=>Promise<D1Result<T>|D1Result<T>[]>):Promise<D1Result<T>[]> {
   this.databaseStarted(name);
@@ -153,10 +163,12 @@ export function safeTimingDetails(value:TimingDetails|undefined):string|null {
   if(Object.keys(metrics).length)stages[name]=metrics;
  }
  if(Object.keys(stages).length)safe.db_stages=stages;
- for(const name of ['db_calls','db_sql_ms','db_rows_read','db_rows_written','db_attempts','provider_token_age_s','apns_started_at_ms','apns_response_at_ms','observed_attempts','next_attempt_at_ms','preparation_started_at_ms','preparation_finished_at_ms','journal_failures_before_write','outcome_queue_age_ms'] as const){
+ for(const name of ['db_calls','db_sql_ms','db_rows_read','db_rows_written','db_attempts','provider_token_age_s','apns_started_at_ms','apns_response_at_ms','observed_attempts','next_attempt_at_ms','preparation_started_at_ms','preparation_finished_at_ms','journal_failures_before_write','outcome_queue_age_ms','in_flight_ms'] as const){
   if(number(value[name]))safe[name]=value[name];
  }
  for(const name of ['durable_outcome','outcome_recovery'] as const)if(typeof value[name]==='boolean')safe[name]=value[name];
+ if(typeof value.client_request_id==='string'&&/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value.client_request_id))safe.client_request_id=value.client_request_id.toLowerCase();
+ if(spans.includes(value.in_flight_span!))safe.in_flight_span=value.in_flight_span;
  if(appleReasons.includes(value.apns_reason!))safe.apns_reason=value.apns_reason;
  if(['development','production'].includes(value.apns_environment!))safe.apns_environment=value.apns_environment;
  if(['timeout','network'].includes(value.transport!))safe.transport=value.transport;

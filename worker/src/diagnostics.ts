@@ -15,12 +15,12 @@ const routes = {
  'POST /v1/connection-alerts':'connection_preferences','POST /v1/test-push':'test_push',
  'GET /v1/live-sound':'live_sound'
 } as const;
-export type Operation = typeof routes[keyof typeof routes] | 'unknown_route' | 'dispatch' | 'dispatch_outcome' | 'dispatch_skip' | 'reminder_prepare' | 'maintenance' | 'reminder_schedule' | 'reminder_alarm' | 'watch_test_dispatch';
+export type Operation = typeof routes[keyof typeof routes] | 'unknown_route' | 'alert_progress' | 'dispatch' | 'dispatch_outcome' | 'dispatch_skip' | 'reminder_prepare' | 'maintenance' | 'reminder_schedule' | 'reminder_alarm' | 'watch_test_dispatch';
 export type Stage = 'validation' | 'rate_limit' | 'authentication' | 'handler' | 'claim' | 'push' | 'storage' | 'cleanup';
 export type Outcome = 'ok' | 'rejected' | 'internal_error' | 'sent' | 'retry' | 'blocked' | 'uncertain' | 'failed'
  | 'expired_event' | 'no_push_token' | 'transport_unknown' | 'invalid_device_token' | 'provider_configuration'
  | 'apns_429' | 'apns_500' | 'apns_503' | 'apns_rejected' | 'apns_configuration' | 'dispatch_interrupted'
- | PreparationFailure | 'claim_skipped' | 'notice_cancelled' | 'reminder_stopped' | 'reminder_not_created' | 'bad_topic' | 'missing_topic' | 'bad_priority' | 'bad_expiration' | 'bad_payload' | 'payload_too_large' | 'diagnostic_cleanup_failed';
+ | 'still_running' | PreparationFailure | 'claim_skipped' | 'notice_cancelled' | 'reminder_stopped' | 'reminder_not_created' | 'bad_topic' | 'missing_topic' | 'bad_priority' | 'bad_expiration' | 'bad_payload' | 'payload_too_large' | 'diagnostic_cleanup_failed';
 export type PreparationFailure = 'token_decryption' | 'provider_signing' | 'apns_environment';
 export class PushPreparationError extends Error {
  constructor(readonly code:PreparationFailure) { super(code); }

@@ -1,5 +1,6 @@
 import {APIError, defaultConfiguration, requireRole, type Device, type Env} from './types';
-import {constantTimeEqual, encryptToken, rateLimit, sha256, uuid} from './security';
+import {Latency} from './latency';
+import {constantTimeEqual, encryptToken, rateLimit, rateLimitStatement, sha256, uuid} from './security';
 import {revokeLiveSound} from './live-sound';
 export async function register(env:Env,value:Record<string,unknown>,ip:string) {
  await rateLimit(env,'register',ip,10,600);
@@ -13,12 +14,33 @@ export async function register(env:Env,value:Record<string,unknown>,ip:string) {
  if(!saved||saved.role!==role||!constantTimeEqual(saved.secret_hash,hash))throw new APIError(409,'Device registration conflict.');
  return {ok:true};
 }
-export async function authenticate(env:Env,request:Request):Promise<Device> {
+function credentialFor(request:Request):{id:string;secret:string} {
  const authorization=request.headers.get('authorization')??'';
  const match=/^Bearer ([0-9a-f-]+)\.([A-Za-z0-9+/]{43}=)$/i.exec(authorization);
  if(!match)throw new APIError(401,'Device authentication required.');
- const id=uuid(match[1]);const device=await env.DB.prepare('SELECT * FROM devices WHERE id=?').bind(id).first<Device>();
- if(!device||!constantTimeEqual(device.secret_hash,await sha256(match[2])))throw new APIError(401,'Device authentication failed.');
+ return {id:uuid(match[1]),secret:match[2]};
+}
+export async function authenticate(env:Env,request:Request):Promise<Device> {
+ const {id,secret}=credentialFor(request);
+ const device=await env.DB.prepare('SELECT * FROM devices WHERE id=?').bind(id).first<Device>();
+ if(!device||!constantTimeEqual(device.secret_hash,await sha256(secret)))throw new APIError(401,'Device authentication failed.');
+ return device;
+}
+// One transaction/remote call instead of separate authentication and rate-limit
+// calls. No cache, background admission, write retry or hedged mutation.
+export async function admitAlert(env:Env,request:Request,latency:Latency):Promise<Device> {
+ const {id,secret}=credentialFor(request);
+ const [hash,key]=await latency.measure('authentication_hash_ms',()=>Promise.all([
+  sha256(secret),sha256(`${env.PAIRING_PEPPER}|alert|${id}`)
+ ]));
+ const window=Math.floor(Date.now()/1000/600);
+ const results=await latency.db<Device|{attempts:number}>('alert_admission_ms',()=>env.DB.batch<Device|{attempts:number}>([
+  env.DB.prepare('SELECT * FROM devices WHERE id=?').bind(id),rateLimitStatement(env,key,window,{id,hash})
+ ]));
+ const device=results[0].results[0] as Device|undefined;
+ if(!device||!constantTimeEqual(device.secret_hash,hash))throw new APIError(401,'Device authentication failed.');
+ const budget=results[1].results[0] as {attempts:number}|undefined;
+ if(!budget||budget.attempts>600)throw new APIError(429,'Too many requests. Try again later.');
  return device;
 }
 export async function savePushToken(env:Env,device:Device,value:Record<string,unknown>) {

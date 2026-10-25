@@ -8,6 +8,9 @@ private final class DiagnosticsURLProtocol: URLProtocol, @unchecked Sendable {
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
         let path = request.url!.path
+        if path.contains("client-correlation"), UUID(uuidString: request.value(forHTTPHeaderField: "X-Client-Request-ID") ?? "") == nil {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse));return
+        }
         if path.contains("transport") {
             client?.urlProtocol(self, didFailWithError: URLError(.timedOut, userInfo: [NSURLErrorFailingURLStringErrorKey: "https://private-host/private-token"]))
             return
@@ -25,6 +28,7 @@ private final class DiagnosticsURLProtocol: URLProtocol, @unchecked Sendable {
         let body: String
         if path.contains("schema-error") { body = "{\"quietResetDuration\":20,\"sensitivity\":\"medium\",\"absoluteThreshold\":-35}" }
         else if path.contains("date-error") { body = "{\"code\":\"private-pairing-code\",\"expiresAt\":\"private-invalid-timestamp\"}" }
+        else if path.contains("client-correlation") { body = "{\"status\":\"\(request.value(forHTTPHeaderField: "X-Client-Request-ID")!)\"}" }
         else if path.hasSuffix("/v1/listener/event") { body = "{\"status\":\"sent\"}" }
         else { body = path.contains("decode-error") ? "private-response-body" : (status == 503 ? "{\"error\":\"private-server-message\"}" : "{\"ok\":true}") }
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
@@ -236,14 +240,43 @@ final class DiagnosticsTests: XCTestCase {
                              durationSeconds: 5, createdAt: Date(), isRepeat: false)
         let receipt = try await client.send(alert)
         XCTAssertEqual(receipt.status, "sent")
-        XCTAssertEqual(log.lines.count, 1, "Correlation must reuse the existing network log write")
+        XCTAssertEqual(log.lines.count, 2, "Start correlation must survive a missing response")
         XCTAssertTrue(log.lines[0].contains("event_id=\(alert.eventId.uuidString.lowercased())"))
-        XCTAssertTrue(log.lines[0].contains("request_id=6705ae24-2863-49df-8dc5-5fa15b2d0418"))
+        XCTAssertTrue(log.lines[1].contains("request_id=6705ae24-2863-49df-8dc5-5fa15b2d0418"))
+        let clientID = log.lines[0].components(separatedBy: "client_request_id=").last!
+        XCTAssertNotNil(UUID(uuidString: clientID))
+        XCTAssertTrue(log.lines[1].contains("client_request_id=\(clientID)"))
         XCTAssertFalse(log.export.contains(credential.deviceId.uuidString.lowercased()))
         XCTAssertFalse(log.export.contains("private-credential"))
         XCTAssertFalse(log.export.contains("private-host"))
         log.network(operation: "status", outcome: "ok", elapsedMS: 1, eventID: alert.eventId)
         XCTAssertFalse(log.lines.last!.contains("event_id="), "Only alert operations may add event identifiers")
+    }
+    @MainActor func testAlertTimeoutsRetainDistinctAttemptIDsBeforeAnyServerResponse() async throws {
+        let config = URLSessionConfiguration.ephemeral;config.protocolClasses = [DiagnosticsURLProtocol.self]
+        let session = URLSession(configuration: config);defer { session.invalidateAndCancel() }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let log = DiagnosticLog(directory: directory),credential = DeviceCredential(deviceId: UUID(), secret: "private-credential", role: .listener, registered: true)
+        let alert = CryAlert(episodeId: UUID(), listenerId: credential.deviceId, cryStartedAt: Date(), durationSeconds: 5, createdAt: Date(), isRepeat: false)
+        let client = BackendClient(baseURL: URL(string: "https://private-host/client-correlation-transport")!, credential: credential, log: log, session: session)
+        for _ in 0..<2 {
+            do { _ = try await client.send(alert);XCTFail("Expected timeout") }
+            catch { XCTAssertEqual((error as? URLError)?.code, .timedOut) }
+        }
+        let starts = log.lines.filter { $0.contains("alert_upload phase=started") }
+        let ends = log.lines.filter { $0.contains("network operation=alert") }
+        XCTAssertEqual(starts.count, 2);XCTAssertEqual(ends.count, 2)
+        let ids = starts.map { $0.components(separatedBy: "client_request_id=").last! }
+        XCTAssertEqual(Set(ids).count, 2)
+        for (id, end) in zip(ids, ends) {
+            XCTAssertNotNil(UUID(uuidString: id));XCTAssertTrue(end.contains("client_request_id=\(id)"))
+            XCTAssertFalse(end.contains(" request_id="))
+        }
+        let ok = BackendClient(baseURL: URL(string: "https://private-host/client-correlation")!, credential: credential, log: log, session: session)
+        let response = try await ok.send(alert)
+        XCTAssertTrue(log.lines.last!.contains("client_request_id=\(response.status)"), "Header and logged correlation must agree")
+        XCTAssertFalse(log.export.contains("private-credential"));XCTAssertFalse(log.export.contains("private-host"))
     }
     @MainActor func testBatteryHistorySurvivesDiagnosticRingAndRelaunch() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

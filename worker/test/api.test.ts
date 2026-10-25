@@ -1355,7 +1355,7 @@ describe('latency path and diagnostic spans',()=>{
   mockPush();
   try {
    const response=await worker.fetch(new Request('https://monitor.test/v1/listener/event',{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${listener.deviceId}.${listener.secret}`},body:JSON.stringify(alert(listener))}),slow,{waitUntil:(job:Promise<unknown>)=>jobs.push(job)} as unknown as ExecutionContext);
-   expect(await response.json()).toEqual({status:'sent'});expect(pushRequests).toHaveLength(1);expect(jobs).toHaveLength(1);
+   expect(await response.json()).toEqual({status:'sent'});expect(pushRequests).toHaveLength(1);expect(jobs).toHaveLength(2);
   }finally{release();await Promise.all(jobs);}
  });
  it('repairs failed background scheduling from durable events during maintenance',async()=>{
@@ -1592,7 +1592,7 @@ describe('diagnostic gap regressions',()=>{
  it('times failed initial preparation and the response journal write',async()=>{
   const {listener}=await paired();const db=interceptDB(async(sql,_args,_method,execute)=>{if(sql==='SELECT * FROM events WHERE event_id=?')throw new Error('D1_ERROR: private-lookup-marker');return execute();});
   const response=await worker.fetch(new Request('https://monitor.test/v1/listener/event',{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${listener.deviceId}.${listener.secret}`},body:JSON.stringify(alert(listener))}),{...testEnv,DB:db});expect(response.status).toBe(503);expect(response.headers.get('x-diagnostics-elapsed-ms')).toMatch(/^\d+$/);
-  const row=await env.DB.prepare('SELECT event_ref,details FROM diagnostics WHERE request_id=?').bind(response.headers.get('x-request-id')).first<{event_ref:string;details:string}>();expect(row?.event_ref).toMatch(/^[0-9a-f]{64}$/);expect(JSON.parse(row!.details).failed_span).toBe('event_lookup_ms');expect(JSON.parse(row!.details).spans.alert_prepare_ms).toBeGreaterThanOrEqual(0);
+  const row=await env.DB.prepare('SELECT event_ref,details FROM diagnostics WHERE request_id=?').bind(response.headers.get('x-request-id')).first<{event_ref:string;details:string}>();expect(row?.event_ref).toMatch(/^[0-9a-f]{64}$/);expect(JSON.parse(row!.details).failed_span).toBe('alert_snapshot_ms');expect(JSON.parse(row!.details).spans.alert_prepare_ms).toBeGreaterThanOrEqual(0);
  });
  it('preserves successful DB results when optional metrics are absent',async()=>{
   const {Latency}=await import('../src/latency');const latency=new Latency();const result={success:true,results:[{ok:true}]} as unknown as D1Result<{ok:boolean}>;expect(await latency.db('event_lookup_ms',async()=>result)).toEqual([result]);expect(latency.details.db_sql_ms).toBeUndefined();
@@ -1701,5 +1701,84 @@ describe('durable accepted reminder outcomes',()=>{
   const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});mockPush();await call('listener/event',listener,alert(listener));vi.spyOn(Date,'now').mockReturnValue(Date.now()+10000);
   const {AlertReminders}=await import('../src/reminders');const state=reminderContext(parent.deviceId);pushResponses.push(new Error('ambiguous'));await new AlertReminders(state.ctx,testEnv).alarm();await state.drain();
   expect([...state.values.keys()].filter(k=>k.startsWith('accepted/'))).toHaveLength(0);expect((await env.DB.prepare('SELECT status FROM events ORDER BY created_at DESC LIMIT 1').first<{status:string}>())?.status).toBe('uncertain');expect(pushRequests).toHaveLength(2);
+ });
+});
+
+describe('initial upload admission and batching',()=>{
+ it('uses four database calls before Apple and retains client attempt correlation',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  let calls=0,beforeApple=0;const external=globalThis.fetch,clientID=crypto.randomUUID();
+  const db=interceptDB(async(_sql,_args,_method,execute)=>{calls++;return execute();});
+  vi.stubGlobal('fetch',vi.fn(async(input:RequestInfo|URL,init?:RequestInit)=>{beforeApple=calls;return external(input,init);}));mockPush();
+  const response=await worker.fetch(new Request('https://monitor.test/v1/listener/event',{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${listener.deviceId}.${listener.secret}`,'x-client-request-id':clientID},body:JSON.stringify(alert(listener))}),{...testEnv,DB:db});
+  expect(await response.json()).toEqual({status:'sent'});expect(beforeApple).toBe(4);
+  const row=await env.DB.prepare("SELECT details FROM diagnostics WHERE operation='alert' AND request_id=?").bind(response.headers.get('x-request-id')).first<{details:string}>(),details=JSON.parse(row!.details);
+  expect(details.client_request_id).toBe(clientID);
+  for(const stage of ['alert_admission_ms','alert_snapshot_ms','event_insert_ms'])expect(details.db_stages[stage]).toMatchObject({calls:1,statements:2});
+ });
+ it('does not let invalid or revoked credentials consume the real alert budget',async()=>{
+  const {listener}=await paired(),value=alert(listener),key=await sha256(`${testEnv.PAIRING_PEPPER}|alert|${listener.deviceId}`);
+  await env.DB.prepare('INSERT INTO rate_limits(key,window,attempts) VALUES(?,?,600)').bind(key,Math.floor(Date.now()/1000/600)).run();
+  expect((await call('listener/event',{...listener,secret:btoa('xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')},value)).status).toBe(401);
+  expect((await env.DB.prepare('SELECT attempts FROM rate_limits WHERE key=?').bind(key).first<{attempts:number}>())?.attempts).toBe(600);
+  expect((await call('listener/event',listener,value)).status).toBe(429);
+  expect((await call('device/delete',listener)).status).toBe(200);expect((await call('listener/event',listener,value)).status).toBe(401);
+  expect(pushRequests).toHaveLength(0);expect((await env.DB.prepare('SELECT event_id FROM events').all()).results).toHaveLength(0);
+ });
+ it('refuses conflicting metadata after a concurrent upload wins the insert',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});const value=alert(listener);
+  let release!:()=>void,entered!:()=>void;const gate=new Promise<void>(r=>{release=r;}),ready=new Promise<void>(r=>{entered=r;});
+  const db=interceptDB(async(sql,_args,method,execute)=>{const result=await execute();if(method==='batch'&&sql==='SELECT * FROM events WHERE event_id=?'){entered();await gate;}return result;});
+  const running=worker.fetch(new Request('https://monitor.test/v1/listener/event',{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${listener.deviceId}.${listener.secret}`},body:JSON.stringify(value)}),{...testEnv,DB:db});await ready;
+  try {mockPush();expect((await call('listener/event',listener,{...value,isTest:true})).status).toBe(200);}finally{release();}
+  expect((await running).status).toBe(409);expect(pushRequests).toHaveLength(1);
+ });
+ it('uses one read fallback while preserving a newer Stop at the final claim',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});const value=alert(listener);
+  let release!:()=>void,entered!:()=>void,reads=0;const gate=new Promise<void>(r=>{release=r;}),ready=new Promise<void>(r=>{entered=r;});
+  const db=interceptDB(async(sql,_args,method,execute)=>{const result=await execute();if(method==='batch'&&sql==='SELECT * FROM events WHERE event_id=?'&&++reads===1){entered();await gate;}return result;});
+  const running=worker.fetch(new Request('https://monitor.test/v1/listener/event',{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${listener.deviceId}.${listener.secret}`},body:JSON.stringify(value)}),{...testEnv,DB:db});await ready;
+  try {
+   expect((await call('monitoring',parent,{id:crypto.randomUUID(),enabled:false})).status).toBe(200);
+   expect(await (await running).json()).toEqual({status:'acknowledged'});expect(reads).toBe(2);expect(pushRequests).toHaveLength(0);
+  }finally{release();await running;}
+ });
+ it('never repeats a committed admission write while its reply is delayed',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  let release!:()=>void,entered!:()=>void,calls=0;const gate=new Promise<void>(r=>{release=r;}),ready=new Promise<void>(r=>{entered=r;});
+  const db=interceptDB(async(sql,_args,method,execute)=>{const result=await execute();if(method==='batch'&&sql==='SELECT * FROM devices WHERE id=?'){calls++;entered();await gate;}return result;});
+  const running=worker.fetch(new Request('https://monitor.test/v1/listener/event',{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${listener.deviceId}.${listener.secret}`},body:JSON.stringify(alert(listener))}),{...testEnv,DB:db});await ready;
+  try{await new Promise(r=>setTimeout(r,1550));expect(calls).toBe(1);expect(pushRequests).toHaveLength(0);}finally{mockPush();release();await running;}
+  expect(pushRequests).toHaveLength(1);
+ });
+});
+
+describe('slow initial upload checkpoints',()=>{
+ it('records one frozen in-flight stage before completion',async()=>{
+  const {Latency}=await import('../src/latency'),{startAlertProgress}=await import('../src/alert-progress');
+  const latency=new Latency(),clientID=crypto.randomUUID(),requestID=crypto.randomUUID();latency.details.client_request_id=clientID;
+  let release!:()=>void;const gate=new Promise<void>(r=>{release=r;}),jobs:Promise<unknown>[]=[];
+  const work=latency.db('alert_admission_ms',async()=>{await gate;return {success:true,results:[],meta:{duration:1}} as unknown as D1Result;});
+  const stop=startAlertProgress(testEnv,{waitUntil:job=>jobs.push(job)},requestID,Date.now(),latency,()=> 'authentication',5);
+  try {
+   await Promise.all(jobs);await new Promise(r=>setTimeout(r,15));
+   const rows=await env.DB.prepare('SELECT operation,outcome,details FROM diagnostics WHERE request_id=?').bind(requestID).all<{operation:string;outcome:string;details:string}>();
+   expect(rows.results).toHaveLength(1);expect(rows.results[0]).toMatchObject({operation:'alert_progress',outcome:'still_running'});
+   const details=JSON.parse(rows.results[0].details);expect(details).toMatchObject({client_request_id:clientID,in_flight_span:'alert_admission_ms',db_stages:{alert_admission_ms:{calls:1}}});expect(details.in_flight_ms).toBeGreaterThanOrEqual(0);expect(details.db_stages.alert_admission_ms.completed).toBeUndefined();
+  }finally{stop();release();await work;}
+ });
+ it('cancels fast checkpoints and keeps a started journal alive until it finishes',async()=>{
+  const {Latency}=await import('../src/latency'),{startAlertProgress}=await import('../src/alert-progress');const jobs:Promise<unknown>[]=[];
+  const stop=startAlertProgress(testEnv,{waitUntil:job=>jobs.push(job)},crypto.randomUUID(),Date.now(),new Latency(),()=> 'handler',5);stop();await Promise.all(jobs);
+  await new Promise(r=>setTimeout(r,15));expect((await env.DB.prepare('SELECT sequence FROM diagnostics').all()).results).toHaveLength(0);
+  let release!:()=>void,entered!:()=>void;const gate=new Promise<void>(r=>{release=r;}),ready=new Promise<void>(r=>{entered=r;});
+  const db=interceptDB(async(sql,_args,_method,execute)=>{if(sql.startsWith('INSERT INTO diagnostics')){entered();await gate;}return execute();});let finished=false;
+  const slow=startAlertProgress({...testEnv,DB:db},{waitUntil:job=>{jobs.push(job);void job.then(()=>{finished=true;});}},crypto.randomUUID(),Date.now(),new Latency(),()=> 'handler',5);await ready;
+  try {slow();await new Promise(r=>setTimeout(r,5));expect(finished).toBe(false);}finally{release();await Promise.all(jobs);}
+  expect(finished).toBe(true);
+ });
+ it('drops arbitrary correlation and stage strings at the privacy boundary',async()=>{
+  const {safeTimingDetails}=await import('../src/latency');
+  expect(safeTimingDetails({client_request_id:'private-marker',in_flight_span:'private-marker',in_flight_ms:-1} as unknown as import('../src/latency').TimingDetails)).toBeNull();
  });
 });
