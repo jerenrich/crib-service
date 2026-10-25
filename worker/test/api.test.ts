@@ -1,3 +1,4 @@
+import {WatchTest} from '../src/watch-test';
 import {runReminder} from '../src/reminders';
 import {env,applyD1Migrations,runInDurableObject,runDurableObjectAlarm} from 'cloudflare:test';
 import {beforeAll,afterEach,beforeEach,describe,it,expect,vi} from 'vitest';
@@ -1344,5 +1345,76 @@ describe('settled episode resolution and notification cleanup',()=>{
   const {listener}=await setup(),event=alert(listener),value=beat(listener,event,true);
   expect((await call('listener/heartbeat',listener,{...value,episodes:[{...value.episodes[0],endedAt:null}]})).status).toBe(400);
   expect((await call('listener/heartbeat',listener,{...value,episodes:[{...value.episodes[0],quietConfirmed:'yes'}]})).status).toBe(400);
+ });
+});
+
+
+describe('repeating Watch push test',()=>{
+ async function ready() {
+  const pair=await paired();
+  await call('device/watch-push-token',pair.parent,{token:'cd'.repeat(32)});
+  return {...pair,stub:testEnv.WATCH_TEST.getByName(pair.parent.deviceId)};
+ }
+ it('requires a Parent, pairing, registered Watch and a 1–10 second integer interval',async()=>{
+  const {parent,listener}=await paired();
+  expect((await call('watch-test',listener,{running:true,interval:5})).status).toBe(403);
+  expect((await call('watch-test',parent,{running:true,interval:5})).status).toBe(409);
+  await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
+  for(const interval of [0,11,1.5,'5',null])
+   expect((await call('watch-test',parent,{running:true,interval})).status).toBe(400);
+  expect((await call('watch-test',parent,{running:'yes',interval:5})).status).toBe(400);
+ });
+ it('persists frequency, changes an active alarm, and stops without changing monitoring settings',async()=>{
+  const {parent,stub}=await ready();
+  for(const interval of [1,10,3]) {
+   const before=Date.now();
+   const response=await call('watch-test',parent,{running:true,interval});
+   expect(response.status).toBe(200);expect(await response.json()).toEqual({running:true,interval});
+   const alarm=await runInDurableObject(stub,async(_,state)=>state.storage.getAlarm());
+   expect(alarm).toBeGreaterThanOrEqual(before+interval*1000);
+   expect(alarm).toBeLessThanOrEqual(Date.now()+interval*1000);
+   expect(await (await call('watch-test',parent,undefined,'GET')).json()).toEqual({running:true,interval});
+  }
+  expect((await call('watch-test',parent,{running:false})).status).toBe(200);
+  expect(await runInDurableObject(stub,async(_,state)=>state.storage.getAlarm())).toBeNull();
+  expect(await (await call('watch-test',parent,undefined,'GET')).json()).toEqual({running:false,interval:5});
+  const config=await env.DB.prepare('SELECT config FROM devices WHERE id=?').bind(parent.deviceId).first<{config:string}>();
+  expect(JSON.parse(config!.config)).toEqual(defaultConfiguration);
+ });
+ it('sends distinct real Watch test pushes without queuing retries or generating cry events',async()=>{
+  const {parent,stub}=await ready();
+  await call('watch-test',parent,{running:true,interval:1});
+  // Use the test APNs credentials with the same durable storage.
+  const alarm=()=>runInDurableObject(stub,async(_,state)=>new WatchTest(state,testEnv).alarm());
+  mockPush();await alarm();mockPush();await alarm();
+  expect(pushRequests).toHaveLength(2);
+  const contents=pushRequests.map(request=>JSON.parse(String(request.init?.body)));
+  expect(contents[0].isTest).toBe(true);
+  expect(contents[0].eventId).not.toBe(contents[1].eventId);
+  expect(pushRequests[0].url).toContain('cd'.repeat(32));
+  expect((pushRequests[0].init?.headers as Record<string,string>)['apns-topic']).toMatch(/watchkitapp$/);
+  expect((await env.DB.prepare('SELECT * FROM events').all()).results).toHaveLength(0);
+  await call('watch-test',parent,{running:false});await alarm();expect(pushRequests).toHaveLength(2);
+ });
+ it('stops on pairing changes and missing Watch tokens',async()=>{
+  const {parent,stub}=await ready();
+  const alarm=()=>runInDurableObject(stub,async(_,state)=>new WatchTest(state,testEnv).alarm());
+  await call('watch-test',parent,{running:true,interval:5});
+  await call('device/watch-push-token',parent,{token:null});await alarm();
+  expect(await runInDurableObject(stub,async(_,state)=>state.storage.getAlarm())).toBeNull();
+  await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
+  await call('watch-test',parent,{running:true,interval:5});
+  await env.DB.prepare('UPDATE pairs SET created_at=created_at+1 WHERE parent_id=?').bind(parent.deviceId).run();
+  await alarm();expect(pushRequests).toHaveLength(0);
+  expect(await runInDurableObject(stub,async(_,state)=>state.storage.getAlarm())).toBeNull();
+ });
+ it('does not queue failed deliveries after Stop',async()=>{
+  const {parent,stub}=await ready();
+  await call('watch-test',parent,{running:true,interval:2});
+  mockPush(503);
+  await runInDurableObject(stub,async(_,state)=>new WatchTest(state,testEnv).alarm());
+  expect(await runInDurableObject(stub,async(_,state)=>state.storage.getAlarm())).not.toBeNull();
+  await call('watch-test',parent,{running:false});
+  await flushPending(testEnv);expect(pushRequests).toHaveLength(1);
  });
 });

@@ -3,6 +3,8 @@ import SwiftUI
 struct SettingsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
+    @State private var testInterval = 5.0
+    @Environment(\.scenePhase) private var scenePhase
     @State private var pairing = false
     @State private var readiness = false
     @State private var removal = Removal.unpair
@@ -77,6 +79,51 @@ struct SettingsView: View {
                     if model.role == .parent { Button("Enable notifications") { Task { await model.notifications.register() } } }
                 }
                 if model.role == .parent {
+                    Section {
+                        LabeledContent("Send every", value: "\(Int(testInterval)) \(Int(testInterval) == 1 ? "second" : "seconds")")
+                        Slider(value: $testInterval, in: 1...10, step: 1) { editing in
+                            if !editing, model.watchTestRunning {
+                                Task { await model.updateWatchTest(running: true, interval: testInterval) }
+                            }
+                        }
+                        .accessibilityLabel("Watch test frequency")
+                        .accessibilityValue("\(Int(testInterval)) seconds")
+                        .accessibilityIdentifier("watchTestFrequency")
+                        .disabled(model.changingWatchTest)
+                        if model.watchTestRunning {
+                            Button("Stop Watch test", role: .destructive) {
+                                Task { await model.updateWatchTest(running: false) }
+                            }
+                            .accessibilityIdentifier("stopWatchTest")
+                            .disabled(model.changingWatchTest)
+                            Text("Test running · Every \(Int(model.watchTestInterval)) seconds").font(.footnote)
+                        } else {
+                            Button("Start Watch test") {
+                                Task { await model.updateWatchTest(running: true, interval: testInterval) }
+                            }
+                            .accessibilityIdentifier("startWatchTest")
+                            .disabled(!model.paired || !model.watchTestLoaded || model.changingWatchTest || model.managingDevice)
+                        }
+                        if let error = model.watchTestError {
+                            Text(error).foregroundStyle(.orange)
+                            Button("Refresh Watch test status") { Task { await model.updateWatchTest() } }
+                                .disabled(model.changingWatchTest)
+                        }
+                    } header: { Text("Watch alert testing mode") } footer: {
+                        Text("Sends real test notifications directly to your registered Apple Watch, including while this iPhone is locked. Repeats until you tap Stop Watch test here. Internet is required to start, change or stop the test. watchOS and Focus settings control delivery and wrist taps; the selected timing is not guaranteed. A notification already sent may arrive after stopping.")
+                    }
+                    .task {
+                        await model.updateWatchTest()
+                        if model.watchTestLoaded { testInterval = model.watchTestInterval }
+                    }
+                    .onChange(of: scenePhase) { _, phase in
+                        if phase == .active {
+                            Task {
+                                await model.updateWatchTest()
+                                if model.watchTestLoaded { testInterval = model.watchTestInterval }
+                            }
+                        }
+                    }
                     Section {
                         Button("Ready for tonight?") { readiness = true }
                         if let enabled = model.parentStatus?.connectionAlertsEnabled {

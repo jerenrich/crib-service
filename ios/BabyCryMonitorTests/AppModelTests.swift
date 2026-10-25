@@ -224,6 +224,12 @@ final class AppModelTests: XCTestCase {
             if testRequestFails { throw URLError(.notConnectedToInternet) }
             requestedTest = true
         }
+        private var watchTestValue = WatchTestStatus(running: false, interval: 5)
+        func watchTest(running: Bool?, interval: Int) async throws -> WatchTestStatus {
+            if testRequestFails { throw URLError(.notConnectedToInternet) }
+            if let running { watchTestValue = WatchTestStatus(running: running, interval: running ? interval : 5) }
+            return watchTestValue
+        }
         func connectionAlerts(_ enabled: Bool) async throws {
             connectionAlertPreferences.append(enabled)
             statusValue?.connectionAlertsEnabled = enabled
@@ -623,6 +629,28 @@ final class AppModelTests: XCTestCase {
         fixture.model.stop(); await gate.open()
         for _ in 0..<10 { await Task.yield() }
         XCTAssertFalse(fixture.model.monitoring); XCTAssertEqual(fixture.audio.starts, 0)
+    }
+
+    @MainActor func testRepeatingWatchTestRestoresChangesAndStops() async throws {
+        let fixture = try Fixture(); fixture.model.selectRole(.parent)
+        await fixture.model.updateWatchTest()
+        XCTAssertTrue(fixture.model.watchTestLoaded)
+        XCTAssertFalse(fixture.model.watchTestRunning)
+        await fixture.model.updateWatchTest(running: true, interval: 1)
+        XCTAssertTrue(fixture.model.watchTestRunning)
+        XCTAssertEqual(fixture.model.watchTestInterval, 1)
+        await fixture.model.updateWatchTest(running: true, interval: 10)
+        await fixture.model.updateWatchTest()
+        XCTAssertEqual(fixture.model.watchTestInterval, 10)
+        await fixture.backend.setTestRequestFailure(true)
+        await fixture.model.updateWatchTest(running: false)
+        XCTAssertTrue(fixture.model.watchTestRunning) // Failed stop must remain visible and retryable.
+        XCTAssertNotNil(fixture.model.watchTestError)
+        XCTAssertFalse(fixture.model.changingWatchTest)
+        await fixture.backend.setTestRequestFailure(false)
+        await fixture.model.updateWatchTest(running: false)
+        XCTAssertFalse(fixture.model.watchTestRunning)
+        XCTAssertNil(fixture.model.watchTestError)
     }
 
     @MainActor func testWatchTestRequiresFreshWatchRegistration() async throws {

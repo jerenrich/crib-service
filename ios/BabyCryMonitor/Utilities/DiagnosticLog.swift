@@ -2,6 +2,8 @@ import Foundation
 import Observation
 
 @MainActor @Observable final class DiagnosticLog {
+    static let maximumLines = 10_000
+    private static let compactionSlack = 1_000
     private(set) var lines: [String] = []
     private(set) var persistenceAvailable = true
     private(set) var persistenceFailure: String?
@@ -10,6 +12,8 @@ import Observation
     let benchmark: BackgroundBenchmark
     private var recent: [String: Date] = [:]
     private var watchTraceKeys: Set<String> = []
+    private var persistedLineCount = 0
+    private var storagePrepared = false
     private static let timestampStyle = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
     private static let events: Set<String> = [
         "app_launched", "foreground", "background", "monitoring_recovered_after_relaunch",
@@ -45,7 +49,9 @@ import Observation
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
             if FileManager.default.fileExists(atPath: url.path) {
                 let text = try String(contentsOf: url, encoding: .utf8)
-                lines = Array(text.components(separatedBy: "\n").filter { !$0.isEmpty }.suffix(500))
+                let saved = text.components(separatedBy: "\n").filter { !$0.isEmpty }
+                persistedLineCount = saved.count
+                lines = Array(saved.suffix(Self.maximumLines))
                 watchTraceKeys = Set(lines.compactMap(WatchAlertTrace.key(in:)))
             }
         } catch { persistenceAvailable = false; persistenceFailure = Self.errorDetails(error) }
@@ -183,31 +189,56 @@ import Observation
     }
     private func appendLines(_ entries: [String]) {
         lines.append(contentsOf: entries)
-        if lines.count > 500 {
-            for line in lines.prefix(lines.count - 500) {
+        if lines.count > Self.maximumLines {
+            for line in lines.prefix(lines.count - Self.maximumLines) {
                 if let key = WatchAlertTrace.key(in: line) { watchTraceKeys.remove(key) }
             }
-            lines = Array(lines.suffix(500))
+            lines = Array(lines.suffix(Self.maximumLines))
         }
         do {
             guard let url else { persistenceAvailable = false; return }
-            let data = Data(lines.joined(separator: "\n").utf8)
+            // Append only the new rows. Compact occasionally, rather than rewriting
+            // several MB on every notification. The plain-text file stays directly
+            // readable; its temporary overlap is bounded to 1,000 older rows.
+            if !storagePrepared || persistedLineCount + entries.count > Self.maximumLines + Self.compactionSlack
+                || !FileManager.default.fileExists(atPath: url.path) {
+                let data = Data(lines.joined(separator: "\n").utf8)
             #if os(iOS) || os(watchOS)
-            try data.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+                try data.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
             #else
-            try data.write(to: url, options: .atomic)
+                try data.write(to: url, options: .atomic)
             #endif
-            var protectedURL = url
-            var values = URLResourceValues(); values.isExcludedFromBackup = true
-            try protectedURL.setResourceValues(values)
+                var protectedURL = url
+                var values = URLResourceValues(); values.isExcludedFromBackup = true
+                try protectedURL.setResourceValues(values)
+                persistedLineCount = lines.count
+                storagePrepared = true
+            } else {
+                let file = try FileHandle(forWritingTo: url)
+                defer { try? file.close() }
+                let offset = try file.seekToEnd()
+                try file.write(contentsOf: Data(((offset > 0 ? "\n" : "") + entries.joined(separator: "\n")).utf8))
+                persistedLineCount += entries.count
+            }
             persistenceAvailable = true; persistenceFailure = nil
-        } catch { persistenceAvailable = false; persistenceFailure = Self.errorDetails(error) }
+        } catch {
+            // A failed append may be partial. Repair from the bounded in-memory
+            // snapshot on the next write instead of appending to uncertain data.
+            storagePrepared = false
+            persistenceAvailable = false; persistenceFailure = Self.errorDetails(error)
+        }
     }
-    var recentExport: String {
+    private var exportHeader: String {
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
         return "Crib Service diagnostics · app=\(version) build=\(build) os=\(ProcessInfo.processInfo.operatingSystemVersionString)\npersistence=\(persistenceAvailable ? "available" : "unavailable")\n"
-            + (persistenceFailure.map { "diagnostic_storage_error \($0)\n" } ?? "") + lines.joined(separator: "\n")
+            + "retention_limit=\(Self.maximumLines) retained_lines=\(lines.count)\n"
+            + (persistenceFailure.map { "diagnostic_storage_error \($0)\n" } ?? "")
+    }
+    var recentExport: String { exportHeader + lines.joined(separator: "\n") }
+    var previewExport: String {
+        exportHeader + "Showing latest \(min(200, lines.count)) retained lines. Full history is available in the diagnostic log.\n"
+            + lines.suffix(200).joined(separator: "\n")
     }
     var export: String { recentExport + "\n\n" + batteryDrain.export }
 }

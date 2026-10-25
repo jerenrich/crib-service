@@ -29,6 +29,76 @@ private final class DiagnosticsURLProtocol: URLProtocol, @unchecked Sendable {
 }
 
 final class DiagnosticsTests: XCTestCase {
+    @MainActor func testAppendsPreserveExistingFileAndProtection() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let log = DiagnosticLog(directory: directory)
+        log.record("foreground")
+        let url = directory.appendingPathComponent("diagnostics.txt")
+        let first = try Data(contentsOf: url)
+        let inode = try FileManager.default.attributesOfItem(atPath: url.path)[.systemFileNumber] as? NSNumber
+        let protection = try FileManager.default.attributesOfItem(atPath: url.path)[.protectionKey] as? FileProtectionType
+        #if !targetEnvironment(simulator)
+        XCTAssertEqual(protection, .completeUntilFirstUserAuthentication)
+        #endif
+        log.record("background")
+        XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: url.path)[.systemFileNumber] as? NSNumber, inode,
+                       "Routine records must append instead of replacing the whole file")
+        let appended = try Data(contentsOf: url)
+        XCTAssertEqual(appended.prefix(first.count), first)
+        XCTAssertEqual(DiagnosticLog(directory: directory).lines, log.lines)
+        XCTAssertEqual(try url.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup, true)
+        XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: url.path)[.protectionKey] as? FileProtectionType, protection,
+                       "Appending must retain protection; the simulator does not expose hardware protection classes")
+    }
+    @MainActor func testTenThousandLineRetentionCompactsBoundedDiskOverlap() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("diagnostics.txt")
+        let seed = (0..<10_000).map { "2027-01-15T08:00:00Z foreground code=\($0)" }.joined(separator: "\n")
+        try Data(seed.utf8).write(to: url)
+        let log = DiagnosticLog(directory: directory)
+        XCTAssertEqual(log.lines.count, 10_000)
+        log.record("background", code: 10_000) // First write prepares protection and the bounded snapshot.
+        for code in 10_001...11_000 { log.record("background", code: code) }
+        XCTAssertEqual(log.lines.count, 10_000)
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8).split(separator: "\n").count, 11_000)
+        let inode = try FileManager.default.attributesOfItem(atPath: url.path)[.systemFileNumber] as? NSNumber
+        log.record("background", code: 11_001)
+        XCTAssertNotEqual(try FileManager.default.attributesOfItem(atPath: url.path)[.systemFileNumber] as? NSNumber, inode)
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8).split(separator: "\n").count, 10_000)
+        XCTAssertTrue(log.lines.last?.hasSuffix("code=11001") == true)
+        XCTAssertEqual(DiagnosticLog(directory: directory).lines, log.lines)
+    }
+    @MainActor func testFailedAppendRepairsSnapshotWithoutLosingInMemoryRecords() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let log = DiagnosticLog(directory: directory)
+        log.record("foreground")
+        let url = directory.appendingPathComponent("diagnostics.txt")
+        try FileManager.default.removeItem(at: url)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
+        log.record("background")
+        XCTAssertFalse(log.persistenceAvailable)
+        XCTAssertEqual(log.lines.count, 2)
+        try FileManager.default.removeItem(at: url)
+        log.record("foreground")
+        XCTAssertTrue(log.persistenceAvailable)
+        XCTAssertEqual(log.lines.count, 3)
+        XCTAssertEqual(DiagnosticLog(directory: directory).lines, log.lines)
+    }
+    @MainActor func testDiagnosticPreviewStaysSmallWhileExportsKeepHistory() {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let log = DiagnosticLog(directory: directory)
+        for code in 0..<250 { log.record("foreground", code: code) }
+        XCTAssertTrue(log.recentExport.contains("foreground code=0\n"))
+        XCTAssertFalse(log.previewExport.contains("foreground code=0\n"))
+        XCTAssertTrue(log.previewExport.contains("foreground code=249"))
+        XCTAssertTrue(log.previewExport.contains("Showing latest 200 retained lines"))
+        XCTAssertTrue(log.recentExport.contains("retention_limit=10000 retained_lines=250"))
+    }
     @MainActor func testWatchTraceDeduplicatesAcrossCallbacksAndRelaunchButPreservesDistinctPhases() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -49,10 +119,10 @@ final class DiagnosticsTests: XCTestCase {
         XCTAssertEqual(restored.lines.count, 2)
         restored.watchAlerts([trace, trace])
         XCTAssertEqual(restored.lines.count, 2, "Repeated foreground history scans must not grow the log")
-        for _ in 0..<500 { restored.record("foreground") }
-        XCTAssertEqual(restored.lines.count, 500)
+        for _ in 0..<DiagnosticLog.maximumLines { restored.record("foreground") }
+        XCTAssertEqual(restored.lines.count, DiagnosticLog.maximumLines)
         restored.watchAlert(trace)
-        XCTAssertEqual(restored.lines.count, 500)
+        XCTAssertEqual(restored.lines.count, DiagnosticLog.maximumLines)
         XCTAssertTrue(restored.lines.last?.contains("watch_alert phase=retained") == true, "Evicted keys must not accumulate forever")
     }
     @MainActor func testAlertNetworkLogLinksWatchEventToBackendRequest() async throws {
@@ -84,8 +154,8 @@ final class DiagnosticsTests: XCTestCase {
         let log = DiagnosticLog(directory: directory)
         log.battery(batteryLevel: 0.65, powerConnected: false, monitoring: true, audioActive: true,
                     lowPowerMode: false, appActive: false, at: Date())
-        for _ in 0..<600 { log.record("foreground") }
-        XCTAssertEqual(log.lines.count, 500)
+        for _ in 0..<(DiagnosticLog.maximumLines + 100) { log.record("foreground") }
+        XCTAssertEqual(log.lines.count, DiagnosticLog.maximumLines)
         let restored = DiagnosticLog(directory: directory)
         XCTAssertTrue(restored.export.contains("Battery drain samples"))
         XCTAssertTrue(restored.export.contains(",65.00,0,1,1,0,0"))
@@ -98,8 +168,8 @@ final class DiagnosticsTests: XCTestCase {
         log.record("Bearer secret-token")
         log.record("https://private-url")
         XCTAssertTrue(log.lines.isEmpty)
-        for _ in 0..<510 { log.record("foreground") }
-        XCTAssertEqual(log.lines.count, 500)
+        for _ in 0..<(DiagnosticLog.maximumLines + 10) { log.record("foreground") }
+        XCTAssertEqual(log.lines.count, DiagnosticLog.maximumLines)
         XCTAssertTrue(log.persistenceAvailable)
         XCTAssertEqual(DiagnosticLog(directory: directory).lines, log.lines)
         let url = directory.appendingPathComponent("diagnostics.txt")
