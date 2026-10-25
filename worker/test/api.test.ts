@@ -1841,6 +1841,7 @@ describe('owned claim receipt suppression',()=>{
    expect((await call('monitoring',parent,{id:crypto.randomUUID(),enabled:false})).status).toBe(200);
    await Promise.race([running,new Promise<never>((_,reject)=>setTimeout(()=>reject(new Error('Stop receipt not observed')),1000))]);
    expect(latency.details).toMatchObject({claim_result_source:'receipt',exit_reason:'acknowledged'});expect(pushRequests).toHaveLength(0);
+   const skipped=await env.DB.prepare("SELECT attempt,target FROM diagnostics WHERE operation='dispatch_skip' AND event_ref=? ORDER BY sequence DESC LIMIT 1").bind(await eventReference(testEnv,event!.event_id)).first();expect(skipped).toEqual({attempt:2,target:'phone'});
   }finally{release();await running;}
  });
  it('does not send after a claim lease expires while its original reply is delayed',async()=>{

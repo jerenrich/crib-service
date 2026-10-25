@@ -113,6 +113,7 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
   latency.details.exit_reason='not_created';await record('claim_skipped',undefined,'dispatch_skip');return;
  }
  const event=claim.source==='receipt'?claim.receipt:claims![offset+2].results[0] as StoredEvent|undefined;
+ if(event){attempt=event.attempts;latency.deliveryAttempt=attempt;target=event.push_target??'phone';}
  if(claim.source==='receipt'){
   const current=claim.receipt;
   if(!current.pair_current||current.status!=='sending'||current.acknowledged_at||current.resolved_at){
@@ -139,7 +140,7 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
   await record('claim_skipped',undefined,'dispatch_skip');return;
  }
  latency.details.spans!.generated_to_dispatch_ms=Math.max(0,now-event.created_at);
- attempt=event.attempts;latency.deliveryAttempt=attempt;target=event.push_target??'phone';stage='storage';
+ stage='storage';
  // No replay after uncertain transport or a worker death during APNs dispatch. APNs does
  // not offer an exactly-once receipt transaction with D1. Surface uncertainty explicitly.
  if(now-Date.parse((JSON.parse(event.payload) as Alert).createdAt)>86400000){
@@ -257,8 +258,8 @@ export async function flushPending(env:Env,requestId=crypto.randomUUID(),latency
   await recordDiagnostic(env,{requestId,started:Date.now(),operation:'dispatch',stage:'claim',outcome:'dispatch_interrupted',eventRef,attempt:event.attempts,target:event.push_target??undefined});
  }
  const events=await latency.measure('maintenance_pending_ms',()=>env.DB.prepare("SELECT event_id FROM events WHERE status='pending' AND acknowledged_at IS NULL AND resolved_at IS NULL AND next_attempt<=? ORDER BY created_at LIMIT 25").bind(Date.now()).all<{event_id:string}>());
- // Bounded fan-out; each row has an atomic database claim.
- await latency.measure('maintenance_dispatch_ms',async()=>{for(let index=0;index<events.results.length;index+=5){await Promise.all(events.results.slice(index,index+5).map(event=>{const trace=new Latency();trace.details.dispatch_source='maintenance';return dispatchEvent(env,event.event_id,requestId,trace);}));}});
+ // Bound recovery fan-out to leave capacity for proof reads and connection notices.
+ await latency.measure('maintenance_dispatch_ms',async()=>{for(let index=0;index<events.results.length;index+=2){await Promise.all(events.results.slice(index,index+2).map(event=>{const trace=new Latency();trace.details.dispatch_source='maintenance';return dispatchEvent(env,event.event_id,requestId,trace);}));}});
  // Repair scheduling after a failed background request or worker reset. Bound
  // fan-out; existing alarms are never postponed by these idempotent refreshes.
  await latency.measure('maintenance_schedule_ms',async()=>{

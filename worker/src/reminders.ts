@@ -60,7 +60,8 @@ export class AlertReminders implements DurableObject {
   // Bound background work and never hold the object's concurrency lock on D1.
   // Slow results can overlap the next alarm, which consults the durable receipt.
   const entries=[...outcomes];
-  for(let index=0;index<entries.length;index+=4)await Promise.all(entries.slice(index,index+4).map(async([key,saved])=>{
+  // Reserve connection capacity for the next snapshot/claim and its proof read.
+  for(let index=0;index<entries.length;index+=2)await Promise.all(entries.slice(index,index+2).map(async([key,saved])=>{
    const delivery=this.recentAccepted.get(saved.eventId)??saved;
    this.rememberAccepted(delivery);
    const recovery=!this.freshOutcomes.delete(delivery.eventId);
