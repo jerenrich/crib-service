@@ -34,6 +34,8 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(started)
         let sent = await fixture.backend.sent
         let event = try XCTUnwrap(sent.first)
+        XCTAssertEqual(event.cryStartedAt, start)
+        XCTAssertEqual(event.createdAt.timeIntervalSince(start), 5)
         let saved = try MetadataStore(directory: fixture.directory).load()
         XCTAssertTrue(saved.pending.contains { $0.alert.eventId == event.eventId })
         XCTAssertTrue(fixture.model.log.export.contains("alert_outbox phase=persisted event_id=\(event.eventId.uuidString.lowercased())"))
@@ -53,7 +55,8 @@ final class AppModelTests: XCTestCase {
         await fixture.backend.configure(heartbeatGate: gate)
         await fixture.model.start()
         let start = fixture.time.now
-        for index in 0..<39 {
+        // Confirmation is included: the alert is due at 5 seconds, not 9.75.
+        for index in 0..<20 {
             fixture.time.now = start.addingTimeInterval(Double(index) / 4)
             fixture.audio.emit(AudioLevelSample(timestamp: fixture.time.now, dbFS: -10))
         }
@@ -66,7 +69,7 @@ final class AppModelTests: XCTestCase {
         // atomic metadata write (an empty target directory can be replaced).
         try FileManager.default.removeItem(at: fixture.directory)
         try Data("blocked directory".utf8).write(to: fixture.directory)
-        fixture.time.now = start.addingTimeInterval(9.75)
+        fixture.time.now = start.addingTimeInterval(5)
         fixture.audio.emit(AudioLevelSample(timestamp: fixture.time.now, dbFS: -10))
         let failed = await eventually { fixture.model.log.export.contains("metadata_write_failed") }
         XCTAssertTrue(failed)

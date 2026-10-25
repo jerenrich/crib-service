@@ -53,6 +53,7 @@ final class OnboardingUITests: XCTestCase {
         for _ in 0..<4 { if timing.isHittable { break }; app.swipeUp() }
         timing.tap()
         XCTAssertTrue(app.navigationBars["Alert timing"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["The timer counts from the start of sustained loud sound, including the initial sound check. Brief noises are filtered out."].exists)
         app.buttons["30 sec"].tap()
         app.buttons["Done"].tap()
         XCTAssertTrue(NSPredicate(format: "label CONTAINS %@", "00:30").evaluate(with: timing) || app.staticTexts["Requested 30 sec · Waiting for nursery confirmation"].exists)
