@@ -242,6 +242,7 @@ All authenticated calls use `Authorization: Bearer <device UUID>.<random secret>
 | `POST /v1/settings` | Paired device | Update shared configuration |
 | `POST /v1/alert/acknowledge` | Parent | Acknowledge episode alerts |
 | `POST /v1/alert/resume` | Parent | End the observed snooze early using `expectedUntil` in epoch milliseconds |
+| `GET /v1/watch-test` / `POST /v1/watch-test` | Parent | Read/start/update/stop the repeating Watch test; integer interval 1–10 seconds |
 | `POST /v1/test-push` | Parent | Request a marked real test through the paired Listener's alert path |
 | `POST /v1/connection-alerts` | Parent | Opt in/out of Listener connection notices |
 | `POST /v1/pairing/remove` | Paired device | Revoke pairing and clear shared server history |
@@ -558,3 +559,10 @@ Apply `0009_resolved_episodes.sql` before deploying this Worker, then install bo
 Notification cleanup rollout: merged source `89855c0` into `main` and pushed it to GitHub. All 113 Worker integration tests, TypeScript checks, 105 shared Swift tests and 217 iPhone unit tests passed. The existing live-chart assertion was updated to match its 120-bar window. The combined iPhone/Watch development build and deep signature verification passed. Applied additive migration `0009` to the existing remote D1 database, verified no pending migrations, and deployed Worker version `a13dccb6-9ca2-49de-85aa-0aac4346266c` with the existing bindings, development APNs and minute cron. Live temporary-pair checks passed for confirmed quiet resolution, delayed outbox suppression, relevance, Snooze/idempotence, early resume, monitoring commands, replacement pairing and deletion. Temporary devices were deleted without registering push tokens or sending notifications; a successful scheduled-maintenance record was verified for the deployed version.
 
 Installed in place and launched successfully on Listener J14, Parent J17 and Jordan’s Apple Watch. Read-back preferences confirmed the original roles, accepted onboarding and retained pairing on both phones. Listener metadata reported monitoring stopped after launch; start monitoring on J14 when ready. Physical notification presentation/clearing still needs user observation. Local evidence is retained in the ignored `.local/notification-cleanup-2026-10-25/` directory.
+
+
+### Repeating Watch alert test (25 October 2026)
+
+Parent Settings includes a dedicated Watch alert testing mode with Start/Stop controls and a 1–10 second frequency slider. Updating the slider changes an active test. A separate `WatchTest` Durable Object persists the timer and keeps sending direct Watch test pushes while the iPhone is locked. Deploy `WATCH_TEST` and migration `v3-watch-test` before installing the app update; there is no new D1 migration. Tests require the current pairing and a registered Watch token, and end if either is removed or the pairing changes. Test pushes use short APNs expiration and no retry outbox, so stopping does not leave a delivery backlog. Already submitted notifications may still arrive. Internet is required to control the timer; watchOS controls presentation and wrist taps.
+
+Validation before release passed 120 Worker integration tests, TypeScript source/test checks, 106 shared Swift tests, 223 iOS unit tests, and the combined iPhone/Watch simulator build. The live temporary-device smoke script also checks the new timer binding, role/interval validation, Watch-registration requirement and idempotent Stop without sending test notifications.

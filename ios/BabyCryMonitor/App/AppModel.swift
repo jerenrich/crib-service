@@ -24,6 +24,11 @@ import UIKit
     var connectionRetryMessage: String?
     var sendingTestPush = false
     var testPushStatus: String?
+    private(set) var watchTestRunning = false
+    private(set) var watchTestInterval = 5.0
+    private(set) var watchTestLoaded = false
+    private(set) var changingWatchTest = false
+    private(set) var watchTestError: String?
     var pairingError: String?
     var pairingCode: PairingCode?
     var parentStatus: ParentStatus?
@@ -363,6 +368,7 @@ import UIKit
         parentStatus = nil; pairingCode = nil; credential = nil; uploadedToken = nil; loadCredential()
         nextParentRefreshAt = .distantPast
         testPushStatus = nil; latestTestEventID = nil
+        watchTestRunning = false; watchTestLoaded = false; watchTestError = nil
         hasPendingWatchToken = false; pendingWatchToken = nil
         publishWatch()
         if value == .parent { Task { await notifications.register(); await refreshParent() } }
@@ -381,6 +387,7 @@ import UIKit
         credential = nil; parentStatus = nil; pairingCode = nil; uploadedToken = nil
         nextParentRefreshAt = .distantPast
         testPushStatus = nil; latestTestEventID = nil
+        watchTestRunning = false; watchTestLoaded = false; watchTestError = nil
         hasPendingWatchToken = false; pendingWatchToken = nil
         loadCredential()
         publishWatch()
@@ -1229,6 +1236,26 @@ import UIKit
             return false
         }
     }
+    func updateWatchTest(running: Bool? = nil, interval: Double? = nil) async {
+        guard role == .parent, !changingWatchTest else { return }
+        changingWatchTest = true
+        defer { changingWatchTest = false }
+        let revision = environmentRevision
+        do {
+            let client = try await registeredClient()
+            guard revision == environmentRevision else { return }
+            let status = try await client.watchTest(running: running, interval: Int((interval ?? watchTestInterval).rounded()))
+            guard revision == environmentRevision else { return }
+            watchTestRunning = status.running
+            watchTestInterval = Double(status.interval)
+            watchTestLoaded = true
+            watchTestError = nil
+        } catch {
+            guard revision == environmentRevision else { return }
+            watchTestError = error.localizedDescription
+        }
+    }
+
     var canTestWatchAlert: Bool {
         role == .parent && paired && parentStatus?.watchPushRegistered == true && !sendingTestPush && !managingDevice
     }
@@ -1319,6 +1346,7 @@ import UIKit
             settingsDirty = false; defaults.set(false, forKey: "settingsDirty")
             engine = CrySessionManager(); configuration = engine.snapshot.configuration; persist()
             calibration = SoundCalibration(); testPushStatus = nil; latestTestEventID = nil
+            watchTestRunning = false; watchTestLoaded = false; watchTestError = nil
             hasPendingWatchToken = false; pendingWatchToken = nil
             if deleteDevice { role = nil; defaults.removeObject(forKey: "role"); uploadedToken = nil }
             deliveryStatus = "Pair a device to reconnect"; error = nil

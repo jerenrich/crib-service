@@ -101,6 +101,12 @@ try {
     check((await request('connection-alerts', parent, {enabled: true})).status === 200, 'connection alert opt-in');
     check((await request('listener/status', parent, null, 'GET')).body.connectionAlertsEnabled === true, 'connection alert preference persisted');
     check((await request('connection-alerts', parent, {enabled: false})).status === 200, 'connection alert opt-out');
+    const watchTest = await request('watch-test', parent, null, 'GET');
+    check(watchTest.status === 200 && watchTest.body.running === false, 'Watch test timer starts stopped');
+    check((await request('watch-test', listener, {running: true, interval: 5})).status === 403, 'Watch test controls restricted to Parent');
+    check((await request('watch-test', parent, {running: true, interval: 0})).status === 400, 'Watch test frequency validated');
+    check((await request('watch-test', parent, {running: true, interval: 1})).status === 409, 'Watch test requires registered Watch before starting');
+    check((await request('watch-test', parent, {running: false})).body.running === false, 'Watch test Stop is idempotent');
     const test = await request('test-push', parent);
     check(test.status === 200 && test.body.status === 'blocked', 'marked real-test route blocked safely without push tokens');
     const testStatus = await request('listener/status', parent, null, 'GET');
