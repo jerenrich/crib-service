@@ -1,5 +1,5 @@
 // Bounded numeric spans only. No SQL, exception text, tokens or payloads.
-export const spans = ['rate_limit_ms','authentication_ms','authentication_hash_ms','authentication_lookup_ms','ip_rate_limit_ms','device_rate_limit_ms','status_pair_ms','status_snapshot_ms','alert_admission_ms','alert_snapshot_ms','body_read_ms','handler_ms','alert_prepare_ms','claim_ms','claim_receipt_ms','destination_ms',
+export const spans = ['rate_limit_ms','authentication_ms','authentication_hash_ms','authentication_lookup_ms','ip_rate_limit_ms','device_rate_limit_ms','status_pair_ms','status_snapshot_ms','heartbeat_admission_ms','heartbeat_snapshot_ms','heartbeat_storage_ms','heartbeat_schedule_ms','alert_admission_ms','alert_snapshot_ms','body_read_ms','handler_ms','alert_prepare_ms','claim_ms','claim_receipt_ms','destination_ms',
  'token_decrypt_ms','provider_sign_ms','apns_fetch_ms','apns_body_ms','outcome_storage_ms','reminder_prepare_ms',
  'reminder_schedule_ms','reminder_snapshot_ms','reminder_pair_ms','reminder_control_ms','reminder_latest_ms','reminder_heartbeat_ms','reminder_original_ms','reminder_insert_ms','alarm_lag_ms','generated_to_dispatch_ms',
  'pair_ms','event_lookup_ms','event_insert_ms','event_reload_ms','event_episode_ms','response_read_ms','claim_observe_ms',

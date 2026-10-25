@@ -20,13 +20,38 @@ function credentialFor(request:Request):{id:string;secret:string} {
  if(!match)throw new APIError(401,'Device authentication required.');
  return {id:uuid(match[1]),secret:match[2]};
 }
-export async function authenticate(env:Env,request:Request,latency?:Latency):Promise<Device> {
+export async function authenticate(env:Env,request:Request,latency?:Latency,readFallbackMS?:number):Promise<Device> {
  const {id,secret}=credentialFor(request);
  const statement=env.DB.prepare('SELECT * FROM devices WHERE id=?').bind(id);
- const device=latency?await latency.read<Device>('authentication_lookup_ms',statement):await statement.first<Device>();
+ const device=latency&&readFallbackMS!==undefined?(await latency.readOnly<Device>('authentication_lookup_ms',()=>statement.all<Device>(),readFallbackMS))[0].results[0]:latency?await latency.read<Device>('authentication_lookup_ms',statement):await statement.first<Device>();
  const hash=latency?await latency.measure('authentication_hash_ms',()=>sha256(secret)):await sha256(secret);
  if(!device||!constantTimeEqual(device.secret_hash,hash))throw new APIError(401,'Device authentication failed.');
  return device;
+}
+// Heartbeats retain both existing quotas. Only credential SELECTs may fall back;
+// the subsequent quota transaction executes once and revalidates the credential.
+export async function admitHeartbeat(env:Env,request:Request,ip:string,latency:Latency):Promise<Device> {
+ let verified:Device;
+ try {verified=await authenticate(env,request,latency,250);}
+ catch(error){
+  // Rejected credentials still consume the IP flood budget, as on other routes.
+  await latency.measure('rate_limit_ms',()=>rateLimit(env,'api',ip,3000,600,latency,'ip_rate_limit_ms'));
+  throw error;
+ }
+ const [ipKey,deviceKey]=await Promise.all([sha256(`${env.PAIRING_PEPPER}|api|${ip}`),sha256(`${env.PAIRING_PEPPER}|device|${verified.id}`)]);
+ const window=Math.floor(Date.now()/1000/600);
+ const results=await latency.db<Device|{attempts:number}>('heartbeat_admission_ms',()=>env.DB.batch<Device|{attempts:number}>([
+  rateLimitStatement(env,ipKey,window),
+  env.DB.prepare('SELECT * FROM devices WHERE id=?').bind(verified.id),
+  rateLimitStatement(env,deviceKey,window,{id:verified.id,hash:verified.secret_hash},{key:ipKey,window,limit:3000})
+ ]));
+ const ipBudget=results[0].results[0] as {attempts:number}|undefined;
+ if(!ipBudget||ipBudget.attempts>3000)throw new APIError(429,'Too many requests. Try again later.');
+ const current=results[1].results[0] as Device|undefined;
+ if(!current||!constantTimeEqual(current.secret_hash,verified.secret_hash))throw new APIError(401,'Device authentication failed.');
+ const deviceBudget=results[2].results[0] as {attempts:number}|undefined;
+ if(!deviceBudget||deviceBudget.attempts>600)throw new APIError(429,'Too many requests. Try again later.');
+ return current;
 }
 // One transaction/remote call instead of separate authentication and rate-limit
 // calls. No cache, background admission, write retry or hedged mutation.

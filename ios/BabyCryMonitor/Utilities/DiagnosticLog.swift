@@ -175,7 +175,7 @@ import Observation
             guard !watchTraceKeys.contains(trace.key) else { deduplicatedRecords += 1; continue }
             guard let entry = trace.entry else { continue }
             watchTraceKeys.insert(trace.key)
-            entries.append("\(trace.observedAt.formatted(Self.timestampStyle)) \(entry)" + (latestClockSample?.fields(at: trace.observedAt) ?? " clock_sample=unavailable"))
+            entries.append("\(trace.observedAt.formatted(Self.timestampStyle)) \(entry) process_id=\(processID.uuidString.lowercased())" + (latestClockSample?.fields(at: trace.observedAt) ?? " clock_sample=unavailable"))
         }
         // A recovered Notification Center history needs only one atomic write.
         if !entries.isEmpty { appendLines(entries) }

@@ -12,11 +12,17 @@ struct WatchAlertTrace: Sendable {
         var presentationRequestMS: Int? = nil
         var mainActorWaitMS: Int? = nil
         var handlingMS: Int? = nil
+        var journalWriteMS: Int? = nil
         var fields: String {
-            [("presentation_request_ms", presentationRequestMS), ("main_actor_wait_ms", mainActorWaitMS), ("app_handling_ms", handlingMS)]
+            [("presentation_request_ms", presentationRequestMS), ("main_actor_wait_ms", mainActorWaitMS), ("app_handling_ms", handlingMS), ("journal_write_ms", journalWriteMS)]
                 .compactMap { key, value in value.flatMap { (0...3_600_000).contains($0) ? " \(key)=\($0)" : nil } }.joined()
         }
     }
+    enum CollapseScope: String, Sendable { case event, episode, other }
+    enum HistorySource: String, Sendable { case foreground, cleanup }
+    let callbackID: UUID?
+    let collapseScope: CollapseScope?
+    let historySource: HistorySource?
     let applicationState: ApplicationState?
     let timing: CallbackTiming?
     let interruptionLevel: Int?
@@ -25,9 +31,10 @@ struct WatchAlertTrace: Sendable {
     let deliveredAt: Date?
     let observedAt: Date
 
-    init(alert: WatchCryAlert, phase: Phase, deliveredAt: Date? = nil, observedAt: Date = Date(), applicationState: ApplicationState? = nil, timing: CallbackTiming? = nil, interruptionLevel: Int? = nil) {
+    init(alert: WatchCryAlert, phase: Phase, deliveredAt: Date? = nil, observedAt: Date = Date(), applicationState: ApplicationState? = nil, timing: CallbackTiming? = nil, interruptionLevel: Int? = nil, callbackID: UUID? = nil, collapseScope: CollapseScope? = nil, historySource: HistorySource? = nil) {
         self.alert = alert; self.phase = phase; self.deliveredAt = deliveredAt; self.observedAt = observedAt
         self.applicationState = applicationState; self.timing = timing; self.interruptionLevel = interruptionLevel
+        self.callbackID = callbackID; self.collapseScope = collapseScope; self.historySource = historySource
     }
 
     var key: String {
@@ -35,6 +42,7 @@ struct WatchAlertTrace: Sendable {
         if DiagnosticCorrelation.reference(alert.diagnosticRef) != nil, let attempt = DiagnosticCorrelation.attempt(alert.deliveryAttempt) {
             key += "|\(attempt)"
         }
+        if let callbackID { key += "|\(callbackID.uuidString.lowercased())" }
         return key
     }
     var entry: String? {
@@ -43,7 +51,14 @@ struct WatchAlertTrace: Sendable {
         result += DiagnosticCorrelation.fields(reference: alert.diagnosticRef, attempt: alert.deliveryAttempt)
         if let deliveredAt {
             guard let delivered = Self.milliseconds(deliveredAt) else { return nil }
-            result += " delivered_at_ms=\(delivered) delivery_age_ms=\(delivered - created) callback_lag_ms=\(observed - delivered)"
+            result += " delivered_at_ms=\(delivered) delivery_age_ms=\(delivered - created)"
+            let lagName: String
+            switch phase {
+            case .retained: lagName = "history_observation_lag_ms"
+            case .opened, .acknowledged: lagName = "user_action_lag_ms"
+            default: lagName = "callback_lag_ms"
+            }
+            result += " \(lagName)=\(observed - delivered)"
             if delivered < created || observed < delivered { result += " clock_order=check" }
         }
         switch phase {
@@ -55,6 +70,9 @@ struct WatchAlertTrace: Sendable {
         case .hapticRequested: result += " callback_scope=app_haptic_request"
         case .presented: break
         }
+        if let callbackID { result += " callback_id=\(callbackID.uuidString.lowercased())" }
+        if let collapseScope { result += " collapse_scope=\(collapseScope.rawValue)" }
+        if let historySource { result += " history_source=\(historySource.rawValue)" }
         if let applicationState { result += " app_state=\(applicationState.rawValue)" }
         if let timing { result += timing.fields }
         if let interruptionLevel, (0...3).contains(interruptionLevel) { result += " interruption_level=\(interruptionLevel)" }
@@ -71,6 +89,9 @@ struct WatchAlertTrace: Sendable {
         let reference = fields.first { $0.hasPrefix("diagnostic_ref=") }.map { String($0.dropFirst("diagnostic_ref=".count)) }
         var key = "\(phase.rawValue)|\(id.uuidString.lowercased())"
         if DiagnosticCorrelation.reference(reference) != nil, let attempt = DiagnosticCorrelation.attempt(attempt) { key += "|\(attempt)" }
+        if let callbackID = fields.first(where: { $0.hasPrefix("callback_id=") }).flatMap({ UUID(uuidString: String($0.dropFirst("callback_id=".count))) }) {
+            key += "|\(callbackID.uuidString.lowercased())"
+        }
         return key
     }
     private static func milliseconds(_ date: Date) -> Int64? {

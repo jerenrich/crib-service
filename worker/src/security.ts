@@ -64,11 +64,12 @@ export function alert(value:Record<string,unknown>):Alert {
 }
 // Parameterized admission write. A supplied credential gate keeps unauthenticated
 // requests from consuming another device's budget when batched with authentication.
-export function rateLimitStatement(env:Env,key:string,window:number,credential?:{id:string;hash:string}):D1PreparedStatement {
- const gate=credential?' WHERE EXISTS(SELECT 1 FROM devices WHERE id=? AND secret_hash=?)':'';
+export function rateLimitStatement(env:Env,key:string,window:number,credential?:{id:string;hash:string},ipBudget?:{key:string;window:number;limit:number}):D1PreparedStatement {
+ const gates=[...(credential?['EXISTS(SELECT 1 FROM devices WHERE id=? AND secret_hash=?)']:[]),...(ipBudget?['EXISTS(SELECT 1 FROM rate_limits WHERE key=? AND window=? AND attempts<=?)']:[])];
+ const gate=gates.length?' WHERE '+gates.join(' AND '):'';
  return env.DB.prepare(`INSERT INTO rate_limits(key,window,attempts) SELECT ?,?,1${gate}
  ON CONFLICT(key) DO UPDATE SET attempts=CASE WHEN window=excluded.window THEN attempts+1 ELSE 1 END, window=excluded.window RETURNING attempts`)
-  .bind(key,window,...(credential?[credential.id,credential.hash]:[]));
+  .bind(key,window,...(credential?[credential.id,credential.hash]:[]),...(ipBudget?[ipBudget.key,ipBudget.window,ipBudget.limit]:[]));
 }
 export async function rateLimit(env:Env, scope:string, identifier:string, limit:number, windowSeconds:number,latency?:Latency,span:Span='device_rate_limit_ms'):Promise<void> {
  const key=await sha256(`${env.PAIRING_PEPPER}|${scope}|${identifier}`);const window=Math.floor(Date.now()/1000/windowSeconds);

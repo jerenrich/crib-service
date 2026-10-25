@@ -228,7 +228,7 @@ final class DiagnosticsTests: XCTestCase {
         for _ in 0..<100 { log.watchAlert(trace) }
         XCTAssertEqual(log.lines.count, 1)
         XCTAssertTrue(log.lines[0].hasPrefix("2027-01-15T08:00:30.625Z "))
-        XCTAssertTrue(log.lines[0].contains("callback_lag_ms=29500"))
+        XCTAssertTrue(log.lines[0].contains("history_observation_lag_ms=29500"))
         let restored = DiagnosticLog(directory: directory)
         restored.watchAlert(trace)
         XCTAssertEqual(restored.lines, log.lines)

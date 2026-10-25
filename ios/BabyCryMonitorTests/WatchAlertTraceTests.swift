@@ -48,7 +48,7 @@ final class WatchAlertTraceTests: XCTestCase {
         let entry = try XCTUnwrap(trace.entry)
         XCTAssertTrue(entry.contains("delivered_at_ms=1800000001125"))
         XCTAssertTrue(entry.contains("delivery_age_ms=1125"))
-        XCTAssertTrue(entry.contains("callback_lag_ms=30500"))
+        XCTAssertTrue(entry.contains("user_action_lag_ms=30500"))
         XCTAssertTrue(entry.contains("event_id=\(value.eventId.uuidString.lowercased())"))
         XCTAssertTrue(entry.contains("episode_id=\(value.episodeId.uuidString.lowercased())"))
         XCTAssertEqual(WatchAlertTrace.key(in: "2027-01-15T08:00:31.625Z " + entry), trace.key)
@@ -65,8 +65,21 @@ final class WatchAlertTraceTests: XCTestCase {
         let entry = try XCTUnwrap(WatchAlertTrace(alert: alert(), phase: .retained,
             deliveredAt: created.addingTimeInterval(-2), observedAt: created.addingTimeInterval(-3)).entry)
         XCTAssertTrue(entry.contains("delivery_age_ms=-2000"))
-        XCTAssertTrue(entry.contains("callback_lag_ms=-1000"))
+        XCTAssertTrue(entry.contains("history_observation_lag_ms=-1000"))
         XCTAssertTrue(entry.contains("clock_order=check"))
+    }
+    func testCallbackInstancesSurviveDeduplicationAndHistoryIsNotACallback() throws {
+        let value = alert(), id = UUID()
+        let first = WatchAlertTrace(alert: value, phase: .controllerReceived, callbackID: id, collapseScope: .episode)
+        let second = WatchAlertTrace(alert: value, phase: .controllerReceived, callbackID: UUID())
+        XCTAssertNotEqual(first.key, second.key)
+        XCTAssertEqual(WatchAlertTrace.key(in: "timestamp " + (try XCTUnwrap(first.entry))), first.key)
+        let history = try XCTUnwrap(WatchAlertTrace(alert: value, phase: .retained, deliveredAt: created,
+            observedAt: created.addingTimeInterval(60), interruptionLevel: 2, collapseScope: .episode, historySource: .cleanup).entry)
+        XCTAssertTrue(history.contains("history_observation_lag_ms=60000"))
+        XCTAssertFalse(history.contains("callback_lag_ms="))
+        XCTAssertTrue(history.contains("collapse_scope=episode"));XCTAssertTrue(history.contains("history_source=cleanup"))
+        XCTAssertTrue(history.contains("interruption_level=2"))
     }
     func testMalformedDatesAndUntrustedDeduplicationKeysAreRejected() {
         XCTAssertNil(WatchAlertTrace(alert: alert(), phase: .foreground, deliveredAt: Date(timeIntervalSince1970: .nan)).entry)

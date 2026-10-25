@@ -2031,3 +2031,99 @@ describe('claim ownership across competing requests and token rotation',()=>{
   }finally{release();await running;}
  });
 });
+
+describe('heartbeat binding wait recovery',()=>{
+ const beat=(listener:TestDevice)=>({listenerId:listener.deviceId,timestamp:new Date().toISOString(),monitoring:true,powerConnected:true,state:'quiet',episodes:[]});
+ const request=(listener:TestDevice)=>new Request('https://monitor.test/v1/listener/heartbeat',{method:'POST',headers:{'content-type':'application/json','CF-Connecting-IP':'127.0.0.1',authorization:`Bearer ${listener.deviceId}.${listener.secret}`},body:JSON.stringify(beat(listener))});
+ it('uses four binding calls with fully instrumented snapshot and atomic persistence',async()=>{
+  const {listener}=await paired();let calls=0;
+  const db=interceptDB(async(_sql,_args,_method,execute)=>{calls++;return execute();});
+  const response=await worker.fetch(request(listener),{...testEnv,DB:db});expect(await response.json()).toEqual(defaultConfiguration);
+  expect(calls).toBe(5); // Four functional calls plus the existing diagnostic write.
+  const row=await env.DB.prepare('SELECT details FROM diagnostics WHERE request_id=?').bind(response.headers.get('x-request-id')).first<{details:string}>();
+  const d=JSON.parse(row!.details);expect(d.db_calls).toBe(4);
+  expect(d.db_stages.heartbeat_admission_ms).toMatchObject({calls:1,statements:3});
+  expect(d.db_stages.heartbeat_snapshot_ms).toMatchObject({calls:1,statements:1});
+  expect(d.db_stages.heartbeat_storage_ms).toMatchObject({calls:1,statements:4});
+ });
+ it('recovers a stalled credential reply with one fresh SELECT and charges quotas once',async()=>{
+  const {listener}=await paired();let reads=0,release!:()=>void,entered!:()=>void;
+  const gate=new Promise<void>(r=>{release=r;}),ready=new Promise<void>(r=>{entered=r;});
+  const db=interceptDB(async(sql,_args,method,execute)=>{const result=await execute();if(sql==='SELECT * FROM devices WHERE id=?'&&method==='all'&&++reads===1){entered();await gate;}return result;});
+  const work=worker.fetch(request(listener),{...testEnv,DB:db});await ready;
+  try {
+   const response=await work;expect(response.status).toBe(200);expect(reads).toBe(2);
+   const row=await env.DB.prepare('SELECT details FROM diagnostics WHERE request_id=?').bind(response.headers.get('x-request-id')).first<{details:string}>();
+   expect(JSON.parse(row!.details).db_stages.authentication_lookup_ms).toMatchObject({calls:2,hedges:1,hedge_wins:1,unfinished:1,hedge_after_ms:250});
+  }finally{release();await work;}
+ });
+ it('refuses credentials deleted while their original lookup reply is stalled',async()=>{
+  const {listener}=await paired();let reads=0,release!:()=>void,entered!:()=>void;
+  const gate=new Promise<void>(r=>{release=r;}),ready=new Promise<void>(r=>{entered=r;});
+  const db=interceptDB(async(sql,_args,method,execute)=>{const result=await execute();if(sql==='SELECT * FROM devices WHERE id=?'&&method==='all'&&++reads===1){entered();await gate;}return result;});
+  const work=worker.fetch(request(listener),{...testEnv,DB:db});await ready;
+  try {expect((await call('device/delete',listener)).status).toBe(200);expect((await work).status).toBe(401);expect(reads).toBe(2);}
+  finally{release();await work;}
+  expect((await env.DB.prepare('SELECT * FROM heartbeats').all()).results).toHaveLength(0);
+ });
+ it('revalidates credentials inside the quota transaction and does not charge a revoked device',async()=>{
+  const {listener}=await paired(),key=await sha256(`${testEnv.PAIRING_PEPPER}|device|${listener.deviceId}`);
+  const prior=(await env.DB.prepare('SELECT attempts FROM rate_limits WHERE key=?').bind(key).first<{attempts:number}>())?.attempts;
+  const db=interceptDB(async(sql,_args,method,execute)=>{if(method==='batch'&&sql.startsWith('INSERT INTO rate_limits'))await env.DB.prepare('UPDATE devices SET secret_hash=? WHERE id=?').bind(await sha256('revoked'),listener.deviceId).run();return execute();});
+  expect((await worker.fetch(request(listener),{...testEnv,DB:db})).status).toBe(401);
+  expect((await env.DB.prepare('SELECT attempts FROM rate_limits WHERE key=?').bind(key).first<{attempts:number}>())?.attempts).toBe(prior);
+ });
+ it('preserves both budgets and does not charge the device after the IP ceiling rejects it',async()=>{
+  const {listener}=await paired(),window=Math.floor(Date.now()/1000/600);
+  const ip=await sha256(`${testEnv.PAIRING_PEPPER}|api|127.0.0.1`),deviceKey=await sha256(`${testEnv.PAIRING_PEPPER}|device|${listener.deviceId}`);
+  await env.DB.prepare('INSERT INTO rate_limits(key,window,attempts) VALUES(?,?,3000) ON CONFLICT(key) DO UPDATE SET window=excluded.window,attempts=3000').bind(ip,window).run();
+  const prior=(await env.DB.prepare('SELECT attempts FROM rate_limits WHERE key=?').bind(deviceKey).first<{attempts:number}>())?.attempts;
+  expect((await worker.fetch(request(listener),testEnv)).status).toBe(429);
+  expect((await env.DB.prepare('SELECT attempts FROM rate_limits WHERE key=?').bind(deviceKey).first<{attempts:number}>())?.attempts).toBe(prior);
+  await env.DB.prepare('UPDATE rate_limits SET attempts=0 WHERE key=?').bind(ip).run();
+  await env.DB.prepare('INSERT INTO rate_limits(key,window,attempts) VALUES(?,?,600) ON CONFLICT(key) DO UPDATE SET window=excluded.window,attempts=600').bind(deviceKey,window).run();
+  expect((await worker.fetch(request(listener),testEnv)).status).toBe(429);
+  const bad={...listener,secret:btoa('xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')};expect((await worker.fetch(request(bad),testEnv)).status).toBe(401);
+  expect((await env.DB.prepare('SELECT attempts FROM rate_limits WHERE key=?').bind(deviceKey).first<{attempts:number}>())?.attempts).toBe(601);
+ });
+ it('uses a fresh heartbeat snapshot fallback and refuses a removed pairing',async()=>{
+  const {listener}=await paired();let reads=0,release!:()=>void,entered!:()=>void;
+  const gate=new Promise<void>(r=>{release=r;}),ready=new Promise<void>(r=>{entered=r;});
+  const db=interceptDB(async(sql,_args,method,execute)=>{const result=await execute();if(sql.startsWith('SELECT p.parent_id,p.listener_id,p.created_at,h.received_at')&&method==='all'&&++reads===1){entered();await gate;}return result;});
+  const work=worker.fetch(request(listener),{...testEnv,DB:db});await ready;
+  try {await env.DB.prepare('DELETE FROM pairs WHERE listener_id=?').bind(listener.deviceId).run();expect((await work).status).toBe(409);expect(reads).toBe(2);}
+  finally{release();await work;}
+  expect((await env.DB.prepare('SELECT * FROM heartbeats').all()).results).toHaveLength(0);
+ });
+ it('guards all persistence when pairing changes after the snapshot',async()=>{
+  const {listener}=await paired();
+  const db=interceptDB(async(sql,_args,method,execute)=>{if(method==='batch'&&sql.startsWith('INSERT INTO heartbeats'))await env.DB.prepare('DELETE FROM pairs WHERE listener_id=?').bind(listener.deviceId).run();return execute();});
+  expect((await worker.fetch(request(listener),{...testEnv,DB:db})).status).toBe(409);
+  for(const table of ['heartbeats','timeline_events','connection_states'])expect((await env.DB.prepare(`SELECT * FROM ${table}`).all()).results).toHaveLength(0);
+ });
+ it('never repeats committed heartbeat writes while their reply is delayed',async()=>{
+  const {listener}=await paired();let writes=0,release!:()=>void,entered!:()=>void;
+  const gate=new Promise<void>(r=>{release=r;}),ready=new Promise<void>(r=>{entered=r;});
+  const db=interceptDB(async(sql,_args,method,execute)=>{const result=await execute();if(method==='batch'&&sql.startsWith('INSERT INTO heartbeats')){writes++;entered();await gate;}return result;});
+  const work=worker.fetch(request(listener),{...testEnv,DB:db});await ready;
+  try {await new Promise(r=>setTimeout(r,350));expect(writes).toBe(1);expect((await env.DB.prepare('SELECT * FROM heartbeats').all()).results).toHaveLength(1);}
+  finally{release();expect((await work).status).toBe(200);}
+ });
+});
+
+describe('heartbeat journal isolation',()=>{
+ it('returns persisted heartbeat configuration without waiting for its unsampled diagnostic',async()=>{
+  const {listener}=await paired(),jobs:Promise<unknown>[]=[];let release!:()=>void,entered!:()=>void;
+  const gate=new Promise<void>(r=>{release=r;}),ready=new Promise<void>(r=>{entered=r;});
+  const db=interceptDB(async(sql,_args,_method,execute)=>{if(sql.startsWith('INSERT INTO diagnostics')){entered();await gate;}return execute();});
+  const value={listenerId:listener.deviceId,timestamp:new Date().toISOString(),monitoring:true,powerConnected:true,state:'quiet',episodes:[]};
+  const request=new Request('https://monitor.test/v1/listener/heartbeat',{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${listener.deviceId}.${listener.secret}`},body:JSON.stringify(value)});
+  const running=worker.fetch(request,{...testEnv,DB:db},{waitUntil:(job:Promise<unknown>)=>jobs.push(job)} as unknown as ExecutionContext);await ready;
+  try {
+   const response=await Promise.race([running,new Promise<never>((_,reject)=>setTimeout(()=>reject(new Error('Heartbeat waited for its journal')),1000))]);
+   expect(response.status).toBe(200);expect(await response.json()).toEqual(defaultConfiguration);
+   expect(response.headers.get('x-diagnostics-status')).toBe('queued');expect(response.headers.get('x-diagnostics-elapsed-ms')).toBe('0');
+   expect((await env.DB.prepare('SELECT * FROM heartbeats WHERE listener_id=?').bind(listener.deviceId).all()).results).toHaveLength(1);
+  }finally{release();await running;await Promise.all(jobs);}
+ });
+});

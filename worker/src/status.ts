@@ -5,14 +5,16 @@ import {scheduleReminders} from './reminders';
 import {APIError,defaultConfiguration,requireRole,type Device,type Env,type Heartbeat} from './types';
 import {configuration,heartbeat as validateHeartbeat} from './security';
 import {pairFor} from './devices';
-export async function saveHeartbeat(env:Env,device:Device,value:Record<string,unknown>) {
+export async function saveHeartbeat(env:Env,device:Device,value:Record<string,unknown>,latency=new Latency()) {
  requireRole(device,'listener');const heartbeat=validateHeartbeat(value);
  if(heartbeat.listenerId!==device.id)throw new APIError(403,'Listener identity mismatch.');
- const pair=await pairFor(env,device);if(!pair)throw new APIError(409,'Listener is not paired.');
+ const [snapshot]=await latency.readOnly<{parent_id:string;listener_id:string;created_at:number;received_at:string|null;metadata:string|null}>('heartbeat_snapshot_ms',()=>env.DB.prepare(`SELECT p.parent_id,p.listener_id,p.created_at,h.received_at,h.metadata
+  FROM pairs p LEFT JOIN heartbeats h ON h.listener_id=p.listener_id WHERE p.listener_id=?`).bind(device.id).all(),250);
+ const pair=snapshot.results[0];if(!pair)throw new APIError(409,'Listener is not paired.');
  // A replacement pairing must not resurrect the previous family's history.
  heartbeat.episodes=heartbeat.episodes.filter(e=>Date.parse(e.startedAt)>=pair.created_at);
  if(heartbeat.currentEpisode&&Date.parse(heartbeat.currentEpisode.startedAt)<pair.created_at)heartbeat.currentEpisode=null;
- const previous=await env.DB.prepare('SELECT received_at,metadata FROM heartbeats WHERE listener_id=?').bind(device.id).first<{received_at:string;metadata:string}>();
+ const previous=pair.received_at&&pair.metadata?{received_at:pair.received_at,metadata:pair.metadata}:null;
  const observedAt=Date.now();
  // Server receive time is authoritative for freshness, never a client's clock.
  const heartbeatWrite=env.DB.prepare('INSERT INTO heartbeats(listener_id,received_at,metadata) SELECT ?,?,? WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?) ON CONFLICT(listener_id) DO UPDATE SET received_at=excluded.received_at,metadata=excluded.metadata').bind(device.id,new Date().toISOString(),JSON.stringify(heartbeat),pair.parent_id,pair.listener_id,pair.created_at);
@@ -27,12 +29,15 @@ export async function saveHeartbeat(env:Env,device:Device,value:Record<string,un
   AND EXISTS(SELECT 1 FROM resolved_episodes r JOIN pairs p ON p.parent_id=r.parent_id AND p.listener_id=r.listener_id AND p.created_at=r.pair_created_at
    WHERE r.parent_id=events.parent_id AND r.listener_id=events.listener_id AND r.episode_id=events.episode_id)`)
   .bind(new Date(observedAt).toISOString(),pair.parent_id,pair.listener_id);
- const [saved]=await env.DB.batch([heartbeatWrite,...heartbeatTimeline(env,pair,heartbeat,previous,observedAt),...resolutionWrites,...(resolutions.length?[retire]:[])]);
+ const online=env.DB.prepare("INSERT INTO connection_states(listener_id,state,changed_at) SELECT ?,'online',? WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?) ON CONFLICT DO NOTHING").bind(device.id,new Date(observedAt).toISOString(),pair.parent_id,pair.listener_id,pair.created_at);
+ const results=await latency.db<unknown>('heartbeat_storage_ms',()=>env.DB.batch([heartbeatWrite,...heartbeatTimeline(env,pair,heartbeat,previous,observedAt),...resolutionWrites,...(resolutions.length?[retire]:[]),...(heartbeat.monitoring?[online]:[]),
+  env.DB.prepare('SELECT d.config,d.alerts_muted_until FROM devices d JOIN pairs p ON p.parent_id=d.id WHERE p.parent_id=? AND p.listener_id=? AND p.created_at=?').bind(pair.parent_id,pair.listener_id,pair.created_at)
+ ]));
+ const saved=results[0];
  if(!saved.meta.changes)throw new APIError(409,'Pairing changed. Pair again.');
- if(heartbeat.monitoring)await env.DB.prepare("INSERT INTO connection_states(listener_id,state,changed_at) SELECT ?,'online',? WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?) ON CONFLICT DO NOTHING").bind(device.id,new Date().toISOString(),pair.parent_id,pair.listener_id,pair.created_at).run();
- const parent=await env.DB.prepare('SELECT config,alerts_muted_until FROM devices WHERE id=?').bind(pair.parent_id).first<{config:string;alerts_muted_until:number}>();
+ const parent=results[results.length-1].results[0] as {config:string;alerts_muted_until:number}|undefined;
  // Re-arm after a stale/offline mute-expiry check when the Listener reconnects.
- if(parent?.alerts_muted_until&&heartbeat.monitoring&&heartbeat.state==='crying'&&heartbeat.currentEpisode)await scheduleReminders(env,pair.parent_id);
+ if(parent?.alerts_muted_until&&heartbeat.monitoring&&heartbeat.state==='crying'&&heartbeat.currentEpisode)await latency.measure('heartbeat_schedule_ms',()=>scheduleReminders(env,pair.parent_id));
  return parent?configuration(JSON.parse(parent.config)):defaultConfiguration;
 }
 export async function listenerStatus(env:Env,device:Device,latency=new Latency()) {

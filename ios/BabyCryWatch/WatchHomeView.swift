@@ -55,6 +55,12 @@ struct WatchHomeView: View {
         .tint(mint)
         .task { await model.foreground() }
         .task(id: phase) {
+            switch phase {
+            case .background: NotificationCallbackJournal.shared.lifecycle(.background)
+            case .inactive: NotificationCallbackJournal.shared.lifecycle(.inactive)
+            case .active: break
+            @unknown default: break
+            }
             guard phase == .active else { return }
             while !Task.isCancelled {
                 model.refresh()

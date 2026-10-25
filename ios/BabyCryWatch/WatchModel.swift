@@ -29,7 +29,7 @@ import UserNotifications
     override private init() {
         super.init()
         log.record("app_launched", code: DiagnosticLog.maximumLines)
-        log.record("alert_pipeline_ready", code: 6)
+        log.record("alert_pipeline_ready", code: 7)
         log.checkpointCoverage()
         if let data = UserDefaults.standard.data(forKey: "watchSnapshot") {
             do { snapshot = try JSONDecoder().decode(WatchSnapshot.self, from: data) }
@@ -56,6 +56,7 @@ import UserNotifications
     }
 
     func foreground() async {
+        NotificationCallbackJournal.shared.lifecycle(.foreground)
         log.record("foreground")
         log.checkpointCoverage()
         await recoverNotificationHistory()
@@ -79,13 +80,16 @@ import UserNotifications
         recoveringNotificationHistory = true; defer { recoveringNotificationHistory = false }
         // Recover delivery dates while awake; never poll or replay background alerts.
         let notifications = await UNUserNotificationCenter.current().deliveredNotifications()
-        recordDeliveredNotifications(notifications)
+        recordDeliveredNotifications(notifications, source: .foreground)
+        NotificationCallbackJournal.shared.checkpoint(historyCount: notifications.count)
     }
-    private func recordDeliveredNotifications(_ notifications: [UNNotification]) {
+    private func recordDeliveredNotifications(_ notifications: [UNNotification], source: WatchAlertTrace.HistorySource = .cleanup) {
         let observedAt = Date()
         log.watchAlerts(notifications.sorted { $0.date < $1.date }.compactMap { notification in
             guard let alert = WatchCryAlert.notification(notification.request.content) else { return nil }
-            return WatchAlertTrace(alert: alert, phase: .retained, deliveredAt: notification.date, observedAt: observedAt)
+            return WatchAlertTrace(alert: alert, phase: .retained, deliveredAt: notification.date, observedAt: observedAt,
+                applicationState: diagnosticApplicationState, interruptionLevel: Int(exactly: notification.request.content.interruptionLevel.rawValue),
+                collapseScope: notification.diagnosticCollapseScope(alert), historySource: source)
         })
     }
     @discardableResult private func inspectNotificationSettings() async -> UNNotificationSettings {

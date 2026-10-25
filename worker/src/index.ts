@@ -6,13 +6,13 @@ export {LiveSound} from './live-sound';
 import {openLiveSound} from './live-sound';
 import {APIError,type Env} from './types';
 import {body,rateLimit} from './security';
-import {admitAlert,authenticate,register,savePushToken,saveWatchPushToken,saveSilentWatchAlarms,removeDeviceData,pairFor} from './devices';
+import {admitAlert,admitHeartbeat,authenticate,register,savePushToken,saveWatchPushToken,saveSilentWatchAlarms,removeDeviceData,pairFor} from './devices';
 import {connectionPreferences,flushConnections} from './connections';
 import {createPairing,claimPairing} from './pairing';
 import {receiveAlert,acknowledge,resumeAlerts,flushPending} from './alerts';
 import {saveHeartbeat,listenerStatus,saveSettings} from './status';
 import {operationFor,recordDiagnostic,type Stage} from './diagnostics';
-import {queueStatusDiagnostic} from './status-diagnostics';
+import {queueStatusDiagnostic,queueHeartbeatDiagnostic} from './status-diagnostics';
 import {startAlertProgress} from './alert-progress';
 import {Latency} from './latency';
 
@@ -22,8 +22,9 @@ export default {
   latency.details.colo=typeof request.cf?.colo==='string'?request.cf.colo:undefined;
   let operation=operationFor('', ''),stage:Stage='validation',stopProgress:(()=>void)|undefined;
   const respond=async(result:unknown,status:number,outcome:'ok'|'rejected'|'internal_error')=>{
-   if(operation==='status'&&outcome==='ok'&&ctx){
-    const state=queueStatusDiagnostic(env,ctx,{requestId,started,operation,stage,outcome,httpStatus:status,details:latency.progressDetails()});
+   if((operation==='status'||operation==='heartbeat')&&outcome==='ok'&&ctx){
+    const diagnostic={requestId,started,stage,outcome,httpStatus:status,details:latency.progressDetails()};
+    const state=operation==='status'?queueStatusDiagnostic(env,ctx,{...diagnostic,operation}):queueHeartbeatDiagnostic(env,ctx,{...diagnostic,operation});
     return Response.json(result,{status,headers:{'cache-control':'no-store','x-content-type-options':'nosniff','x-request-id':requestId,
      'x-diagnostics-status':state,'x-diagnostics-elapsed-ms':'0','x-server-received-at-ms':String(started),'x-server-sent-at-ms':String(Date.now())}});
    }
@@ -41,7 +42,7 @@ export default {
    if(!env.PAIRING_PEPPER||env.PAIRING_PEPPER.length<32)throw new Error('Pairing configuration missing');
    const route=`${request.method} ${url.pathname}`;
    const ip=request.headers.get('CF-Connecting-IP')??'local';
-   const alertUpload=route==='POST /v1/listener/event';
+   const alertUpload=route==='POST /v1/listener/event',heartbeatUpload=route==='POST /v1/listener/heartbeat';
    if(alertUpload){
     const clientRequestId=request.headers.get('x-client-request-id');
     if(clientRequestId&&/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(clientRequestId))latency.details.client_request_id=clientRequestId.toLowerCase();
@@ -50,16 +51,16 @@ export default {
    stage='rate_limit';
    // Both phones usually share one address (carrier NAT shares it more widely), so the
    // address bucket is only a flood ceiling. Crying alerts never depend on it.
-   if(!alertUpload)await latency.measure('rate_limit_ms',()=>rateLimit(env,'api',ip,3000,600,latency,'ip_rate_limit_ms'));
+   if(!alertUpload&&!heartbeatUpload)await latency.measure('rate_limit_ms',()=>rateLimit(env,'api',ip,3000,600,latency,'ip_rate_limit_ms'));
    let result:unknown;
    if(route==='POST /v1/device/register'){stage='handler';result=await latency.measure('handler_ms',async()=>register(env,await body(request),ip));}
    else{
     stage='authentication';
-    const device=alertUpload?await admitAlert(env,request,latency):await latency.measure('authentication_ms',()=>authenticate(env,request,latency));
+    const device=alertUpload?await admitAlert(env,request,latency):heartbeatUpload?await admitHeartbeat(env,request,ip,latency):await latency.measure('authentication_ms',()=>authenticate(env,request,latency));
     stage='rate_limit';
     // Separate budgets: a device's own polling must never delay a crying alert.
     const watchTestPush=route==='POST /v1/watch-test/push';
-    if(!alertUpload)await latency.measure('rate_limit_ms',()=>rateLimit(env,watchTestPush?'watch-test-push':'device',device.id,watchTestPush?660:600,600,latency,'device_rate_limit_ms'));
+    if(!alertUpload&&!heartbeatUpload)await latency.measure('rate_limit_ms',()=>rateLimit(env,watchTestPush?'watch-test-push':'device',device.id,watchTestPush?660:600,600,latency,'device_rate_limit_ms'));
     stage='handler';
     const special=await latency.measure('handler_ms',async()=>{switch(route){
      case 'POST /v1/pairing/create':result=await createPairing(env,device);break;
@@ -88,7 +89,7 @@ export default {
       result=await receiveAlert(env,listener,{eventId:crypto.randomUUID(),episodeId:crypto.randomUUID(),listenerId:listener.id,type:'sustained_cry',cryStartedAt:new Date(now.getTime()-config.alertDuration*1000).toISOString(),durationSeconds:config.alertDuration,createdAt:now.toISOString(),isRepeat:false,isTest:true},requestId,latency,ctx);
       break;
      }
-     case 'POST /v1/listener/heartbeat':result=await saveHeartbeat(env,device,await body(request));break;
+     case 'POST /v1/listener/heartbeat':result=await saveHeartbeat(env,device,await latency.measure('body_read_ms',()=>body(request)),latency);break;
      case 'POST /v1/listener/event':result=await receiveAlert(env,device,await latency.measure('body_read_ms',()=>body(request)),requestId,latency,ctx);break;
      case 'GET /v1/timeline':result=await timeline(env,device);break;
      case 'GET /v1/listener/status':result=await listenerStatus(env,device,latency);break;
