@@ -94,7 +94,7 @@ try {
     check(status.body.configuration?.alertDuration === 5, 'parent sees the same five-second configuration');
     check(status.body.listenerConfiguration?.alertDuration === 5, 'Listener applied-settings acknowledgement');
     check(status.body.configuration?.absoluteThreshold === -45 && status.body.listenerConfiguration?.absoluteThreshold === -45, 'Parent sees the selected and applied fixed threshold');
-    check(/^[0-9a-f-]{36}$/i.test(status.requestId ?? '') && status.diagnostics === 'recorded', 'live diagnostic request reference recorded');
+    check(/^[0-9a-f-]{36}$/i.test(status.requestId ?? '') && ['recorded', 'queued'].includes(status.diagnostics), 'live diagnostic request reference accepted');
     check(status.body.connectionAlertsEnabled === true, 'connection alerts default on');
     check(status.body.configuration?.snoozeDuration === 120 && status.body.listenerConfiguration?.snoozeDuration === 120, 'configurable snooze syncs to Listener and Parent');
     check((await request('connection-alerts', listener, {enabled: true})).status === 403, 'connection preferences restricted to Parent');

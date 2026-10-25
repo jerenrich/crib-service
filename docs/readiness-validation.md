@@ -1,5 +1,15 @@
 # Readiness release checks
 
+## Main integration and redeployment — 25 October 2026
+
+Merged the overnight silent alarm feature with main's current monitoring presentation, single alert timer and delivery-claim recovery fixes at `590deb2`, then fast-forwarded and pushed main. Both the normal claim reply and recovered ownership receipt retain the optional phone token and alarm flag. Recovery fan-out keeps main's two-request bound and retains independent auxiliary background work. A regression test verifies that a recovered claim still sends both the original Watch notification and the optional silent phone alarm request.
+
+The combined release passed TypeScript checks, 192 Worker tests, 144 shared Swift tests and all 287 iOS unit tests. The first iOS run stalled on the existing simulator before tests; a fresh temporary simulator completed successfully and was removed. The signed iPhone/embedded Watch build passed deep signature verification, and both bundles contain the same validated silent CAF asset. No pending remote D1 migrations remained. Worker version `5e1353d5-843a-4ebd-9187-10f1f7f8b51d` was deployed with existing bindings and development APNs retained.
+
+Both iPhones were updated in place and launched normally. Preference read-back confirmed Listener role on J14, Parent role on J17 and retained pairing on both. The Parent's silent Watch alarm option was off before installation and remains off afterward. Updating the Listener requires restarting monitoring. Watch wireless tunnel attempts timed out; installation is awaiting device reconnection. No real cry or alarm was triggered by this rollout.
+
+The smoke script now accepts either recorded or queued diagnostic references, reflecting main's asynchronous status journaling. The first run stopped at its obsolete recorded-only assertion; fallback SQL removed only that run's generated temporary identities before rerunning. The full live recheck passed and removed all temporary registrations and shared metadata through the authenticated API. No push tokens were registered and no push was sent. Final Watch installation remains pending reconnection. Evidence is retained under ignored `.local/main-redeploy-2026-10-25/`.
+
 ## Optional overnight silent crying alarms — 25 October 2026
 
 Parent Settings → Overnight wrist alarms → Silent Watch alarms is off by default and stays enabled until switched off. Apply additive migration `0011_silent_watch_alarms.sql` before deploying this Worker. No existing notification setting is replaced. The Listener's current event API remains compatible.
