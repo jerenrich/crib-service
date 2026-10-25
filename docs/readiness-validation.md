@@ -4,6 +4,25 @@ The readiness release is deployed to the configured backend and installed on bot
 
 Record device/OS versions, build and Worker revision, timestamps, Focus settings and observed outcomes. Use a dedicated test pair for destructive checks. Never erase the family's active pairing as a test without the user's explicit intent.
 
+## Manual system alarm test — 25 October 2026
+
+This test is available in Parent Settings on iOS 26+. Physical iPhone/Watch checks remain pending; simulator builds cannot establish wrist delivery or haptic strength.
+
+Installation completed on 25 October 2026: simulator and signed combined device builds passed, along with deep signature verification. Installed in place and launched successfully on Listener J14, Parent J17 and the paired Apple Watch. Read-back preferences verified both phones retained their original roles and pairing. The build uses automatic iPhone signing with the installed Time Sensitive Notifications profile and the existing manual Watch development profile. No backend deployment was required. No alarm was fired during installation; use Parent Settings → System alarm test → Test alarm in 5 seconds to evaluate sound and wrist delivery. Restart Listener monitoring after updating. Build logs, device receipts and preference comparisons are retained under ignored `.local/alarm-test-rollout-2026-10-25/`.
+
+| Check | Expected result |
+| --- | --- |
+| First test, allow alarm permission | Exactly one system alarm is scheduled five seconds after authorization completes; permission-prompt time does not consume the five seconds |
+| Deny permission | No alarm is scheduled; Settings explains the permission requirement and offers a link to system Settings |
+| Allow permission in system Settings and return | The next test can be scheduled without relaunching |
+| Tap Test repeatedly | Only one test alarm is scheduled |
+| Cancel before five seconds | No test alarm fires |
+| Let alarm fire; stop from Settings or the system alert | Alarm stops; the test can be run again |
+| Close Settings, lock phone, or relaunch while test exists | System retains the alarm; reopening Parent Settings recovers its cancel/stop control |
+| Wear paired, unlocked Watch; repeat with phone open/locked and Silent Mode/Focus on/off | Record phone sound, Watch sound, wrist haptics and actual latency for each case; do not assume Watch-only delivery |
+| Test without server pairing or internet | The local system test can be scheduled without server or push registration |
+| iOS 17–25 | Settings shows the iOS 26 requirement; existing notification tests remain available |
+
 ## Live sound integration — 24 October 2026
 
 The shared live sound chart is integrated on top of `c0d652b`, retaining the separate server/local warning preferences, Keep screen awake, battery readiness, monitoring controls, audio-route recovery confirmation, transient-error retries, and late warning recovery. Existing unit and UI tests are retained. Live readings are display data: they cannot confirm a monitoring command or arm/renew connection-warning deadlines. Unpairing and device deletion still succeed if the live relay is unavailable; D1 revocation remains authoritative and active sockets recheck their pairing.
