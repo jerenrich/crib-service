@@ -9,6 +9,7 @@ const routes = {
  'POST /v1/alert/resume':'resume_alerts',
  'POST /v1/settings':'settings', 'POST /v1/alert/acknowledge':'acknowledge',
  'POST /v1/pairing/remove':'unpair','POST /v1/device/delete':'delete_device',
+ 'POST /v1/watch-test/push':'test_push',
  'GET /v1/watch-test':'test_push','POST /v1/watch-test':'test_push',
  'POST /v1/connection-alerts':'connection_preferences','POST /v1/test-push':'test_push',
  'GET /v1/live-sound':'live_sound'
