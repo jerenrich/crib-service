@@ -244,7 +244,7 @@ export async function resumeAlerts(env:Env,device:Device,value:Record<string,unk
  await scheduleReminders(env,device.id);
  return {ok:true};
 }
-export async function flushPending(env:Env,requestId=crypto.randomUUID(),latency=new Latency()) {
+export async function flushPending(env:Env,requestId=crypto.randomUUID(),latency=new Latency(),background?:Pick<ExecutionContext,'waitUntil'>) {
  // Expire diagnostic data before delivery work so a broken push path cannot defer expiry.
  try { await latency.measure('maintenance_expiry_ms',()=>env.DB.prepare('DELETE FROM diagnostics WHERE recorded_at<?').bind(Date.now()-7*86400000).run()); }
  catch { await recordDiagnostic(env,{requestId,started:Date.now(),operation:'maintenance',stage:'cleanup',outcome:'diagnostic_cleanup_failed'}); }
@@ -255,7 +255,7 @@ export async function flushPending(env:Env,requestId=crypto.randomUUID(),latency
  }
  const events=await latency.measure('maintenance_pending_ms',()=>env.DB.prepare("SELECT event_id FROM events WHERE status='pending' AND acknowledged_at IS NULL AND resolved_at IS NULL AND next_attempt<=? ORDER BY created_at LIMIT 25").bind(Date.now()).all<{event_id:string}>());
  // Bounded fan-out; each row has an atomic database claim.
- await latency.measure('maintenance_dispatch_ms',async()=>{for(let index=0;index<events.results.length;index+=5){await Promise.all(events.results.slice(index,index+5).map(event=>{const trace=new Latency();trace.details.dispatch_source='maintenance';return dispatchEvent(env,event.event_id,requestId,trace);}));}});
+ await latency.measure('maintenance_dispatch_ms',async()=>{for(let index=0;index<events.results.length;index+=5){await Promise.all(events.results.slice(index,index+5).map(event=>{const trace=new Latency();trace.details.dispatch_source='maintenance';return dispatchEvent(env,event.event_id,requestId,trace,{background});}));}});
  // Repair scheduling after a failed background request or worker reset. Bound
  // fan-out; existing alarms are never postponed by these idempotent refreshes.
  await latency.measure('maintenance_schedule_ms',async()=>{

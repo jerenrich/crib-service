@@ -103,10 +103,10 @@ export default {
    return await respond({error:expected?error.message:'Server configuration or storage unavailable.'},expected?error.status:503,expected?'rejected':'internal_error');
   }finally{stopProgress?.();}
  },
- async scheduled(_controller:ScheduledController,env:Env):Promise<void> {
+ async scheduled(_controller:ScheduledController,env:Env,ctx?:ExecutionContext):Promise<void> {
   const requestId=crypto.randomUUID(),started=Date.now(),latency=new Latency();
   try {
-   const results=await Promise.allSettled([flushPending(env,requestId,latency),latency.measure('maintenance_connections_ms',()=>flushConnections(env,requestId))]);
+   const results=await Promise.allSettled([flushPending(env,requestId,latency,ctx),latency.measure('maintenance_connections_ms',()=>flushConnections(env,requestId))]);
    if(results.some(result=>result.status==='rejected'))throw new Error('Maintenance failed.');
    await recordDiagnostic(env,{requestId,started,operation:'maintenance',stage:'handler',outcome:'ok',details:latency.details});
   } catch {
