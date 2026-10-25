@@ -29,10 +29,10 @@ function alert(listener:TestDevice):Alert {
  const started=new Date(Date.now()-300000).toISOString();
  return {eventId:crypto.randomUUID(),episodeId:crypto.randomUUID(),listenerId:listener.deviceId,type:'sustained_cry',cryStartedAt:started,durationSeconds:300,createdAt:new Date().toISOString(),isRepeat:false};
 }
-let pushResponses: (Response | Error)[] = [];
+let pushResponses: (Response | Error | {body:string;status:number;headers?:Record<string,string>})[] = [];
 let pushRequests: {url:string;init?:RequestInit}[] = [];
 function mockPush(status=200,times=1){
- for(let i=0;i<times;i++)pushResponses.push(new Response(status===200?'':JSON.stringify({reason:'ServiceUnavailable'}),{status}));
+ for(let i=0;i<times;i++)pushResponses.push({body:status===200?'':JSON.stringify({reason:'ServiceUnavailable'}),status});
 }
 
 beforeAll(async()=>{
@@ -48,7 +48,7 @@ beforeEach(async()=>{
   const url=String(input);expect(url).toMatch(/^https:\/\/api\.sandbox\.push\.apple\.com\/3\/device\//);
   pushRequests.push({url,init});
   const response=pushResponses.shift();if(!response)throw new Error('Unexpected external request');
-  if(response instanceof Error)throw response;return response;
+  if(response instanceof Error)throw response;return response instanceof Response?response:new Response(response.body,{status:response.status,headers:response.headers});
  }));
 });
 afterEach(()=>{try{expect(pushResponses).toHaveLength(0);}finally{vi.unstubAllGlobals();vi.restoreAllMocks();}});
@@ -1421,7 +1421,7 @@ describe('repeating Watch push test',()=>{
  }
  it('records Apple response subtypes for the independent Watch test sender',async()=>{
   const {parent,stub}=await ready();await call('watch-test',parent,{running:true,interval:5});
-  pushResponses.push(new Response(JSON.stringify({reason:'TooManyProviderTokenUpdates'}),{status:429}));
+  pushResponses.push({body:JSON.stringify({reason:'TooManyProviderTokenUpdates'}),status:429});
   await runInDurableObject(stub,async(_,state)=>new WatchTest(state,testEnv).alarm());
   const row=await env.DB.prepare("SELECT outcome,details FROM diagnostics WHERE operation='watch_test_dispatch'").first<{outcome:string;details:string}>();
   expect(row?.outcome).toBe('apns_429');expect(JSON.parse(row!.details).apns_reason).toBe('TooManyProviderTokenUpdates');
