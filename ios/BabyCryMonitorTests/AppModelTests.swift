@@ -541,6 +541,36 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(confirmed); XCTAssertEqual(fixture.audio.starts, 1)
         fixture.model.stop()
     }
+    @MainActor func testListenerPauseReportsStandbyAndAllowsRemoteResumeWithoutRestartingMicrophone() async throws {
+        let fixture = try Fixture()
+        await fixture.model.start()
+        await fixture.model.tick()
+        fixture.model.pauseMonitoring()
+        XCTAssertTrue(fixture.model.standby)
+        XCTAssertFalse(fixture.model.monitoring)
+        XCTAssertTrue(fixture.model.microphoneActive)
+        XCTAssertEqual(fixture.audio.stops, 0)
+        XCTAssertNil(fixture.model.snapshot.current)
+        XCTAssertEqual(fixture.model.currentDBFS, -100)
+        fixture.time.now = fixture.time.now.addingTimeInterval(3)
+        await fixture.model.tick()
+        let requests = await fixture.backend.monitoringRequests
+        XCTAssertEqual(requests.map(\.0), [true, false], "Local pause must also cancel server alert reminders")
+        let reported = await eventually {
+            let beat = await fixture.backend.beats.last
+            return beat?.monitoring == false && beat?.microphoneActive == true
+        }
+        XCTAssertTrue(reported)
+        fixture.model.setAppActive(false)
+        try await remoteCommand(true, fixture: fixture)
+        XCTAssertTrue(fixture.model.monitoring)
+        XCTAssertFalse(fixture.model.standby)
+        XCTAssertEqual(fixture.audio.starts, 1, "Parent resume must reuse the microphone while Listener is in the background")
+        fixture.model.stop()
+        XCTAssertFalse(fixture.model.microphoneActive)
+        XCTAssertEqual(fixture.audio.stops, 1)
+    }
+
     @MainActor func testRemotePauseKeepsAudioAndPublishesStandbyHeartbeat() async throws {
         let fixture = try Fixture(); await fixture.model.start()
         let command = MonitoringCommand(id: UUID(), enabled: false, status: "pending", createdAt: fixture.time.now, expiresAt: fixture.time.now.addingTimeInterval(30))

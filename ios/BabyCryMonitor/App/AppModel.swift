@@ -537,9 +537,14 @@ import UIKit
         if !remote, role == .listener, paired { queueLocalMonitoringReport(false) }
         haltMonitoring()
     }
-    /// Parent Pause leaves capture running, but no sample reaches detection or
-    /// live sound. A local Stop always releases the microphone.
-    private func pauseMonitoring() {
+    /// Pause from either iPhone keeps capture available for remote resume, but
+    /// no sample reaches detection or live sound. Stop releases the microphone.
+    func pauseMonitoring(remote: Bool = false) {
+        guard role == .listener, !starting, !managingDevice else { return }
+        if !remote {
+            controlGeneration += 1
+            if paired { queueLocalMonitoringReport(false) }
+        }
         let wasMonitoring = monitoring
         detectionPaused = microphoneActive || recoveringAudio
         monitoring = false; detectionStartedAt = nil
@@ -682,7 +687,7 @@ import UIKit
         if defaults.string(forKey: handledKey) != command.id.uuidString {
             defaults.set(command.id.uuidString, forKey: handledKey)
             if command.enabled { await start(remote: true, deadline: deadline, commandID: command.id) }
-            else { pauseMonitoring() }
+            else { pauseMonitoring(remote: true) }
         }
         guard revision == environmentRevision, control == controlGeneration, role == .listener else { return }
         // A route change can cancel the original audio.start() while recovery
