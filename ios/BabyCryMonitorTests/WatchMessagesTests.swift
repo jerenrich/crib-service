@@ -9,6 +9,23 @@ import XCTest
 final class WatchMessagesTests: XCTestCase {
     let now = Date(timeIntervalSince1970: 1_800_000_000)
 
+    func testLivePresentationMatchesParentWithoutChangingRawHeartbeatOrWarningDeadline() throws {
+        var snapshot = WatchSnapshot(updatedAt: now, parentMode: true, paired: true,
+            lastHeartbeat: now.addingTimeInterval(-180), monitoring: false, state: .quiet)
+        snapshot.monitoringDisplayState = "Monitoring"
+        snapshot.monitoringObservedAt = now
+        XCTAssertTrue(snapshot.nurseryOnline(at: now))
+        XCTAssertNil(snapshot.nurseryDisplayState(at: now.addingTimeInterval(46)))
+        XCTAssertFalse(snapshot.monitoring)
+        XCTAssertNil(snapshot.localConnectionDeadline)
+        snapshot = try JSONDecoder().decode(WatchSnapshot.self, from: JSONEncoder().encode(snapshot))
+        XCTAssertTrue(snapshot.nurseryOnline(at: now))
+        snapshot.monitoringDisplayState = "Standby"
+        XCTAssertFalse(snapshot.nurseryOnline(at: now))
+        snapshot.monitoringDisplayState = "Pausing…"
+        XCTAssertFalse(snapshot.nurseryOnline(at: now))
+    }
+
     func testCachedStatusBecomesUnknownEvenWhenHeartbeatIsRecent() {
         var snapshot = WatchSnapshot(updatedAt: now, parentMode: true, paired: true,
                                      lastHeartbeat: now, monitoring: true, state: .quiet)

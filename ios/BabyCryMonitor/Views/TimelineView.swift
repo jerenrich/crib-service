@@ -168,9 +168,9 @@ struct TimelineView: View {
         }
         .onChange(of: phase) { _, value in if value == .active { Task { await model.refreshTimeline() } } }
     }
-    private var statusActive: Bool { model.role == .listener ? model.monitoring : !sharedStatusUnavailable && model.parentOnline }
+    private var statusActive: Bool { model.role == .listener ? model.monitoring : model.parentDisplaysMonitoring }
     private var statusText: String {
-        if sharedStatusUnavailable { return model.loadingTimeline && model.timeline == nil ? "Loading timeline…" : "Status unavailable" }
+        if sharedStatusUnavailable && model.role != .parent { return model.loadingTimeline && model.timeline == nil ? "Loading timeline…" : "Status unavailable" }
         return model.role == .listener ? (model.monitoring ? "Monitoring on this iPhone" : model.recoveringAudio ? "Microphone interrupted" : "Monitoring stopped") : model.nurseryConnection
     }
     private func statistic(_ count: Int, _ title: String) -> some View {

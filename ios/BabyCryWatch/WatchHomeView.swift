@@ -81,10 +81,10 @@ struct WatchHomeView: View {
                 Circle().stroke(mint.opacity(0.24), lineWidth: 1).frame(width: 74, height: 74)
                 Image(systemName: online ? "waveform" : "moon.zzz").font(.system(size: 30, weight: .light)).foregroundStyle(online ? mint : .secondary)
             }.accessibilityHidden(true)
-            Text(stateTitle(online: online)).font(.system(.title3, design: .rounded).weight(.semibold)).multilineTextAlignment(.center)
+            Text(stateTitle(online: online, now: now)).font(.system(.title3, design: .rounded).weight(.semibold)).multilineTextAlignment(.center)
             HStack(spacing: 5) {
                 Circle().fill(online ? mint : .orange).frame(width: 5, height: 5)
-                Text(online ? "Listener monitoring" : "Status unknown").font(.caption2).foregroundStyle(.secondary)
+                Text(online ? "Listener monitoring" : model.snapshot.nurseryDisplayState(at: now) ?? "Status unknown").font(.caption2).foregroundStyle(.secondary)
             }
             if model.snapshot.parentMode && model.snapshot.paired {
                 HStack { Text("Alert after"); Spacer(); Text(duration(model.snapshot.alertDuration)).foregroundStyle(mint).monospacedDigit() }
@@ -108,8 +108,8 @@ struct WatchHomeView: View {
             if !alert.isTest { Text("Tap Snooze to pause crying alerts for \(duration(model.snapshot.snoozeDuration ?? 60)).").font(.caption2).foregroundStyle(.secondary) }
         }.padding(.vertical, 8)
     }
-    private func stateTitle(online: Bool) -> String {
-        guard online else { return "Check connection" }
+    private func stateTitle(online: Bool, now: Date) -> String {
+        guard online else { return model.snapshot.nurseryDisplayState(at: now) ?? "Check connection" }
         switch model.snapshot.state {
         case .quiet: return "All quiet"
         case .possibleCry: return "Sound detected"
