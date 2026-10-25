@@ -28,7 +28,7 @@ import UserNotifications
 
     override private init() {
         super.init()
-        log.record("app_launched")
+        log.record("app_launched", code: DiagnosticLog.maximumLines)
         if let data = UserDefaults.standard.data(forKey: "watchSnapshot") {
             do { snapshot = try JSONDecoder().decode(WatchSnapshot.self, from: data) }
             catch { log.record("watch_snapshot_failed", error: error) }

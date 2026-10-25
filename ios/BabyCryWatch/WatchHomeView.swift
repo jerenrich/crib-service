@@ -166,7 +166,7 @@ struct WatchSetupView: View {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 8) {
                             if !model.log.persistenceAvailable { Text("Log storage unavailable").foregroundStyle(.orange) }
-                            Text(model.log.export).font(.system(.caption2, design: .monospaced))
+                            Text(model.log.previewExport).font(.system(.caption2, design: .monospaced))
                         }
                     }.navigationTitle("Diagnostics")
                 }

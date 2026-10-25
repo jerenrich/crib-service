@@ -68,7 +68,7 @@ struct DebugView: View {
                 Button("Copy log") { UIPasteboard.general.string = model.log.export }
                 ShareLink("Export diagnostic log", item: model.log.export)
                 Text("The export also includes up to 30 days of Listener battery-drain samples for calibration.").font(.footnote)
-                Text(model.log.recentExport).font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
+                Text(model.log.previewExport).font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
             }
         }.accessibilityIdentifier("diagnosticsForm").navigationTitle("Diagnostics")
     }
