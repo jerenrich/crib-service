@@ -18,13 +18,20 @@ import SwiftUI
     private struct TestMetadata: AlarmMetadata {}
 
     var body: some View {
+        Group {
+            manualTest
+            RemoteSilentAlarmSection()
+        }
+    }
+
+    private var manualTest: some View {
         Section {
             if alarm != nil {
                 Button("Cancel / stop test alarm", role: .destructive) { cancel() }
                     .accessibilityIdentifier("cancelAlarmTest")
                     .disabled(busy)
             } else {
-                Button("Test alarm in 5 seconds") {
+                Button("Test silent alarm in 5 seconds") {
                     Task { await schedule() }
                 }
                 .accessibilityIdentifier("startAlarmTest")
@@ -43,9 +50,9 @@ import SwiftUI
                 Button("Retry alarm status") { refresh() }
             }
         } header: {
-            Text("System alarm test")
+            Text("Silent alarm experiment")
         } footer: {
-            Text("Schedules one alarm five seconds after permission is granted. It may sound on this iPhone, even in Silent Mode or Focus. Wear your paired Watch to check its vibration and sound; Apple controls delivery and haptics. The alarm remains scheduled if you close Settings or lock this iPhone. Stop it in the alarm alert or return here to cancel. This test does not trigger from crying.")
+            Text("Uses a bundled silent tone. Tap Test, then immediately lock this iPhone to check wrist delivery. Wear your Watch unlocked in Silent Mode with Prominent haptics. Check that both speakers stay silent and wrist taps repeat until stopped. Experimental: the system may still play a fallback sound, so first test while your partner is awake. The alarm stays scheduled if you leave Settings or lock the phone. Stop it in the alarm alert or return here to cancel. This test does not trigger from crying.")
         }
         .task {
             let updates = AlarmManager.shared.alarmUpdates
@@ -106,19 +113,26 @@ import SwiftUI
                 status = "Alarm permission is required. No test alarm scheduled."
                 return
             }
+            // Never deliberately fall back to the audible default if packaging fails.
+            guard Bundle.main.url(forResource: "AlarmTestSilence", withExtension: "caf") != nil else {
+                status = "No test alarm scheduled."
+                error = "The silent tone is missing from this build. Reinstall the updated app before testing."
+                return
+            }
             // Schedule after the permission prompt, so the parent gets all five seconds.
             let presentation = AlarmPresentation(alert: .init(
-                title: "Crib Service test alarm",
+                title: "Crib Service silent alarm test",
                 stopButton: AlarmButton(text: "Stop", textColor: .white, systemImageName: "stop.circle")
             ))
             let attributes = AlarmAttributes<TestMetadata>(presentation: presentation, metadata: TestMetadata(), tintColor: .mint)
             let configuration = AlarmManager.AlarmConfiguration<TestMetadata>.alarm(
                 schedule: .fixed(Date().addingTimeInterval(5)),
                 attributes: attributes,
-                sound: .default
+                // Include the extension: an unresolved name can play a system tone.
+                sound: .named("AlarmTestSilence.caf")
             )
             alarm = try await manager.schedule(id: Self.alarmID, configuration: configuration)
-            status = "Test alarm scheduled for five seconds from now."
+            status = "Silent-tone test scheduled in five seconds. Lock this iPhone now and check your Watch."
         } catch {
             status = "Test alarm could not be scheduled."
             self.error = error.localizedDescription
@@ -137,6 +151,30 @@ import SwiftUI
             status = "Test alarm cancelled."
         } catch {
             self.error = "Could not cancel test alarm: \(error.localizedDescription)"
+        }
+    }
+}
+
+@available(iOS 26.0, *)
+private struct RemoteSilentAlarmSection: View {
+    @State private var experiment = SilentAlarmExperiment.shared
+    var body: some View {
+        Section {
+            SwiftUI.TimelineView(.periodic(from: .now, by: 1)) { context in
+                if let until = experiment.armedUntil, until > context.date {
+                    Text("Armed until \(until.formatted(date: .omitted, time: .standard))")
+                    Button("Disarm remote test") { experiment.disarm() }
+                } else {
+                    Button("Arm Listener test for 10 minutes") { Task { await experiment.arm() } }
+                        .disabled(experiment.busy)
+                        .accessibilityIdentifier("armSilentAlarmTest")
+                }
+            }
+            Text(experiment.status).font(.footnote)
+                .accessibilityIdentifier("remoteSilentAlarmStatus")
+            Button("Cancel remote test alarms", role: .destructive) { experiment.cancelAlarms() }
+        } header: { Text("Locked-phone delivery experiment") } footer: {
+            Text("Arm here, lock this iPhone, then use Listener Settings → Diagnostics & simulation → Send silent alarm test to Parent. The test sends one notification without a sound and requests background execution to schedule a silent alarm three seconds later. iOS may delay or omit background execution. Keep your Watch worn, unlocked and in Silent Mode. This does not enable alarms for real crying. First test while your partner is awake; system fallback sounds remain possible.")
         }
     }
 }

@@ -158,6 +158,14 @@ import Observation
         let age = Int64(observed.rounded()) - Int64(created.rounded())
         append("alert_outbox phase=\(phase) event_id=\(alert.eventId.uuidString.lowercased()) generated_at_ms=\(Int64(created.rounded())) observed_at_ms=\(Int64(observed.rounded())) age_ms=\(age)" + extra + (age < 0 ? " clock_order=check" : ""))
     }
+    func silentAlarmTest(phase: String, eventID: UUID? = nil, appActive: Bool, protectedDataAvailable: Bool) {
+        guard ["armed", "disarmed", "received", "ignored", "duplicate", "scheduled", "failed", "cancelled", "send_started", "send_accepted", "send_failed"].contains(phase) else { return }
+        append("silent_alarm_test phase=\(phase) app_active=\(appActive) protected_data_available=\(protectedDataAvailable)" + (eventID.map { " event_id=\($0.uuidString.lowercased())" } ?? ""))
+    }
+    func silentCryAlarm(phase: String, eventID: UUID? = nil, appActive: Bool) {
+        guard ["received", "scheduled", "ignored", "duplicate", "failed", "snoozed", "ack_pending", "acknowledged"].contains(phase) else { return }
+        append("silent_cry_alarm phase=\(phase) app_active=\(appActive)" + (eventID.map { " event_id=\($0.uuidString.lowercased())" } ?? ""))
+    }
     func watchAlert(_ trace: WatchAlertTrace) {
         watchAlerts([trace])
     }

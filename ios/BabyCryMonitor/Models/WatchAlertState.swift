@@ -15,10 +15,12 @@ import Observation
     private var mutedUntil: Date?
     private var localMutedUntil: Date?
     private var pendingAcknowledgements: [UUID]
+    private var pendingTests: [String: Bool]
 
     init(defaults: UserDefaults = .standard, currentTime: @escaping () -> Date = Date.init) {
         self.defaults = defaults
         self.currentTime = currentTime
+        pendingTests = defaults.dictionary(forKey: "pendingAcknowledgementTests") as? [String: Bool] ?? [:]
         snoozeDuration = defaults.object(forKey: "snoozeDuration") as? Double ?? 60
         mutedUntil = defaults.object(forKey: "cryAlertsMutedUntil") as? Date
         localMutedUntil = defaults.object(forKey: "localCryAlertsMutedUntil") as? Date
@@ -61,6 +63,7 @@ import Observation
         acknowledgedEpisodes.append(value.episodeId)
         acknowledgedEpisodes = Array(acknowledgedEpisodes.suffix(100))
         pendingAcknowledgements.append(value.eventId)
+        pendingTests[value.eventId.uuidString] = value.isTest
         // A real Snooze applies to all crying episodes, including older alerts.
         // Test acknowledgements affect only that test.
         if !value.isTest {
@@ -100,6 +103,7 @@ import Observation
     func confirmAcknowledgement(_ eventID: UUID?) {
         guard let eventID, pendingAcknowledgements.contains(eventID) else { return }
         pendingAcknowledgements.removeAll { $0 == eventID }
+        pendingTests.removeValue(forKey: eventID.uuidString)
         persist()
         retryPendingAcknowledgement()
     }
@@ -108,7 +112,7 @@ import Observation
     /// The transport may be unavailable; retain each event until the Parent confirms it.
     func retryPendingAcknowledgement() {
         guard let eventID = pendingAcknowledgements.first else { return }
-        sendAcknowledgement?(WatchCommand(kind: .acknowledge, eventId: eventID))
+        sendAcknowledgement?(WatchCommand(kind: .acknowledge, eventId: eventID, isTest: pendingTests[eventID.uuidString]))
     }
 
     private func isSuppressed(_ value: WatchCryAlert) -> Bool {
@@ -132,6 +136,8 @@ import Observation
         defaults.set(localMutedUntil, forKey: "localCryAlertsMutedUntil")
         defaults.set(acknowledgedEpisodes.map(\.uuidString), forKey: "acknowledgedEpisodes")
         defaults.set(pendingAcknowledgements.map(\.uuidString), forKey: "pendingAcknowledgements")
+        pendingTests = pendingTests.filter { key, _ in pendingAcknowledgements.contains { $0.uuidString == key } }
+        defaults.set(pendingTests, forKey: "pendingAcknowledgementTests")
         defaults.removeObject(forKey: "pendingAcknowledgement")
     }
 }

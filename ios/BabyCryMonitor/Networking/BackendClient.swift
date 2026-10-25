@@ -5,6 +5,7 @@ struct ParentStatus: Codable, Sendable {
     var pairingID: String?
     var watchPushRegistered: Bool?
     var phonePushRegistered: Bool?
+    var silentWatchAlarmsEnabled: Bool? = nil
     var connectionAlertsEnabled: Bool?
     var alertsMutedUntil: Date?
     var listenerConfiguration: MonitoringConfiguration?
@@ -95,10 +96,14 @@ protocol BackendServing: AlertSending {
     func connectionAlerts(_ enabled: Bool) async throws
     func requestTestPush() async throws
     func sendWatchTest() async throws
+    func sendSilentAlarmTest() async throws -> UUID
+    func silentWatchAlarms(_ enabled: Bool) async throws
     func unpair() async throws
     func deleteDevice() async throws
 }
 extension BackendServing {
+    func silentWatchAlarms(_ enabled: Bool) async throws { throw BackendError.message("Silent Watch alarms require an updated connection service.") }
+    func sendSilentAlarmTest() async throws -> UUID { throw BackendError.message("Silent alarm testing requires an updated connection service.") }
     func sendWatchTest() async throws { throw BackendError.message("Watch test mode requires an updated connection service.") }
     func resumeAlerts(until: Date) async throws { throw BackendError.message("Resume alerts requires an updated connection service.") }
     func setMonitoring(_ enabled: Bool, id: UUID) async throws -> MonitoringCommand { throw BackendError.message("Monitoring controls require an updated connection service.") }
@@ -114,6 +119,7 @@ struct BackendClient: BackendServing {
     let credential: DeviceCredential
     var log: DiagnosticLog? = nil
     var session: URLSession = .shared
+    var requestTimeout: TimeInterval = 20
     func register() async throws {
         struct Registration: Codable { let deviceId: UUID; let role: DeviceRole; let secret: String }
         let _: EmptyResponse = try await request("/v1/device/register", body: Registration(deviceId: credential.deviceId, role: credential.role, secret: credential.secret))
@@ -143,6 +149,14 @@ struct BackendClient: BackendServing {
     func sendWatchTest() async throws {
         let _: EmptyResponse = try await request("/v1/watch-test/push", body: [String:String]())
     }
+    func sendSilentAlarmTest() async throws -> UUID {
+        struct Receipt: Decodable { let eventId: UUID }
+        let receipt: Receipt = try await request("/v1/listener/silent-alarm-test", body: [String:String]())
+        return receipt.eventId
+    }
+    func silentWatchAlarms(_ enabled: Bool) async throws {
+        let _: EmptyResponse = try await request("/v1/silent-watch-alarms", body: ["enabled": enabled])
+    }
     func unpair() async throws { let _: EmptyResponse = try await request("/v1/pairing/remove", body: [String:String]()) }
     func deleteDevice() async throws {
         // A lost success response leaves a revoked credential. Retrying deletion is safe.
@@ -159,13 +173,13 @@ struct BackendClient: BackendServing {
         guard baseURL.scheme == "https", baseURL.host != nil, baseURL.user == nil, baseURL.password == nil,
               baseURL.query == nil, baseURL.fragment == nil else { throw BackendError.message("Set a valid HTTPS backend URL in Settings.") }
         var request = URLRequest(url: baseURL.appendingPathComponent(String(path.dropFirst())))
-        request.httpMethod = method; request.timeoutInterval = 20
+        request.httpMethod = method; request.timeoutInterval = requestTimeout
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(credential.deviceId.uuidString.lowercased()).\(credential.secret)", forHTTPHeaderField: "Authorization")
         let operation = ["/v1/device/register": "register", "/v1/pairing/create": "pairing_create", "/v1/pairing/claim": "pairing_claim",
                          "/v1/device/push-token": "push_token", "/v1/device/watch-push-token": "watch_token",
                          "/v1/listener/heartbeat": "heartbeat", "/v1/listener/event": "alert", "/v1/listener/status": "status",
-                         "/v1/timeline": "timeline", "/v1/monitoring": "monitoring", "/v1/monitoring/complete": "monitoring_complete", "/v1/settings": "settings", "/v1/alert/acknowledge": "acknowledge", "/v1/test-push": "test_push", "/v1/watch-test": "test_push", "/v1/watch-test/push": "test_push", "/v1/alert/resume": "resume_alerts",
+                         "/v1/timeline": "timeline", "/v1/monitoring": "monitoring", "/v1/monitoring/complete": "monitoring_complete", "/v1/settings": "settings", "/v1/alert/acknowledge": "acknowledge", "/v1/test-push": "test_push", "/v1/watch-test": "test_push", "/v1/watch-test/push": "test_push", "/v1/listener/silent-alarm-test": "test_push", "/v1/alert/resume": "resume_alerts",
                          "/v1/connection-alerts": "connection_preferences", "/v1/pairing/remove": "unpair", "/v1/device/delete": "delete_device"][path] ?? "unknown"
         // Generated for each transport attempt, before receiving any response.
         // It is diagnostic correlation only; the event UUID remains idempotency authority.

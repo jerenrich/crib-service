@@ -7,6 +7,23 @@ import XCTest
 #endif
 
 final class WatchAlertStateTests: XCTestCase {
+    @MainActor func testDurableAcknowledgementsKeepRealAndTestClassification() throws {
+        let fixture = try Fixture()
+        var state = fixture.makeState()
+        let real = fixture.alert()
+        let test = WatchCryAlert(eventId: UUID(), episodeId: UUID(), startedAt: Date(), createdAt: Date(), duration: 0, isTest: true)
+        state.handleNotification(real, acknowledging: true)
+        state.handleNotification(test, acknowledging: true)
+        state = fixture.makeState()
+        fixture.activated = true
+        state.retryPendingAcknowledgement()
+        XCTAssertEqual(fixture.commands.last?.isTest, false)
+        state.confirmAcknowledgement(real.eventId)
+        XCTAssertEqual(fixture.commands.last?.isTest, true)
+        state.confirmAcknowledgement(test.eventId)
+        XCTAssertTrue((fixture.defaults.dictionary(forKey: "pendingAcknowledgementTests") ?? [:]).isEmpty)
+    }
+
     @MainActor func testEarlyResumeAllowsNewRemindersButKeepsOldNotificationsDismissed() throws {
         let fixture = try Fixture()
         var now = Date()

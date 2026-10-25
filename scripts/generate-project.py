@@ -19,13 +19,13 @@ for name in ['Debug', 'Release']:
 for name, folder, kind in [('BabyCryMonitor', 'BabyCryMonitor', 'application'), ('BabyCryMonitorTests', 'BabyCryMonitorTests', 'bundle.unit-test'), ('BabyCryMonitorUITests', 'BabyCryMonitorUITests', 'bundle.ui-testing')]:
     sourceRefs = []; sourceBuilds = []; resourceBuilds = []
     files = sorted((ios/folder).rglob('*.swift'))
-    if kind == 'application': files += [ios/folder/'Assets.xcassets', ios/folder/'PrivacyInfo.xcprivacy', ios/folder/'Info.plist', ios/folder/'BabyCryMonitor.entitlements']
+    if kind == 'application': files += [ios/folder/'Assets.xcassets', ios/folder/'PrivacyInfo.xcprivacy', ios/folder/'Info.plist', ios/folder/'BabyCryMonitor.entitlements'] + sorted((ios/folder/'Resources').glob('*.caf'))
     for path in files:
         rel = path.relative_to(ios).as_posix()
-        filetype = {'swift':'sourcecode.swift', 'xcassets':'folder.assetcatalog', 'xcprivacy':'text.xml', 'plist':'text.plist.xml', 'entitlements':'text.plist.entitlements'}[path.suffix[1:]]
+        filetype = {'swift':'sourcecode.swift', 'xcassets':'folder.assetcatalog', 'xcprivacy':'text.xml', 'plist':'text.plist.xml', 'entitlements':'text.plist.entitlements', 'caf':'file'}[path.suffix[1:]]
         ref = obj('file'+rel, fields(isa='PBXFileReference', lastKnownFileType=filetype, path=q(rel), sourceTree=q('<group>'))); sourceRefs.append(ref)
         if path.suffix == '.swift': sourceBuilds.append(obj('build'+rel, fields(isa='PBXBuildFile', fileRef=ref)))
-        elif path.suffix in ['.xcassets', '.xcprivacy']: resourceBuilds.append(obj('build'+rel, fields(isa='PBXBuildFile', fileRef=ref)))
+        elif path.suffix in ['.xcassets', '.xcprivacy', '.caf']: resourceBuilds.append(obj('build'+rel, fields(isa='PBXBuildFile', fileRef=ref)))
     refs.append(obj('group'+name, fields(isa='PBXGroup', name=q(name), children=array(sourceRefs), sourceTree=q('<group>'))))
     product = obj('product'+name, fields(isa='PBXFileReference', explicitFileType='wrapper.application' if kind == 'application' else 'wrapper.cfbundle', includeInIndex='0', path=q(name+('.app' if kind == 'application' else '.xctest')), sourceTree='BUILT_PRODUCTS_DIR'))
     products.append(product)
@@ -49,14 +49,15 @@ for name, folder, kind in [('BabyCryMonitor', 'BabyCryMonitor', 'application'), 
 # Modern, single-target watchOS companion; shared messages stay Foundation-only.
 watchName = 'BabyCryWatch'
 watchFiles = sorted((ios/watchName).rglob('*.swift')) + [ios/'BabyCryMonitor/Utilities/DiagnosticLog.swift', ios/'BabyCryMonitor/Utilities/ConnectionWarningNotification.swift', ios/'BabyCryMonitor/Utilities/NotificationCleanup.swift', ios/'BabyCryMonitor/Models/NotificationRelevance.swift', ios/'BabyCryMonitor/Models/Models.swift', ios/'BabyCryMonitor/Models/BatteryDrainLog.swift', ios/'BabyCryMonitor/Models/BackgroundBenchmark.swift', ios/'BabyCryMonitor/Models/Timeline.swift', ios/'BabyCryMonitor/Models/WatchMessages.swift', ios/'BabyCryMonitor/Models/WatchAlertTrace.swift', ios/'BabyCryMonitor/Models/DiagnosticTiming.swift', ios/'BabyCryMonitor/Models/WatchAlertState.swift', ios/'BabyCryMonitor/Models/WatchAlertSetup.swift', ios/watchName/'Info.plist', ios/watchName/'BabyCryWatch.entitlements', ios/watchName/'Assets.xcassets', ios/'BabyCryMonitor/PrivacyInfo.xcprivacy']
+watchFiles += sorted((ios/'BabyCryMonitor/Resources').glob('*.caf'))
 watchRefs = []; watchSources = []; watchResources = []
 for path in watchFiles:
     rel = path.relative_to(ios).as_posix()
-    filetype = {'swift':'sourcecode.swift', 'xcassets':'folder.assetcatalog', 'xcprivacy':'text.xml', 'plist':'text.plist.xml', 'entitlements':'text.plist.entitlements'}[path.suffix[1:]]
+    filetype = {'swift':'sourcecode.swift', 'xcassets':'folder.assetcatalog', 'xcprivacy':'text.xml', 'plist':'text.plist.xml', 'entitlements':'text.plist.entitlements', 'caf':'file'}[path.suffix[1:]]
     ref = obj('file'+rel, fields(isa='PBXFileReference', lastKnownFileType=filetype, path=q(rel), sourceTree=q('<group>')))
     if rel.startswith(watchName+'/'): watchRefs.append(ref)
     if path.suffix == '.swift': watchSources.append(obj('watchbuild'+rel, fields(isa='PBXBuildFile', fileRef=ref)))
-    elif path.suffix in ['.xcassets', '.xcprivacy']: watchResources.append(obj('watchbuild'+rel, fields(isa='PBXBuildFile', fileRef=ref)))
+    elif path.suffix in ['.xcassets', '.xcprivacy', '.caf']: watchResources.append(obj('watchbuild'+rel, fields(isa='PBXBuildFile', fileRef=ref)))
 refs.append(obj('group'+watchName, fields(isa='PBXGroup', name=watchName, children=array(watchRefs), sourceTree=q('<group>'))))
 watchProduct = obj('product'+watchName, fields(isa='PBXFileReference', explicitFileType='wrapper.application', includeInIndex='0', path=q(watchName+'.app'), sourceTree='BUILT_PRODUCTS_DIR'))
 products.append(watchProduct)

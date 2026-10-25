@@ -89,6 +89,13 @@ extension NotificationProviding {
         try await ConnectionWarningNotification.apply(deadline: deadline)
     }
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
+        if let request = SilentCryAlarmRequest(payload: notification.request.content.userInfo) {
+            if #available(iOS 26.0, *) { _ = await SilentCryAlarmService.shared.receive(request) }
+        }
+        if let request = SilentAlarmTestRequest(payload: notification.request.content.userInfo) {
+            if #available(iOS 26.0, *) { _ = await SilentAlarmExperiment.shared.receive(request) }
+            return []
+        }
         await refresh()
         return notification.request.content.userInfo["localConnectionWarning"] as? Bool == true
             ? [.banner, .list, .sound] : [.banner, .list]
@@ -108,6 +115,17 @@ extension NotificationProviding {
 }
 @MainActor final class AppDelegate: NSObject, UIApplicationDelegate {
     var notifications: (any NotificationProviding)?
+    func application(_ application: UIApplication, didReceiveRemoteNotification userInfo: [AnyHashable: Any]) async -> UIBackgroundFetchResult {
+        if let request = SilentCryAlarmRequest(payload: userInfo) {
+            if #available(iOS 26.0, *) { return await SilentCryAlarmService.shared.receive(request) ? .newData : .noData }
+            return .noData
+        }
+        guard let request = SilentAlarmTestRequest(payload: userInfo) else { return .noData }
+        if #available(iOS 26.0, *) {
+            return await SilentAlarmExperiment.shared.receive(request) ? .newData : .noData
+        }
+        return .noData
+    }
     func application(_ application: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) { notifications?.registered(deviceToken) }
     func application(_ application: UIApplication, didFailToRegisterForRemoteNotificationsWithError error: Error) {
         (notifications as? NotificationService)?.log?.record("push_registration_failed", error: error)

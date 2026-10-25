@@ -5,7 +5,7 @@ import worker from '../src/index';
 import {defaultConfiguration,type Env,type Alert} from '../src/types';
 import {payload,apnsToken} from '../src/apns';
 import {encryptToken,decryptToken,sha256} from '../src/security';
-import {flushPending} from '../src/alerts';
+import {flushPending,dispatchEvent} from '../src/alerts';
 import {eventReference,recordDiagnostic} from '../src/diagnostics';
 import {flushConnections} from '../src/connections';
 import {soundFrame} from '../src/live-sound';
@@ -1786,6 +1786,154 @@ describe('slow initial upload checkpoints',()=>{
  it('drops arbitrary correlation and stage strings at the privacy boundary',async()=>{
   const {safeTimingDetails}=await import('../src/latency');
   expect(safeTimingDetails({client_request_id:'private-marker',in_flight_span:'private-marker',in_flight_ms:-1} as unknown as import('../src/latency').TimingDetails)).toBeNull();
+ });
+});
+
+
+describe('Listener-originated silent alarm experiment',()=>{
+ it('requires a paired Listener and a registered Parent phone token',async()=>{
+  const {parent,listener}=await paired();
+  expect((await call('listener/silent-alarm-test',parent)).status).toBe(403);
+  expect((await call('listener/silent-alarm-test',listener)).status).toBe(409);
+  const unpaired=device('listener');await register(unpaired);
+  expect((await call('listener/silent-alarm-test',unpaired)).status).toBe(409);
+  expect(pushRequests).toHaveLength(0);
+ });
+ it('sends one labelled soundless alert to the phone even when a Watch token exists, without creating episodes or reminders',async()=>{
+  const {parent,listener}=await paired();
+  await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
+  mockPush();const response=await call('listener/silent-alarm-test',listener);
+  expect(response.status).toBe(200);
+  const receipt=await response.json() as {eventId:string};
+  expect(pushRequests).toHaveLength(1);
+  expect(pushRequests[0].url).toContain('ab'.repeat(32));
+  const headers=pushRequests[0].init?.headers as Record<string,string>;
+  expect(headers['apns-topic']).toBe(testEnv.APNS_BUNDLE_ID);
+  expect(headers['apns-push-type']).toBe('alert');
+  expect(headers['apns-priority']).toBe('10');
+  const content=JSON.parse(String(pushRequests[0].init?.body));
+  expect(content.eventId).toBe(receipt.eventId);
+  expect(content.isTest).toBe(true);expect(content.silentAlarmTest).toBe(true);
+  expect(content.aps['content-available']).toBe(1);
+  expect(content.aps.alert.title).toContain('Test');
+  expect(content.aps.sound).toBeUndefined();
+  expect(content.aps.category).toBe('SILENT_ALARM_TEST');
+  expect((await env.DB.prepare('SELECT COUNT(*) AS n FROM events').first<{n:number}>())?.n).toBe(0);
+  const row=await env.DB.prepare("SELECT target,outcome FROM diagnostics WHERE operation='silent_alarm_test_dispatch'").first<{target:string;outcome:string}>();
+  expect(row).toMatchObject({target:'phone',outcome:'sent'});
+ });
+ it('does not retry an ambiguous send or schedule a real reminder',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  pushResponses.push(new Error('network unavailable'));
+  expect((await call('listener/silent-alarm-test',listener)).status).toBe(503);
+  await flushPending(testEnv);
+  expect(pushRequests).toHaveLength(1);
+  expect((await env.DB.prepare('SELECT COUNT(*) AS n FROM events').first<{n:number}>())?.n).toBe(0);
+ });
+});
+
+
+describe('optional overnight silent Watch alarms',()=>{
+ async function setup(){
+  const pair=await paired();
+  await call('device/push-token',pair.parent,{token:'ab'.repeat(32)});
+  await call('device/watch-push-token',pair.parent,{token:'cd'.repeat(32)});
+  return pair;
+ }
+ function fanout(watchStatus=200,phoneStatus=200){
+  vi.stubGlobal('fetch',vi.fn(async(input:string|URL|Request,init?:RequestInit)=>{
+   pushRequests.push({url:String(input),init});
+   const isWatch=(init?.headers as Record<string,string>)['apns-topic'].endsWith('.watchkitapp');
+   const status=isWatch?watchStatus:phoneStatus;
+   return new Response(status===200?'':JSON.stringify({reason:'ServiceUnavailable'}),{status});
+  }));
+ }
+ it('defaults off and only a paired Parent can enable it with a boolean',async()=>{
+  const {parent,listener}=await setup();
+  expect((await (await call('listener/status',parent,undefined,'GET')).json() as {silentWatchAlarmsEnabled:boolean}).silentWatchAlarmsEnabled).toBe(false);
+  expect((await call('silent-watch-alarms',listener,{enabled:true})).status).toBe(403);
+  expect((await call('silent-watch-alarms',parent,{enabled:'true'})).status).toBe(400);
+  await env.DB.prepare('UPDATE devices SET push_token=NULL WHERE id=?').bind(parent.deviceId).run();
+  expect((await call('silent-watch-alarms',parent,{enabled:true})).status).toBe(409);
+  await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  expect((await call('silent-watch-alarms',parent,{enabled:true})).status).toBe(200);
+  expect((await (await call('listener/status',parent,undefined,'GET')).json() as {silentWatchAlarmsEnabled:boolean}).silentWatchAlarmsEnabled).toBe(true);
+  fanout();await call('listener/event',listener,alert(listener));
+  expect(pushRequests).toHaveLength(2);
+  const bodies=pushRequests.map(r=>JSON.parse(String(r.init?.body)));
+  expect(bodies.find(b=>b.silentCryAlarm)?.aps['content-available']).toBe(1);
+  expect(bodies.find(b=>b.silentCryAlarm)?.aps.sound).toBeUndefined();
+  expect(bodies.find(b=>!b.silentCryAlarm)?.aps.sound).toBe('default');
+  expect(bodies[0].eventId).toBe(bodies[1].eventId);
+ });
+ it('keeps the original Watch notification successful if the additional phone push fails',async()=>{
+  const {parent,listener}=await setup();await call('silent-watch-alarms',parent,{enabled:true});
+  fanout(200,503);const event=alert(listener);
+  const response=await call('listener/event',listener,event);
+  expect(response.status).toBe(200);expect(await response.json()).toEqual({status:'sent'});
+  expect(pushRequests).toHaveLength(2);
+  expect(await env.DB.prepare('SELECT status,push_target FROM events WHERE event_id=?').bind(event.eventId).first()).toMatchObject({status:'sent',push_target:'watch'});
+  expect(await env.DB.prepare("SELECT outcome FROM diagnostics WHERE operation='silent_cry_alarm_dispatch'").first()).toMatchObject({outcome:'apns_503'});
+ });
+ it('returns the original send while an auxiliary send is stalled',async()=>{
+  const {parent,listener}=await setup();await call('silent-watch-alarms',parent,{enabled:true});
+  const event=alert(listener);
+  await env.DB.prepare('INSERT INTO events(event_id,episode_id,listener_id,parent_id,is_repeat,payload,created_at) VALUES(?,?,?,?,?,?,?)')
+   .bind(event.eventId,event.episodeId,listener.deviceId,parent.deviceId,0,JSON.stringify(event),Date.now()).run();
+  let release!:()=>void,phoneEntered=false;
+  const gate=new Promise<void>(r=>{release=r;});const jobs:Promise<unknown>[]=[];
+  vi.stubGlobal('fetch',vi.fn(async(input:string|URL|Request,init?:RequestInit)=>{
+   pushRequests.push({url:String(input),init});
+   if(!(init?.headers as Record<string,string>)['apns-topic'].endsWith('.watchkitapp')){phoneEntered=true;await gate;}
+   return new Response('',{status:200});
+  }));
+  try{
+   await dispatchEvent(testEnv,event.eventId,undefined,undefined,{background:{waitUntil:job=>{jobs.push(job);}}});
+   expect(phoneEntered).toBe(true);expect(jobs).toHaveLength(1);
+   expect(await env.DB.prepare('SELECT status FROM events WHERE event_id=?').bind(event.eventId).first()).toMatchObject({status:'sent'});
+  }finally{release();await Promise.all(jobs);}
+ });
+ it('adds processing to the existing phone notification without duplicating it when Watch routing is absent',async()=>{
+  const {parent,listener}=await setup();await call('device/watch-push-token',parent,{token:null});
+  await call('silent-watch-alarms',parent,{enabled:true});fanout();
+  await call('listener/event',listener,alert(listener));expect(pushRequests).toHaveLength(1);
+  const body=JSON.parse(String(pushRequests[0].init?.body));
+  expect(body.silentCryAlarm).toBe(true);expect(body.aps['content-available']).toBe(1);
+  expect(body.aps.category).toBe('BABY_CRY_ALERT');expect(body.aps.sound).toBeUndefined();
+ });
+ it('does not add alarms when disabled, for tests, or for acknowledged events',async()=>{
+  const {parent,listener}=await setup();fanout();
+  await call('listener/event',listener,alert(listener));expect(pushRequests).toHaveLength(1);
+  await call('silent-watch-alarms',parent,{enabled:true});
+  const test={...alert(listener),isTest:true};await call('listener/event',listener,test);
+  expect(pushRequests).toHaveLength(2);
+  const event=alert(listener);await call('listener/event',listener,event);expect(pushRequests).toHaveLength(4);
+  await call('alert/acknowledge',parent,{eventId:event.eventId});
+  await dispatchEvent(testEnv,event.eventId);expect(pushRequests).toHaveLength(4);
+  await call('silent-watch-alarms',parent,{enabled:false});
+  expect((await (await call('listener/status',parent,undefined,'GET')).json() as {silentWatchAlarmsEnabled:boolean}).silentWatchAlarmsEnabled).toBe(false);
+ });
+ it('retains silent alarm fan-out when recovering an owned claim with a delayed reply',async()=>{
+  const {parent,listener}=await setup();await call('silent-watch-alarms',parent,{enabled:true});
+  const event=alert(listener);
+  await env.DB.prepare('INSERT INTO events(event_id,episode_id,listener_id,parent_id,is_repeat,payload,created_at) VALUES(?,?,?,?,?,?,?)')
+   .bind(event.eventId,event.episodeId,listener.deviceId,parent.deviceId,0,JSON.stringify(event),Date.now()).run();
+  let release!:()=>void,entered!:()=>void;const gate=new Promise<void>(r=>{release=r;}),ready=new Promise<void>(r=>{entered=r;});
+  const db=interceptDB(async(sql,_args,method,execute)=>{const result=await execute();if(method==='batch'&&sql.startsWith('UPDATE events SET resolved_at=')){entered();await gate;}return result;});
+  const {Latency}=await import('../src/latency');const latency=new Latency();fanout();
+  const running=dispatchEvent({...testEnv,DB:db},event.eventId,undefined,latency);await ready;
+  try {
+   await Promise.race([running,new Promise<never>((_,reject)=>setTimeout(()=>reject(new Error('Owned claim fan-out stalled')),1000))]);
+   expect(latency.details.claim_result_source).toBe('receipt');expect(pushRequests).toHaveLength(2);
+   expect(pushRequests.map(r=>JSON.parse(String(r.init?.body))).filter(b=>b.silentCryAlarm)).toHaveLength(1);
+  }finally{release();await running;}
+ });
+ it('preserves the Watch notification when the Parent has no phone token',async()=>{
+  const {parent,listener}=await setup();await call('silent-watch-alarms',parent,{enabled:true});
+  await env.DB.prepare('UPDATE devices SET push_token=NULL WHERE id=?').bind(parent.deviceId).run();
+  fanout();await call('listener/event',listener,alert(listener));expect(pushRequests).toHaveLength(1);
+  expect(JSON.parse(String(pushRequests[0].init?.body)).silentCryAlarm).toBeUndefined();
  });
 });
 

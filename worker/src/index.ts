@@ -1,4 +1,4 @@
-import {retiredWatchTest,sendWatchTest} from './watch-test';
+import {retiredWatchTest,sendWatchTest,sendSilentAlarmTest} from './watch-test';
 import {requestMonitoring,completeMonitoring} from './monitoring';
 import {timeline} from './timeline';
 export {AlertReminders} from './reminders';
@@ -6,7 +6,7 @@ export {LiveSound} from './live-sound';
 import {openLiveSound} from './live-sound';
 import {APIError,type Env} from './types';
 import {body,rateLimit} from './security';
-import {admitAlert,authenticate,register,savePushToken,saveWatchPushToken,removeDeviceData,pairFor} from './devices';
+import {admitAlert,authenticate,register,savePushToken,saveWatchPushToken,saveSilentWatchAlarms,removeDeviceData,pairFor} from './devices';
 import {connectionPreferences,flushConnections} from './connections';
 import {createPairing,claimPairing} from './pairing';
 import {receiveAlert,acknowledge,resumeAlerts,flushPending} from './alerts';
@@ -66,10 +66,16 @@ export default {
      case 'POST /v1/pairing/claim':result=await claimPairing(env,device,await body(request),ip);break;
      case 'POST /v1/device/push-token':result=await savePushToken(env,device,await body(request));break;
      case 'POST /v1/device/watch-push-token':result=await saveWatchPushToken(env,device,await body(request));break;
+     case 'POST /v1/silent-watch-alarms':result=await saveSilentWatchAlarms(env,device,await body(request));break;
      case 'POST /v1/pairing/remove':result=await removeDeviceData(env,device);break;
      case 'POST /v1/device/delete':result=await removeDeviceData(env,device,true);break;
      case 'POST /v1/connection-alerts':result=await connectionPreferences(env,device,await body(request));break;
      case 'POST /v1/watch-test/push':result=await sendWatchTest(env,device,latency,requestId);break;
+     case 'POST /v1/listener/silent-alarm-test':{
+      if(device.role!=='listener')throw new APIError(403,'Only the Listener can send this test.');
+      await rateLimit(env,'silent-alarm-test',device.id,6,600);
+      result=await sendSilentAlarmTest(env,device,latency,requestId);break;
+     }
      case 'GET /v1/watch-test':result=retiredWatchTest(device);break;
      case 'POST /v1/watch-test':result=retiredWatchTest(device,await body(request));break;
      case 'POST /v1/test-push':{
@@ -103,10 +109,10 @@ export default {
    return await respond({error:expected?error.message:'Server configuration or storage unavailable.'},expected?error.status:503,expected?'rejected':'internal_error');
   }finally{stopProgress?.();}
  },
- async scheduled(_controller:ScheduledController,env:Env):Promise<void> {
+ async scheduled(_controller:ScheduledController,env:Env,ctx?:ExecutionContext):Promise<void> {
   const requestId=crypto.randomUUID(),started=Date.now(),latency=new Latency();
   try {
-   const results=await Promise.allSettled([flushPending(env,requestId,latency),latency.measure('maintenance_connections_ms',()=>flushConnections(env,requestId))]);
+   const results=await Promise.allSettled([flushPending(env,requestId,latency,ctx),latency.measure('maintenance_connections_ms',()=>flushConnections(env,requestId))]);
    if(results.some(result=>result.status==='rejected'))throw new Error('Maintenance failed.');
    await recordDiagnostic(env,{requestId,started,operation:'maintenance',stage:'handler',outcome:'ok',details:latency.details});
   } catch {
