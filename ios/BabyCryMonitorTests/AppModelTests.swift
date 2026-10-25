@@ -677,6 +677,44 @@ final class AppModelTests: XCTestCase {
         XCTAssertFalse(fixture.model.microphoneActive); XCTAssertFalse(fixture.model.standby)
         XCTAssertEqual(fixture.audio.starts, 0)
     }
+    @MainActor func testParentRemoteStartRequiresRecentStandbyAndConnectivity() throws {
+        let fixture = try Fixture()
+        fixture.model.selectRole(.parent)
+        fixture.model.paired = true
+        var status = ParentStatus(paired: true, lastHeartbeat: fixture.time.now,
+            monitoring: false, configuration: MonitoringConfiguration(), microphoneActive: true)
+        fixture.model.parentStatus = status
+        XCTAssertTrue(fixture.model.canStartMonitoringRemotely)
+        for microphone in [false, nil] as [Bool?] {
+            status.microphoneActive = microphone
+            fixture.model.parentStatus = status
+            XCTAssertFalse(fixture.model.canStartMonitoringRemotely)
+        }
+        status.microphoneActive = true
+        for age in [31.0, 180, -6] {
+            status.lastHeartbeat = fixture.time.now.addingTimeInterval(-age)
+            fixture.model.parentStatus = status
+            XCTAssertFalse(fixture.model.canStartMonitoringRemotely)
+        }
+        status.lastHeartbeat = nil
+        fixture.model.parentStatus = status
+        XCTAssertFalse(fixture.model.canStartMonitoringRemotely)
+        status.lastHeartbeat = fixture.time.now
+        fixture.model.parentStatus = status
+        fixture.connectivity.available = false
+        XCTAssertFalse(fixture.model.canStartMonitoringRemotely)
+        fixture.connectivity.available = true
+        XCTAssertTrue(fixture.model.canStartMonitoringRemotely)
+        status.monitoring = true
+        fixture.model.parentStatus = status
+        XCTAssertFalse(fixture.model.canStartMonitoringRemotely)
+        status.monitoring = false; status.paired = false
+        fixture.model.parentStatus = status
+        XCTAssertFalse(fixture.model.canStartMonitoringRemotely)
+        fixture.model.parentStatus = nil
+        XCTAssertFalse(fixture.model.canStartMonitoringRemotely)
+    }
+
     @MainActor func testParentDistinguishesStandbyOffAndStaleListener() async throws {
         let fixture = try Fixture(); fixture.model.selectRole(.parent)
         var status = ParentStatus(paired: true, lastHeartbeat: fixture.time.now,

@@ -31,9 +31,9 @@ struct ReadinessView: View {
                 check("Settings applied on nursery iPhone", passed: model.parentOnline && model.parentStatus?.listenerConfiguration == model.configuration)
                 powerCheck
                 if !model.parentOnline {
-                    Button(model.pendingMonitoringCommand != nil || model.requestingMonitoring ? "Starting…" : "Start monitoring") {
+                    Button(model.pendingMonitoringCommand != nil || model.requestingMonitoring ? "Starting…" : model.canStartMonitoringRemotely ? "Start Monitoring" : "Start on Nursery iPhone") {
                         Task { await model.requestMonitoring(true) }
-                    }.disabled(!model.paired || model.pendingMonitoringCommand != nil || model.requestingMonitoring)
+                    }.disabled(!model.canStartMonitoringRemotely || model.pendingMonitoringCommand != nil || model.requestingMonitoring)
                     if let error = model.monitoringControlError { Text(error).foregroundStyle(Palette.amber) }
                 }
                 Button(model.retryingConnection ? "Checking…" : "Refresh connection") { Task { await model.retryConnection() } }

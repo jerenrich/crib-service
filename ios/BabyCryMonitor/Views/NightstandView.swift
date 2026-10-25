@@ -28,6 +28,7 @@ struct NightstandView: View {
     private var confirmedParentState: Bool { ["Monitoring", "Standby", "Stopped"].contains(model.nurseryConnection) }
     private var standby: Bool { listener ? model.standby : confirmedParentState && model.parentStatus?.monitoring == false && model.parentStatus?.microphoneActive == true }
     private var monitoringActive: Bool { listener ? model.monitoring || model.recoveringAudio : confirmedParentState && model.parentStatus?.monitoring == true }
+    private var parentStartUnavailable: Bool { !listener && model.paired && !monitoringActive && !model.canStartMonitoringRemotely && model.pendingMonitoringCommand == nil }
     private var busy: Bool { listener ? model.starting : model.requestingMonitoring || model.pendingMonitoringCommand != nil }
     private var currentState: CryState? { listener ? model.state : soundLive ? frame?.state : nil }
     private var listenerAlertFailed: Bool {
@@ -411,10 +412,11 @@ struct NightstandView: View {
                 Label(controlTitle, systemImage: monitoringActive ? "pause" : "play")
                     .font(.headline).fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, minHeight: 52)
-                    .foregroundStyle(Palette.lavender).background(Palette.panel, in: RoundedRectangle(cornerRadius: 18))
+                    .foregroundStyle(parentStartUnavailable ? Palette.muted : Palette.lavender).background(Palette.panel, in: RoundedRectangle(cornerRadius: 18))
             }
-            .disabled(!model.paired || busy || model.managingDevice)
+            .disabled(!model.paired || busy || model.managingDevice || parentStartUnavailable)
             .accessibilityIdentifier("nightstandMonitoringControl")
+            .accessibilityHint(parentStartUnavailable ? "Open Crib Service on the nursery iPhone and start monitoring there." : "")
             HStack(alignment: .top, spacing: 16) {
                 if !model.paired {
                     Button(listener ? "Pair with Parent" : "Set up for tonight") { if listener { pairing = true } else { readiness = true } }
@@ -449,6 +451,7 @@ struct NightstandView: View {
     private var controlTitle: String {
         if listener && model.starting { return "Starting…" }
         if let command = model.pendingMonitoringCommand, !listener { return command.enabled ? "Starting…" : "Pausing…" }
+        if parentStartUnavailable { return "Start on Nursery iPhone" }
         return monitoringActive ? "Pause Monitoring" : "Start Monitoring"
     }
 

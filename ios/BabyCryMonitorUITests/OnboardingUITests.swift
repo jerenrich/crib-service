@@ -141,6 +141,27 @@ final class OnboardingUITests: XCTestCase {
         let shot = XCTAttachment(screenshot: app.screenshot()); shot.name = "Short nightly check"; shot.lifetime = .keepAlways; add(shot)
     }
 
+    @MainActor func testParentStartIsDisabledUnlessListenerHasRecentStandbyHeartbeat() {
+        let app = XCUIApplication()
+        for state in ["--uitesting-standby", "--uitesting-microphone-off", "--uitesting-listener-stale"] {
+            app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", state]
+            app.launch()
+            let control = app.buttons["nightstandMonitoringControl"]
+            XCTAssertTrue(control.waitForExistence(timeout: 5))
+            if state == "--uitesting-standby" {
+                XCTAssertEqual(control.label, "Start Monitoring")
+                XCTAssertTrue(control.isEnabled)
+            } else {
+                XCTAssertEqual(control.label, "Start on Nursery iPhone")
+                XCTAssertFalse(control.isEnabled)
+            }
+            if state == "--uitesting-listener-stale" {
+                XCTAssertTrue(app.buttons["Pause Monitoring"].isEnabled, "Cancelling alerts must remain available")
+            }
+            app.terminate()
+        }
+    }
+
     @MainActor func testBothModesShowPauseAndListenerPauseKeepsMicrophoneInStandby() {
         let app = XCUIApplication()
         for listener in [false, true] {
@@ -282,7 +303,7 @@ final class OnboardingUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-timeline", "--uitesting-monitoring-rejected"]
         app.launch()
-        let start = app.buttons["Start Monitoring"]
+        let start = app.buttons["nightstandMonitoringControl"]
         XCTAssertTrue(start.waitForExistence(timeout: 5))
         let chart = app.descendants(matching: .any)["soundLevelChart"].firstMatch
         let initialChartFrame = chart.frame

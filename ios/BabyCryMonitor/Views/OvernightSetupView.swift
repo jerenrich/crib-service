@@ -113,16 +113,16 @@ struct OvernightSetupView: View {
             let power = model.listenerPowerReadiness
             Label(power.title, systemImage: power.needsPower ? "battery.25percent" : "battery.100percent")
             Text(power.detail).font(.footnote)
-            Text("Leave the nursery iPhone plugged in with Crib Service open, then start monitoring. Wait for its microphone to be confirmed.")
+            Text("Leave the nursery iPhone plugged in and start monitoring in Crib Service on that iPhone. After pausing, you can resume from Parent while its microphone remains active in Standby.")
             if model.parentOnline {
                 Label("Nursery microphone confirmed active", systemImage: "checkmark.circle.fill").foregroundStyle(Palette.mint)
                 Text(model.settingsSyncStatus).font(.footnote)
                 Button("Finish setup") { model.completeBedtimeSetup(); dismiss() }
                     .accessibilityIdentifier("finishBedtimeSetup")
             } else {
-                Button(model.pendingMonitoringCommand != nil || model.requestingMonitoring ? "Starting…" : "Start monitoring") {
+                Button(model.pendingMonitoringCommand != nil || model.requestingMonitoring ? "Starting…" : model.canStartMonitoringRemotely ? "Start Monitoring" : "Start on Nursery iPhone") {
                     Task { await model.requestMonitoring(true) }
-                }.disabled(!model.paired || model.pendingMonitoringCommand != nil || model.requestingMonitoring)
+                }.disabled(!model.canStartMonitoringRemotely || model.pendingMonitoringCommand != nil || model.requestingMonitoring)
                 if let error = model.monitoringControlError { Text(error).foregroundStyle(Palette.amber) }
                 Button(model.retryingConnection ? "Checking…" : "Retry connection") { Task { await model.retryConnection() } }
                     .disabled(model.retryingConnection)

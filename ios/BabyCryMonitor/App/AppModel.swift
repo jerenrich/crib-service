@@ -252,7 +252,9 @@ import UIKit
         }
         if ProcessInfo.processInfo.arguments.contains("--uitesting-timeline") {
             seedTimelineForUITest()
-            if ProcessInfo.processInfo.arguments.contains("--uitesting-monitoring-rejected") { parentStatus?.monitoring = false }
+            if ProcessInfo.processInfo.arguments.contains("--uitesting-monitoring-rejected") {
+                parentStatus?.monitoring = false; parentStatus?.microphoneActive = true
+            }
         }
         if ProcessInfo.processInfo.arguments.contains("--uitesting-live-sound") {
             safetyAccepted = true; paired = true
@@ -267,7 +269,15 @@ import UIKit
             let status = ParentStatus(paired: true, pairingID: "ui-test-pair", watchPushRegistered: true, phonePushRegistered: true,
                 lastHeartbeat: now, monitoring: !paused, batteryLevel: 1, powerConnected: true,
                 state: .quiet, configuration: configuration, microphoneActive: true)
-            if role == .parent { parentStatus = status }
+            if role == .parent {
+                parentStatus = status
+                if ProcessInfo.processInfo.arguments.contains("--uitesting-microphone-off") {
+                    parentStatus?.monitoring = false; parentStatus?.microphoneActive = false
+                }
+                if ProcessInfo.processInfo.arguments.contains("--uitesting-listener-stale") {
+                    parentStatus?.lastHeartbeat = now.addingTimeInterval(-180)
+                }
+            }
             else { listenerPairStatus = status; listenerPairStatusReceivedAt = now }
             seedLiveSoundFrameForUITest()
             if ProcessInfo.processInfo.arguments.contains("--uitesting-active-alert") {
@@ -309,6 +319,16 @@ import UIKit
         guard let status = parentStatus, status.monitoring == true, let last = status.lastHeartbeat else { return false }
         return (-5...150).contains(now.timeIntervalSince(last))
     }
+    /// A recent Standby heartbeat is evidence that capture can be reused while
+    /// the Listener is locked. A stopped or unknown microphone needs local setup.
+    var canStartMonitoringRemotely: Bool {
+        guard role == .parent, paired, let status = parentStatus, status.paired,
+              status.monitoring == false, status.microphoneActive == true,
+              let heartbeat = status.lastHeartbeat,
+              !connectivity.checked || connectivity.available else { return false }
+        return (-5...30).contains(now.timeIntervalSince(heartbeat))
+    }
+
     var nurseryConnection: String {
         guard paired else { return "Not paired" }
         if let command = pendingMonitoringCommand { return command.enabled ? "Starting…" : "Pausing…" }
