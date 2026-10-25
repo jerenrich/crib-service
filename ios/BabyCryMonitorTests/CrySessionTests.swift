@@ -42,28 +42,83 @@ final class CrySessionTests: XCTestCase {
     func testCryShorterThanThreshold() {
         var s = Simulation(); s.run(180); s.run(25, loud: false)
         XCTAssertEqual(s.engine.snapshot.history.count, 1); XCTAssertTrue(s.emitted.isEmpty)
-        XCTAssertLessThan(s.engine.snapshot.history[0].duration(at: s.time), 180)
+        XCTAssertEqual(s.engine.snapshot.history[0].duration(at: s.time), 180, accuracy: 0.001)
     }
-    func testExactlyOneInitialAlertAndTimerStartsAtConfirmation() {
-        var s = Simulation(); s.run(304); XCTAssertTrue(s.emitted.isEmpty)
-        s.run(2); XCTAssertEqual(s.emitted.count, 1)
+    func testExactlyOneInitialAlertAndTimerStartsAtFirstLoudSample() {
+        var s = Simulation(); s.run(300); XCTAssertTrue(s.emitted.isEmpty)
+        s.run(0.25); XCTAssertEqual(s.emitted.count, 1)
         XCTAssertEqual(s.emitted[0].durationSeconds, 300, accuracy: 0.25)
         s.run(600); XCTAssertEqual(s.emitted.count, 1)
     }
-    func testFiveSecondAlertStartsAtConfirmationAndDoesNotRepeat() throws {
+    func testFiveSecondAlertIncludesConfirmationAndDoesNotRepeat() throws {
         var s = Simulation(); var config = MonitoringConfiguration(); config.alertDuration = 5
         s.engine.configure(config)
         s.run(5)
         let episode = try XCTUnwrap(s.engine.snapshot.current)
         XCTAssertTrue(s.emitted.isEmpty)
-        s.run(4.75)
-        XCTAssertTrue(s.emitted.isEmpty)
+        XCTAssertEqual(episode.startedAt, Date(timeIntervalSince1970: 1000.25))
         s.run(0.25)
         let alert = try XCTUnwrap(s.emitted.first)
         XCTAssertEqual(alert.cryStartedAt, episode.startedAt)
         XCTAssertEqual(alert.durationSeconds, 5, accuracy: 0.001)
         s.run(30)
         XCTAssertEqual(s.emitted.count, 1)
+    }
+    func testWarmDetectorUsesNewSoundOnsetWithoutAnAdditionalWait() throws {
+        var s = Simulation(); var config = MonitoringConfiguration(); config.alertDuration = 5
+        s.engine.configure(config); s.run(30, loud: false)
+        let onset = s.time.addingTimeInterval(0.25)
+        s.run(2.75)
+        XCTAssertNil(s.engine.snapshot.current)
+        XCTAssertTrue(s.emitted.isEmpty)
+        s.run(2.25)
+        XCTAssertEqual(s.engine.snapshot.current?.startedAt, onset)
+        XCTAssertTrue(s.emitted.isEmpty)
+        s.run(0.25)
+        let alert = try XCTUnwrap(s.emitted.first)
+        XCTAssertEqual(alert.cryStartedAt, onset)
+        XCTAssertEqual(alert.createdAt.timeIntervalSince(onset), 5)
+    }
+    func testRejectedNoiseDoesNotStartNextAlertTimer() throws {
+        var s = Simulation(); var config = MonitoringConfiguration(); config.alertDuration = 5
+        s.engine.configure(config)
+        s.run(2); s.run(2, loud: false)
+        XCTAssertNil(s.engine.snapshot.current)
+        let onset = s.time.addingTimeInterval(0.25)
+        s.run(5)
+        XCTAssertTrue(s.emitted.isEmpty)
+        s.run(0.25)
+        XCTAssertEqual(try XCTUnwrap(s.emitted.first).cryStartedAt, onset)
+    }
+    func testSubsecondPauseDuringConfirmationPreservesSoundOnset() throws {
+        var s = Simulation(); var config = MonitoringConfiguration(); config.alertDuration = 5
+        s.engine.configure(config)
+        let onset = s.time.addingTimeInterval(0.25)
+        s.run(2); s.run(0.5, loud: false); s.run(2.5)
+        XCTAssertTrue(s.emitted.isEmpty)
+        s.run(0.25)
+        XCTAssertEqual(try XCTUnwrap(s.emitted.first).cryStartedAt, onset)
+    }
+    func testQuietResetStartsNextTimerFromNewSound() throws {
+        var s = Simulation(); var config = MonitoringConfiguration(); config.alertDuration = 5
+        s.engine.configure(config); s.run(6); s.run(21, loud: false)
+        XCTAssertEqual(s.emitted.count, 1)
+        let onset = s.time.addingTimeInterval(0.25)
+        s.run(5)
+        XCTAssertEqual(s.emitted.count, 1)
+        s.run(0.25)
+        XCTAssertEqual(s.emitted.count, 2)
+        XCTAssertEqual(try XCTUnwrap(s.emitted.last).cryStartedAt, onset)
+    }
+    func testCaptureGapDiscardsUnconfirmedSoundOnset() throws {
+        var s = Simulation(); var config = MonitoringConfiguration(); config.alertDuration = 5
+        s.engine.configure(config); s.run(2)
+        s.time = s.time.addingTimeInterval(10)
+        let onset = s.time.addingTimeInterval(0.25)
+        s.run(5)
+        XCTAssertTrue(s.emitted.isEmpty)
+        s.run(0.25)
+        XCTAssertEqual(try XCTUnwrap(s.emitted.first).cryStartedAt, onset)
     }
     func testAlertDurationBounds() {
         var config = MonitoringConfiguration()
@@ -83,7 +138,7 @@ final class CrySessionTests: XCTestCase {
         XCTAssertTrue(s.engine.snapshot.history.isEmpty)
     }
     func testSettlesJustBeforeThresholdDoesNotAlertDuringTrailingGap() {
-        var s = Simulation(); s.run(303); s.run(30, loud: false)
+        var s = Simulation(); s.run(300); s.run(30, loud: false)
         XCTAssertTrue(s.emitted.isEmpty); XCTAssertEqual(s.engine.snapshot.history.count, 1)
     }
     func testQuietGapCrossesThresholdAndAlertsOnResumption() {

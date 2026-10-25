@@ -7,6 +7,9 @@ public protocol CryDetecting {
 public struct CryDetector: CryDetecting, Sendable {
     public private(set) var state: CryState = .quiet
     public private(set) var quietSince: Date?
+    /// First loud sample in the activity that passed confirmation. Confirmation
+    /// validates this start; it must not add another delay to the alert timer.
+    public private(set) var cryStartedAt: Date?
     private var frames: [(Date, Bool)] = []
     private var firstFrame: Date?
     private var activeSince: Date?
@@ -35,11 +38,13 @@ public struct CryDetector: CryDetecting, Sendable {
             if let activeSince, sample.timestamp.timeIntervalSince(activeSince) >= 2 { state = .possibleCry }
         case .possibleCry:
             if let firstFrame, sample.timestamp.timeIntervalSince(firstFrame) >= 4.75, proportion >= 0.6, loud {
+                cryStartedAt = activeSince ?? sample.timestamp
                 state = .crying
             } else if let quietSince, sample.timestamp.timeIntervalSince(quietSince) >= 1 { state = .quiet }
         case .crying:
             if let quietSince, sample.timestamp.timeIntervalSince(quietSince) >= configuration.quietResetDuration {
                 state = .quiet
+                cryStartedAt = nil
                 frames.removeAll(); activeSince = nil; firstFrame = sample.timestamp
             }
         }
