@@ -15,7 +15,7 @@ import Observation
     private var storagePrepared = false
     private static let timestampStyle = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
     private static let events: Set<String> = [
-        "app_launched", "foreground", "background", "monitoring_recovered_after_relaunch",
+        "alert_pipeline_ready", "app_launched", "foreground", "background", "monitoring_recovered_after_relaunch",
         "paired_successfully", "pairing_created", "pairing_failed", "credential_failed", "metadata_load_failed",
         "monitoring_started", "monitoring_stopped", "monitoring_paused", "monitoring_start_failed", "microphone_permission_denied",
         "test_push_queued", "audio_active", "audio_recovering", "audio_interrupted", "audio_stalled",
@@ -94,6 +94,18 @@ import Observation
         if storageUnavailable { entry += " server_diagnostics=unavailable" }
         if !details.isEmpty { entry += " " + details }
         append(entry)
+    }
+    func alertPersisted(_ alert: CryAlert, at now: Date, elapsedMS: Int) {
+        alertOutbox(alert, phase: "persisted", at: now, extra: " persistence_ms=\(max(0, elapsedMS))")
+    }
+    func alertUploadStarted(_ alert: CryAlert, attempt: Int, at now: Date) {
+        alertOutbox(alert, phase: "upload_started", at: now, extra: " attempt=\(max(1, attempt))")
+    }
+    private func alertOutbox(_ alert: CryAlert, phase: String, at now: Date, extra: String) {
+        let created = alert.createdAt.timeIntervalSince1970 * 1000, observed = now.timeIntervalSince1970 * 1000
+        guard created.isFinite, observed.isFinite, abs(created) < 9e15, abs(observed) < 9e15 else { return }
+        let age = Int64(observed.rounded()) - Int64(created.rounded())
+        append("alert_outbox phase=\(phase) event_id=\(alert.eventId.uuidString.lowercased()) generated_at_ms=\(Int64(created.rounded())) observed_at_ms=\(Int64(observed.rounded())) age_ms=\(age)" + extra + (age < 0 ? " clock_order=check" : ""))
     }
     func watchAlert(_ trace: WatchAlertTrace) {
         watchAlerts([trace])

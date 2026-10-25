@@ -1346,3 +1346,67 @@ describe('settled episode resolution and notification cleanup',()=>{
   expect((await call('listener/heartbeat',listener,{...value,episodes:[{...value.episodes[0],quietConfirmed:'yes'}]})).status).toBe(400);
  });
 });
+
+describe('latency path and diagnostic spans',()=>{
+ it('returns the first push while reminder scheduling is still blocked',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  let release!:()=>void;const gate=new Promise<void>(resolve=>{release=resolve;});const jobs:Promise<unknown>[]=[];
+  const slow={...testEnv,ALERT_REMINDERS:{getByName:()=>({fetch:async()=>{await gate;return new Response(null,{status:204});}})}} as unknown as Env;
+  mockPush();
+  try {
+   const response=await worker.fetch(new Request('https://monitor.test/v1/listener/event',{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${listener.deviceId}.${listener.secret}`},body:JSON.stringify(alert(listener))}),slow,{waitUntil:(job:Promise<unknown>)=>jobs.push(job)} as unknown as ExecutionContext);
+   expect(await response.json()).toEqual({status:'sent'});expect(pushRequests).toHaveLength(1);expect(jobs).toHaveLength(1);
+  }finally{release();await Promise.all(jobs);}
+ });
+ it('repairs failed background scheduling from durable events during maintenance',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  const broken={...testEnv,ALERT_REMINDERS:{getByName:()=>({fetch:async()=>{throw new Error('private-scheduler-marker');}})}} as unknown as Env;
+  mockPush();const response=await worker.fetch(new Request('https://monitor.test/v1/listener/event',{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${listener.deviceId}.${listener.secret}`},body:JSON.stringify(alert(listener))}),broken);
+  expect(await response.json()).toEqual({status:'sent'});
+  const row=await env.DB.prepare("SELECT * FROM diagnostics WHERE operation='reminder_schedule'").first();
+  expect(row).toMatchObject({outcome:'internal_error'});expect(JSON.stringify(row)).not.toContain('private-scheduler-marker');
+  const stub=testEnv.ALERT_REMINDERS.getByName(parent.deviceId);
+  expect(await runInDurableObject(stub,async(_i,state)=>state.storage.getAlarm())).toBeNull();
+  await flushPending(testEnv);
+  expect(await runInDurableObject(stub,async(_i,state)=>state.storage.getAlarm())).toBeGreaterThan(Date.now());expect(pushRequests).toHaveLength(1);
+ });
+ it.each(['TooManyRequests','TooManyProviderTokenUpdates'])('preserves Apple 429 subtype %s with spans on one dispatch row',async(reason)=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  const appleID=crypto.randomUUID();pushResponses.push(new Response(JSON.stringify({reason,private:'private-body-marker'}),{status:429,headers:{'apns-unique-id':appleID,'private-header':'private-header-marker'}}));
+  expect(await (await call('listener/event',listener,alert(listener))).json()).toEqual({status:'pending'});
+  const rows=(await env.DB.prepare("SELECT details FROM diagnostics WHERE operation='dispatch'").all<{details:string}>()).results;
+  expect(rows).toHaveLength(1);const details=JSON.parse(rows[0].details);
+  expect(details).toMatchObject({apns_reason:reason,apns_environment:'development',apns_unique_id:appleID,db_calls:3,provider_token_cached:expect.any(Boolean)});
+  for(const span of ['claim_ms','destination_ms','token_decrypt_ms','provider_sign_ms','apns_fetch_ms','apns_body_ms','outcome_storage_ms'])expect(details.spans[span]).toBeGreaterThanOrEqual(0);
+  expect(details.apns_response_at_ms).toBeGreaterThanOrEqual(details.apns_started_at_ms);
+  expect(JSON.stringify(details)).not.toContain('private-body-marker');expect(JSON.stringify(details)).not.toContain('private-header-marker');
+ });
+ it('bounds hostile Apple bodies and identifiers without changing retry behavior',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  pushResponses.push(new Response(JSON.stringify({reason:'private-marker',extra:'x'.repeat(5000)}),{status:429,headers:{'apns-unique-id':'private-header-marker'}}));
+  expect(await (await call('listener/event',listener,alert(listener))).json()).toEqual({status:'pending'});
+  const row=await env.DB.prepare("SELECT details FROM diagnostics WHERE operation='dispatch'").first<{details:string}>();
+  expect(JSON.parse(row!.details).apns_reason).toBe('unreadable');expect(row!.details).not.toContain('private-');
+ });
+ it('records transport uncertainty without exposing exception messages',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});pushResponses.push(new Error('private-transport-marker'));
+  expect(await (await call('listener/event',listener,alert(listener))).json()).toEqual({status:'uncertain'});
+  const row=await env.DB.prepare("SELECT details FROM diagnostics WHERE operation='dispatch'").first<{details:string}>();
+  expect(JSON.parse(row!.details).transport).toBe('network');expect(row!.details).not.toContain('private-transport-marker');
+ });
+ it('rejects unknown detail keys, strings and invalid durations at the journal boundary',async()=>{
+  await recordDiagnostic(testEnv,{requestId:crypto.randomUUID(),started:Date.now(),operation:'dispatch',stage:'push',outcome:'sent',details:{spans:{apns_fetch_ms:12,claim_ms:NaN,private:'private-marker'},apns_reason:'private-marker',apns_unique_id:'private-marker',private:'private-marker',db_calls:-1} as unknown as import('../src/latency').TimingDetails});
+  const row=await env.DB.prepare('SELECT details FROM diagnostics').first<{details:string}>();expect(JSON.parse(row!.details)).toEqual({spans:{apns_fetch_ms:12}});
+ });
+ it('allows scheduling during reminder I/O and preserves the fresh wakeup',async()=>{
+  const {parent}=await paired();const {AlertReminders}=await import('../src/reminders');
+  const values=new Map<string,unknown>([['parentId',parent.deviceId],['interval',5000]]);let alarm:number|null=Date.now()+5000;let chain=Promise.resolve();
+  const ctx={storage:{get:async(key:string|string[])=>Array.isArray(key)?new Map(key.map(k=>[k,values.get(k)])):values.get(key),put:async(key:string|Record<string,unknown>,value?:unknown)=>{if(typeof key==='string')values.set(key,value);else for(const [k,v] of Object.entries(key))values.set(k,v);},getAlarm:async()=>alarm,setAlarm:async(n:number)=>{alarm=n;},deleteAlarm:async()=>{alarm=null;},delete:async(key:string|string[])=>{for(const k of Array.isArray(key)?key:[key])values.delete(k);}},blockConcurrencyWhile:<T>(work:()=>Promise<T>)=>{const result=chain.then(work);chain=result.then(()=>{},()=>{});return result;}} as unknown as DurableObjectState;
+  let release!:()=>void,entered!:()=>void;const gate=new Promise<void>(r=>{release=r;}),ready=new Promise<void>(r=>{entered=r;});
+  const db=new Proxy(testEnv.DB,{get(target,key){if(key==='prepare')return (sql:string)=>{const statement=target.prepare(sql);if(!sql.startsWith('SELECT p.listener_id'))return statement;return new Proxy(statement,{get(t,k){if(k==='bind')return (...args:unknown[])=>{const bound=t.bind(...args);return {all:async()=>{entered();await gate;return bound.all();}};};const value=Reflect.get(t,k);return typeof value==='function'?value.bind(t):value;}});};const value=Reflect.get(target,key);return typeof value==='function'?value.bind(target):value;}});
+  const instance=new AlertReminders(ctx,{...testEnv,DB:db}),running=instance.alarm();await ready;
+  try {expect((await instance.fetch(new Request('https://reminders.internal/schedule',{method:'POST',body:parent.deviceId}))).status).toBe(204);}finally{release();await running;}
+  expect(alarm).not.toBeNull();expect(values.get('parentId')).toBe(parent.deviceId);
+  await instance.alarm();expect(alarm).toBeNull();expect(values.has('parentId')).toBe(false);
+ });
+});

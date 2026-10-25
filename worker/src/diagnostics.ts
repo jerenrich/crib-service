@@ -1,4 +1,5 @@
 import type {Env} from './types';
+import {safeTimingDetails,type TimingDetails} from './latency';
 
 const routes = {
  'POST /v1/device/register':'register', 'POST /v1/device/push-token':'push_token',
@@ -12,7 +13,7 @@ const routes = {
  'POST /v1/connection-alerts':'connection_preferences','POST /v1/test-push':'test_push',
  'GET /v1/live-sound':'live_sound'
 } as const;
-export type Operation = typeof routes[keyof typeof routes] | 'unknown_route' | 'dispatch' | 'maintenance';
+export type Operation = typeof routes[keyof typeof routes] | 'unknown_route' | 'dispatch' | 'maintenance' | 'reminder_schedule' | 'reminder_alarm';
 export type Stage = 'validation' | 'rate_limit' | 'authentication' | 'handler' | 'claim' | 'push' | 'storage' | 'cleanup';
 export type Outcome = 'ok' | 'rejected' | 'internal_error' | 'sent' | 'retry' | 'blocked' | 'uncertain' | 'failed'
  | 'expired_event' | 'no_push_token' | 'transport_unknown' | 'invalid_device_token' | 'provider_configuration'
@@ -25,6 +26,7 @@ export class PushPreparationError extends Error {
 export interface Diagnostic {
  requestId:string; operation:Operation; stage:Stage; outcome:Outcome; started:number;
  httpStatus?:number; eventRef?:string; attempt?:number; target?:'phone'|'watch';
+ details?:TimingDetails;
 }
 export function operationFor(method:string,path:string):Operation {
  return routes[`${method} ${path}` as keyof typeof routes] ?? 'unknown_route';
@@ -41,10 +43,10 @@ export async function recordDiagnostic(env:Env,value:Diagnostic):Promise<boolean
  // Fail open: diagnostics must never change delivery or turn acceptance into a retry.
  try {
   const release=env.CF_VERSION_METADATA?.id;
-  await env.DB.prepare('INSERT INTO diagnostics(recorded_at,request_id,operation,stage,outcome,http_status,elapsed_ms,event_ref,attempt,target,release) VALUES(?,?,?,?,?,?,?,?,?,?,?)')
+  await env.DB.prepare('INSERT INTO diagnostics(recorded_at,request_id,operation,stage,outcome,http_status,elapsed_ms,event_ref,attempt,target,release,details) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)')
    .bind(Date.now(),value.requestId,value.operation,value.stage,value.outcome,value.httpStatus??null,
     Math.max(0,Date.now()-value.started),value.eventRef??null,value.attempt??null,value.target??null,
-    release && /^[0-9a-f-]{36}$/i.test(release)?release:null).run();
+    release && /^[0-9a-f-]{36}$/i.test(release)?release:null,safeTimingDetails(value.details)).run();
   return true;
  } catch { return false; }
 }

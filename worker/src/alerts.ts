@@ -1,11 +1,13 @@
 import {stoppedMonitoringSQL} from './monitoring';
 import {scheduleReminders} from './reminders';
+import {Latency} from './latency';
 import {APIError,requireRole,type Alert,type Device,type Env,type StoredEvent} from './types';
 import {alert as validateAlert,uuid,configuration} from './security';
 import {pairFor} from './devices';
 import {sendPush,type PushResult} from './apns';
 import {eventReference,recordDiagnostic,PushPreparationError,type Outcome,type Stage} from './diagnostics';
-export async function receiveAlert(env:Env,device:Device,value:Record<string,unknown>,requestId=crypto.randomUUID()) {
+export async function receiveAlert(env:Env,device:Device,value:Record<string,unknown>,requestId=crypto.randomUUID(),latency=new Latency(),background?:Pick<ExecutionContext,'waitUntil'>) {
+ const prepareStarted=Date.now();
  requireRole(device,'listener');const alert=validateAlert(value);
  if(alert.listenerId!==device.id)throw new APIError(403,'Listener identity mismatch.');
  const pair=await pairFor(env,device);if(!pair)throw new APIError(409,'Listener is not paired.');
@@ -24,26 +26,41 @@ export async function receiveAlert(env:Env,device:Device,value:Record<string,unk
   record=await env.DB.prepare('SELECT * FROM events WHERE listener_id=? AND episode_id=? AND is_repeat=0').bind(device.id,alert.episodeId).first<StoredEvent>();
  }
  if(!record)throw new APIError(409,'Event conflict.');
- // Older Listeners also use server reminders.
- if(!alert.isTest)await scheduleReminders(env,pair.parent_id);
- await dispatchEvent(env,record.event_id,requestId);
+ latency.details.spans!.alert_prepare_ms=Date.now()-prepareStarted;
+ // Start durable scheduling independently of push delivery. The minute recovery
+ // job repairs an interrupted or failed scheduling request from stored events.
+ try {await dispatchEvent(env,record.event_id,requestId);}
+ finally {
+  if(!alert.isTest){
+   const scheduling=scheduleRemindersSafely(env,pair.parent_id,requestId);
+   if(background)background.waitUntil(scheduling);else await scheduling;
+  }
+ }
  const result=await env.DB.prepare('SELECT status,acknowledged_at,resolved_at FROM events WHERE event_id=?').bind(record.event_id).first<{status:string;acknowledged_at:string|null;resolved_at:string|null}>();
  return {status:result?.acknowledged_at?'acknowledged':result?.resolved_at?'resolved':result?.status??'pending'};
 }
-export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.randomUUID()):Promise<void> {
+async function scheduleRemindersSafely(env:Env,parentId:string,requestId:string):Promise<void> {
+ const started=Date.now(),latency=new Latency();
+ try {
+  await latency.measure('reminder_schedule_ms',()=>scheduleReminders(env,parentId));
+  if(Date.now()-started>=2000)await recordDiagnostic(env,{requestId,started,operation:'reminder_schedule',stage:'handler',outcome:'ok',details:latency.details});
+ }
+ catch {await recordDiagnostic(env,{requestId,started,operation:'reminder_schedule',stage:'handler',outcome:'internal_error',details:latency.details});}
+}
+export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.randomUUID(),latency=new Latency()):Promise<void> {
  const now=Date.now();
  let stage:Stage='claim',eventRef:string|undefined,attempt:number|undefined,target:'phone'|'watch'|undefined;
- const record=(outcome:Outcome,httpStatus?:number)=>recordDiagnostic(env,{requestId,started:now,operation:'dispatch',stage,outcome,eventRef,attempt,target,httpStatus});
+ const record=(outcome:Outcome,httpStatus?:number)=>recordDiagnostic(env,{requestId,started:now,operation:'dispatch',stage,outcome,eventRef,attempt,target,httpStatus,details:latency.details});
  try {
  // Diagnostic computation is best effort, just like journal writes.
  try { eventRef=await eventReference(env,eventId); } catch { /* No diagnostic identity available. */ }
  // Tombstones also suppress an offline outbox upload after its episode settled.
- await env.DB.prepare(`UPDATE events SET resolved_at=COALESCE(resolved_at,(SELECT r.resolved_at FROM resolved_episodes r
+ const claims=await latency.db<StoredEvent>('claim_ms',()=>env.DB.batch<StoredEvent>([env.DB.prepare(`UPDATE events SET resolved_at=COALESCE(resolved_at,(SELECT r.resolved_at FROM resolved_episodes r
   JOIN pairs p ON p.parent_id=r.parent_id AND p.listener_id=r.listener_id AND p.created_at=r.pair_created_at
   WHERE r.parent_id=events.parent_id AND r.listener_id=events.listener_id AND r.episode_id=events.episode_id))
-  WHERE event_id=? AND COALESCE(json_extract(payload,'$.isTest'),0)=0`).bind(eventId).run();
+  WHERE event_id=? AND COALESCE(json_extract(payload,'$.isTest'),0)=0`).bind(eventId),
  // Suppress uploads during a mute, including delayed offline outbox entries.
- await env.DB.prepare(`UPDATE events SET acknowledged_at=COALESCE(acknowledged_at,?) WHERE event_id=?
+ env.DB.prepare(`UPDATE events SET acknowledged_at=COALESCE(acknowledged_at,?) WHERE event_id=?
  AND COALESCE(json_extract(payload,'$.isTest'),0)=0 AND (
  EXISTS(SELECT 1 FROM devices d WHERE d.id=events.parent_id AND d.alerts_muted_until>0
  AND (d.alerts_muted_until>? OR CAST((julianday(json_extract(events.payload,'$.createdAt'))-2440587.5)*86400000 AS INTEGER) BETWEEN d.alerts_muted_at AND d.alerts_muted_until))
@@ -55,25 +72,28 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  WHERE m.parent_id=events.parent_id AND m.listener_id=events.listener_id AND m.enabled=0
  AND CAST(ROUND((julianday(json_extract(events.payload,'$.createdAt'))-2440587.5)*86400000) AS INTEGER)<=m.created_at)
  OR (is_repeat=1 AND EXISTS(SELECT 1 FROM events prior WHERE prior.parent_id=events.parent_id AND prior.episode_id=events.episode_id AND prior.acknowledged_at IS NOT NULL AND prior.created_at>=events.created_at))
- )`).bind(new Date(now).toISOString(),eventId,now,now).run();
- const event=await env.DB.prepare("UPDATE events SET status='sending',lease_until=?,attempts=attempts+1,push_target=COALESCE(push_target,CASE WHEN (SELECT watch_push_token FROM devices WHERE id=events.parent_id) IS NOT NULL THEN 'watch' ELSE 'phone' END) WHERE event_id=? AND status='pending' AND acknowledged_at IS NULL AND resolved_at IS NULL AND next_attempt<=? RETURNING *").bind(now+30000,eventId,now).first<StoredEvent>();
+ )`).bind(new Date(now).toISOString(),eventId,now,now),
+ env.DB.prepare("UPDATE events SET status='sending',lease_until=?,attempts=attempts+1,push_target=COALESCE(push_target,CASE WHEN (SELECT watch_push_token FROM devices WHERE id=events.parent_id) IS NOT NULL THEN 'watch' ELSE 'phone' END) WHERE event_id=? AND status='pending' AND acknowledged_at IS NULL AND resolved_at IS NULL AND next_attempt<=? RETURNING *").bind(now+30000,eventId,now)]));
+ const event=claims[2].results[0];
  if(!event)return;
+ latency.details.spans!.generated_to_dispatch_ms=Math.max(0,now-event.created_at);
  attempt=event.attempts;target=event.push_target??'phone';stage='storage';
  // No replay after uncertain transport or a worker death during APNs dispatch. APNs does
  // not offer an exactly-once receipt transaction with D1. Surface uncertainty explicitly.
  if(now-Date.parse((JSON.parse(event.payload) as Alert).createdAt)>86400000){
-  await env.DB.prepare("UPDATE events SET status='failed',last_error='expired_event',lease_until=NULL WHERE event_id=?").bind(eventId).run();await record('expired_event');return;
+  await latency.db('outcome_storage_ms',()=>env.DB.prepare("UPDATE events SET status='failed',last_error='expired_event',lease_until=NULL WHERE event_id=?").bind(eventId).run());await record('expired_event');return;
  }
  const column=target==='watch'?'watch_push_token':'push_token';
- const parent=await env.DB.prepare(`SELECT ${column} AS token FROM devices WHERE id=?`).bind(event.parent_id).first<{token:string|null}>();
+ const [destinations]=await latency.db<{token:string|null}>('destination_ms',()=>env.DB.prepare(`SELECT ${column} AS token FROM devices WHERE id=?`).bind(event.parent_id).all<{token:string|null}>());
+ const parent=destinations.results[0];
  if(!parent?.token){
   // A token upload can race with this read. Decide blocked/pending in the same
   // database statement that releases the claim, so either ordering can recover.
-  await env.DB.prepare("UPDATE events SET status=CASE WHEN EXISTS(SELECT 1 FROM devices WHERE id=parent_id AND (push_token IS NOT NULL OR watch_push_token IS NOT NULL)) THEN 'pending' ELSE 'blocked' END,last_error='no_push_token',lease_until=NULL,push_target=NULL WHERE event_id=? AND status='sending'").bind(eventId).run();await record('no_push_token');return;
+  await latency.db('outcome_storage_ms',()=>env.DB.prepare("UPDATE events SET status=CASE WHEN EXISTS(SELECT 1 FROM devices WHERE id=parent_id AND (push_token IS NOT NULL OR watch_push_token IS NOT NULL)) THEN 'pending' ELSE 'blocked' END,last_error='no_push_token',lease_until=NULL,push_target=NULL WHERE event_id=? AND status='sending'").bind(eventId).run());await record('no_push_token');return;
  }
  stage='push';
  let result:PushResult;
- try{result=await sendPush(env,parent.token,JSON.parse(event.payload) as Alert,target);}
+ try{result=await sendPush(env,parent.token,JSON.parse(event.payload) as Alert,target,latency);}
  catch(error){result={status:'retry',reason:error instanceof PushPreparationError?error.code:'apns_configuration'};}
  const status=result.status==='retry'?'pending':result.status;
  const next=now+Math.min(300000,2000*2**Math.min(event.attempts,8));
@@ -81,15 +101,15 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  if(result.reason==='invalid_device_token'){
   // Atomically invalidate only the rejected token and release the event. A
   // replacement uploaded during APNs dispatch must remain eligible for retry.
-  await env.DB.batch([
+  await latency.db('outcome_storage_ms',()=>env.DB.batch([
    env.DB.prepare(`UPDATE devices SET ${column}=NULL WHERE id=? AND ${column}=?`).bind(event.parent_id,parent.token),
    env.DB.prepare("UPDATE events SET status=CASE WHEN EXISTS(SELECT 1 FROM devices WHERE id=parent_id AND (push_token IS NOT NULL OR watch_push_token IS NOT NULL)) THEN 'pending' ELSE 'blocked' END,next_attempt=0,lease_until=NULL,push_target=NULL,last_error=? WHERE event_id=? AND status='sending'").bind(result.reason,eventId)
-  ]);
+  ]));
   await record(result.reason,result.httpStatus);
   return;
  }
- await env.DB.prepare('UPDATE events SET status=?,next_attempt=?,lease_until=NULL,sent_at=?,last_error=? WHERE event_id=? AND status=\'sending\'')
-  .bind(status,next,status==='sent'?new Date().toISOString():null,result.reason??null,eventId).run();
+ await latency.db('outcome_storage_ms',()=>env.DB.prepare('UPDATE events SET status=?,next_attempt=?,lease_until=NULL,sent_at=?,last_error=? WHERE event_id=? AND status=\'sending\'')
+  .bind(status,next,status==='sent'?new Date().toISOString():null,result.reason??null,eventId).run());
  await record(result.reason??result.status,result.httpStatus);
  } catch(error) { await record('internal_error');throw error; }
 }
@@ -172,6 +192,12 @@ export async function flushPending(env:Env,requestId=crypto.randomUUID()) {
  const events=await env.DB.prepare("SELECT event_id FROM events WHERE status='pending' AND acknowledged_at IS NULL AND resolved_at IS NULL AND next_attempt<=? ORDER BY created_at LIMIT 25").bind(Date.now()).all<{event_id:string}>();
  // Bounded fan-out; each row has an atomic database claim.
  for(let index=0;index<events.results.length;index+=5){await Promise.all(events.results.slice(index,index+5).map(event=>dispatchEvent(env,event.event_id,requestId)));}
+ // Repair scheduling after a failed background request or worker reset. Bound
+ // fan-out; existing alarms are never postponed by these idempotent refreshes.
+ const parents=await env.DB.prepare(`SELECT DISTINCT parent_id FROM events WHERE acknowledged_at IS NULL AND resolved_at IS NULL
+  AND status IN ('pending','blocked','sent','uncertain') AND COALESCE(last_error,'')!='expired_event'
+  AND COALESCE(json_extract(payload,'$.isTest'),0)=0 ORDER BY parent_id LIMIT 25`).all<{parent_id:string}>();
+ for(let index=0;index<parents.results.length;index+=5)await Promise.all(parents.results.slice(index,index+5).map(p=>scheduleRemindersSafely(env,p.parent_id,requestId)));
  // Keep deduplication tombstones for 30 days. Codes are short-lived; claimed codes retain
  // enough time to recover a lost claim response. Status metadata retains max 100 episodes.
  await env.DB.batch([

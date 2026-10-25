@@ -19,6 +19,65 @@ actor RequestGate {
 }
 
 final class AppModelTests: XCTestCase {
+    @MainActor func testGeneratedAlertUploadsWithoutNetworkTickAfterDurableSave() async throws {
+        let fixture = try Fixture()
+        let gate = RequestGate()
+        await fixture.backend.configure(sendGate: gate)
+        await fixture.model.start()
+        let start = fixture.time.now
+        // automaticallyStart is false: no networking tick runs in this test.
+        for index in 0...44 {
+            fixture.time.now = start.addingTimeInterval(Double(index) / 4)
+            fixture.audio.emit(AudioLevelSample(timestamp: fixture.time.now, dbFS: -10))
+        }
+        let started = await eventually { await fixture.backend.sent.count == 1 }
+        XCTAssertTrue(started)
+        let sent = await fixture.backend.sent
+        let event = try XCTUnwrap(sent.first)
+        let saved = try MetadataStore(directory: fixture.directory).load()
+        XCTAssertTrue(saved.pending.contains { $0.alert.eventId == event.eventId })
+        XCTAssertTrue(fixture.model.log.export.contains("alert_outbox phase=persisted event_id=\(event.eventId.uuidString.lowercased())"))
+        XCTAssertTrue(fixture.model.log.export.contains("alert_outbox phase=upload_started event_id=\(event.eventId.uuidString.lowercased())"))
+        let tick = Task { await fixture.model.tick() }
+        await gate.open(); await tick.value
+        let finished = await eventually { fixture.model.snapshot.pending.isEmpty }
+        XCTAssertTrue(finished)
+        let requests = await fixture.backend.sent
+        XCTAssertEqual(requests.map(\.eventId), [event.eventId])
+        fixture.model.stop()
+    }
+
+    @MainActor func testFailedDurableSavePreventsImmediateAlertUpload() async throws {
+        let fixture = try Fixture()
+        let gate = RequestGate()
+        await fixture.backend.configure(heartbeatGate: gate)
+        await fixture.model.start()
+        let start = fixture.time.now
+        for index in 0..<39 {
+            fixture.time.now = start.addingTimeInterval(Double(index) / 4)
+            fixture.audio.emit(AudioLevelSample(timestamp: fixture.time.now, dbFS: -10))
+        }
+        let observed = await eventually { fixture.model.snapshot.lastObservedAt == fixture.time.now }
+        XCTAssertTrue(observed)
+        XCTAssertTrue(fixture.model.snapshot.pending.isEmpty)
+        let before = await fixture.backend.sent
+        XCTAssertTrue(before.isEmpty)
+        // A file in place of the parent directory cannot be replaced by an
+        // atomic metadata write (an empty target directory can be replaced).
+        try FileManager.default.removeItem(at: fixture.directory)
+        try Data("blocked directory".utf8).write(to: fixture.directory)
+        fixture.time.now = start.addingTimeInterval(9.75)
+        fixture.audio.emit(AudioLevelSample(timestamp: fixture.time.now, dbFS: -10))
+        let failed = await eventually { fixture.model.log.export.contains("metadata_write_failed") }
+        XCTAssertTrue(failed)
+        await fixture.model.tick()
+        let requests = await fixture.backend.sent
+        XCTAssertTrue(requests.isEmpty)
+        XCTAssertFalse(fixture.model.log.export.contains("alert_outbox phase=upload_started"))
+        await gate.open()
+        fixture.model.stop()
+    }
+
     @MainActor func testCleanupUsesSuccessfulCompleteStatusAndFailureLeavesNotificationsAlone() async throws {
         let fixture = try Fixture()
         fixture.model.role = .parent; fixture.model.paired = true

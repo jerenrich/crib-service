@@ -76,6 +76,9 @@ import UIKit
     @ObservationIgnored private var loopTask: Task<Void, Never>?
     @ObservationIgnored private var audioTask: Task<Void, Never>?
     @ObservationIgnored private var networkTask: Task<Void, Never>?
+    @ObservationIgnored private var immediateAlertTask: Task<Void, Never>?
+    @ObservationIgnored private var alertDeliveryTask: Task<Void, Never>?
+    @ObservationIgnored private var alertDeliveryRequested = false
     @ObservationIgnored private var settingsTask: Task<Void, Never>?
     @ObservationIgnored private var heartbeatTask: Task<Void, Never>?
     @ObservationIgnored private var listenerStatusTask: Task<Void, Never>?
@@ -193,6 +196,7 @@ import UIKit
         }
         if automaticallyStart {
             log.record("app_launched", code: DiagnosticLog.maximumLines)
+            log.record("alert_pipeline_ready", code: 1)
             if needsRestart { log.record("monitoring_recovered_after_relaunch") }
             // Local health and freshness must advance even while a request is suspended.
             loopTask = Task { [weak self] in
@@ -270,7 +274,7 @@ import UIKit
         publishWatch()
     }
     deinit {
-        loopTask?.cancel(); networkTask?.cancel(); audioTask?.cancel()
+        loopTask?.cancel(); networkTask?.cancel(); audioTask?.cancel(); immediateAlertTask?.cancel(); alertDeliveryTask?.cancel()
         settingsTask?.cancel(); heartbeatTask?.cancel()
         listenerStatusTask?.cancel(); parentRefreshTask?.cancel()
     }
@@ -767,7 +771,15 @@ import UIKit
             log.record(engine.detector.quietSince == nil ? "crying_resumed" : "quiet_gap_started")
         }
         if !events.isEmpty { log.record("alert_threshold_reached") }
+        let persistenceStarted = ContinuousClock.now
         if !events.isEmpty || before != state || sample.timestamp.timeIntervalSince(lastSavedAt) >= 5 { persist(); lastSavedAt = sample.timestamp }
+        if !events.isEmpty, storageHealthy, store != nil {
+            let duration = persistenceStarted.duration(to: .now).components
+            let elapsedMS = Int(duration.seconds * 1000 + duration.attoseconds / 1_000_000_000_000_000)
+            for event in events { log.alertPersisted(event, at: currentTime(), elapsedMS: elapsedMS) }
+        }
+        // Persistence must succeed before any request can observe the new outbox.
+        if !events.isEmpty, storageHealthy, store != nil { requestImmediateAlertDelivery() }
         if before == .crying, state == .quiet { queueHeartbeat() }
         // Publish the actual chart window and applied threshold, rather than
         // rebuilding or interpolating a different chart on the Parent.
@@ -934,44 +946,79 @@ import UIKit
                 guard paired else { return }
                 scheduleHeartbeatIfDue()
                 guard revision == environmentRevision, role == .listener, storageHealthy else { return }
-                await alerts.deliverReady(snapshot.pending, listenerId: client.credential.deviceId, now: currentTime(), sender: client) { alert, result in
-                    guard revision == environmentRevision else { return }
-                    switch result {
-                    case .success(let receipt) where receipt.status == "sent":
-                        engine.delivered(alert.eventId, at: Date()); log.record("alert_apns_accepted")
-                        deliveryStatus = "Connected · APNs accepted alert"
-                    case .success(let receipt) where receipt.status == "resolved":
-                        engine.acknowledged(alert.eventId)
-                        deliveryStatus = "Episode settled · alert retired"
-                    case .success(let receipt) where receipt.status == "acknowledged":
-                        engine.acknowledged(alert.eventId)
-                        log.record("alert_acknowledged")
-                        deliveryStatus = "Alert acknowledged on Parent"
-                    case .success(let receipt) where receipt.status == "failed":
-                        engine.permanentlyFailed(alert.eventId, at: currentTime())
-                        deliveryStatus = "Alert delivery failed. Check Worker/APNs diagnostics."
-                        log.record("alert_delivery_failed")
-                    case .success(let receipt):
-                        engine.failed(alert.eventId, at: Date())
-                        switch receipt.status {
-                        case "uncertain": deliveryStatus = "Alert delivery uncertain. Check the Parent iPhone."; log.record("alert_uncertain")
-                        case "blocked": deliveryStatus = "Alert blocked. Open Parent Mode and enable notifications."; log.record("alert_blocked")
-                        default: deliveryStatus = "Alert queued on server (\(receipt.status))."; log.record("alert_server_pending")
-                        }
-                    case .failure(let failure):
-                        engine.failed(alert.eventId, at: Date()); deliveryStatus = "Alert pending: \(failure.localizedDescription)"
-                        log.record("alert_retry_scheduled", error: failure)
-                    }
-                    if alert.eventId == latestTestEventID {
-                        if case .success(let receipt) = result, receipt.status == "sent" {
-                            testPushStatus = "APNs accepted the test push. Check your registered Apple Watch, or the Parent iPhone if Watch alerts are not set up."
-                            log.record("test_push_apns_accepted")
-                        } else { testPushStatus = "Test push: \(deliveryStatus)" }
-                    }
-                    persist()
-                }
+                await deliverAlerts(using: client, revision: revision)
             }
         } catch { deliveryStatus = "Backend unavailable: \(error.localizedDescription)"; log.record("backend_unavailable", error: error) }
+    }
+    private func requestImmediateAlertDelivery() {
+        alertDeliveryRequested = true
+        guard immediateAlertTask == nil else { return }
+        immediateAlertTask = Task { [weak self] in
+            guard let self else { return }
+            defer { self.immediateAlertTask = nil }
+            let revision = self.environmentRevision
+            guard !self.managingDevice, self.role == .listener, self.paired, self.storageHealthy,
+                  self.connectivity.available else { return }
+            do {
+                let client = try await self.registeredClient()
+                await self.deliverAlerts(using: client, revision: revision)
+            } catch { self.log.record("backend_unavailable", error: error) }
+        }
+    }
+    private func deliverAlerts(using client: any BackendServing, revision: Int) async {
+        alertDeliveryRequested = true
+        if let alertDeliveryTask { await alertDeliveryTask.value; return }
+        let task = Task { [weak self] in
+            guard let self else { return }
+            defer { self.alertDeliveryTask = nil }
+            while self.alertDeliveryRequested {
+                self.alertDeliveryRequested = false
+                guard !Task.isCancelled, revision == self.environmentRevision, !self.managingDevice,
+                      self.role == .listener, self.paired, self.storageHealthy, self.connectivity.available else { return }
+                await self.flushAlerts(using: client, revision: revision)
+            }
+        }
+        alertDeliveryTask = task
+        await task.value
+    }
+    private func flushAlerts(using client: any BackendServing, revision: Int) async {
+        await alerts.deliverReady(snapshot.pending, listenerId: client.credential.deviceId, now: currentTime(), sender: client,
+                                  willSend: { [self] alert, attempt in log.alertUploadStarted(alert, attempt: attempt, at: currentTime()) }) { alert, result in
+            guard revision == environmentRevision else { return }
+            switch result {
+            case .success(let receipt) where receipt.status == "sent":
+                engine.delivered(alert.eventId, at: Date()); log.record("alert_apns_accepted")
+                deliveryStatus = "Connected · APNs accepted alert"
+            case .success(let receipt) where receipt.status == "resolved":
+                engine.acknowledged(alert.eventId)
+                deliveryStatus = "Episode settled · alert retired"
+            case .success(let receipt) where receipt.status == "acknowledged":
+                engine.acknowledged(alert.eventId)
+                log.record("alert_acknowledged")
+                deliveryStatus = "Alert acknowledged on Parent"
+            case .success(let receipt) where receipt.status == "failed":
+                engine.permanentlyFailed(alert.eventId, at: currentTime())
+                deliveryStatus = "Alert delivery failed. Check Worker/APNs diagnostics."
+                log.record("alert_delivery_failed")
+            case .success(let receipt):
+                engine.failed(alert.eventId, at: Date())
+                switch receipt.status {
+                case "uncertain": deliveryStatus = "Alert delivery uncertain. Check the Parent iPhone."; log.record("alert_uncertain")
+                case "blocked": deliveryStatus = "Alert blocked. Open Parent Mode and enable notifications."; log.record("alert_blocked")
+                default: deliveryStatus = "Alert queued on server (\(receipt.status))."; log.record("alert_server_pending")
+                }
+            case .failure(let failure):
+                engine.failed(alert.eventId, at: Date()); deliveryStatus = "Alert pending: \(failure.localizedDescription)"
+                log.record("alert_retry_scheduled", error: failure)
+            }
+            if alert.eventId == latestTestEventID {
+                if case .success(let receipt) = result, receipt.status == "sent" {
+                    testPushStatus = "APNs accepted the test push. Check your registered Apple Watch, or the Parent iPhone if Watch alerts are not set up."
+                    log.record("test_push_apns_accepted")
+                } else { testPushStatus = "Test push: \(deliveryStatus)" }
+            }
+            persist()
+        }
     }
     private func synchronizeSettings(using client: any BackendServing) {
         guard settingsDirty, paired, settingsTask == nil else { return }

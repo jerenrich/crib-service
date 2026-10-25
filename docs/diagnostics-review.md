@@ -34,6 +34,20 @@ Watch latency diagnostics added on 24 October 2026: local `watch_alert` rows inc
 
 Cloudflare documents that automatic invocation logs include request/response metadata and URL-derived messages: [Workers Logs](https://developers.cloudflare.com/workers/observability/logs/workers-logs/). Leave `[observability] enabled = false` in place. Avoid broad `wrangler tail`, request dumps, remote SQL dumps of functional tables, or enabling tracing as a default support procedure.
 
+## Alert latency spans (25 October 2026)
+
+Migration `0010_diagnostic_timings.sql` adds one nullable `details` JSON column to existing journal rows. Apply it before deploying this Worker. The seven-day expiry and 10,000-row cap still apply. Normal dispatches retain one row per actual attempt; stages do not issue individual journal writes. Only failed or unusually slow (at least two seconds) reminder scheduling adds a scheduling row, and failed alarms add a failure row.
+
+The bounded allowlist contains numeric spans for authentication/rate limiting, alert preparation, the atomic suppression/claim batch, destination lookup, token decryption, provider signing, APNs response headers/body, outcome storage, reminder preparation and individual reminder queries. Reminder dispatch rows also carry alarm lateness when the persisted deadline exists. `generated_to_dispatch_ms` uses server event storage time for phone uploads and reminder-handler start for server reminders; it is not a cross-device total. Spans can be nested: do not add `handler_ms`, `reminder_prepare_ms`, and their child spans together. `elapsed_ms` ends before the journal insert itself.
+
+Instrumented D1 calls also retain aggregate SQL duration, rows read/written and reported total attempts. `db_calls` counts instrumented binding calls, while `db_attempts` sums per-statement attempt metadata (a batch contains multiple statements). Calls in shared authentication/control helpers may have wall-time spans without D1 metadata and are excluded from those aggregate counts. SQL execution time does not include all binding/queue/network overhead. A fixed error category can identify an explicitly reported D1 overload/timeout; the raw error is never stored.
+
+APNs details retain allowlisted Apple response reasons, including `TooManyRequests` versus `TooManyProviderTokenUpdates`, and safe fallback labels `unknown`/`unreadable`. Rejection-body reads are capped at 4 KiB and retain no body text. The journal may retain a format-validated Apple `apns-unique-id` solely to look up development delivery logs in Apple's Push Notifications Console, the development/production environment, provider-token cache hit/age, APNs request/response timestamps and timeout/network uncertainty. This is a narrowly allowed response identifier; arbitrary headers remain excluded. A validated three-letter Cloudflare colo helps distinguish request locations without retaining addresses. New identifiers are pseudonymous operational metadata and require the same restricted access as event references.
+
+Phone `alert_outbox` rows record typed event UUIDs, exact creation and persistence/upload-start times, persistence duration and attempt number. Negative ages are retained with `clock_order=check`. This closes the local queue/persistence gap without automatic uploads. Local writes remain bounded by the existing 10,000-line policy. Watch OS delivery still does not prove haptic timing, and cross-device clocks still require checking.
+
+For investigation, add `details` to the diagnostic SELECT below. Join initial API and dispatch rows using the server request reference, then follow `event_ref` for retries. APNs start-to-Watch is now separable from backend preparation when receipt evidence exists; APNs response-to-Watch is not a sequential last-mile measurement because delivery can precede the response reaching the Worker.
+
 ## Investigating an incident
 
 1. Record approximate incident time/timezone and whether it involved detection, delivery, phone presentation or Watch presentation. Export iPhone diagnostics promptly from Settings → Diagnostics & simulation. For wrist-only symptoms inspect the Watch's Diagnostics screen too.
@@ -43,7 +57,7 @@ Cloudflare documents that automatic invocation logs include request/response met
    ```sql
    SELECT datetime(recorded_at/1000, 'unixepoch') AS utc,
           request_id, operation, stage, outcome, http_status,
-          elapsed_ms, event_ref, attempt, target, release
+          elapsed_ms, event_ref, attempt, target, release, details
    FROM diagnostics
    WHERE request_id = 'REPLACE-WITH-REQUEST-UUID'
    ORDER BY sequence;
