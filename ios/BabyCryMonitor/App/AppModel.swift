@@ -66,6 +66,7 @@ import UIKit
     let notifications: any NotificationProviding
     let watch: PhoneWatchBridge
     let log: DiagnosticLog
+    let refreshExperiment: BackgroundRefreshController?
     private var engine = CrySessionManager()
     @ObservationIgnored private var store: MetadataStore?
     @ObservationIgnored private let audio: any AudioLevelProviding
@@ -132,6 +133,7 @@ import UIKit
          makeClient: @escaping (URL, DeviceCredential) -> any BackendServing = { BackendClient(baseURL: $0, credential: $1) },
          currentTime: @escaping () -> Date = Date.init,
           heartbeatJitter: @escaping () -> Double = { Double.random(in: 0.9...1.1) }, automaticallyStart: Bool = true) {
+        self.refreshExperiment = automaticallyStart ? .shared : nil
         self.defaults = defaults; self.audio = audio; self.connectivity = connectivity; self.log = log
         self.liveSound = liveSound ?? LiveSoundStream(enabled: automaticallyStart)
         self.notifications = notifications; self.keychain = keychain; self.makeClient = makeClient
@@ -226,6 +228,10 @@ import UIKit
             engine.recordTimeline("monitoring_unverified", at: interruptedMonitoringAt ?? currentTime()); persist()
         }
         #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--refresh-experiment-start"), role == .parent {
+            startBackgroundBenchmark()
+            Task { await refreshExperiment?.setEnabled(true) }
+        }
         if ProcessInfo.processInfo.arguments.contains("--benchmark-start"), role == .parent {
             startBackgroundBenchmark()
             if let argument = ProcessInfo.processInfo.arguments.first(where: { $0.hasPrefix("--benchmark-scenario=") }),
@@ -796,9 +802,11 @@ import UIKit
         observeBackgroundBenchmark()
     }
     private func observeBackgroundBenchmark() {
+        let active = UIApplication.shared.applicationState == .active
+        refreshExperiment?.maintain(parent: role == .parent, foreground: active)
         guard role == .parent else { log.benchmark.stop(); return }
         let device = UIDevice.current
-        log.benchmark.observe(.init(active: appActive,
+        log.benchmark.observe(.init(active: active,
             powered: device.batteryState == .unknown ? nil : device.batteryState == .charging || device.batteryState == .full,
             lowPower: ProcessInfo.processInfo.isLowPowerModeEnabled, networkAvailable: connectivity.available,
             battery: device.batteryLevel >= 0 ? Double(device.batteryLevel) : nil))
