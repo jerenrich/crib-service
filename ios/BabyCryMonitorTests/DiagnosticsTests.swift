@@ -19,6 +19,7 @@ private final class DiagnosticsURLProtocol: URLProtocol, @unchecked Sendable {
         let body: String
         if path.contains("schema-error") { body = "{\"quietResetDuration\":20,\"sensitivity\":\"medium\",\"absoluteThreshold\":-35}" }
         else if path.contains("date-error") { body = "{\"code\":\"private-pairing-code\",\"expiresAt\":\"private-invalid-timestamp\"}" }
+        else if path.hasSuffix("/v1/listener/event") { body = "{\"status\":\"sent\"}" }
         else { body = path.contains("decode-error") ? "private-response-body" : (status == 503 ? "{\"error\":\"private-server-message\"}" : "{\"ok\":true}") }
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: Data(body.utf8))
@@ -28,6 +29,55 @@ private final class DiagnosticsURLProtocol: URLProtocol, @unchecked Sendable {
 }
 
 final class DiagnosticsTests: XCTestCase {
+    @MainActor func testWatchTraceDeduplicatesAcrossCallbacksAndRelaunchButPreservesDistinctPhases() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let created = Date(timeIntervalSince1970: 1_800_000_000)
+        let alert = WatchCryAlert(eventId: UUID(), episodeId: UUID(), startedAt: created,
+                                  createdAt: created, duration: 5, isTest: false)
+        let trace = WatchAlertTrace(alert: alert, phase: .retained,
+                                   deliveredAt: created.addingTimeInterval(1.125), observedAt: created.addingTimeInterval(30.625))
+        let log = DiagnosticLog(directory: directory)
+        for _ in 0..<100 { log.watchAlert(trace) }
+        XCTAssertEqual(log.lines.count, 1)
+        XCTAssertTrue(log.lines[0].hasPrefix("2027-01-15T08:00:30.625Z "))
+        XCTAssertTrue(log.lines[0].contains("callback_lag_ms=29500"))
+        let restored = DiagnosticLog(directory: directory)
+        restored.watchAlert(trace)
+        XCTAssertEqual(restored.lines, log.lines)
+        restored.watchAlert(WatchAlertTrace(alert: alert, phase: .opened, deliveredAt: trace.deliveredAt, observedAt: trace.observedAt))
+        XCTAssertEqual(restored.lines.count, 2)
+        restored.watchAlerts([trace, trace])
+        XCTAssertEqual(restored.lines.count, 2, "Repeated foreground history scans must not grow the log")
+        for _ in 0..<500 { restored.record("foreground") }
+        XCTAssertEqual(restored.lines.count, 500)
+        restored.watchAlert(trace)
+        XCTAssertEqual(restored.lines.count, 500)
+        XCTAssertTrue(restored.lines.last?.contains("watch_alert phase=retained") == true, "Evicted keys must not accumulate forever")
+    }
+    @MainActor func testAlertNetworkLogLinksWatchEventToBackendRequest() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [DiagnosticsURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let log = DiagnosticLog(directory: directory)
+        let credential = DeviceCredential(deviceId: UUID(), secret: "private-credential", role: .listener, registered: true)
+        let client = BackendClient(baseURL: URL(string: "https://private-host")!, credential: credential, log: log, session: session)
+        let alert = CryAlert(episodeId: UUID(), listenerId: credential.deviceId, cryStartedAt: Date(),
+                             durationSeconds: 5, createdAt: Date(), isRepeat: false)
+        let receipt = try await client.send(alert)
+        XCTAssertEqual(receipt.status, "sent")
+        XCTAssertEqual(log.lines.count, 1, "Correlation must reuse the existing network log write")
+        XCTAssertTrue(log.lines[0].contains("event_id=\(alert.eventId.uuidString.lowercased())"))
+        XCTAssertTrue(log.lines[0].contains("request_id=6705ae24-2863-49df-8dc5-5fa15b2d0418"))
+        XCTAssertFalse(log.export.contains(credential.deviceId.uuidString.lowercased()))
+        XCTAssertFalse(log.export.contains("private-credential"))
+        XCTAssertFalse(log.export.contains("private-host"))
+        log.network(operation: "status", outcome: "ok", elapsedMS: 1, eventID: alert.eventId)
+        XCTAssertFalse(log.lines.last!.contains("event_id="), "Only alert operations may add event identifiers")
+    }
     @MainActor func testBatteryHistorySurvivesDiagnosticRingAndRelaunch() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

@@ -30,17 +30,23 @@ import UserNotifications
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
         let alert = WatchCryAlert.notification(notification.request.content)
         let hasSound = notification.request.content.sound != nil
+        let deliveredAt = notification.date, observedAt = Date()
         await MainActor.run {
-            WatchModel.shared.log.record("watch_foreground_notification", code: hasSound ? 1 : 0)
-            if let alert { WatchModel.shared.receive(alert) }
+            if let alert {
+                WatchModel.shared.log.watchAlert(WatchAlertTrace(alert: alert, phase: .foreground, deliveredAt: deliveredAt, observedAt: observedAt))
+                WatchModel.shared.receive(alert)
+            } else { WatchModel.shared.log.record("watch_foreground_notification", code: hasSound ? 1 : 0) }
         }
         return [.banner, .list, .sound]
     }
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
         let alert = WatchCryAlert.notification(response.notification.request.content)
         let acknowledge = response.actionIdentifier == WatchNotification.acknowledge
+        let deliveredAt = response.notification.date, observedAt = Date()
         await MainActor.run {
             if let alert {
+                WatchModel.shared.log.watchAlert(WatchAlertTrace(alert: alert, phase: acknowledge ? .acknowledged : .opened,
+                                                               deliveredAt: deliveredAt, observedAt: observedAt))
                 WatchModel.shared.handleNotification(alert, acknowledging: acknowledge)
             }
         }
@@ -69,19 +75,23 @@ extension WatchCryAlert {
 
 final class CryNotificationController: WKUserNotificationHostingController<CryNotificationView> {
     private var alert: WatchCryAlert?
+    private var deliveredAt: Date?
     private var text = "Open the app for nursery status."
     override class var isInteractive: Bool { true }
     override var body: CryNotificationView {
         CryNotificationView(alert: alert, text: text) { [weak self, alert] in
             guard let alert else { return }
+            WatchModel.shared.log.watchAlert(WatchAlertTrace(alert: alert, phase: .acknowledged, deliveredAt: self?.deliveredAt))
             WatchModel.shared.handleNotification(alert, acknowledging: true)
             self?.performDismissAction()
         }
     }
     override func didReceive(_ notification: UNNotification) {
         alert = WatchCryAlert.notification(notification.request.content)
+        deliveredAt = notification.date
         text = notification.request.content.body
         if let alert {
+            WatchModel.shared.log.watchAlert(WatchAlertTrace(alert: alert, phase: .presented, deliveredAt: notification.date))
             WatchModel.shared.receive(alert)
             // The inline action appears immediately, above the notification details.
             notificationActions = []

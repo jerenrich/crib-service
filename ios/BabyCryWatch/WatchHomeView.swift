@@ -64,7 +64,7 @@ struct WatchHomeView: View {
         .task(id: hapticKey) {
             guard phase == .active, let alert = model.alert, alert.isRecent(at: Date()) else { return }
             // Foreground reminder only. Background delivery belongs to APNs/watchOS.
-            await WatchAlertHaptics.play(for: .seconds(180), log: model.log) {
+            await WatchAlertHaptics.play(for: .seconds(180), log: model.log, alert: alert) {
                 phase == .active && model.alert?.eventId == alert.eventId && alert.isRecent(at: Date())
             }
         }

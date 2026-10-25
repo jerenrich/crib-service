@@ -8,6 +8,8 @@ import Observation
     private let url: URL?
     private let batteryDrain: BatteryDrainLog
     private var recent: [String: Date] = [:]
+    private var watchTraceKeys: Set<String> = []
+    private static let timestampStyle = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
     private static let events: Set<String> = [
         "app_launched", "foreground", "background", "monitoring_recovered_after_relaunch",
         "paired_successfully", "pairing_created", "pairing_failed", "credential_failed", "metadata_load_failed",
@@ -42,6 +44,7 @@ import Observation
             if FileManager.default.fileExists(atPath: url.path) {
                 let text = try String(contentsOf: url, encoding: .utf8)
                 lines = Array(text.components(separatedBy: "\n").filter { !$0.isEmpty }.suffix(500))
+                watchTraceKeys = Set(lines.compactMap(WatchAlertTrace.key(in:)))
             }
         } catch { persistenceAvailable = false; persistenceFailure = Self.errorDetails(error) }
     }
@@ -65,7 +68,7 @@ import Observation
         append(event + (code.map { " code=\($0)" } ?? "") + (details.isEmpty ? "" : " " + details))
     }
     func network(operation: String, outcome: String, status: Int? = nil, requestID: UUID? = nil,
-                 elapsedMS: Int, storageUnavailable: Bool = false, error: (any Error)? = nil) {
+                 elapsedMS: Int, storageUnavailable: Bool = false, error: (any Error)? = nil, eventID: UUID? = nil) {
         let operations: Set<String> = ["register", "pairing_create", "pairing_claim", "push_token", "watch_token", "heartbeat", "alert", "status", "timeline", "monitoring", "monitoring_complete", "settings", "acknowledge", "test_push", "connection_preferences", "unpair", "delete_device"]
         guard operations.contains(operation), ["ok", "http_error", "transport_error", "decode_error", "encode_error", "cancelled", "invalid_response"].contains(outcome) else { return }
         // Routine successes are sampled; preserve a failure and its first recovery.
@@ -81,9 +84,23 @@ import Observation
         var entry = "network operation=\(operation) outcome=\(outcome) elapsed_ms=\(max(0, elapsedMS))"
         if let status { entry += " status=\(status)" }
         if let requestID { entry += " request_id=\(requestID.uuidString.lowercased())" }
+        if operation == "alert", let eventID { entry += " event_id=\(eventID.uuidString.lowercased())" }
         if storageUnavailable { entry += " server_diagnostics=unavailable" }
         if !details.isEmpty { entry += " " + details }
         append(entry)
+    }
+    func watchAlert(_ trace: WatchAlertTrace) {
+        watchAlerts([trace])
+    }
+    func watchAlerts(_ traces: [WatchAlertTrace]) {
+        var entries: [String] = []
+        for trace in traces {
+            guard !watchTraceKeys.contains(trace.key), let entry = trace.entry else { continue }
+            watchTraceKeys.insert(trace.key)
+            entries.append("\(trace.observedAt.formatted(Self.timestampStyle)) \(entry)")
+        }
+        // A recovered Notification Center history needs only one atomic write.
+        if !entries.isEmpty { appendLines(entries) }
     }
     /// Error descriptions, debug descriptions and userInfo can contain payloads, paths or secrets.
     /// Export only known categories, numeric codes and allowlisted schema keys, with a bounded cause chain.
@@ -157,7 +174,16 @@ import Observation
         }.joined() + (keys.count > 12 ? ".<truncated>" : "")
     }
     private func append(_ event: String) {
-        lines.append("\(Date().formatted(.iso8601)) \(event)"); lines = Array(lines.suffix(500))
+        appendLines(["\(Date().formatted(Self.timestampStyle)) \(event)"])
+    }
+    private func appendLines(_ entries: [String]) {
+        lines.append(contentsOf: entries)
+        if lines.count > 500 {
+            for line in lines.prefix(lines.count - 500) {
+                if let key = WatchAlertTrace.key(in: line) { watchTraceKeys.remove(key) }
+            }
+            lines = Array(lines.suffix(500))
+        }
         do {
             guard let url else { persistenceAvailable = false; return }
             let data = Data(lines.joined(separator: "\n").utf8)

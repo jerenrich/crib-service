@@ -22,6 +22,7 @@ import UserNotifications
     private(set) var connectionWarningError: String?
     @ObservationIgnored private var connectionWarningTask: Task<Void, Never>?
     @ObservationIgnored private var connectionWarningUpdatePending = false
+    @ObservationIgnored private var recoveringNotificationHistory = false
     private static let scheduledWarningKey = "scheduledConnectionWarningDeadline"
     private let alertState = WatchAlertState()
 
@@ -54,6 +55,7 @@ import UserNotifications
 
     func foreground() async {
         log.record("foreground")
+        await recoverNotificationHistory()
         alertState.retryPendingAcknowledgement()
         if alertSetup.phase != .requestingPermission {
             let settings = await inspectNotificationSettings()
@@ -68,6 +70,17 @@ import UserNotifications
         }
         refresh()
         if connectionWarningError != nil { updateConnectionWarning(connectionWarningDeadline, force: true) }
+    }
+    private func recoverNotificationHistory() async {
+        guard !recoveringNotificationHistory else { return }
+        recoveringNotificationHistory = true; defer { recoveringNotificationHistory = false }
+        // Recover delivery dates while awake; never poll or replay background alerts.
+        let notifications = await UNUserNotificationCenter.current().deliveredNotifications()
+        let observedAt = Date()
+        log.watchAlerts(notifications.sorted { $0.date < $1.date }.compactMap { notification in
+            guard let alert = WatchCryAlert.notification(notification.request.content) else { return nil }
+            return WatchAlertTrace(alert: alert, phase: .retained, deliveredAt: notification.date, observedAt: observedAt)
+        })
     }
     @discardableResult private func inspectNotificationSettings() async -> UNNotificationSettings {
         let settings = await UNUserNotificationCenter.current().notificationSettings()
@@ -116,11 +129,9 @@ import UserNotifications
     func refresh() { send(WatchCommand(kind: .refresh)) }
 
     func receive(_ value: WatchCryAlert) {
-        log.record("watch_push_received")
         alertState.receive(value)
     }
     func handleNotification(_ value: WatchCryAlert, acknowledging: Bool) {
-        log.record("watch_push_received")
         alertState.handleNotification(value, acknowledging: acknowledging)
     }
     func resumeAlerts() {
@@ -132,7 +143,10 @@ import UserNotifications
         notice = "Requesting resume. Waiting for iPhone confirmation."
         send(WatchCommand(kind: .resumeAlerts, snoozeDeadline: until))
     }
-    func acknowledge() { log.record("watch_acknowledgement_requested"); alertState.acknowledgeCurrent() }
+    func acknowledge() {
+        if let alert { log.watchAlert(WatchAlertTrace(alert: alert, phase: .acknowledged)) }
+        log.record("watch_acknowledgement_requested"); alertState.acknowledgeCurrent()
+    }
     func previewHaptic() async {
         await WatchAlertHaptics.play(for: .seconds(4.5), log: log) { self.alert == nil }
     }
@@ -254,7 +268,7 @@ import UserNotifications
 @MainActor enum WatchAlertHaptics {
     /// Three distinct notification haptics, then a pause before the next burst.
     /// Leave time for each system haptic to finish; rapid calls cut it short.
-    static func play(for duration: Duration, log: DiagnosticLog? = nil, while shouldContinue: () -> Bool) async {
+    static func play(for duration: Duration, log: DiagnosticLog? = nil, alert: WatchCryAlert? = nil, while shouldContinue: () -> Bool) async {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: duration)
         let spacing: [Duration] = [.seconds(1.5), .seconds(1.5), .seconds(2.5)]
@@ -270,7 +284,11 @@ import UserNotifications
                         log?.record("watch_haptic_inactive"); return
                     }
                     WKInterfaceDevice.current().play(.notification)
-                    if !requested { log?.record("watch_haptic_requested"); requested = true }
+                    if !requested {
+                        if let alert { log?.watchAlert(WatchAlertTrace(alert: alert, phase: .hapticRequested)) }
+                        else { log?.record("watch_haptic_requested") }
+                        requested = true
+                    }
                     try await clock.sleep(until: min(clock.now.advanced(by: delay), deadline))
                 }
             }
