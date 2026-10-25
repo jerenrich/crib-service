@@ -189,6 +189,7 @@ import UIKit
         }
         (notifications as? NotificationService)?.log = log
         if #available(iOS 26.0, *) { SilentAlarmExperiment.shared.log = log }
+        if #available(iOS 26.0, *) { SilentCryAlarmService.shared.log = log }
         watch.log = log
         (audio as? AudioLevelMonitor)?.log = log
         notifications.onToken = { [weak self] token in self?.pushToken = token; self?.uploadedToken = nil; self?.log.record("push_token_received") }
@@ -389,6 +390,7 @@ import UIKit
     func acceptSafety() { safetyAccepted = true; defaults.set(true, forKey: "safetyAccepted") }
     func selectRole(_ value: DeviceRole) {
         guard !managingDevice else { return }
+        if value != .parent, #available(iOS 26.0, *), defaults === UserDefaults.standard { SilentCryAlarmService.shared.disableLocally() }
         clearLiveSound()
         setParentConnectionDeadline(nil)
         cancelCalibration()
@@ -408,6 +410,7 @@ import UIKit
         guard let url = URL(string: value.trimmingCharacters(in: .whitespacesAndNewlines)), url.scheme == "https",
               url.host != nil, url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
               url.path.isEmpty || url.path == "/" else { error = "Enter the HTTPS origin of your deployed Worker."; return }
+        if #available(iOS 26.0, *), defaults === UserDefaults.standard { SilentCryAlarmService.shared.disableLocally() }
         setParentConnectionDeadline(nil)
         resetMonitoringControl()
         environmentRevision += 1; backendURL = url.absoluteString
@@ -718,6 +721,15 @@ import UIKit
         } catch {
             testPushStatus = "Silent alarm test could not be confirmed: \(error.localizedDescription)"
             log.silentAlarmTest(phase: "send_failed", appActive: appActive, protectedDataAvailable: UIApplication.shared.isProtectedDataAvailable)
+        }
+    }
+    func setSilentWatchAlarms(_ enabled: Bool) async {
+        guard role == .parent else { return }
+        if #available(iOS 26.0, *) {
+            let service = SilentCryAlarmService.shared
+            if !enabled { service.disableLocally() }
+            do { let backend = try await registeredClient(); await service.setEnabled(enabled, using: backend) }
+            catch { service.settingUnavailable() }
         }
     }
     func sendTestPush() async {
@@ -1222,6 +1234,10 @@ import UIKit
         do {
             let client = try await registeredClient(); let status = try await client.status()
             guard revision == environmentRevision, role == .parent else { return }
+            if #available(iOS 26.0, *), defaults === UserDefaults.standard {
+                await SilentCryAlarmService.shared.synchronize(using: client, status: status, checkedAt: checkedAt)
+                guard revision == environmentRevision, role == .parent else { return }
+            }
             if !status.paired || (parentStatus?.pairingID != nil && parentStatus?.pairingID != status.pairingID) {
                 timeline = nil; timelineError = nil; clearLiveSound()
             }
@@ -1335,6 +1351,9 @@ import UIKit
         guard !acknowledgingAlert else { return false }
         acknowledgingAlert = true; defer { acknowledgingAlert = false }
         if let alert = parentStatus?.alerts?.first(where: { $0.eventId == id }) {
+            if alert.isTest != true, #available(iOS 26.0, *), defaults === UserDefaults.standard {
+                SilentCryAlarmService.shared.snoozeLocally(eventID: id, duration: configuration.snoozeDuration)
+            }
             await notifications.dismissCryingAlerts(testEventID: alert.isTest == true ? id : nil)
         }
         let revision = environmentRevision
@@ -1462,6 +1481,7 @@ import UIKit
         do {
             let client = try await registeredClient()
             if deleteDevice { try await client.deleteDevice() } else { try await client.unpair() }
+            if #available(iOS 26.0, *), defaults === UserDefaults.standard { SilentCryAlarmService.shared.disableLocally() }
             if deleteDevice, let old {
                 let replacement = try keychain.create(role: old.role)
                 try keychain.save(replacement, environment: backendURL)
@@ -1590,6 +1610,10 @@ import UIKit
             }
         case .acknowledge:
             if let id = command.eventId {
+                if #available(iOS 26.0, *), defaults === UserDefaults.standard {
+                    if command.isTest == false { SilentCryAlarmService.shared.snoozeLocally(eventID: id, duration: configuration.snoozeDuration) }
+                    else if command.isTest == nil { SilentCryAlarmService.shared.acknowledgeKnownEvent(id) }
+                }
                 var queue = defaults.stringArray(forKey: watchAcknowledgementsKey) ?? []
                 if !queue.contains(id.uuidString) { queue.append(id.uuidString) }
                 defaults.set(queue, forKey: watchAcknowledgementsKey)

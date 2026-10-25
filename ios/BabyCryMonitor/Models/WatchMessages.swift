@@ -65,4 +65,5 @@ struct WatchCommand: Codable, Sendable {
     var token: String?
     var eventId: UUID?
     var snoozeDeadline: Date?
+    var isTest: Bool?
 }

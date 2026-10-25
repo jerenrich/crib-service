@@ -5,6 +5,7 @@ struct ParentStatus: Codable, Sendable {
     var pairingID: String?
     var watchPushRegistered: Bool?
     var phonePushRegistered: Bool?
+    var silentWatchAlarmsEnabled: Bool? = nil
     var connectionAlertsEnabled: Bool?
     var alertsMutedUntil: Date?
     var listenerConfiguration: MonitoringConfiguration?
@@ -96,10 +97,12 @@ protocol BackendServing: AlertSending {
     func requestTestPush() async throws
     func sendWatchTest() async throws
     func sendSilentAlarmTest() async throws -> UUID
+    func silentWatchAlarms(_ enabled: Bool) async throws
     func unpair() async throws
     func deleteDevice() async throws
 }
 extension BackendServing {
+    func silentWatchAlarms(_ enabled: Bool) async throws { throw BackendError.message("Silent Watch alarms require an updated connection service.") }
     func sendSilentAlarmTest() async throws -> UUID { throw BackendError.message("Silent alarm testing requires an updated connection service.") }
     func sendWatchTest() async throws { throw BackendError.message("Watch test mode requires an updated connection service.") }
     func resumeAlerts(until: Date) async throws { throw BackendError.message("Resume alerts requires an updated connection service.") }
@@ -116,6 +119,7 @@ struct BackendClient: BackendServing {
     let credential: DeviceCredential
     var log: DiagnosticLog? = nil
     var session: URLSession = .shared
+    var requestTimeout: TimeInterval = 20
     func register() async throws {
         struct Registration: Codable { let deviceId: UUID; let role: DeviceRole; let secret: String }
         let _: EmptyResponse = try await request("/v1/device/register", body: Registration(deviceId: credential.deviceId, role: credential.role, secret: credential.secret))
@@ -150,6 +154,9 @@ struct BackendClient: BackendServing {
         let receipt: Receipt = try await request("/v1/listener/silent-alarm-test", body: [String:String]())
         return receipt.eventId
     }
+    func silentWatchAlarms(_ enabled: Bool) async throws {
+        let _: EmptyResponse = try await request("/v1/silent-watch-alarms", body: ["enabled": enabled])
+    }
     func unpair() async throws { let _: EmptyResponse = try await request("/v1/pairing/remove", body: [String:String]()) }
     func deleteDevice() async throws {
         // A lost success response leaves a revoked credential. Retrying deletion is safe.
@@ -166,7 +173,7 @@ struct BackendClient: BackendServing {
         guard baseURL.scheme == "https", baseURL.host != nil, baseURL.user == nil, baseURL.password == nil,
               baseURL.query == nil, baseURL.fragment == nil else { throw BackendError.message("Set a valid HTTPS backend URL in Settings.") }
         var request = URLRequest(url: baseURL.appendingPathComponent(String(path.dropFirst())))
-        request.httpMethod = method; request.timeoutInterval = 20
+        request.httpMethod = method; request.timeoutInterval = requestTimeout
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(credential.deviceId.uuidString.lowercased()).\(credential.secret)", forHTTPHeaderField: "Authorization")
         let operation = ["/v1/device/register": "register", "/v1/pairing/create": "pairing_create", "/v1/pairing/claim": "pairing_claim",

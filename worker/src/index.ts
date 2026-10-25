@@ -6,7 +6,7 @@ export {LiveSound} from './live-sound';
 import {openLiveSound} from './live-sound';
 import {APIError,type Env} from './types';
 import {body,rateLimit} from './security';
-import {admitAlert,authenticate,register,savePushToken,saveWatchPushToken,removeDeviceData,pairFor} from './devices';
+import {admitAlert,authenticate,register,savePushToken,saveWatchPushToken,saveSilentWatchAlarms,removeDeviceData,pairFor} from './devices';
 import {connectionPreferences,flushConnections} from './connections';
 import {createPairing,claimPairing} from './pairing';
 import {receiveAlert,acknowledge,resumeAlerts,flushPending} from './alerts';
@@ -60,6 +60,7 @@ export default {
      case 'POST /v1/pairing/claim':result=await claimPairing(env,device,await body(request),ip);break;
      case 'POST /v1/device/push-token':result=await savePushToken(env,device,await body(request));break;
      case 'POST /v1/device/watch-push-token':result=await saveWatchPushToken(env,device,await body(request));break;
+     case 'POST /v1/silent-watch-alarms':result=await saveSilentWatchAlarms(env,device,await body(request));break;
      case 'POST /v1/pairing/remove':result=await removeDeviceData(env,device);break;
      case 'POST /v1/device/delete':result=await removeDeviceData(env,device,true);break;
      case 'POST /v1/connection-alerts':result=await connectionPreferences(env,device,await body(request));break;

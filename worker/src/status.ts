@@ -39,7 +39,7 @@ export async function listenerStatus(env:Env,device:Device) {
  if(!pair)return {paired:false,watchPushRegistered:false,serverTime:new Date().toISOString(),nextHeartbeatExpectedAt:null,notificationRelevance:{cryEpisodeIDs:[],testEventIDs:[]},configuration:configuration(JSON.parse(device.config))};
  const [last,parent,events,monitoringCommand,relevant]=await Promise.all([
   env.DB.prepare('SELECT * FROM heartbeats WHERE listener_id=?').bind(pair.listener_id).first<{received_at:string;metadata:string}>(),
-  env.DB.prepare('SELECT config,push_token,watch_push_token,connection_alerts,alerts_muted_until FROM devices WHERE id=?').bind(pair.parent_id).first<{config:string;push_token:string|null;watch_push_token:string|null;connection_alerts:number;alerts_muted_until:number}>(),
+  env.DB.prepare('SELECT config,push_token,watch_push_token,connection_alerts,alerts_muted_until,silent_watch_alarms FROM devices WHERE id=?').bind(pair.parent_id).first<{config:string;push_token:string|null;watch_push_token:string|null;connection_alerts:number;alerts_muted_until:number;silent_watch_alarms:number}>(),
   env.DB.prepare('SELECT payload,status,sent_at,acknowledged_at,resolved_at,push_target FROM events WHERE parent_id=? ORDER BY created_at DESC LIMIT 100').bind(pair.parent_id).all<{payload:string;status:string;sent_at:string|null;acknowledged_at:string|null;resolved_at:string|null;push_target:string|null}>(),
   latestMonitoringCommand(env,pair),
   env.DB.prepare(`SELECT DISTINCT CASE WHEN COALESCE(json_extract(payload,'$.isTest'),0)=1 THEN event_id ELSE episode_id END AS id,
@@ -53,6 +53,7 @@ export async function listenerStatus(env:Env,device:Device) {
  return {paired:true,pairingID:`${pair.parent_id}|${pair.listener_id}|${pair.created_at}`,listenerId:pair.listener_id,lastHeartbeat:last?.received_at??null,monitoring:metadata?.monitoring??false,microphoneActive:metadata?.microphoneActive??metadata?.monitoring??false,batteryLevel:metadata?.batteryLevel??null,powerConnected:metadata?.powerConnected??false,state:metadata?.state??null,currentEpisode:metadata?.currentEpisode??null,episodes:metadata?.episodes??[],configuration:parent?configuration(JSON.parse(parent.config)):defaultConfiguration,
  serverTime:new Date().toISOString(),nextHeartbeatExpectedAt,monitoringCommand,
  watchPushRegistered:parent?.watch_push_token!=null,phonePushRegistered:parent?.push_token!=null,
+ silentWatchAlarmsEnabled:parent?.silent_watch_alarms===1,
  alertsMutedUntil:parent?.alerts_muted_until?new Date(parent.alerts_muted_until).toISOString():null,
  connectionAlertsEnabled:parent?.connection_alerts===1,listenerConfiguration:metadata?.appliedConfiguration?configuration({...metadata.appliedConfiguration}):null,
  notificationRelevance:relevant.results.length>1000?null:{cryEpisodeIDs:relevant.results.filter(e=>!e.test).map(e=>e.id),testEventIDs:relevant.results.filter(e=>e.test).map(e=>e.id)},

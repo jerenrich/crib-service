@@ -78,6 +78,7 @@ struct SettingsView: View {
                 }
                 if model.role == .parent {
                     if #available(iOS 26.0, *) {
+                        SilentWatchAlarmSettingsSection()
                         AlarmTestSection()
                     } else {
                         Section("System alarm test") {

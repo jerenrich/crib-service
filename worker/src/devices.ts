@@ -62,7 +62,7 @@ export async function removeDeviceData(env:Env,device:Device,deleteDevice=false)
  const pair=await pairFor(env,device);
  const listener=pair?.listener_id??device.id, parent=pair?.parent_id??device.id;
  await env.DB.batch([
-  env.DB.prepare('UPDATE devices SET alerts_muted_until=0,alerts_muted_at=0 WHERE id=?').bind(parent),
+  env.DB.prepare('UPDATE devices SET alerts_muted_until=0,alerts_muted_at=0,silent_watch_alarms=0 WHERE id=?').bind(parent),
   env.DB.prepare('DELETE FROM monitoring_commands WHERE listener_id=? OR parent_id=?').bind(listener,parent),
   env.DB.prepare('DELETE FROM resolved_episodes WHERE listener_id=? OR parent_id=?').bind(listener,parent),
   env.DB.prepare('DELETE FROM alert_snoozes WHERE listener_id=? OR parent_id=?').bind(listener,parent),
@@ -90,5 +90,14 @@ export async function saveWatchPushToken(env:Env,device:Device,value:Record<stri
   env.DB.prepare('UPDATE devices SET watch_push_token=? WHERE id=?').bind(value.token===null?null:await encryptToken(env,value.token),device.id),
   env.DB.prepare("UPDATE events SET status='pending',next_attempt=0,push_target=NULL WHERE parent_id=? AND status='blocked' AND acknowledged_at IS NULL AND resolved_at IS NULL").bind(device.id)
  ]);
+ return {ok:true};
+}
+
+export async function saveSilentWatchAlarms(env:Env,device:Device,value:Record<string,unknown>) {
+ requireRole(device,'parent');
+ if(typeof value.enabled!=='boolean')throw new APIError(400,'Choose whether silent Watch alarms are enabled.');
+ if(value.enabled&&!await pairFor(env,device))throw new APIError(409,'Pair a Listener first.');
+ if(value.enabled&&!device.push_token)throw new APIError(409,'Enable notifications on the Parent iPhone first.');
+ await env.DB.prepare('UPDATE devices SET silent_watch_alarms=? WHERE id=?').bind(Number(value.enabled),device.id).run();
  return {ok:true};
 }

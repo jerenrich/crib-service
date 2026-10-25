@@ -5,7 +5,7 @@ import {Latency} from './latency';
 import {APIError,requireRole,type Alert,type Device,type Env,type StoredEvent} from './types';
 import {alert as validateAlert,uuid,configuration} from './security';
 import {pairFor} from './devices';
-import {sendPush,type PushResult} from './apns';
+import {sendPush,sendSilentCryAlarmPush,type PushResult} from './apns';
 import {eventReference,recordDiagnostic,PushPreparationError,type Outcome,type Stage} from './diagnostics';
 export async function receiveAlert(env:Env,device:Device,value:Record<string,unknown>,requestId=crypto.randomUUID(),latency=new Latency(),background?:Pick<ExecutionContext,'waitUntil'>) {
  latency.details.dispatch_source='upload';
@@ -47,7 +47,7 @@ export async function receiveAlert(env:Env,device:Device,value:Record<string,unk
  // Start durable scheduling independently of push delivery. The minute recovery
  // job repairs an interrupted or failed scheduling request from stored events.
  try {await dispatchEvent(env,record.event_id,requestId,latency,
-  background&&!alert.isTest?{accepted:delivery=>queueAcceptedDelivery(env,delivery)}:{});}
+  background&&!alert.isTest?{accepted:delivery=>queueAcceptedDelivery(env,delivery),background}:{});}
  finally {
   if(!alert.isTest){
    const scheduling=scheduleRemindersSafely(env,pair.parent_id,requestId);
@@ -69,11 +69,13 @@ async function scheduleRemindersSafely(env:Env,parentId:string,requestId:string)
 export interface DispatchOptions {
  insert?:D1PreparedStatement;
  accepted?:(delivery:AcceptedDelivery)=>Promise<void>;
+ background?:Pick<ExecutionContext,'waitUntil'>;
 }
 export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.randomUUID(),latency=new Latency(),options:DispatchOptions={}):Promise<void> {
  const now=Date.now();
  let stage:Stage='claim',eventRef:string|undefined,attempt:number|undefined,target:'phone'|'watch'|undefined;
  let pushResult:PushResult|undefined;
+ let auxiliary:Promise<void>|undefined;
  const record=(outcome:Outcome,httpStatus?:number,operation:'dispatch'|'dispatch_skip'='dispatch')=>recordDiagnostic(env,{requestId,started:now,operation,stage,outcome,eventRef,attempt,target,httpStatus,details:latency.details});
  try {
  // Diagnostic computation is best effort, just like journal writes.
@@ -100,7 +102,7 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  env.DB.prepare("UPDATE events SET status='sending',lease_until=?,attempts=attempts+1,push_target=COALESCE(push_target,CASE WHEN (SELECT watch_push_token FROM devices WHERE id=events.parent_id) IS NOT NULL THEN 'watch' ELSE 'phone' END) WHERE event_id=? AND status='pending' AND acknowledged_at IS NULL AND resolved_at IS NULL AND next_attempt<=? RETURNING *").bind(now+30000,eventId,now),
  // Read the selected token in the claim transaction, avoiding another remote
  // round trip. A losing claimant must still return before using this result.
- env.DB.prepare(`SELECT CASE e.push_target WHEN 'watch' THEN d.watch_push_token ELSE d.push_token END AS token
+ env.DB.prepare(`SELECT CASE e.push_target WHEN 'watch' THEN d.watch_push_token ELSE d.push_token END AS token,d.push_token AS phone_token,d.silent_watch_alarms
   FROM events e JOIN devices d ON d.id=e.parent_id WHERE e.event_id=? AND e.status='sending'`).bind(eventId)]));
  const offset=options.insert?1:0;
  if(options.insert&&!claims[0].meta.changes){
@@ -127,15 +129,28 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
   await latency.db('outcome_storage_ms',()=>env.DB.prepare("UPDATE events SET status='failed',last_error='expired_event',lease_until=NULL WHERE event_id=?").bind(eventId).run());await record('expired_event');return;
  }
  const column=target==='watch'?'watch_push_token':'push_token';
- const parent=claims[offset+3].results[0] as {token:string|null}|undefined;
+ const parent=claims[offset+3].results[0] as {token:string|null;phone_token:string|null;silent_watch_alarms:number}|undefined;
  if(!parent?.token){
   // A token upload can race with this read. Decide blocked/pending in the same
   // database statement that releases the claim, so either ordering can recover.
   await latency.db('outcome_storage_ms',()=>env.DB.prepare("UPDATE events SET status=CASE WHEN EXISTS(SELECT 1 FROM devices WHERE id=parent_id AND (push_token IS NOT NULL OR watch_push_token IS NOT NULL)) THEN 'pending' ELSE 'blocked' END,last_error='no_push_token',lease_until=NULL,push_target=NULL WHERE event_id=? AND status='sending'").bind(eventId).run());await record('no_push_token');return;
  }
  stage='push';
+ const alert=JSON.parse(event.payload) as Alert;
+ const silentAlarm=parent.silent_watch_alarms===1&&!alert.isTest;
+ // The original send and its receipt never depend on the auxiliary phone send.
+ const primary=sendPush(env,parent.token,alert,target,latency,silentAlarm);
+ if(silentAlarm&&target==='watch'&&parent.phone_token){
+  auxiliary=(async()=>{
+   const started=Date.now(),timing=new Latency();let result:PushResult;
+   try{result=await sendSilentCryAlarmPush(env,parent.phone_token!,alert,timing);}
+   catch(error){result={status:'failed',reason:error instanceof PushPreparationError?error.code:'apns_configuration'};}
+   await recordDiagnostic(env,{requestId,started,operation:'silent_cry_alarm_dispatch',stage:'push',outcome:result.reason??result.status,eventRef,target:'phone',attempt,httpStatus:result.httpStatus,details:timing.details});
+  })().catch(()=>{});
+  if(options.background){options.background.waitUntil(auxiliary);auxiliary=undefined;}
+ }
  let result:PushResult;
- try{result=await sendPush(env,parent.token,JSON.parse(event.payload) as Alert,target,latency);}
+ try{result=await primary;}
  catch(error){result={status:'retry',reason:error instanceof PushPreparationError?error.code:'apns_configuration'};}
  pushResult=result;latency.details.push_outcome=result.status;
  const status=result.status==='retry'?'pending':result.status;
@@ -160,6 +175,7 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
   .bind(status,next,status==='sent'?new Date().toISOString():null,result.reason??null,eventId).run());
  await record(result.reason??result.status,result.httpStatus);
  } catch(error) { latency.failure(error);await record('internal_error',pushResult?.httpStatus);throw error; }
+ finally {if(auxiliary)await auxiliary;}
 }
 export async function acknowledge(env:Env,device:Device,value:Record<string,unknown>) {
  requireRole(device,'parent');const id=uuid(value.eventId);
