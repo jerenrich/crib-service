@@ -1376,8 +1376,8 @@ describe('latency path and diagnostic spans',()=>{
   expect(await (await call('listener/event',listener,alert(listener))).json()).toEqual({status:'pending'});
   const rows=(await env.DB.prepare("SELECT details FROM diagnostics WHERE operation='dispatch'").all<{details:string}>()).results;
   expect(rows).toHaveLength(1);const details=JSON.parse(rows[0].details);
-  expect(details).toMatchObject({apns_reason:reason,apns_environment:'development',apns_unique_id:appleID,db_calls:6,provider_token_cached:expect.any(Boolean)});
-  for(const span of ['claim_ms','destination_ms','token_decrypt_ms','provider_sign_ms','apns_fetch_ms','apns_body_ms','outcome_storage_ms'])expect(details.spans[span]).toBeGreaterThanOrEqual(0);
+  expect(details).toMatchObject({apns_reason:reason,apns_environment:'development',apns_unique_id:appleID,db_calls:5,provider_token_cached:expect.any(Boolean)});
+  for(const span of ['claim_ms','token_decrypt_ms','provider_sign_ms','apns_fetch_ms','apns_body_ms','outcome_storage_ms'])expect(details.spans[span]).toBeGreaterThanOrEqual(0);
   expect(details.apns_response_at_ms).toBeGreaterThanOrEqual(details.apns_started_at_ms);
   expect(JSON.stringify(details)).not.toContain('private-body-marker');expect(JSON.stringify(details)).not.toContain('private-header-marker');
  });
@@ -1403,7 +1403,7 @@ describe('latency path and diagnostic spans',()=>{
   const values=new Map<string,unknown>([['parentId',parent.deviceId],['interval',5000]]);let alarm:number|null=Date.now()+5000;let chain=Promise.resolve();
   const ctx={storage:{get:async(key:string|string[])=>Array.isArray(key)?new Map(key.map(k=>[k,values.get(k)])):values.get(key),put:async(key:string|Record<string,unknown>,value?:unknown)=>{if(typeof key==='string')values.set(key,value);else for(const [k,v] of Object.entries(key))values.set(k,v);},getAlarm:async()=>alarm,setAlarm:async(n:number)=>{alarm=n;},deleteAlarm:async()=>{alarm=null;},delete:async(key:string|string[])=>{for(const k of Array.isArray(key)?key:[key])values.delete(k);}},blockConcurrencyWhile:<T>(work:()=>Promise<T>)=>{const result=chain.then(work);chain=result.then(()=>{},()=>{});return result;}} as unknown as DurableObjectState;
   let release!:()=>void,entered!:()=>void;const gate=new Promise<void>(r=>{release=r;}),ready=new Promise<void>(r=>{entered=r;});
-  const db=new Proxy(testEnv.DB,{get(target,key){if(key==='prepare')return (sql:string)=>{const statement=target.prepare(sql);if(!sql.startsWith('SELECT p.listener_id'))return statement;return new Proxy(statement,{get(t,k){if(k==='bind')return (...args:unknown[])=>{const bound=t.bind(...args);return {all:async()=>{entered();await gate;return bound.all();}};};const value=Reflect.get(t,k);return typeof value==='function'?value.bind(t):value;}});};const value=Reflect.get(target,key);return typeof value==='function'?value.bind(target):value;}});
+  const db=interceptDB(async(sql,_args,method,execute)=>{if(sql.startsWith('SELECT p.listener_id')&&method==='batch'){entered();await gate;}return execute();});
   const instance=new AlertReminders(ctx,{...testEnv,DB:db}),running=instance.alarm();await ready;
   try {expect((await instance.fetch(new Request('https://reminders.internal/schedule',{method:'POST',body:parent.deviceId}))).status).toBe(204);}finally{release();await running;}
   expect(alarm).not.toBeNull();expect(values.get('parentId')).toBe(parent.deviceId);
@@ -1466,19 +1466,69 @@ describe('phone-controlled Watch push test',()=>{
 });
 
 function interceptDB(work:(sql:string,args:unknown[],method:string,execute:()=>Promise<any>)=>Promise<any>):D1Database {
+ const metadata=new WeakMap<object,{sql:string;args:unknown[]}>();
  return new Proxy(testEnv.DB,{get(db,key){
+  if(key==='batch')return (statements:D1PreparedStatement[])=>{const first=metadata.get(statements[0]);return work(first?.sql??'',first?.args??[],'batch',()=>db.batch(statements));};
   if(key==='prepare')return (sql:string)=>{
-   const wrap=(statement:D1PreparedStatement,args:unknown[]):D1PreparedStatement=>new Proxy(statement,{get(target,name){
+   const wrap=(statement:D1PreparedStatement,args:unknown[]):D1PreparedStatement=>{const wrapped=new Proxy(statement,{get(target,name){
     if(name==='bind')return (...values:unknown[])=>wrap(target.bind(...values),values);
     const value=Reflect.get(target,name);
     if(typeof value==='function'&&['all','first','run','raw'].includes(String(name)))return (...values:unknown[])=>work(sql,args,String(name),()=>value.apply(target,values));
     return typeof value==='function'?value.bind(target):value;
-   }});return wrap(db.prepare(sql),[]);
+   }});metadata.set(wrapped,{sql,args});return wrapped;};return wrap(db.prepare(sql),[]);
   };const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;
  }});
 }
 
 describe('diagnostic gap regressions',()=>{
+ it('uses three binding calls before reminder delivery and includes the current Watch token in the claim',async()=>{
+  const {parent,listener}=await paired();await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});mockPush();await call('listener/event',listener,alert(listener));
+  vi.spyOn(Date,'now').mockReturnValue(Date.now()+10000);let replaced=false;
+  const db=interceptDB(async(sql,_args,method,execute)=>{
+   if(method==='batch'&&sql.startsWith('UPDATE events SET resolved_at=')){
+    replaced=true;await env.DB.prepare('UPDATE devices SET watch_push_token=? WHERE id=?').bind(await encryptToken(testEnv,'ef'.repeat(32)),parent.deviceId).run();
+   }
+   return execute();
+  });
+  const {Latency}=await import('../src/latency');const latency=new Latency();mockPush();await runReminder({...testEnv,DB:db},parent.deviceId,latency);
+  expect(replaced).toBe(true);expect(pushRequests).toHaveLength(2);expect(pushRequests[1].url).toContain('ef'.repeat(32));
+  expect(latency.details.db_calls).toBe(4); // snapshot + insert + claim/token before Apple; outcome after Apple
+  expect(Object.keys(latency.details.db_stages!)).toEqual(['reminder_snapshot_ms','reminder_insert_ms','claim_ms','outcome_storage_ms']);
+  expect(latency.details.db_stages?.reminder_snapshot_ms).toMatchObject({calls:1,completed:1});expect(latency.details.spans?.destination_ms).toBeUndefined();
+ });
+ it('uses one fallback after a stalled snapshot and observes a newer Stop without sending',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});mockPush();await call('listener/event',listener,alert(listener));
+  vi.spyOn(Date,'now').mockReturnValue(Date.now()+10000);
+  let release!:()=>void,entered!:()=>void,reads=0;const gate=new Promise<void>(r=>{release=r;}),ready=new Promise<void>(r=>{entered=r;});
+  const db=interceptDB(async(sql,_args,method,execute)=>{
+   if(method==='batch'&&sql.startsWith('SELECT p.listener_id')){const index=++reads,result=await execute();if(index===1){entered();await gate;}return result;}return execute();
+  });
+  const {Latency}=await import('../src/latency');const latency=new Latency(),running=runReminder({...testEnv,DB:db},parent.deviceId,latency);await ready;
+  try {
+   expect((await call('monitoring',parent,{id:crypto.randomUUID(),enabled:false})).status).toBe(200);
+   expect(await running).toBe(false);expect(reads).toBe(2);expect(pushRequests).toHaveLength(1);
+   expect(latency.details).toMatchObject({exit_reason:'monitoring_stopped',db_stages:{reminder_snapshot_ms:{calls:2,completed:1,hedges:1,hedge_wins:1,unfinished:1}}});
+  }finally{release();await running;}
+  expect((await env.DB.prepare('SELECT event_id FROM events').all()).results).toHaveLength(1);
+ });
+ it('keeps the atomic Stop guard when the original snapshot returns stale state',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});mockPush();await call('listener/event',listener,alert(listener));
+  vi.spyOn(Date,'now').mockReturnValue(Date.now()+10000);let stopped=false;
+  const db=interceptDB(async(sql,_args,method,execute)=>{
+   const result=await execute();if(method==='batch'&&sql.startsWith('SELECT p.listener_id')){stopped=true;await call('monitoring',parent,{id:crypto.randomUUID(),enabled:false});}return result;
+  });
+  await runReminder({...testEnv,DB:db},parent.deviceId);expect(stopped).toBe(true);expect(pushRequests).toHaveLength(1);
+  expect((await env.DB.prepare('SELECT event_id FROM events').all()).results).toHaveLength(1);
+ });
+ it('never hedges a slow committed delivery claim or sends twice',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});mockPush();await call('listener/event',listener,alert(listener));
+  vi.spyOn(Date,'now').mockReturnValue(Date.now()+10000);
+  let release!:()=>void,entered!:()=>void,claims=0;const gate=new Promise<void>(r=>{release=r;}),ready=new Promise<void>(r=>{entered=r;});
+  const db=interceptDB(async(sql,_args,method,execute)=>{const result=await execute();if(method==='batch'&&sql.startsWith('UPDATE events SET resolved_at=')){claims++;entered();await gate;}return result;});
+  const running=runReminder({...testEnv,DB:db},parent.deviceId);await ready;
+  try {await new Promise(r=>setTimeout(r,1550));expect(claims).toBe(1);expect(pushRequests).toHaveLength(1);}finally{mockPush();release();await running;}
+  expect(pushRequests).toHaveLength(2);
+ });
  it('retains preparation when maintenance sees an insert before its binding reply returns',async()=>{
   const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});mockPush();await call('listener/event',listener,alert(listener));
   const clock=Date.now();vi.spyOn(Date,'now').mockReturnValue(clock+10000);
@@ -1496,7 +1546,7 @@ describe('diagnostic gap regressions',()=>{
   const {parent}=await paired();const db=interceptDB(async(sql,_args,_method,execute)=>{if(sql.startsWith('SELECT p.listener_id'))throw new Error('D1_ERROR: timed out private-query-marker');return execute();});
   await expect(runReminder({...testEnv,DB:db},parent.deviceId)).rejects.toThrow();
   const row=await env.DB.prepare("SELECT outcome,details FROM diagnostics WHERE operation='reminder_prepare'").first<{outcome:string;details:string}>();
-  expect(row?.outcome).toBe('internal_error');expect(JSON.parse(row!.details)).toMatchObject({failed_span:'reminder_pair_ms',error_kind:'d1_timeout'});expect(row!.details).not.toContain('private-query-marker');expect(pushRequests).toHaveLength(0);
+  expect(row?.outcome).toBe('internal_error');expect(JSON.parse(row!.details)).toMatchObject({failed_span:'reminder_snapshot_ms',error_kind:'d1_timeout'});expect(row!.details).not.toContain('private-query-marker');expect(pushRequests).toHaveLength(0);
  });
  it('logs durable-alarm storage failures before preparation starts',async()=>{
   const {parent}=await paired();const {AlertReminders}=await import('../src/reminders');

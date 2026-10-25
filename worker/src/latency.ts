@@ -1,7 +1,7 @@
 // Bounded numeric spans only. No SQL, exception text, tokens or payloads.
 export const spans = ['rate_limit_ms','authentication_ms','handler_ms','alert_prepare_ms','claim_ms','destination_ms',
  'token_decrypt_ms','provider_sign_ms','apns_fetch_ms','apns_body_ms','outcome_storage_ms','reminder_prepare_ms',
- 'reminder_schedule_ms','reminder_pair_ms','reminder_control_ms','reminder_latest_ms','reminder_heartbeat_ms','reminder_original_ms','reminder_insert_ms','alarm_lag_ms','generated_to_dispatch_ms',
+ 'reminder_schedule_ms','reminder_snapshot_ms','reminder_pair_ms','reminder_control_ms','reminder_latest_ms','reminder_heartbeat_ms','reminder_original_ms','reminder_insert_ms','alarm_lag_ms','generated_to_dispatch_ms',
  'pair_ms','event_lookup_ms','event_insert_ms','event_reload_ms','event_episode_ms','response_read_ms','claim_observe_ms',
  'alarm_state_ms','alarm_arm_ms','alarm_finalize_ms','schedule_read_ms','schedule_state_ms',
  'maintenance_expiry_ms','maintenance_recovery_ms','maintenance_pending_ms','maintenance_dispatch_ms','maintenance_schedule_ms','maintenance_cleanup_ms','maintenance_connections_ms'] as const;
@@ -13,8 +13,11 @@ export const appleReasons = ['BadCollapseId','BadDeviceToken','BadExpirationDate
  'MethodNotAllowed','ExpiredToken','Unregistered','PayloadTooLarge','TooManyProviderTokenUpdates','TooManyRequests',
  'InternalServerError','ServiceUnavailable','Shutdown','unknown','unreadable'] as const;
 export type AppleReason = typeof appleReasons[number];
+const databaseMetrics=['calls','completed','errors','statements','sql_ms','rows_read','rows_written','attempts','hedges','hedge_wins','unfinished'] as const;
+type DatabaseMetrics=Partial<Record<typeof databaseMetrics[number],number>>;
 export interface TimingDetails {
  spans?:Partial<Record<Span,number>>;
+ db_stages?:Partial<Record<Span,DatabaseMetrics>>;
  db_calls?:number; db_sql_ms?:number; db_rows_read?:number; db_rows_written?:number; db_attempts?:number;
  apns_reason?:AppleReason; apns_environment?:'development'|'production';
  transport?:'timeout'|'network'; provider_token_cached?:boolean; provider_token_age_s?:number;
@@ -44,18 +47,59 @@ export class Latency {
   try{return await work();}catch(error){this.failure(error,name);throw error;}finally{this.details.spans![name]=(this.details.spans![name]??0)+Math.max(0,Date.now()-start);}
  }
  async db<T>(name:Span,work:()=>Promise<D1Result<T>|D1Result<T>[]>):Promise<D1Result<T>[]> {
-  this.details.db_calls=(this.details.db_calls??0)+1;
-  const value=await this.measure(name,work),results=Array.isArray(value)?value:[value];
+  this.databaseStarted(name);
+  try {
+   const value=await this.measure(name,work),results=Array.isArray(value)?value:[value];
+   this.databaseCompleted(name,results);return results;
+  }catch(error){this.metric(name,'errors');throw error;}
+ }
+ private metric(name:Span,key:typeof databaseMetrics[number],amount=1) {
+  const stages=this.details.db_stages??={},stage=stages[name]??={};
+  stage[key]=(stage[key]??0)+amount;
+ }
+ private databaseStarted(name:Span) {
+  this.details.db_calls=(this.details.db_calls??0)+1;this.metric(name,'calls');
+ }
+ private databaseCompleted<T>(name:Span,results:D1Result<T>[]) {
+  this.metric(name,'completed');this.metric(name,'statements',results.length);
   for(const result of results){
    // Missing/malformed optional metrics must never turn a successful DB call into a failure.
    const meta=result.meta as (Partial<D1Meta> & {total_attempts?:number})|undefined;
-   const add=(name:'db_sql_ms'|'db_rows_read'|'db_rows_written'|'db_attempts',n:unknown)=>{
-    if(typeof n==='number'&&Number.isFinite(n)&&n>=0)this.details[name]=(this.details[name]??0)+n;
+   const add=(aggregate:'db_sql_ms'|'db_rows_read'|'db_rows_written'|'db_attempts',key:'sql_ms'|'rows_read'|'rows_written'|'attempts',n:unknown)=>{
+    if(typeof n==='number'&&Number.isFinite(n)&&n>=0){this.details[aggregate]=(this.details[aggregate]??0)+n;this.metric(name,key,n);}
    };
-   add('db_sql_ms',meta?.duration);add('db_rows_read',meta?.rows_read);add('db_rows_written',meta?.rows_written);
-   add('db_attempts',meta?.total_attempts);
+   add('db_sql_ms','sql_ms',meta?.duration);add('db_rows_read','rows_read',meta?.rows_read);add('db_rows_written','rows_written',meta?.rows_written);
+   add('db_attempts','attempts',meta?.total_attempts);
   }
-  return results;
+ }
+ // Only SELECT work belongs here. D1 cannot cancel a losing call: never use this
+ // for writes, claims or APNs. One extra read is the full fallback budget.
+ async readOnly<T>(name:Span,work:()=>Promise<D1Result<T>|D1Result<T>[]>,hedgeAfterMs=1500):Promise<D1Result<T>[]> {
+  return this.measure(name,()=>new Promise<D1Result<T>[]>((resolve,reject)=>{
+   let settled=false,started=0,failed=0,timer:ReturnType<typeof setTimeout>|undefined;
+   const clear=()=>{if(timer!==undefined)clearTimeout(timer);};
+   const attempt=async()=>{
+    if(settled||started>=2)return;
+    started++;this.databaseStarted(name);if(started===2)this.metric(name,'hedges');
+    const index=started;
+    try {
+     const value=await work();
+     // Freeze the trace when the logical read returns. Ignore late losers and
+     // consume their errors so they cannot alter a later send's diagnostics.
+     if(settled)return;
+     const results=Array.isArray(value)?value:[value];this.databaseCompleted(name,results);
+     if(index===2)this.metric(name,'hedge_wins');
+     if(started-failed-1>0)this.metric(name,'unfinished',started-failed-1);
+     settled=true;clear();resolve(results);
+    }catch(error){
+     if(settled)return;
+     failed++;this.metric(name,'errors');
+     if(started===1){clear();void attempt();}
+     else if(failed===2){settled=true;clear();reject(error);}
+    }
+   };
+   timer=setTimeout(()=>{void attempt();},hedgeAfterMs);void attempt();
+  }));
  }
  async read<T>(name:Span,statement:D1PreparedStatement):Promise<T|null> {
   const [result]=await this.db<T>(name,()=>statement.all<T>());return result.results[0]??null;
@@ -69,6 +113,14 @@ export function safeTimingDetails(value:TimingDetails|undefined):string|null {
  const times:Record<string,number>={};
  for(const name of spans){const n=value.spans?.[name];if(number(n))times[name]=Math.round(n!*1000)/1000;}
  if(Object.keys(times).length)safe.spans=times;
+ const stages:Record<string,Record<string,number>>={};
+ for(const name of spans){
+  const source=value.db_stages?.[name];if(!source)continue;
+  const metrics:Record<string,number>={};
+  for(const key of databaseMetrics){const n=source[key];if(number(n))metrics[key]=Math.round(n!*1000)/1000;}
+  if(Object.keys(metrics).length)stages[name]=metrics;
+ }
+ if(Object.keys(stages).length)safe.db_stages=stages;
  for(const name of ['db_calls','db_sql_ms','db_rows_read','db_rows_written','db_attempts','provider_token_age_s','apns_started_at_ms','apns_response_at_ms','observed_attempts','next_attempt_at_ms','preparation_started_at_ms','preparation_finished_at_ms'] as const){
   if(number(value[name]))safe[name]=value[name];
  }

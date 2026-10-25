@@ -1,4 +1,3 @@
-import {latestMonitoringCommand} from './monitoring';
 import type {Alert,Env,Heartbeat,StoredEvent} from './types';
 import {configuration} from './security';
 import {dispatchEvent} from './alerts';
@@ -92,18 +91,28 @@ export async function runReminder(env:Env,parentId:string,latency=new Latency(),
  const stop=(reason:typeof latency.details.exit_reason)=>{stopped=true;latency.details.exit_reason=reason;return false;};
  const send=async(id:string)=>{eventId=id;preparation();handedOff=true;await dispatchEvent(env,id,undefined,latency);};
  try {
- const read=async<T>(name:Span,statement:D1PreparedStatement)=>{const [result]=await latency.db<T>(name,()=>statement.all<T>());return result.results[0];};
- const pair=await read<{listener_id:string;created_at:number;alerts_muted_until:number;config:string}>('reminder_pair_ms',env.DB.prepare('SELECT p.listener_id,p.created_at,d.alerts_muted_until,d.config FROM pairs p JOIN devices d ON d.id=p.parent_id WHERE p.parent_id=?')
-  .bind(parentId));
+ const read=async<T>(name:Span,statement:D1PreparedStatement)=>{const [result]=await latency.readOnly<T>(name,()=>statement.all<T>());return result.results[0];};
+ // One consistent read-only snapshot replaces three sequential round trips.
+ // All statements scope themselves to the current pairing, so a fallback cannot
+ // mix a cached pair with control/event state from a replacement pairing.
+ const snapshot=await latency.readOnly<unknown>('reminder_snapshot_ms',()=>env.DB.batch([
+  env.DB.prepare('SELECT p.listener_id,p.created_at,d.alerts_muted_until,d.config FROM pairs p JOIN devices d ON d.id=p.parent_id WHERE p.parent_id=?').bind(parentId),
+  env.DB.prepare(`SELECT m.enabled,m.status,m.expires_at FROM monitoring_commands m JOIN pairs p
+   ON p.parent_id=m.parent_id AND p.listener_id=m.listener_id AND p.created_at=m.pair_created_at
+   WHERE p.parent_id=? ORDER BY m.sequence DESC LIMIT 1`).bind(parentId),
+  env.DB.prepare(`SELECT e.* FROM events e JOIN pairs p ON p.parent_id=e.parent_id AND p.listener_id=e.listener_id
+   WHERE p.parent_id=? AND e.acknowledged_at IS NULL AND e.resolved_at IS NULL AND COALESCE(e.last_error,'')!='expired_event'
+   AND COALESCE(json_extract(e.payload,'$.isTest'),0)=0 ORDER BY e.created_at DESC,e.event_id DESC LIMIT 1`).bind(parentId)
+ ]));
+ const pair=snapshot[0].results[0] as {listener_id:string;created_at:number;alerts_muted_until:number;config:string}|undefined;
  if(!pair)return stop('no_pair');
  observed?.(configuration(JSON.parse(pair.config)).repeatInterval===2?2000:5000,pair.alerts_muted_until);
- const control=await latestMonitoringCommand(env,{parent_id:parentId,listener_id:pair.listener_id,created_at:pair.created_at},latency);
- if(control&&!control.enabled&&['pending','applied'].includes(control.status))return stop('monitoring_stopped');
+ const control=snapshot[1].results[0] as {enabled:number;status:string;expires_at:number}|undefined;
+ if(control&&!control.enabled&&(control.status==='applied'||control.status==='pending'&&control.expires_at>Date.now()))return stop('monitoring_stopped');
  if(pair.alerts_muted_until>now){latency.details.exit_reason='muted';return true;}
  // An expired upload may have arrived after a live alert. Skip that row rather
  // than letting it shut down reminders for every other outstanding episode.
- let previous=await read<StoredEvent>('reminder_latest_ms',env.DB.prepare("SELECT * FROM events WHERE parent_id=? AND listener_id=? AND acknowledged_at IS NULL AND resolved_at IS NULL AND COALESCE(last_error,'')!='expired_event' AND COALESCE(json_extract(payload,'$.isTest'),0)=0 ORDER BY created_at DESC,event_id DESC LIMIT 1")
-  .bind(parentId,pair.listener_id));
+ let previous=snapshot[2].results[0] as StoredEvent|undefined;
  if(!previous) {
   // After a mute, require a fresh Listener update confirming sustained crying.
   if(!pair.alerts_muted_until)return stop('no_pending_alert');

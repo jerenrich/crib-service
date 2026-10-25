@@ -60,7 +60,7 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  // Diagnostic computation is best effort, just like journal writes.
  try { eventRef=latency.eventRef??await eventReference(env,eventId);latency.eventRef=eventRef; } catch { /* No diagnostic identity available. */ }
  // Tombstones also suppress an offline outbox upload after its episode settled.
- const claims=await latency.db<StoredEvent>('claim_ms',()=>env.DB.batch<StoredEvent>([env.DB.prepare(`UPDATE events SET resolved_at=COALESCE(resolved_at,(SELECT r.resolved_at FROM resolved_episodes r
+ const claims=await latency.db<StoredEvent|{token:string|null}>('claim_ms',()=>env.DB.batch<StoredEvent|{token:string|null}>([env.DB.prepare(`UPDATE events SET resolved_at=COALESCE(resolved_at,(SELECT r.resolved_at FROM resolved_episodes r
   JOIN pairs p ON p.parent_id=r.parent_id AND p.listener_id=r.listener_id AND p.created_at=r.pair_created_at
   WHERE r.parent_id=events.parent_id AND r.listener_id=events.listener_id AND r.episode_id=events.episode_id))
   WHERE event_id=? AND COALESCE(json_extract(payload,'$.isTest'),0)=0`).bind(eventId),
@@ -78,8 +78,12 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  AND CAST(ROUND((julianday(json_extract(events.payload,'$.createdAt'))-2440587.5)*86400000) AS INTEGER)<=m.created_at)
  OR (is_repeat=1 AND EXISTS(SELECT 1 FROM events prior WHERE prior.parent_id=events.parent_id AND prior.episode_id=events.episode_id AND prior.acknowledged_at IS NOT NULL AND prior.created_at>=events.created_at))
  )`).bind(new Date(now).toISOString(),eventId,now,now),
- env.DB.prepare("UPDATE events SET status='sending',lease_until=?,attempts=attempts+1,push_target=COALESCE(push_target,CASE WHEN (SELECT watch_push_token FROM devices WHERE id=events.parent_id) IS NOT NULL THEN 'watch' ELSE 'phone' END) WHERE event_id=? AND status='pending' AND acknowledged_at IS NULL AND resolved_at IS NULL AND next_attempt<=? RETURNING *").bind(now+30000,eventId,now)]));
- const event=claims[2].results[0];
+ env.DB.prepare("UPDATE events SET status='sending',lease_until=?,attempts=attempts+1,push_target=COALESCE(push_target,CASE WHEN (SELECT watch_push_token FROM devices WHERE id=events.parent_id) IS NOT NULL THEN 'watch' ELSE 'phone' END) WHERE event_id=? AND status='pending' AND acknowledged_at IS NULL AND resolved_at IS NULL AND next_attempt<=? RETURNING *").bind(now+30000,eventId,now),
+ // Read the selected token in the claim transaction, avoiding another remote
+ // round trip. A losing claimant must still return before using this result.
+ env.DB.prepare(`SELECT CASE e.push_target WHEN 'watch' THEN d.watch_push_token ELSE d.push_token END AS token
+  FROM events e JOIN devices d ON d.id=e.parent_id WHERE e.event_id=? AND e.status='sending'`).bind(eventId)]));
+ const event=claims[2].results[0] as StoredEvent|undefined;
  if(!event){
   // Losing a claim is a diagnostic outcome too: retain this caller's preparation
   // spans, especially if cron saw an insert before the alarm's D1 reply arrived.
@@ -100,8 +104,7 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
   await latency.db('outcome_storage_ms',()=>env.DB.prepare("UPDATE events SET status='failed',last_error='expired_event',lease_until=NULL WHERE event_id=?").bind(eventId).run());await record('expired_event');return;
  }
  const column=target==='watch'?'watch_push_token':'push_token';
- const [destinations]=await latency.db<{token:string|null}>('destination_ms',()=>env.DB.prepare(`SELECT ${column} AS token FROM devices WHERE id=?`).bind(event.parent_id).all<{token:string|null}>());
- const parent=destinations.results[0];
+ const parent=claims[3].results[0] as {token:string|null}|undefined;
  if(!parent?.token){
   // A token upload can race with this read. Decide blocked/pending in the same
   // database statement that releases the claim, so either ordering can recover.
