@@ -133,6 +133,9 @@ import UserNotifications
     }
     func handleNotification(_ value: WatchCryAlert, acknowledging: Bool) {
         alertState.handleNotification(value, acknowledging: acknowledging)
+        if acknowledging {
+            Task { await NotificationCleanup.dismissCryingAlerts(testEventID: value.isTest ? value.eventId : nil) }
+        }
     }
     func resumeAlerts() {
         guard let until = snapshot.alertsMutedUntil, until > Date() else { return }
@@ -144,7 +147,10 @@ import UserNotifications
         send(WatchCommand(kind: .resumeAlerts, snoozeDeadline: until))
     }
     func acknowledge() {
-        if let alert { log.watchAlert(WatchAlertTrace(alert: alert, phase: .acknowledged)) }
+        if let alert {
+            log.watchAlert(WatchAlertTrace(alert: alert, phase: .acknowledged))
+            Task { await NotificationCleanup.dismissCryingAlerts(testEventID: alert.isTest ? alert.eventId : nil) }
+        }
         log.record("watch_acknowledgement_requested"); alertState.acknowledgeCurrent()
     }
     func previewHaptic() async {
@@ -179,6 +185,9 @@ import UserNotifications
         catch { log.record("watch_snapshot_failed", error: error) }
         notice = value.message
         alertState.acceptAlert(from: value)
+        if value.statusAvailable, let relevance = value.notificationRelevance, let checkedAt = value.notificationsCheckedAt {
+            Task { await NotificationCleanup.removeIrrelevant(using: relevance, deliveredBefore: checkedAt) }
+        }
     }
 
     private func updateConnectionWarning(_ deadline: Date?, force: Bool = false) {

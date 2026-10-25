@@ -13,6 +13,7 @@ import Observation
     private let currentTime: () -> Date
     private var snoozeDuration: TimeInterval
     private var mutedUntil: Date?
+    private var localMutedUntil: Date?
     private var pendingAcknowledgements: [UUID]
 
     init(defaults: UserDefaults = .standard, currentTime: @escaping () -> Date = Date.init) {
@@ -20,6 +21,7 @@ import Observation
         self.currentTime = currentTime
         snoozeDuration = defaults.object(forKey: "snoozeDuration") as? Double ?? 60
         mutedUntil = defaults.object(forKey: "cryAlertsMutedUntil") as? Date
+        localMutedUntil = defaults.object(forKey: "localCryAlertsMutedUntil") as? Date
         if let saved = defaults.dictionary(forKey: "episodeMutedUntil") as? [String: Double] {
             acknowledgedUntil = saved
         } else {
@@ -53,15 +55,22 @@ import Observation
     }
 
     private func acknowledge(_ value: WatchCryAlert) {
-        guard !isSuppressed(value) else { return }
+        guard !isEpisodeSuppressed(value) else { return }
         acknowledgedUntil[value.episodeId.uuidString] = currentTime().timeIntervalSince1970 + snoozeDuration
         acknowledgedEpisodes.removeAll { $0 == value.episodeId }
         acknowledgedEpisodes.append(value.episodeId)
         acknowledgedEpisodes = Array(acknowledgedEpisodes.suffix(100))
         pendingAcknowledgements.append(value.eventId)
-        // A notification action may refer to an older episode than the visible alert.
-        if alert?.episodeId == value.episodeId { alert = nil }
-        if localAlert?.episodeId == value.episodeId { localAlert = nil }
+        // A real Snooze applies to all crying episodes, including older alerts.
+        // Test acknowledgements affect only that test.
+        if !value.isTest {
+            localMutedUntil = currentTime().addingTimeInterval(snoozeDuration)
+            if alert?.isTest == false { alert = nil }
+            if localAlert?.isTest == false { localAlert = nil }
+        } else {
+            if alert?.eventId == value.eventId { alert = nil }
+            if localAlert?.eventId == value.eventId { localAlert = nil }
+        }
         persist()
         retryPendingAcknowledgement()
     }
@@ -70,6 +79,7 @@ import Observation
         snoozeDuration = value.snoozeDuration ?? 60
         if value.statusAvailable {
             mutedUntil = value.alertsMutedUntil
+            if pendingAcknowledgements.isEmpty { localMutedUntil = mutedUntil }
             if let until = mutedUntil, until > currentTime() || pendingAcknowledgements.isEmpty {
                 for id in acknowledgedEpisodes { acknowledgedUntil[id.uuidString] = until.timeIntervalSince1970 }
             }
@@ -102,7 +112,12 @@ import Observation
     }
 
     private func isSuppressed(_ value: WatchCryAlert) -> Bool {
+        if !value.isTest, let localMutedUntil, value.createdAt < localMutedUntil { return true }
         if !value.isTest, let mutedUntil, value.createdAt < mutedUntil { return true }
+        return isEpisodeSuppressed(value)
+    }
+
+    private func isEpisodeSuppressed(_ value: WatchCryAlert) -> Bool {
         guard acknowledgedEpisodes.contains(value.episodeId) else { return false }
         guard let time = acknowledgedUntil[value.episodeId.uuidString] else { return true }
         // Old notifications stay dismissed; a new alert after the mute may wake again.
@@ -114,6 +129,7 @@ import Observation
         defaults.set(acknowledgedUntil, forKey: "episodeMutedUntil")
         defaults.set(snoozeDuration, forKey: "snoozeDuration")
         defaults.set(mutedUntil, forKey: "cryAlertsMutedUntil")
+        defaults.set(localMutedUntil, forKey: "localCryAlertsMutedUntil")
         defaults.set(acknowledgedEpisodes.map(\.uuidString), forKey: "acknowledgedEpisodes")
         defaults.set(pendingAcknowledgements.map(\.uuidString), forKey: "pendingAcknowledgements")
         defaults.removeObject(forKey: "pendingAcknowledgement")

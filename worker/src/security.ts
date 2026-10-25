@@ -27,9 +27,13 @@ export function configuration(value:Record<string,unknown>):Configuration {
 }
 function episode(value:unknown):Episode {
  if(!value||typeof value!=='object'||Array.isArray(value))throw new APIError(400,'Invalid episode.');
- const v=value as Record<string,unknown>;onlyKeys(v,['id','startedAt','endedAt','alertSentAt']);
+ const v=value as Record<string,unknown>;onlyKeys(v,['id','startedAt','endedAt','alertSentAt','quietConfirmed']);
  const result:Episode={id:uuid(v.id),startedAt:date(v.startedAt)};
  if(v.endedAt!=null){result.endedAt=date(v.endedAt);if(Date.parse(result.endedAt)<Date.parse(result.startedAt))throw new APIError(400,'Invalid episode duration.');}
+ if(v.quietConfirmed!==undefined){
+  if(typeof v.quietConfirmed!=='boolean'||v.quietConfirmed&&!result.endedAt)throw new APIError(400,'Invalid quiet confirmation.');
+  result.quietConfirmed=v.quietConfirmed;
+ }
  if(v.alertSentAt!=null)result.alertSentAt=date(v.alertSentAt);
  return result;
 }

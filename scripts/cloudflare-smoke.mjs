@@ -16,6 +16,7 @@ const listener = {deviceId: randomUUID(), role: 'listener', secret: randomBytes(
 const ids = `'${parent.deviceId}','${listener.deviceId}'`;
 const cleanup = [
     `DELETE FROM monitoring_commands WHERE parent_id IN (${ids}) OR listener_id IN (${ids});`,
+    `DELETE FROM resolved_episodes WHERE parent_id IN (${ids}) OR listener_id IN (${ids});`,
     `DELETE FROM alert_snoozes WHERE parent_id IN (${ids}) OR listener_id IN (${ids});`,
     `DELETE FROM timeline_events WHERE parent_id IN (${ids}) OR listener_id IN (${ids});`,
     `DELETE FROM connection_notices WHERE parent_id IN (${ids}) OR listener_id IN (${ids});`,
@@ -69,6 +70,23 @@ try {
     check(Date.parse(status.body.serverTime) >= Date.parse(status.body.lastHeartbeat), 'server clock supplied for adaptive polling');
     const repeatedStatus = await request('listener/status', parent, null, 'GET');
     check(repeatedStatus.body.nextHeartbeatExpectedAt === status.body.nextHeartbeatExpectedAt, 'repeated polling does not postpone the expected heartbeat');
+    const event = {
+        eventId: randomUUID(), episodeId: randomUUID(), listenerId: listener.deviceId,
+        type: 'sustained_cry', cryStartedAt: new Date().toISOString(), durationSeconds: 0,
+        createdAt: new Date().toISOString(), isRepeat: false
+    };
+    const blocked = await request('listener/event', listener, event);
+    check(blocked.status === 200 && blocked.body.status === 'blocked', 'cry alert is blocked without any push token');
+    const relevant = await request('listener/status', parent, null, 'GET');
+    check(relevant.body.notificationRelevance?.cryEpisodeIDs?.includes(event.episodeId), 'outstanding episode is relevant for notification cleanup');
+    const settledBeat = {...beat, timestamp: new Date().toISOString(), episodes: [{id: event.episodeId,
+        startedAt: event.cryStartedAt, endedAt: new Date().toISOString(), quietConfirmed: true}]};
+    check((await request('listener/heartbeat', listener, settledBeat)).status === 200, 'confirmed quiet episode accepted');
+    const settled = await request('listener/status', parent, null, 'GET');
+    const resolved = settled.body.alerts?.find(alert => alert.eventId === event.eventId);
+    check(resolved?.resolvedAt && !resolved.acknowledgedAt && !settled.body.alertsMutedUntil, 'settling resolves without snoozing or acknowledgement');
+    check(!settled.body.notificationRelevance?.cryEpisodeIDs?.includes(event.episodeId), 'settled episode is removed from notification relevance');
+    check((await request('listener/event', listener, event)).body.status === 'resolved', 'late outbox upload cannot revive a settled episode');
     const history = await request('timeline', parent, null, 'GET');
     check(history.status === 200 && history.body.paired && history.body.events?.some(event => event.id === timelineRecord.id), 'Parent timeline includes uploaded monitoring transition');
     check((await request('timeline', listener, null, 'GET')).status === 200, 'Listener can read shared timeline');
@@ -86,7 +104,7 @@ try {
     const test = await request('test-push', parent);
     check(test.status === 200 && test.body.status === 'blocked', 'marked real-test route blocked safely without push tokens');
     const testStatus = await request('listener/status', parent, null, 'GET');
-    check(testStatus.body.alerts?.length === 1 && testStatus.body.alerts[0].isTest === true, 'test event clearly marked in Parent status');
+    check(testStatus.body.alerts?.filter(alert => alert.isTest === true).length === 1, 'test event clearly marked in Parent status');
     const createdAt = new Date();
     const realAlert = {eventId: randomUUID(), episodeId: randomUUID(), listenerId: listener.deviceId, type: 'sustained_cry',
         cryStartedAt: new Date(createdAt.getTime() - 5000).toISOString(), durationSeconds: 5, createdAt: createdAt.toISOString(), isRepeat: false};
@@ -101,7 +119,7 @@ try {
     check(repeatedAcknowledgement.body.alertsMutedUntil === snoozed.body.alertsMutedUntil, 'duplicate acknowledgement does not extend snooze');
     const acknowledgedHistory = await request('timeline', parent, null, 'GET');
     check(acknowledgedHistory.body.events?.filter(event => event.kind === 'alert_acknowledged' && event.episodeID === realAlert.episodeId).length === 1, 'real acknowledgement appears exactly once in timeline');
-    check((await request('alert/acknowledge', parent, {eventId: testStatus.body.alerts[0].eventId})).status === 200, 'test acknowledgement accepted');
+    check((await request('alert/acknowledge', parent, {eventId: testStatus.body.alerts.find(alert => alert.isTest === true).eventId})).status === 200, 'test acknowledgement accepted');
     const afterTest = await request('listener/status', parent, null, 'GET');
     check(afterTest.body.alertsMutedUntil === snoozed.body.alertsMutedUntil, 'test acknowledgement does not extend the real snooze');
     const expectedUntil = Date.parse(snoozed.body.alertsMutedUntil);

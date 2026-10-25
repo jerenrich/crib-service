@@ -38,6 +38,7 @@ final class WatchAlertStateTests: XCTestCase {
         XCTAssertEqual(fixture.commands.last?.eventId, current.eventId)
         state.resolveAcknowledgements(from: WatchSnapshot(acknowledgedEventId: current.eventId))
         XCTAssertFalse(fixture.makeState().acknowledgementPending)
+        state.acceptAlert(from: WatchSnapshot(statusAvailable: true))
         let next = fixture.alert()
         state.receive(next)
         XCTAssertEqual(state.alert, next)
@@ -70,10 +71,12 @@ final class WatchAlertStateTests: XCTestCase {
         let fixture = try Fixture()
         fixture.activated = true
         let state = fixture.makeState()
-        let old = fixture.alert(), current = fixture.alert()
+        let old = fixture.alert()
         state.receive(old)
         state.acknowledgeCurrent()
         state.confirmAcknowledgement(old.eventId)
+        state.acceptAlert(from: WatchSnapshot(statusAvailable: true, alertsMutedUntil: Date()))
+        let current = fixture.alert()
         state.receive(current)
 
         // Notification Center can retain an episode already acknowledged in the app.
@@ -86,7 +89,7 @@ final class WatchAlertStateTests: XCTestCase {
         XCTAssertEqual(state.alert, current)
     }
 
-    @MainActor func testAcknowledgingOlderUnseenNotificationTargetsOnlyItsEpisode() throws {
+    @MainActor func testSnoozingOlderNotificationClearsEveryCryingEpisode() throws {
         let fixture = try Fixture()
         fixture.activated = true
         let state = fixture.makeState()
@@ -95,10 +98,16 @@ final class WatchAlertStateTests: XCTestCase {
 
         state.handleNotification(old, acknowledging: true)
 
-        XCTAssertEqual(state.alert, current)
+        XCTAssertNil(state.alert)
         XCTAssertEqual(fixture.commands.map(\.eventId), [old.eventId])
         state.receive(fixture.alert(episodeID: old.episodeId))
-        XCTAssertEqual(state.alert, current)
+        XCTAssertNil(state.alert)
+        let restored = fixture.makeState()
+        restored.receive(current)
+        XCTAssertNil(restored.alert)
+        let test = WatchCryAlert(eventId: UUID(), episodeId: UUID(), startedAt: Date(), createdAt: Date(), duration: 5, isTest: true)
+        restored.receive(test)
+        XCTAssertEqual(restored.alert, test)
     }
 
     @MainActor func testAcknowledgementBeforeActivationIsReplayedAndWaitsForConfirmation() throws {
@@ -189,6 +198,15 @@ final class WatchAlertStateTests: XCTestCase {
         XCTAssertEqual(fixture.commands.map(\.eventId), [eventID])
         state.confirmAcknowledgement(eventID)
         XCTAssertFalse(fixture.makeState().acknowledgementPending)
+    }
+
+    @MainActor func testTestAcknowledgementKeepsCurrentCryingAlert() throws {
+        let fixture = try Fixture(), state = fixture.makeState()
+        let current = fixture.alert()
+        state.receive(current)
+        let test = WatchCryAlert(eventId: UUID(), episodeId: UUID(), startedAt: Date(), createdAt: Date(), duration: 5, isTest: true)
+        state.handleNotification(test, acknowledging: true)
+        XCTAssertEqual(state.alert, current)
     }
 
     @MainActor func testOpeningNotificationStillShowsAlertAndCurrentAcknowledgementSilencesRepeats() throws {

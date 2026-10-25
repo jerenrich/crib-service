@@ -8,6 +8,8 @@ import Observation
     var onToken: ((String) -> Void)? { get set }
     var onAlert: (() -> Void)? { get set }
     var onAcknowledge: ((UUID) async -> Void)? { get set }
+    func cleanUpAlerts(using relevance: NotificationRelevance, deliveredBefore: Date) async
+    func dismissCryingAlerts(testEventID: UUID?) async
     func register() async
     func registered(_ token: Data)
     func failed()
@@ -15,6 +17,8 @@ import Observation
     func setParentConnectionDeadline(_ deadline: Date?) async throws
 }
 extension NotificationProviding {
+    func cleanUpAlerts(using relevance: NotificationRelevance, deliveredBefore: Date) async {}
+    func dismissCryingAlerts(testEventID: UUID?) async {}
     var authorizationAllowed: Bool { false }
     var onAcknowledge: ((UUID) async -> Void)? { get { nil } set {} }
 }
@@ -32,6 +36,12 @@ extension NotificationProviding {
         UNUserNotificationCenter.current().setNotificationCategories([
             UNNotificationCategory(identifier: WatchNotification.category, actions: [UNNotificationAction(identifier: WatchNotification.acknowledge, title: "Snooze", options: [.foreground]), action], intentIdentifiers: [], options: [])
         ])
+    }
+    func cleanUpAlerts(using relevance: NotificationRelevance, deliveredBefore: Date) async {
+        await NotificationCleanup.removeIrrelevant(using: relevance, deliveredBefore: deliveredBefore)
+    }
+    func dismissCryingAlerts(testEventID: UUID?) async {
+        await NotificationCleanup.dismissCryingAlerts(testEventID: testEventID)
     }
     func register() async {
         #if DEBUG
@@ -65,6 +75,7 @@ extension NotificationProviding {
         content.body = "Synthetic episode reached \(Int(alert.durationSeconds)) seconds."
         content.sound = nil
         content.categoryIdentifier = WatchNotification.category
+        content.userInfo = ["eventId": alert.eventId.uuidString, "episodeId": alert.episodeId.uuidString, "isTest": true]
         do {
             try await UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: alert.eventId.uuidString, content: content, trigger: nil))
             log?.record("local_notification_scheduled")
@@ -84,6 +95,8 @@ extension NotificationProviding {
         if response.actionIdentifier == WatchNotification.acknowledge,
            let rawID = response.notification.request.content.userInfo["eventId"] as? String,
            let id = UUID(uuidString: rawID) {
+            let isTest = response.notification.request.content.userInfo["isTest"] as? Bool == true
+            await NotificationCleanup.dismissCryingAlerts(testEventID: isTest ? id : nil)
             await acknowledge(id)
         }
         await refresh()

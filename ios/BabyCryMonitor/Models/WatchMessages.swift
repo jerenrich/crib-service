@@ -21,6 +21,8 @@ struct WatchSnapshot: Codable, Equatable, Sendable {
     var acknowledgedEventId: UUID?
     // Terminal queue resolution, distinct from an acknowledgement/snooze.
     var discardedAcknowledgementEventId: UUID?
+    var notificationRelevance: NotificationRelevance?
+    var notificationsCheckedAt: Date?
     var alert: WatchCryAlert?
     var message: String?
     // An absolute deadline from a successful Parent server check. An unrelated

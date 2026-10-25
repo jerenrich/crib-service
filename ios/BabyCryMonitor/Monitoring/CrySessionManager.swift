@@ -41,7 +41,7 @@ public struct CrySessionManager: Sendable {
             }
         }
         if previous == .crying && state == .quiet {
-            end(at: detector.quietSince ?? sample.timestamp)
+            end(at: detector.quietSince ?? sample.timestamp, quietConfirmed: true)
         }
         guard var episode = snapshot.current else { return [] }
         episode.sampleCount += 1
@@ -52,7 +52,7 @@ public struct CrySessionManager: Sendable {
         // Once sustained quiet reaches reset, the episode above has already ended.
         // Defer a due alert during a quiet gap until sound resumes. If the gap
         // becomes a full reset, a baby that settled before the threshold sends none.
-        // The server repeats until acknowledgement, independently of later sound.
+        // The server repeats until acknowledgement or a confirmed quiet reset.
         if initial && sample.dbFS >= snapshot.configuration.absoluteThreshold {
             let alert = CryAlert(episodeId: episode.id, listenerId: listenerId, cryStartedAt: episode.startedAt,
                                  durationSeconds: episode.duration(at: sample.timestamp), createdAt: sample.timestamp, isRepeat: !initial)
@@ -82,10 +82,11 @@ public struct CrySessionManager: Sendable {
         snapshot.pendingTimelineIDs.removeAll { ids.contains($0) }
     }
     public mutating func markMonitoring(_ active: Bool) { snapshot.wasMonitoring = active }
-    public mutating func end(at date: Date? = nil) {
+    public mutating func end(at date: Date? = nil, quietConfirmed: Bool = false) {
         if var episode = snapshot.current {
             let endedAt = max(episode.startedAt, date ?? clock.now)
             episode.endedAt = endedAt
+            episode.quietConfirmed = quietConfirmed
             appendTimeline(TimelineEvent(id: "cry-end:\(episode.id.uuidString.lowercased())", kind: "cry_ended",
                                          occurredAt: endedAt, endAt: episode.startedAt, episodeID: episode.id.uuidString.lowercased()))
             snapshot.history.insert(episode, at: 0)

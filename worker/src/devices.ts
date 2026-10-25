@@ -26,7 +26,7 @@ export async function savePushToken(env:Env,device:Device,value:Record<string,un
  if(typeof value.token!=='string'||!/^[0-9a-f]{64,200}$/i.test(value.token))throw new APIError(400,'Invalid APNs token.');
  await env.DB.batch([
   env.DB.prepare('UPDATE devices SET push_token=? WHERE id=?').bind(await encryptToken(env,value.token),device.id),
-  env.DB.prepare("UPDATE events SET status='pending',next_attempt=0 WHERE parent_id=? AND status='blocked' AND acknowledged_at IS NULL").bind(device.id)
+  env.DB.prepare("UPDATE events SET status='pending',next_attempt=0 WHERE parent_id=? AND status='blocked' AND acknowledged_at IS NULL AND resolved_at IS NULL").bind(device.id)
  ]);
  return {ok:true};
 }
@@ -42,6 +42,7 @@ export async function removeDeviceData(env:Env,device:Device,deleteDevice=false)
  await env.DB.batch([
   env.DB.prepare('UPDATE devices SET alerts_muted_until=0,alerts_muted_at=0 WHERE id=?').bind(parent),
   env.DB.prepare('DELETE FROM monitoring_commands WHERE listener_id=? OR parent_id=?').bind(listener,parent),
+  env.DB.prepare('DELETE FROM resolved_episodes WHERE listener_id=? OR parent_id=?').bind(listener,parent),
   env.DB.prepare('DELETE FROM alert_snoozes WHERE listener_id=? OR parent_id=?').bind(listener,parent),
   env.DB.prepare('DELETE FROM timeline_events WHERE listener_id=? OR parent_id=?').bind(listener,parent),
   env.DB.prepare('DELETE FROM connection_notices WHERE listener_id=? OR parent_id=?').bind(listener,parent),
@@ -65,7 +66,7 @@ export async function saveWatchPushToken(env:Env,device:Device,value:Record<stri
  if(value.token!==null && (typeof value.token!=='string'||!/^[0-9a-f]{64,200}$/i.test(value.token)))throw new APIError(400,'Invalid Watch APNs token.');
  await env.DB.batch([
   env.DB.prepare('UPDATE devices SET watch_push_token=? WHERE id=?').bind(value.token===null?null:await encryptToken(env,value.token),device.id),
-  env.DB.prepare("UPDATE events SET status='pending',next_attempt=0,push_target=NULL WHERE parent_id=? AND status='blocked' AND acknowledged_at IS NULL").bind(device.id)
+  env.DB.prepare("UPDATE events SET status='pending',next_attempt=0,push_target=NULL WHERE parent_id=? AND status='blocked' AND acknowledged_at IS NULL AND resolved_at IS NULL").bind(device.id)
  ]);
  return {ok:true};
 }

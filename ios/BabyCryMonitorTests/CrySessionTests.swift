@@ -24,6 +24,17 @@ final class CrySessionTests: XCTestCase {
             }
         }
     }
+    func testQuietConfirmationSurvivesPersistenceAndInterruptionsDoNotConfirmQuiet() throws {
+        var settled = Simulation(); settled.run(306); settled.run(25, loud: false)
+        let encoded = try JSONEncoder().encode(settled.engine.snapshot)
+        let restored = try JSONDecoder().decode(SessionSnapshot.self, from: encoded)
+        XCTAssertEqual(restored.history.first?.quietConfirmed, true)
+        var interrupted = Simulation(); interrupted.run(306); interrupted.engine.suspend()
+        XCTAssertEqual(interrupted.engine.snapshot.history.first?.quietConfirmed, false)
+        var stalled = Simulation(); stalled.run(306)
+        _ = stalled.engine.consume(AudioLevelSample(timestamp: stalled.time.addingTimeInterval(10), dbFS: -65), listenerId: stalled.listener)
+        XCTAssertEqual(stalled.engine.snapshot.history.first?.quietConfirmed, false)
+    }
     func testBriefNoiseDoesNotCreateEpisode() {
         var s = Simulation(); s.run(2); s.run(30, loud: false)
         XCTAssertNil(s.engine.snapshot.current); XCTAssertTrue(s.engine.snapshot.history.isEmpty); XCTAssertTrue(s.emitted.isEmpty)

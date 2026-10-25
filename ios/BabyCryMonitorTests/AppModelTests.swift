@@ -19,6 +19,39 @@ actor RequestGate {
 }
 
 final class AppModelTests: XCTestCase {
+    @MainActor func testCleanupUsesSuccessfulCompleteStatusAndFailureLeavesNotificationsAlone() async throws {
+        let fixture = try Fixture()
+        fixture.model.role = .parent; fixture.model.paired = true
+        let relevance = NotificationRelevance(cryEpisodeIDs: [UUID()], testEventIDs: [UUID()])
+        await fixture.backend.setStatus(ParentStatus(paired: true, configuration: MonitoringConfiguration(), notificationRelevance: relevance))
+        let began = fixture.time.now
+        await fixture.model.refreshParent()
+        XCTAssertEqual(fixture.notifications.cleanupCalls.count, 1)
+        XCTAssertEqual(fixture.notifications.cleanupCalls.first?.0, relevance)
+        XCTAssertEqual(fixture.notifications.cleanupCalls.first?.1, began)
+        await fixture.backend.setStatusFailure(true)
+        await fixture.model.refreshParent()
+        XCTAssertEqual(fixture.notifications.cleanupCalls.count, 1)
+    }
+
+    @MainActor func testSnoozeClearsRealNotificationsAndTestAcknowledgementOnlyClearsItsTest() async throws {
+        let fixture = try Fixture()
+        fixture.model.role = .parent; fixture.model.paired = true
+        let now = fixture.time.now
+        let real = RemoteAlert(eventId: UUID(), episodeId: UUID(), cryStartedAt: now, durationSeconds: 5, createdAt: now, status: "sent", acknowledgedAt: nil, isTest: false)
+        let test = RemoteAlert(eventId: UUID(), episodeId: UUID(), cryStartedAt: now, durationSeconds: 5, createdAt: now, status: "sent", acknowledgedAt: nil, isTest: true)
+        let status = ParentStatus(paired: true, alerts: [real,test], configuration: MonitoringConfiguration())
+        await fixture.backend.setStatus(status); fixture.model.parentStatus = status
+        _ = await fixture.model.acknowledge(real.eventId)
+        _ = await fixture.model.acknowledge(test.eventId)
+        XCTAssertEqual(fixture.notifications.dismissals.count, 2)
+        XCTAssertNil(fixture.notifications.dismissals[0])
+        XCTAssertEqual(fixture.notifications.dismissals[1], test.eventId)
+        var resolved = real; resolved.resolvedAt = now
+        fixture.model.parentStatus?.alerts = [resolved,test]
+        XCTAssertEqual(fixture.model.activeAlert?.id, test.eventId)
+    }
+
     @MainActor func testResumeAlertsRefreshesConfirmedDeadlineAndKeepsMonitoringActive() async throws {
         let fixture = try Fixture()
         fixture.model.role = .parent; fixture.model.paired = true
@@ -101,6 +134,10 @@ final class AppModelTests: XCTestCase {
         func publish(_ frame: SoundLevelFrame) { frames.append(frame) }
     }
     @MainActor final class Notifications: NotificationProviding {
+        var cleanupCalls: [(NotificationRelevance, Date)] = []
+        var dismissals: [UUID?] = []
+        func cleanUpAlerts(using relevance: NotificationRelevance, deliveredBefore: Date) async { cleanupCalls.append((relevance, deliveredBefore)) }
+        func dismissCryingAlerts(testEventID: UUID?) async { dismissals.append(testEventID) }
         var status = "Test notifications"
         var onToken: ((String) -> Void)?
         var onAlert: (() -> Void)?
@@ -280,7 +317,7 @@ final class AppModelTests: XCTestCase {
         for _ in 0..<100 { await Task.yield() }
         let frame = try XCTUnwrap(fixture.liveSound.frames.last)
         XCTAssertEqual(frame.levels, fixture.model.meter)
-        XCTAssertEqual(frame.levels, (8..<40).map { -80 + Double($0) })
+        XCTAssertEqual(frame.levels, Array(repeating: -100.0, count: SoundLevelFrame.barCount - 40) + (0..<40).map { -80 + Double($0) })
         XCTAssertEqual(frame.threshold, fixture.model.threshold)
         XCTAssertEqual(frame.state, fixture.model.state)
         XCTAssertTrue(frame.isValid)

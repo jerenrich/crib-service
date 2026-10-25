@@ -65,7 +65,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Reminders")
                 } footer: {
-                    Text("Crying alerts repeat every 5 seconds until you acknowledge one on your iPhone or Watch, even if the sound stops. Acknowledging snoozes crying alerts for \(alertDurationText(model.configuration.snoozeDuration)). Connection-loss alerts stay on. Notification delivery depends on connectivity and your device settings.")
+                    Text("Crying alerts repeat every 5 seconds until you snooze one on your iPhone or Watch, or the Listener confirms the quiet period. Acknowledging snoozes crying alerts for \(alertDurationText(model.configuration.snoozeDuration)). Snooze clears existing crying notifications on that device. Opening the app clears alerts that have settled or been snoozed. Connection-loss alerts stay on. Notification delivery depends on connectivity and your device settings.")
                 }
                 Section("This iPhone") {
                     Picker("Mode", selection: Binding(get: { model.role ?? .listener }, set: { model.selectRole($0) })) { Text("Listener").tag(DeviceRole.listener); Text("Parent").tag(DeviceRole.parent) }

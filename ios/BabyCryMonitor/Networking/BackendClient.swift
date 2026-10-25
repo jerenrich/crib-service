@@ -21,6 +21,7 @@ struct ParentStatus: Codable, Sendable {
     var episodes: [RemoteEpisode]?
     var alerts: [RemoteAlert]?
     var configuration: MonitoringConfiguration
+    var notificationRelevance: NotificationRelevance? = nil
     var microphoneActive: Bool? = nil
 
     /// Compare two server timestamps so the Parent's clock cannot shift polling.
@@ -45,6 +46,7 @@ struct RemoteEpisode: Identifiable, Codable, Sendable {
     let startedAt: Date
     var endedAt: Date?
     var alertSentAt: Date?
+    var quietConfirmed: Bool? = nil
 }
 struct RemoteAlert: Identifiable, Codable, Sendable {
     let eventId: UUID
@@ -55,6 +57,7 @@ struct RemoteAlert: Identifiable, Codable, Sendable {
     let status: String
     let acknowledgedAt: Date?
     let isTest: Bool?
+    var resolvedAt: Date? = nil
     var deliveryTarget: String? = nil
     var id: UUID { eventId }
 }

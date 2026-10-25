@@ -15,7 +15,18 @@ export async function saveHeartbeat(env:Env,device:Device,value:Record<string,un
  const observedAt=Date.now();
  // Server receive time is authoritative for freshness, never a client's clock.
  const heartbeatWrite=env.DB.prepare('INSERT INTO heartbeats(listener_id,received_at,metadata) SELECT ?,?,? WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?) ON CONFLICT(listener_id) DO UPDATE SET received_at=excluded.received_at,metadata=excluded.metadata').bind(device.id,new Date().toISOString(),JSON.stringify(heartbeat),pair.parent_id,pair.listener_id,pair.created_at);
- const [saved]=await env.DB.batch([heartbeatWrite,...heartbeatTimeline(env,pair,heartbeat,previous,observedAt)]);
+ // Only an explicit quiet reset retires alerts. Interruption, suspension, a
+ // missing heartbeat and old clients' ended episodes are not evidence of quiet.
+ const resolutions=heartbeat.episodes.filter(e=>e.quietConfirmed===true&&e.endedAt&&e.id!==heartbeat.currentEpisode?.id);
+ const resolutionWrites=resolutions.map(e=>env.DB.prepare(`INSERT INTO resolved_episodes(parent_id,listener_id,pair_created_at,episode_id,resolved_at)
+  SELECT ?,?,?,?,? WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?)
+  ON CONFLICT DO NOTHING`).bind(pair.parent_id,pair.listener_id,pair.created_at,e.id,new Date(observedAt).toISOString(),pair.parent_id,pair.listener_id,pair.created_at));
+ const retire=env.DB.prepare(`UPDATE events SET resolved_at=COALESCE(resolved_at,?) WHERE parent_id=? AND listener_id=? AND resolved_at IS NULL AND acknowledged_at IS NULL
+  AND COALESCE(json_extract(payload,'$.isTest'),0)=0
+  AND EXISTS(SELECT 1 FROM resolved_episodes r JOIN pairs p ON p.parent_id=r.parent_id AND p.listener_id=r.listener_id AND p.created_at=r.pair_created_at
+   WHERE r.parent_id=events.parent_id AND r.listener_id=events.listener_id AND r.episode_id=events.episode_id)`)
+  .bind(new Date(observedAt).toISOString(),pair.parent_id,pair.listener_id);
+ const [saved]=await env.DB.batch([heartbeatWrite,...heartbeatTimeline(env,pair,heartbeat,previous,observedAt),...resolutionWrites,...(resolutions.length?[retire]:[])]);
  if(!saved.meta.changes)throw new APIError(409,'Pairing changed. Pair again.');
  if(heartbeat.monitoring)await env.DB.prepare("INSERT INTO connection_states(listener_id,state,changed_at) SELECT ?,'online',? WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?) ON CONFLICT DO NOTHING").bind(device.id,new Date().toISOString(),pair.parent_id,pair.listener_id,pair.created_at).run();
  const parent=await env.DB.prepare('SELECT config,alerts_muted_until FROM devices WHERE id=?').bind(pair.parent_id).first<{config:string;alerts_muted_until:number}>();
@@ -25,12 +36,15 @@ export async function saveHeartbeat(env:Env,device:Device,value:Record<string,un
 }
 export async function listenerStatus(env:Env,device:Device) {
  const pair=await pairFor(env,device);
- if(!pair)return {paired:false,watchPushRegistered:false,serverTime:new Date().toISOString(),nextHeartbeatExpectedAt:null,configuration:configuration(JSON.parse(device.config))};
- const [last,parent,events,monitoringCommand]=await Promise.all([
+ if(!pair)return {paired:false,watchPushRegistered:false,serverTime:new Date().toISOString(),nextHeartbeatExpectedAt:null,notificationRelevance:{cryEpisodeIDs:[],testEventIDs:[]},configuration:configuration(JSON.parse(device.config))};
+ const [last,parent,events,monitoringCommand,relevant]=await Promise.all([
   env.DB.prepare('SELECT * FROM heartbeats WHERE listener_id=?').bind(pair.listener_id).first<{received_at:string;metadata:string}>(),
   env.DB.prepare('SELECT config,push_token,watch_push_token,connection_alerts,alerts_muted_until FROM devices WHERE id=?').bind(pair.parent_id).first<{config:string;push_token:string|null;watch_push_token:string|null;connection_alerts:number;alerts_muted_until:number}>(),
-  env.DB.prepare('SELECT payload,status,sent_at,acknowledged_at,push_target FROM events WHERE parent_id=? ORDER BY created_at DESC LIMIT 100').bind(pair.parent_id).all<{payload:string;status:string;sent_at:string|null;acknowledged_at:string|null;push_target:string|null}>(),
-  latestMonitoringCommand(env,pair)
+  env.DB.prepare('SELECT payload,status,sent_at,acknowledged_at,resolved_at,push_target FROM events WHERE parent_id=? ORDER BY created_at DESC LIMIT 100').bind(pair.parent_id).all<{payload:string;status:string;sent_at:string|null;acknowledged_at:string|null;resolved_at:string|null;push_target:string|null}>(),
+  latestMonitoringCommand(env,pair),
+  env.DB.prepare(`SELECT DISTINCT CASE WHEN COALESCE(json_extract(payload,'$.isTest'),0)=1 THEN event_id ELSE episode_id END AS id,
+   COALESCE(json_extract(payload,'$.isTest'),0) AS test FROM events WHERE parent_id=? AND listener_id=? AND acknowledged_at IS NULL AND resolved_at IS NULL LIMIT 1001`)
+   .bind(pair.parent_id,pair.listener_id).all<{id:string;test:number}>()
  ]);
  const metadata=last?JSON.parse(last.metadata) as Heartbeat:null;
  // An estimate, not a deadline: the Listener waits 15 seconds after its response.
@@ -41,7 +55,8 @@ export async function listenerStatus(env:Env,device:Device) {
  watchPushRegistered:parent?.watch_push_token!=null,phonePushRegistered:parent?.push_token!=null,
  alertsMutedUntil:parent?.alerts_muted_until?new Date(parent.alerts_muted_until).toISOString():null,
  connectionAlertsEnabled:parent?.connection_alerts===1,listenerConfiguration:metadata?.appliedConfiguration?configuration({...metadata.appliedConfiguration}):null,
- alerts:events.results.map(event=>({...JSON.parse(event.payload),status:event.status,deliveryTarget:event.push_target,alertSentAt:event.sent_at,acknowledgedAt:event.acknowledged_at}))};
+ notificationRelevance:relevant.results.length>1000?null:{cryEpisodeIDs:relevant.results.filter(e=>!e.test).map(e=>e.id),testEventIDs:relevant.results.filter(e=>e.test).map(e=>e.id)},
+ alerts:events.results.map(event=>({...JSON.parse(event.payload),status:event.status,deliveryTarget:event.push_target,alertSentAt:event.sent_at,acknowledgedAt:event.acknowledged_at,resolvedAt:event.resolved_at}))};
 }
 export async function saveSettings(env:Env,device:Device,value:Record<string,unknown>) {
  const config=configuration(value);const pair=await pairFor(env,device);

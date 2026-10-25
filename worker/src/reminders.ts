@@ -55,7 +55,7 @@ export async function runReminder(env:Env,parentId:string):Promise<boolean> {
  if(pair.alerts_muted_until>now)return true;
  // An expired upload may have arrived after a live alert. Skip that row rather
  // than letting it shut down reminders for every other outstanding episode.
- let previous=await env.DB.prepare("SELECT * FROM events WHERE parent_id=? AND listener_id=? AND acknowledged_at IS NULL AND COALESCE(last_error,'')!='expired_event' AND COALESCE(json_extract(payload,'$.isTest'),0)=0 ORDER BY created_at DESC,event_id DESC LIMIT 1")
+ let previous=await env.DB.prepare("SELECT * FROM events WHERE parent_id=? AND listener_id=? AND acknowledged_at IS NULL AND resolved_at IS NULL AND COALESCE(last_error,'')!='expired_event' AND COALESCE(json_extract(payload,'$.isTest'),0)=0 ORDER BY created_at DESC,event_id DESC LIMIT 1")
   .bind(parentId,pair.listener_id).first<StoredEvent>();
  if(!previous) {
   // After a mute, require a fresh Listener update confirming sustained crying.
@@ -66,7 +66,7 @@ export async function runReminder(env:Env,parentId:string):Promise<boolean> {
   const episode=heartbeat.currentEpisode;
   if(!heartbeat.monitoring||heartbeat.state!=='crying'||!episode)return false;
   if((now-Date.parse(episode.startedAt))/1000<configuration(JSON.parse(pair.config)).alertDuration)return false;
-  const original=await env.DB.prepare("SELECT * FROM events WHERE parent_id=? AND episode_id=? AND COALESCE(last_error,'')!='expired_event' AND COALESCE(json_extract(payload,'$.isTest'),0)=0 ORDER BY created_at DESC LIMIT 1")
+  const original=await env.DB.prepare("SELECT * FROM events WHERE parent_id=? AND episode_id=? AND resolved_at IS NULL AND COALESCE(last_error,'')!='expired_event' AND COALESCE(json_extract(payload,'$.isTest'),0)=0 ORDER BY created_at DESC LIMIT 1")
    .bind(parentId,episode.id).first<StoredEvent>();
   if(!original)return false;
   previous=original;

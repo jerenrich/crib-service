@@ -27,8 +27,8 @@ export async function receiveAlert(env:Env,device:Device,value:Record<string,unk
  // Older Listeners also use server reminders.
  if(!alert.isTest)await scheduleReminders(env,pair.parent_id);
  await dispatchEvent(env,record.event_id,requestId);
- const result=await env.DB.prepare('SELECT status,acknowledged_at FROM events WHERE event_id=?').bind(record.event_id).first<{status:string;acknowledged_at:string|null}>();
- return {status:result?.acknowledged_at?'acknowledged':result?.status??'pending'};
+ const result=await env.DB.prepare('SELECT status,acknowledged_at,resolved_at FROM events WHERE event_id=?').bind(record.event_id).first<{status:string;acknowledged_at:string|null;resolved_at:string|null}>();
+ return {status:result?.acknowledged_at?'acknowledged':result?.resolved_at?'resolved':result?.status??'pending'};
 }
 export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.randomUUID()):Promise<void> {
  const now=Date.now();
@@ -37,6 +37,11 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  try {
  // Diagnostic computation is best effort, just like journal writes.
  try { eventRef=await eventReference(env,eventId); } catch { /* No diagnostic identity available. */ }
+ // Tombstones also suppress an offline outbox upload after its episode settled.
+ await env.DB.prepare(`UPDATE events SET resolved_at=COALESCE(resolved_at,(SELECT r.resolved_at FROM resolved_episodes r
+  JOIN pairs p ON p.parent_id=r.parent_id AND p.listener_id=r.listener_id AND p.created_at=r.pair_created_at
+  WHERE r.parent_id=events.parent_id AND r.listener_id=events.listener_id AND r.episode_id=events.episode_id))
+  WHERE event_id=? AND COALESCE(json_extract(payload,'$.isTest'),0)=0`).bind(eventId).run();
  // Suppress uploads during a mute, including delayed offline outbox entries.
  await env.DB.prepare(`UPDATE events SET acknowledged_at=COALESCE(acknowledged_at,?) WHERE event_id=?
  AND COALESCE(json_extract(payload,'$.isTest'),0)=0 AND (
@@ -51,7 +56,7 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  AND CAST(ROUND((julianday(json_extract(events.payload,'$.createdAt'))-2440587.5)*86400000) AS INTEGER)<=m.created_at)
  OR (is_repeat=1 AND EXISTS(SELECT 1 FROM events prior WHERE prior.parent_id=events.parent_id AND prior.episode_id=events.episode_id AND prior.acknowledged_at IS NOT NULL AND prior.created_at>=events.created_at))
  )`).bind(new Date(now).toISOString(),eventId,now,now).run();
- const event=await env.DB.prepare("UPDATE events SET status='sending',lease_until=?,attempts=attempts+1,push_target=COALESCE(push_target,CASE WHEN (SELECT watch_push_token FROM devices WHERE id=events.parent_id) IS NOT NULL THEN 'watch' ELSE 'phone' END) WHERE event_id=? AND status='pending' AND acknowledged_at IS NULL AND next_attempt<=? RETURNING *").bind(now+30000,eventId,now).first<StoredEvent>();
+ const event=await env.DB.prepare("UPDATE events SET status='sending',lease_until=?,attempts=attempts+1,push_target=COALESCE(push_target,CASE WHEN (SELECT watch_push_token FROM devices WHERE id=events.parent_id) IS NOT NULL THEN 'watch' ELSE 'phone' END) WHERE event_id=? AND status='pending' AND acknowledged_at IS NULL AND resolved_at IS NULL AND next_attempt<=? RETURNING *").bind(now+30000,eventId,now).first<StoredEvent>();
  if(!event)return;
  attempt=event.attempts;target=event.push_target??'phone';stage='storage';
  // No replay after uncertain transport or a worker death during APNs dispatch. APNs does
@@ -164,7 +169,7 @@ export async function flushPending(env:Env,requestId=crypto.randomUUID()) {
   let eventRef:string|undefined;try {eventRef=await eventReference(env,event.event_id);}catch{/* Best effort. */}
   await recordDiagnostic(env,{requestId,started:Date.now(),operation:'dispatch',stage:'claim',outcome:'dispatch_interrupted',eventRef,attempt:event.attempts,target:event.push_target??undefined});
  }
- const events=await env.DB.prepare("SELECT event_id FROM events WHERE status='pending' AND acknowledged_at IS NULL AND next_attempt<=? ORDER BY created_at LIMIT 25").bind(Date.now()).all<{event_id:string}>();
+ const events=await env.DB.prepare("SELECT event_id FROM events WHERE status='pending' AND acknowledged_at IS NULL AND resolved_at IS NULL AND next_attempt<=? ORDER BY created_at LIMIT 25").bind(Date.now()).all<{event_id:string}>();
  // Bounded fan-out; each row has an atomic database claim.
  for(let index=0;index<events.results.length;index+=5){await Promise.all(events.results.slice(index,index+5).map(event=>dispatchEvent(env,event.event_id,requestId)));}
  // Keep deduplication tombstones for 30 days. Codes are short-lived; claimed codes retain
@@ -173,6 +178,7 @@ export async function flushPending(env:Env,requestId=crypto.randomUUID()) {
   env.DB.prepare('DELETE FROM monitoring_commands WHERE created_at<? AND sequence NOT IN (SELECT MAX(sequence) FROM monitoring_commands GROUP BY parent_id,listener_id,pair_created_at)').bind(Date.now()-30*86400000),
   env.DB.prepare('DELETE FROM alert_snoozes WHERE until_at<?').bind(Date.now()-86400000),
   env.DB.prepare(`DELETE FROM timeline_events WHERE occurred_at<? AND id NOT IN (SELECT id FROM timeline_events t2 WHERE t2.parent_id=timeline_events.parent_id AND t2.listener_id=timeline_events.listener_id AND t2.pair_created_at=timeline_events.pair_created_at AND t2.kind IN ('coverage_active','coverage_stopped') ORDER BY occurred_at DESC LIMIT 1)`).bind(Date.now()-24*3600000),
+  env.DB.prepare('DELETE FROM resolved_episodes WHERE resolved_at<?').bind(new Date(Date.now()-30*86400000).toISOString()),
   env.DB.prepare('DELETE FROM events WHERE created_at<?').bind(Date.now()-30*86400000),
   env.DB.prepare('DELETE FROM pairing_codes WHERE expires_at<?').bind(Date.now()-86400000),
   env.DB.prepare('DELETE FROM rate_limits WHERE window<?').bind(Math.floor(Date.now()/1000/600)-144)

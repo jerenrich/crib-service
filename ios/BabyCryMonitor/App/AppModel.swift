@@ -345,8 +345,10 @@ import UIKit
         }
     }
 
+    @ObservationIgnored private var notificationsCheckedAt: Date?
+
     var activeAlert: RemoteAlert? {
-        let alerts = parentStatus?.alerts?.filter { $0.acknowledgedAt == nil }
+        let alerts = parentStatus?.alerts?.filter { $0.acknowledgedAt == nil && $0.resolvedAt == nil }
         return alerts?.first { $0.isTest != true } ?? alerts?.first
     }
     func acceptSafety() { safetyAccepted = true; defaults.set(true, forKey: "safetyAccepted") }
@@ -766,6 +768,7 @@ import UIKit
         }
         if !events.isEmpty { log.record("alert_threshold_reached") }
         if !events.isEmpty || before != state || sample.timestamp.timeIntervalSince(lastSavedAt) >= 5 { persist(); lastSavedAt = sample.timestamp }
+        if before == .crying, state == .quiet { queueHeartbeat() }
         // Publish the actual chart window and applied threshold, rather than
         // rebuilding or interpolating a different chart on the Parent.
         if monitoring, (0...1).contains(currentTime().timeIntervalSince(sample.timestamp)) {
@@ -937,6 +940,9 @@ import UIKit
                     case .success(let receipt) where receipt.status == "sent":
                         engine.delivered(alert.eventId, at: Date()); log.record("alert_apns_accepted")
                         deliveryStatus = "Connected · APNs accepted alert"
+                    case .success(let receipt) where receipt.status == "resolved":
+                        engine.acknowledged(alert.eventId)
+                        deliveryStatus = "Episode settled · alert retired"
                     case .success(let receipt) where receipt.status == "acknowledged":
                         engine.acknowledged(alert.eventId)
                         log.record("alert_acknowledged")
@@ -994,7 +1000,7 @@ import UIKit
     }
     private func heartbeatValue(listenerID: UUID) -> Heartbeat {
         func remote(_ episode: CryEpisode) -> RemoteEpisode {
-            RemoteEpisode(id: episode.id, startedAt: episode.startedAt, endedAt: episode.endedAt, alertSentAt: episode.alertSentAt)
+            RemoteEpisode(id: episode.id, startedAt: episode.startedAt, endedAt: episode.endedAt, alertSentAt: episode.alertSentAt, quietConfirmed: episode.quietConfirmed)
         }
         return Heartbeat(listenerId: listenerID, timestamp: currentTime(), monitoring: monitoring,
                          batteryLevel: batteryLevel, powerConnected: powerConnected, state: state,
@@ -1096,6 +1102,7 @@ import UIKit
     }
     private func fetchParentStatus() async {
         let revision = environmentRevision, generation = settingsGeneration
+        let checkedAt = currentTime()
         do {
             let client = try await registeredClient(); let status = try await client.status()
             guard revision == environmentRevision, role == .parent else { return }
@@ -1103,6 +1110,11 @@ import UIKit
                 timeline = nil; timelineError = nil; clearLiveSound()
             }
             parentStatus = status; paired = status.paired; defaults.set(paired, forKey: pairingKey)
+            notificationsCheckedAt = checkedAt
+            if let relevance = status.notificationRelevance {
+                await notifications.cleanUpAlerts(using: relevance, deliveredBefore: checkedAt)
+                guard revision == environmentRevision, role == .parent else { return }
+            }
             synchronizeLiveSound()
             reconcileMonitoringControl(status)
             // Only a successful server response renews the local warning. A failed
@@ -1200,6 +1212,9 @@ import UIKit
     @discardableResult func acknowledge(_ id: UUID) async -> Bool {
         guard !acknowledgingAlert else { return false }
         acknowledgingAlert = true; defer { acknowledgingAlert = false }
+        if let alert = parentStatus?.alerts?.first(where: { $0.eventId == id }) {
+            await notifications.dismissCryingAlerts(testEventID: alert.isTest == true ? id : nil)
+        }
         let revision = environmentRevision
         do {
             let client = try await registeredClient()
@@ -1376,6 +1391,8 @@ import UIKit
         value.snoozeDuration = configuration.snoozeDuration
         value.watchPushRegistered = value.parentMode && parentStatus?.watchPushRegistered == true
         value.alertsMutedUntil = value.parentMode ? parentStatus?.alertsMutedUntil : nil
+        value.notificationRelevance = value.parentMode ? parentStatus?.notificationRelevance : nil
+        value.notificationsCheckedAt = value.parentMode ? notificationsCheckedAt : nil
         value.acknowledgedEventId = defaults.string(forKey: watchConfirmedKey).flatMap(UUID.init(uuidString:))
         value.discardedAcknowledgementEventId = defaults.string(forKey: watchDiscardedKey).flatMap(UUID.init(uuidString:))
         if value.parentMode, let alert = activeAlert {

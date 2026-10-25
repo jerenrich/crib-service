@@ -41,7 +41,7 @@ beforeAll(async()=>{
  testEnv={...env,APNS_KEY_ID:'TESTKEY',APNS_TEAM_ID:'TESTTEAM',APNS_PRIVATE_KEY:`-----BEGIN PRIVATE KEY-----\n${pem}\n-----END PRIVATE KEY-----`,APNS_BUNDLE_ID:'com.example.BabyCryMonitor',APNS_ENVIRONMENT:'development'};
 });
 beforeEach(async()=>{
- await env.DB.batch(['monitoring_commands','alert_snoozes','timeline_events','diagnostics','connection_notices','connection_states','events','heartbeats','pairs','pairing_codes','devices','rate_limits'].map(table=>env.DB.prepare(`DELETE FROM ${table}`)));
+ await env.DB.batch(['resolved_episodes','monitoring_commands','alert_snoozes','timeline_events','diagnostics','connection_notices','connection_states','events','heartbeats','pairs','pairing_codes','devices','rate_limits'].map(table=>env.DB.prepare(`DELETE FROM ${table}`)));
  pushResponses=[];pushRequests=[];
  vi.stubGlobal('fetch',vi.fn(async(input:string|URL|Request,init?:RequestInit)=>{
   const url=String(input);expect(url).toMatch(/^https:\/\/api\.sandbox\.push\.apple\.com\/3\/device\//);
@@ -1247,5 +1247,77 @@ describe('monitoring controls',()=>{
   expect((await env.DB.prepare('SELECT COUNT(*) AS n FROM monitoring_commands').first<{n:number}>())?.n).toBe(0);
   const again=await paired();await command(again.parent,false);
   expect((await call('device/delete',again.parent)).status).toBe(200);
+ });
+});
+
+
+describe('settled episode resolution and notification cleanup',()=>{
+ async function setup(){
+  const pair=await paired();
+  await env.DB.prepare('UPDATE pairs SET created_at=? WHERE parent_id=?').bind(Date.now()-3600000,pair.parent.deviceId).run();
+  return pair;
+ }
+ function beat(listener:TestDevice,event:Alert,quietConfirmed?:boolean){
+  return {listenerId:listener.deviceId,timestamp:new Date().toISOString(),monitoring:true,powerConnected:true,state:'quiet',
+   episodes:[{id:event.episodeId,startedAt:event.cryStartedAt,endedAt:new Date().toISOString(),...(quietConfirmed===undefined?{}:{quietConfirmed})}]};
+ }
+ it('resolves confirmed quiet without acknowledging or snoozing, stops repeats and rejects late uploads',async()=>{
+  const {parent,listener}=await setup(), event=alert(listener);
+  await call('device/push-token',parent,{token:'ab'.repeat(32)});mockPush();
+  expect((await call('listener/event',listener,event)).status).toBe(200);
+  expect((await call('listener/heartbeat',listener,beat(listener,event,true))).status).toBe(200);
+  expect(await runReminder(testEnv,parent.deviceId)).toBe(false);
+  const status=await (await call('listener/status',parent,undefined,'GET')).json() as any;
+  expect(status.alerts[0].resolvedAt).toBeTypeOf('string');expect(status.alerts[0].acknowledgedAt).toBeNull();
+  expect(status.alertsMutedUntil).toBeNull();expect(status.notificationRelevance.cryEpisodeIDs).toEqual([]);
+  expect(await (await call('listener/event',listener,event)).json()).toEqual({status:'resolved'});
+  expect(await (await call('listener/event',listener,{...event,eventId:crypto.randomUUID(),isRepeat:true})).json()).toEqual({status:'resolved'});
+  expect(pushRequests).toHaveLength(1);
+  expect((await env.DB.prepare("SELECT * FROM timeline_events WHERE kind='alert_acknowledged'").all()).results).toHaveLength(0);
+ });
+ it.each([undefined,false])('keeps reminders for interrupted or legacy ended episodes (%s)',async(quietConfirmed)=>{
+  const {parent,listener}=await setup(),event=alert(listener);
+  await call('listener/event',listener,event);
+  await call('listener/heartbeat',listener,beat(listener,event,quietConfirmed));
+  const status=await (await call('listener/status',parent,undefined,'GET')).json() as any;
+  expect(status.alerts[0].resolvedAt).toBeNull();
+  expect(status.notificationRelevance.cryEpisodeIDs).toEqual([event.episodeId]);
+  expect(await runReminder(testEnv,parent.deviceId)).toBe(true);
+ });
+ it('retains a newer crying episode and tests while resolving an older one, then snoozes all real alerts',async()=>{
+  const {parent,listener}=await setup(),old=alert(listener),current=alert(listener),test={...alert(listener),isTest:true};
+  for(const event of [old,current,test])await call('listener/event',listener,event);
+  await call('listener/heartbeat',listener,{...beat(listener,old,true),state:'crying',currentEpisode:{id:current.episodeId,startedAt:current.cryStartedAt}});
+  let status=await (await call('listener/status',parent,undefined,'GET')).json() as any;
+  expect(status.notificationRelevance).toEqual({cryEpisodeIDs:[current.episodeId],testEventIDs:[test.eventId]});
+  await call('alert/acknowledge',parent,{eventId:current.eventId});
+  status=await (await call('listener/status',parent,undefined,'GET')).json() as any;
+  expect(status.notificationRelevance).toEqual({cryEpisodeIDs:[],testEventIDs:[test.eventId]});
+  await call('alert/acknowledge',parent,{eventId:test.eventId});
+  status=await (await call('listener/status',parent,undefined,'GET')).json() as any;
+  expect(status.notificationRelevance).toEqual({cryEpisodeIDs:[],testEventIDs:[]});
+ });
+ it('keeps relevance complete beyond the latest 100 displayed reminders and clears pairing tombstones',async()=>{
+  const {parent,listener}=await setup(),old=alert(listener),current=alert(listener);
+  await call('listener/event',listener,old);
+  // Simulate the server reminder stream without issuing API requests/rate limits.
+  await env.DB.batch(Array.from({length:105},(_,i)=>{
+   const event={...current,eventId:crypto.randomUUID(),isRepeat:true};
+   return env.DB.prepare('INSERT INTO events(event_id,episode_id,listener_id,parent_id,is_repeat,payload,created_at) VALUES(?,?,?,?,?,?,?)')
+    .bind(event.eventId,event.episodeId,listener.deviceId,parent.deviceId,1,JSON.stringify(event),Date.now()+i);
+  }));
+  let status=await (await call('listener/status',parent,undefined,'GET')).json() as any;
+  expect(status.alerts).toHaveLength(100);expect(status.notificationRelevance.cryEpisodeIDs.sort()).toEqual([old.episodeId,current.episodeId].sort());
+  await call('listener/heartbeat',listener,beat(listener,old,true));
+  expect((await env.DB.prepare('SELECT * FROM resolved_episodes').all()).results).toHaveLength(1);
+  await call('pairing/remove',parent);
+  expect((await env.DB.prepare('SELECT * FROM resolved_episodes').all()).results).toHaveLength(0);
+  status=await (await call('listener/status',parent,undefined,'GET')).json() as any;
+  expect(status.notificationRelevance).toEqual({cryEpisodeIDs:[],testEventIDs:[]});
+ });
+ it('rejects quiet confirmation without an ended episode or a boolean value',async()=>{
+  const {listener}=await setup(),event=alert(listener),value=beat(listener,event,true);
+  expect((await call('listener/heartbeat',listener,{...value,episodes:[{...value.episodes[0],endedAt:null}]})).status).toBe(400);
+  expect((await call('listener/heartbeat',listener,{...value,episodes:[{...value.episodes[0],quietConfirmed:'yes'}]})).status).toBe(400);
  });
 });

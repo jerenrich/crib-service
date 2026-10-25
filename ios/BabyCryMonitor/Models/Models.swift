@@ -40,6 +40,7 @@ public struct CryEpisode: Identifiable, Codable, Sendable {
     public let id: UUID
     public let startedAt: Date
     public var endedAt: Date?
+    public var quietConfirmed: Bool?
     public var alertQueuedAt: Date?
     public var alertSentAt: Date?
     public var lastAlertQueuedAt: Date?
