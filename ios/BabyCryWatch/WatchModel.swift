@@ -76,6 +76,9 @@ import UserNotifications
         recoveringNotificationHistory = true; defer { recoveringNotificationHistory = false }
         // Recover delivery dates while awake; never poll or replay background alerts.
         let notifications = await UNUserNotificationCenter.current().deliveredNotifications()
+        recordDeliveredNotifications(notifications)
+    }
+    private func recordDeliveredNotifications(_ notifications: [UNNotification]) {
         let observedAt = Date()
         log.watchAlerts(notifications.sorted { $0.date < $1.date }.compactMap { notification in
             guard let alert = WatchCryAlert.notification(notification.request.content) else { return nil }
@@ -134,7 +137,7 @@ import UserNotifications
     func handleNotification(_ value: WatchCryAlert, acknowledging: Bool) {
         alertState.handleNotification(value, acknowledging: acknowledging)
         if acknowledging {
-            Task { await NotificationCleanup.dismissCryingAlerts(testEventID: value.isTest ? value.eventId : nil) }
+            Task { [weak self] in await NotificationCleanup.dismissCryingAlerts(testEventID: value.isTest ? value.eventId : nil, beforeRemoving: { self?.recordDeliveredNotifications($0) }) }
         }
     }
     func resumeAlerts() {
@@ -149,7 +152,7 @@ import UserNotifications
     func acknowledge() {
         if let alert {
             log.watchAlert(WatchAlertTrace(alert: alert, phase: .acknowledged))
-            Task { await NotificationCleanup.dismissCryingAlerts(testEventID: alert.isTest ? alert.eventId : nil) }
+            Task { [weak self] in await NotificationCleanup.dismissCryingAlerts(testEventID: alert.isTest ? alert.eventId : nil, beforeRemoving: { self?.recordDeliveredNotifications($0) }) }
         }
         log.record("watch_acknowledgement_requested"); alertState.acknowledgeCurrent()
     }
@@ -185,8 +188,9 @@ import UserNotifications
         catch { log.record("watch_snapshot_failed", error: error) }
         notice = value.message
         alertState.acceptAlert(from: value)
+        if let alert = alertState.alert { log.watchAlert(WatchAlertTrace(alert: alert, phase: .snapshotReceived)) }
         if value.statusAvailable, let relevance = value.notificationRelevance, let checkedAt = value.notificationsCheckedAt {
-            Task { await NotificationCleanup.removeIrrelevant(using: relevance, deliveredBefore: checkedAt) }
+            Task { [weak self] in await NotificationCleanup.removeIrrelevant(using: relevance, deliveredBefore: checkedAt, beforeRemoving: { self?.recordDeliveredNotifications($0) }) }
         }
     }
 

@@ -3,9 +3,11 @@ import UserNotifications
 
 /// Delete only our crying/test category; connection warnings and other notices survive.
 enum NotificationCleanup {
-    static func removeIrrelevant(using relevance: NotificationRelevance, deliveredBefore: Date) async {
+    @MainActor static func removeIrrelevant(using relevance: NotificationRelevance, deliveredBefore: Date,
+                                           beforeRemoving: (([UNNotification]) -> Void)? = nil) async {
         let center = UNUserNotificationCenter.current()
         let delivered = await center.deliveredNotifications()
+        beforeRemoving?(delivered)
         let identifiers = delivered.compactMap { notification -> String? in
             guard isIrrelevant(notification.request.content, deliveredAt: notification.date,
                                using: relevance, deliveredBefore: deliveredBefore) else { return nil }
@@ -14,10 +16,12 @@ enum NotificationCleanup {
         center.removeDeliveredNotifications(withIdentifiers: identifiers)
     }
 
-    static func dismissCryingAlerts(testEventID: UUID? = nil) async {
+    @MainActor static func dismissCryingAlerts(testEventID: UUID? = nil,
+                                              beforeRemoving: (([UNNotification]) -> Void)? = nil) async {
         let center = UNUserNotificationCenter.current()
         let cutoff = Date()
         let delivered = await center.deliveredNotifications()
+        beforeRemoving?(delivered)
         let pending = await center.pendingNotificationRequests()
         center.removeDeliveredNotifications(withIdentifiers: delivered.filter {
             $0.date <= cutoff && shouldDismiss($0.request.content, testEventID: testEventID)

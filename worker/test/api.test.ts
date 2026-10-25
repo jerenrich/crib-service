@@ -620,7 +620,7 @@ describe('private operational diagnostics',()=>{
   ]));
   await env.DB.prepare('UPDATE events SET next_attempt=0 WHERE event_id=?').bind(event.eventId).run();mockPush();
   await worker.scheduled({} as ScheduledController,testEnv);
-  const retries=await env.DB.prepare('SELECT outcome,attempt FROM diagnostics WHERE event_ref=? ORDER BY sequence').bind(ref).all();
+  const retries=await env.DB.prepare("SELECT outcome,attempt FROM diagnostics WHERE event_ref=? AND operation='dispatch' ORDER BY sequence").bind(ref).all();
   expect(retries.results).toEqual([{outcome:'apns_503',attempt:1},{outcome:'sent',attempt:2}]);
   // Deliberately hostile URLs/headers/body, including a spoofed correlation ID.
   await worker.fetch(new Request('https://monitor.test/private-url-marker?pairing=private-query-marker',{
@@ -1376,7 +1376,7 @@ describe('latency path and diagnostic spans',()=>{
   expect(await (await call('listener/event',listener,alert(listener))).json()).toEqual({status:'pending'});
   const rows=(await env.DB.prepare("SELECT details FROM diagnostics WHERE operation='dispatch'").all<{details:string}>()).results;
   expect(rows).toHaveLength(1);const details=JSON.parse(rows[0].details);
-  expect(details).toMatchObject({apns_reason:reason,apns_environment:'development',apns_unique_id:appleID,db_calls:3,provider_token_cached:expect.any(Boolean)});
+  expect(details).toMatchObject({apns_reason:reason,apns_environment:'development',apns_unique_id:appleID,db_calls:6,provider_token_cached:expect.any(Boolean)});
   for(const span of ['claim_ms','destination_ms','token_decrypt_ms','provider_sign_ms','apns_fetch_ms','apns_body_ms','outcome_storage_ms'])expect(details.spans[span]).toBeGreaterThanOrEqual(0);
   expect(details.apns_response_at_ms).toBeGreaterThanOrEqual(details.apns_started_at_ms);
   expect(JSON.stringify(details)).not.toContain('private-body-marker');expect(JSON.stringify(details)).not.toContain('private-header-marker');
@@ -1462,5 +1462,66 @@ describe('phone-controlled Watch push test',()=>{
   await flushPending(testEnv);await worker.scheduled({} as ScheduledController,testEnv);
   expect(pushRequests).toHaveLength(2);
   expect((await env.DB.prepare('SELECT * FROM events').all()).results).toHaveLength(0);
+ });
+});
+
+function interceptDB(work:(sql:string,args:unknown[],method:string,execute:()=>Promise<any>)=>Promise<any>):D1Database {
+ return new Proxy(testEnv.DB,{get(db,key){
+  if(key==='prepare')return (sql:string)=>{
+   const wrap=(statement:D1PreparedStatement,args:unknown[]):D1PreparedStatement=>new Proxy(statement,{get(target,name){
+    if(name==='bind')return (...values:unknown[])=>wrap(target.bind(...values),values);
+    const value=Reflect.get(target,name);
+    if(typeof value==='function'&&['all','first','run','raw'].includes(String(name)))return (...values:unknown[])=>work(sql,args,String(name),()=>value.apply(target,values));
+    return typeof value==='function'?value.bind(target):value;
+   }});return wrap(db.prepare(sql),[]);
+  };const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;
+ }});
+}
+
+describe('diagnostic gap regressions',()=>{
+ it('retains preparation when maintenance sees an insert before its binding reply returns',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});mockPush();await call('listener/event',listener,alert(listener));
+  const clock=Date.now();vi.spyOn(Date,'now').mockReturnValue(clock+10000);
+  let release!:()=>void,inserted!:()=>void,eventID='';const gate=new Promise<void>(r=>{release=r;}),ready=new Promise<void>(r=>{inserted=r;});
+  const db=interceptDB(async(sql,args,method,execute)=>{const result=await execute();if(sql.startsWith('INSERT INTO events(')&&method==='run'){eventID=String(args[0]);inserted();await gate;}return result;});
+  const alarm=runReminder({...testEnv,DB:db},parent.deviceId);await ready;
+  try {vi.spyOn(Date,'now').mockReturnValue(clock+13073);mockPush();await flushPending(testEnv);}finally{release();await alarm;}
+  expect(pushRequests).toHaveLength(2);const ref=await eventReference(testEnv,eventID);
+  const skip=await env.DB.prepare("SELECT details FROM diagnostics WHERE operation='dispatch_skip' AND event_ref=?").bind(ref).first<{details:string}>();const details=JSON.parse(skip!.details);
+  expect(details).toMatchObject({dispatch_source:'reminder',exit_reason:'already_sent',observed_status:'sent',observed_attempts:1});
+  expect(details.spans.reminder_prepare_ms).toBe(3073);expect(details.spans.reminder_insert_ms).toBe(3073);
+  const sent=await env.DB.prepare("SELECT details FROM diagnostics WHERE operation='dispatch' AND event_ref=?").bind(ref).first<{details:string}>();expect(JSON.parse(sent!.details).dispatch_source).toBe('maintenance');
+ });
+ it('retains the failing preparation query and sanitizes its exception',async()=>{
+  const {parent}=await paired();const db=interceptDB(async(sql,_args,_method,execute)=>{if(sql.startsWith('SELECT p.listener_id'))throw new Error('D1_ERROR: timed out private-query-marker');return execute();});
+  await expect(runReminder({...testEnv,DB:db},parent.deviceId)).rejects.toThrow();
+  const row=await env.DB.prepare("SELECT outcome,details FROM diagnostics WHERE operation='reminder_prepare'").first<{outcome:string;details:string}>();
+  expect(row?.outcome).toBe('internal_error');expect(JSON.parse(row!.details)).toMatchObject({failed_span:'reminder_pair_ms',error_kind:'d1_timeout'});expect(row!.details).not.toContain('private-query-marker');expect(pushRequests).toHaveLength(0);
+ });
+ it('logs durable-alarm storage failures before preparation starts',async()=>{
+  const {parent}=await paired();const {AlertReminders}=await import('../src/reminders');
+  const ctx={blockConcurrencyWhile:<T>(work:()=>Promise<T>)=>work(),storage:{get:async()=>new Map([['parentId',parent.deviceId]]),put:async()=>{throw new Error('private-alarm-storage-marker');}}} as unknown as DurableObjectState;
+  await expect(new AlertReminders(ctx,testEnv).alarm()).rejects.toThrow('Reminder alarm failed.');
+  const row=await env.DB.prepare("SELECT details FROM diagnostics WHERE operation='reminder_alarm'").first<{details:string}>();expect(JSON.parse(row!.details).failed_span).toBe('alarm_arm_ms');expect(row!.details).not.toContain('private-alarm-storage-marker');
+ });
+ it('records an insert overtaken by acknowledgement',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});mockPush();await call('listener/event',listener,alert(listener));vi.spyOn(Date,'now').mockReturnValue(Date.now()+10000);
+  const db=interceptDB(async(sql,_args,method,execute)=>{if(sql.startsWith('INSERT INTO events(')&&method==='run')await env.DB.prepare('UPDATE events SET acknowledged_at=?').bind(new Date().toISOString()).run();return execute();});
+  await runReminder({...testEnv,DB:db},parent.deviceId);
+  const row=await env.DB.prepare("SELECT event_ref,details FROM diagnostics WHERE operation='reminder_prepare' AND outcome='reminder_not_created'").first<{event_ref:string;details:string}>();expect(row?.event_ref).toMatch(/^[0-9a-f]{64}$/);expect(JSON.parse(row!.details).exit_reason).toBe('not_created');expect(pushRequests).toHaveLength(1);
+ });
+ it('keeps Apple acceptance when the outcome write fails and never resends',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});mockPush();
+  const db=interceptDB(async(sql,_args,method,execute)=>{if(sql.startsWith('UPDATE events SET status=?,next_attempt=')&&method==='run')throw new Error('D1_ERROR: private-outcome-write-marker');return execute();});
+  const response=await worker.fetch(new Request('https://monitor.test/v1/listener/event',{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${listener.deviceId}.${listener.secret}`},body:JSON.stringify(alert(listener))}),{...testEnv,DB:db});expect(response.status).toBe(503);
+  const row=await env.DB.prepare("SELECT outcome,http_status,details FROM diagnostics WHERE operation='dispatch'").first<{outcome:string;http_status:number;details:string}>();expect(row).toMatchObject({outcome:'internal_error',http_status:200});expect(JSON.parse(row!.details)).toMatchObject({push_outcome:'sent',failed_span:'outcome_storage_ms'});expect(row!.details).not.toContain('private-outcome-write-marker');await flushPending(testEnv);expect(pushRequests).toHaveLength(1);
+ });
+ it('times failed initial preparation and the response journal write',async()=>{
+  const {listener}=await paired();const db=interceptDB(async(sql,_args,_method,execute)=>{if(sql==='SELECT * FROM events WHERE event_id=?')throw new Error('D1_ERROR: private-lookup-marker');return execute();});
+  const response=await worker.fetch(new Request('https://monitor.test/v1/listener/event',{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${listener.deviceId}.${listener.secret}`},body:JSON.stringify(alert(listener))}),{...testEnv,DB:db});expect(response.status).toBe(503);expect(response.headers.get('x-diagnostics-elapsed-ms')).toMatch(/^\d+$/);
+  const row=await env.DB.prepare('SELECT event_ref,details FROM diagnostics WHERE request_id=?').bind(response.headers.get('x-request-id')).first<{event_ref:string;details:string}>();expect(row?.event_ref).toMatch(/^[0-9a-f]{64}$/);expect(JSON.parse(row!.details).failed_span).toBe('event_lookup_ms');expect(JSON.parse(row!.details).spans.alert_prepare_ms).toBeGreaterThanOrEqual(0);
+ });
+ it('preserves successful DB results when optional metrics are absent',async()=>{
+  const {Latency}=await import('../src/latency');const latency=new Latency();const result={success:true,results:[{ok:true}]} as unknown as D1Result<{ok:boolean}>;expect(await latency.db('event_lookup_ms',async()=>result)).toEqual([result]);expect(latency.details.db_sql_ms).toBeUndefined();
  });
 });

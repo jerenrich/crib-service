@@ -20,9 +20,10 @@ export default {
   latency.details.colo=typeof request.cf?.colo==='string'?request.cf.colo:undefined;
   let operation=operationFor('', ''),stage:Stage='validation';
   const respond=async(result:unknown,status:number,outcome:'ok'|'rejected'|'internal_error')=>{
-   const saved=await recordDiagnostic(env,{requestId,started,operation,stage,outcome,httpStatus:status,details:latency.details});
+   const journalStarted=Date.now();
+   const saved=await recordDiagnostic(env,{requestId,started,operation,stage,outcome,httpStatus:status,eventRef:latency.eventRef,details:latency.details});
    return Response.json(result,{status,headers:{'cache-control':'no-store','x-content-type-options':'nosniff',
-    'x-request-id':requestId,'x-diagnostics-status':saved?'recorded':'unavailable'}});
+    'x-request-id':requestId,'x-diagnostics-status':saved?'recorded':'unavailable','x-diagnostics-elapsed-ms':String(Math.max(0,Date.now()-journalStarted))}});
   };
   try {
    const url=new URL(request.url);
@@ -38,7 +39,7 @@ export default {
    // address bucket is only a flood ceiling. Crying alerts never depend on it.
    if(!alertUpload)await latency.measure('rate_limit_ms',()=>rateLimit(env,'api',ip,3000,600));
    let result:unknown;
-   if(route==='POST /v1/device/register'){stage='handler';result=await register(env,await body(request),ip);}
+   if(route==='POST /v1/device/register'){stage='handler';result=await latency.measure('handler_ms',async()=>register(env,await body(request),ip));}
    else{
     stage='authentication';
     const device=await latency.measure('authentication_ms',()=>authenticate(env,request));
@@ -90,13 +91,13 @@ export default {
   }
  },
  async scheduled(_controller:ScheduledController,env:Env):Promise<void> {
-  const requestId=crypto.randomUUID(),started=Date.now();
+  const requestId=crypto.randomUUID(),started=Date.now(),latency=new Latency();
   try {
-   const results=await Promise.allSettled([flushPending(env,requestId),flushConnections(env,requestId)]);
+   const results=await Promise.allSettled([flushPending(env,requestId,latency),latency.measure('maintenance_connections_ms',()=>flushConnections(env,requestId))]);
    if(results.some(result=>result.status==='rejected'))throw new Error('Maintenance failed.');
-   await recordDiagnostic(env,{requestId,started,operation:'maintenance',stage:'cleanup',outcome:'ok'});
+   await recordDiagnostic(env,{requestId,started,operation:'maintenance',stage:'handler',outcome:'ok',details:latency.details});
   } catch {
-   await recordDiagnostic(env,{requestId,started,operation:'maintenance',stage:'cleanup',outcome:'internal_error'});
+   await recordDiagnostic(env,{requestId,started,operation:'maintenance',stage:'handler',outcome:'internal_error',details:latency.details});
    // Preserve the failed-invocation metric without leaking a D1 exception/SQL value.
    throw new Error('Scheduled maintenance failed.');
   }

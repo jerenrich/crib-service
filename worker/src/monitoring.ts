@@ -1,6 +1,7 @@
 import {APIError,requireRole,type Device,type Env} from './types';
 import {onlyKeys,uuid} from './security';
 import {pairFor} from './devices';
+import type {Latency} from './latency';
 
 type Pair={parent_id:string;listener_id:string;created_at:number};
 type Command={id:string;enabled:number;status:'pending'|'applied'|'failed';created_at:number;expires_at:number};
@@ -8,9 +9,10 @@ function representation(command:Command) {
  return {id:command.id,enabled:command.enabled===1,status:command.status==='pending'&&command.expires_at<=Date.now()?'expired':command.status,
   createdAt:new Date(command.created_at).toISOString(),expiresAt:new Date(command.expires_at).toISOString()};
 }
-export async function latestMonitoringCommand(env:Env,pair:Pair) {
- const row=await env.DB.prepare('SELECT * FROM monitoring_commands WHERE parent_id=? AND listener_id=? AND pair_created_at=? ORDER BY sequence DESC LIMIT 1')
-  .bind(pair.parent_id,pair.listener_id,pair.created_at).first<Command>();
+export async function latestMonitoringCommand(env:Env,pair:Pair,latency?:Latency) {
+ const statement=env.DB.prepare('SELECT * FROM monitoring_commands WHERE parent_id=? AND listener_id=? AND pair_created_at=? ORDER BY sequence DESC LIMIT 1')
+  .bind(pair.parent_id,pair.listener_id,pair.created_at);
+ const row=latency?await latency.read<Command>('reminder_control_ms',statement):await statement.first<Command>();
  return row?representation(row):null;
 }
 export async function requestMonitoring(env:Env,device:Device,value:Record<string,unknown>) {

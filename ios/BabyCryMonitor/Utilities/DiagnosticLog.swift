@@ -32,12 +32,12 @@ import Observation
         "parent_connection_warning_armed", "parent_connection_warning_cancelled", "parent_connection_warning_failed",
         "push_registration_failed", "local_notification_scheduled", "local_notification_failed", "watch_sync_failed", "watch_token_synced",
         "watch_notification_authorization", "watch_alert_permission", "watch_sound_permission", "watch_time_sensitive_permission",
-        "watch_foreground_notification", "watch_haptic_started", "watch_haptic_requested", "watch_haptic_stopped", "watch_haptic_inactive", "watch_acknowledgement_requested",
+        "watch_payload_unrecognized", "watch_foreground_notification", "watch_haptic_started", "watch_haptic_requested", "watch_haptic_stopped", "watch_haptic_inactive", "watch_acknowledgement_requested",
         "watch_acknowledged", "watch_acknowledgement_discarded", "watch_activation_failed", "watch_activated", "watch_reachable", "watch_unreachable",
         "watch_snapshot_failed", "watch_snapshot_received", "watch_command_queued", "watch_command_failed", "watch_push_received",
         "monitoring_start_blocked_safety", "monitoring_start_blocked_storage", "test_push_failed",
         "acknowledgement_failed", "connection_preferences_failed", "device_removal_failed",
-        "calibration_failed", "listener_status_failed", "monitoring_control_failed"
+        "calibration_failed", "listener_status_failed", "monitoring_control_failed", "resume_alerts_failed", "timeline_failed"
     ]
     init(directory: URL? = nil) {
         let folder = directory ?? (try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true))
@@ -68,7 +68,7 @@ import Observation
                                       "heartbeat_retry_scheduled", "settings_sync_failed", "parent_status_failed",
                                       "backend_unavailable", "watch_sync_failed", "watch_snapshot_failed", "watch_snapshot_received",
                                       "listener_status_failed", "monitoring_start_blocked_storage", "monitoring_start_blocked_safety",
-                                      "parent_connection_warning_armed", "parent_connection_warning_failed"]
+                                      "parent_connection_warning_armed", "parent_connection_warning_failed", "watch_payload_unrecognized"]
         let details = error.map { Self.errorDetails($0) } ?? ""
         let fingerprint = "event_\(event)_\(code ?? 0)_\(details)"
         if repetitive.contains(event), let last = recent[fingerprint], Date().timeIntervalSince(last) < 60 { return }
@@ -76,8 +76,8 @@ import Observation
         append(event + (code.map { " code=\($0)" } ?? "") + (details.isEmpty ? "" : " " + details))
     }
     func network(operation: String, outcome: String, status: Int? = nil, requestID: UUID? = nil,
-                 elapsedMS: Int, storageUnavailable: Bool = false, error: (any Error)? = nil, eventID: UUID? = nil, benchmarkAttempt: UUID? = nil) {
-        let operations: Set<String> = ["register", "pairing_create", "pairing_claim", "push_token", "watch_token", "heartbeat", "alert", "status", "timeline", "monitoring", "monitoring_complete", "settings", "acknowledge", "test_push", "connection_preferences", "unpair", "delete_device"]
+                 elapsedMS: Int, storageUnavailable: Bool = false, error: (any Error)? = nil, eventID: UUID? = nil, benchmarkAttempt: UUID? = nil, serverDiagnosticMS: Int? = nil) {
+        let operations: Set<String> = ["register", "pairing_create", "pairing_claim", "push_token", "watch_token", "heartbeat", "alert", "status", "timeline", "monitoring", "monitoring_complete", "settings", "acknowledge", "test_push", "connection_preferences", "unpair", "delete_device", "resume_alerts"]
         guard operations.contains(operation), ["ok", "http_error", "transport_error", "decode_error", "encode_error", "cancelled", "invalid_response"].contains(outcome) else { return }
         if operation == "status" {
             benchmark.requestFinished(benchmarkAttempt, outcome: outcome, requestID: requestID, status: status, elapsedMS: elapsedMS)
@@ -90,13 +90,14 @@ import Observation
         if outcome != "ok" { recent[failureKey] = Date() }
         let routine = ["status", "heartbeat", "timeline"].contains(operation)
         let sample = outcome == "ok" ? routine : operation != "alert"
-        if sample, !recovered, !storageUnavailable, let last = recent[fingerprint], Date().timeIntervalSince(last) < (outcome == "ok" ? 900 : 60) { return }
+        if sample, elapsedMS < 2000, !recovered, !storageUnavailable, (serverDiagnosticMS ?? 0) < 2000, let last = recent[fingerprint], Date().timeIntervalSince(last) < (outcome == "ok" ? 900 : 60) { return }
         recent[fingerprint] = Date()
         var entry = "network operation=\(operation) outcome=\(outcome) elapsed_ms=\(max(0, elapsedMS))"
         if let status { entry += " status=\(status)" }
         if let requestID { entry += " request_id=\(requestID.uuidString.lowercased())" }
         if operation == "alert", let eventID { entry += " event_id=\(eventID.uuidString.lowercased())" }
         if storageUnavailable { entry += " server_diagnostics=unavailable" }
+        if let serverDiagnosticMS, (0...3_600_000).contains(serverDiagnosticMS) { entry += " server_diagnostic_ms=\(serverDiagnosticMS)" }
         if !details.isEmpty { entry += " " + details }
         append(entry)
     }

@@ -35,7 +35,10 @@ import UserNotifications
             if let alert {
                 WatchModel.shared.log.watchAlert(WatchAlertTrace(alert: alert, phase: .foreground, deliveredAt: deliveredAt, observedAt: observedAt))
                 WatchModel.shared.receive(alert)
-            } else { WatchModel.shared.log.record("watch_foreground_notification", code: hasSound ? 1 : 0) }
+            } else {
+                WatchModel.shared.log.record("watch_payload_unrecognized", code: 1)
+                WatchModel.shared.log.record("watch_foreground_notification", code: hasSound ? 1 : 0)
+            }
         }
         return [.banner, .list, .sound]
     }
@@ -48,7 +51,7 @@ import UserNotifications
                 WatchModel.shared.log.watchAlert(WatchAlertTrace(alert: alert, phase: acknowledge ? .acknowledged : .opened,
                                                                deliveredAt: deliveredAt, observedAt: observedAt))
                 WatchModel.shared.handleNotification(alert, acknowledging: acknowledge)
-            }
+            } else { WatchModel.shared.log.record("watch_payload_unrecognized", code: 2) }
         }
     }
 }
@@ -79,9 +82,10 @@ final class CryNotificationController: WKUserNotificationHostingController<CryNo
     private var text = "Open the app for nursery status."
     override class var isInteractive: Bool { true }
     override var body: CryNotificationView {
-        CryNotificationView(alert: alert, text: text) { [weak self, alert] in
+        let deliveredAt = self.deliveredAt
+        return CryNotificationView(alert: alert, deliveredAt: deliveredAt, text: text) { [weak self, alert] in
             guard let alert else { return }
-            WatchModel.shared.log.watchAlert(WatchAlertTrace(alert: alert, phase: .acknowledged, deliveredAt: self?.deliveredAt))
+            WatchModel.shared.log.watchAlert(WatchAlertTrace(alert: alert, phase: .acknowledged, deliveredAt: deliveredAt))
             WatchModel.shared.handleNotification(alert, acknowledging: true)
             self?.performDismissAction()
         }
@@ -91,16 +95,17 @@ final class CryNotificationController: WKUserNotificationHostingController<CryNo
         deliveredAt = notification.date
         text = notification.request.content.body
         if let alert {
-            WatchModel.shared.log.watchAlert(WatchAlertTrace(alert: alert, phase: .presented, deliveredAt: notification.date))
+            WatchModel.shared.log.watchAlert(WatchAlertTrace(alert: alert, phase: .controllerReceived, deliveredAt: notification.date))
             WatchModel.shared.receive(alert)
             // The inline action appears immediately, above the notification details.
             notificationActions = []
-        }
+        } else { WatchModel.shared.log.record("watch_payload_unrecognized", code: 3) }
     }
 }
 
 struct CryNotificationView: View {
     let alert: WatchCryAlert?
+    let deliveredAt: Date?
     let text: String
     let acknowledge: () -> Void
     var body: some View {
@@ -114,6 +119,8 @@ struct CryNotificationView: View {
                 .font(.headline).foregroundStyle(.orange)
             Text(text).font(.footnote)
             if let alert { Text(alert.createdAt, style: .time).font(.caption).foregroundStyle(.secondary) }
-        }.padding(.vertical, 8)
+        }.padding(.vertical, 8).onAppear {
+            if let alert { WatchModel.shared.log.watchAlert(WatchAlertTrace(alert: alert, phase: .viewAppeared, deliveredAt: deliveredAt)) }
+        }
     }
 }

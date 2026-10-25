@@ -12,6 +12,20 @@ final class WatchAlertTraceTests: XCTestCase {
         WatchCryAlert(eventId: UUID(), episodeId: UUID(), startedAt: created.addingTimeInterval(-5),
                       createdAt: created, duration: 5, isTest: false)
     }
+    func testReceiptControllerAndViewPhasesPreserveOneOSDateAndIndependentCallbackTimes() throws {
+        let value = alert(), delivered = created.addingTimeInterval(1)
+        let controller = WatchAlertTrace(alert: value, phase: .controllerReceived, deliveredAt: delivered, observedAt: created.addingTimeInterval(15))
+        let view = WatchAlertTrace(alert: value, phase: .viewAppeared, deliveredAt: delivered, observedAt: created.addingTimeInterval(16))
+        XCTAssertTrue(try XCTUnwrap(controller.entry).contains("callback_lag_ms=14000"))
+        XCTAssertTrue(try XCTUnwrap(view.entry).contains("callback_lag_ms=15000"))
+        XCTAssertNotEqual(controller.key, view.key)
+        for trace in [controller, view, WatchAlertTrace(alert: value, phase: .snapshotReceived)] {
+            XCTAssertEqual(WatchAlertTrace.key(in: "timestamp " + (try XCTUnwrap(trace.entry))), trace.key)
+        }
+        let legacy = WatchAlertTrace(alert: value, phase: .presented, deliveredAt: delivered)
+        XCTAssertEqual(WatchAlertTrace.key(in: "timestamp " + (try XCTUnwrap(legacy.entry))), legacy.key)
+        XCTAssertFalse(try XCTUnwrap(WatchAlertTrace(alert: value, phase: .snapshotReceived).entry).contains("delivered_at_ms="))
+    }
     func testOpeningLaterRetainsActualDeliveryTime() throws {
         let value = alert()
         let trace = WatchAlertTrace(alert: value, phase: .opened,

@@ -4,6 +4,7 @@ import Foundation
 struct WatchAlertTrace: Sendable {
     enum Phase: String, Sendable {
         case foreground, presented, opened, acknowledged, retained, hapticRequested = "haptic_requested"
+        case controllerReceived = "controller_received", viewAppeared = "view_appeared", snapshotReceived = "snapshot_received"
     }
     let alert: WatchCryAlert
     let phase: Phase

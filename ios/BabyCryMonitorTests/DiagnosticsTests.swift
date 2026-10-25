@@ -15,7 +15,8 @@ private final class DiagnosticsURLProtocol: URLProtocol, @unchecked Sendable {
         let status = path.contains("http-error") ? 503 : 200
         let requestID = path.contains("invalid-id") ? "private-token" : "6705ae24-2863-49df-8dc5-5fa15b2d0418"
         let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil,
-            headerFields: ["x-request-id": requestID, "x-diagnostics-status": "unavailable"])!
+            headerFields: ["x-request-id": requestID, "x-diagnostics-status": "unavailable",
+                           "x-diagnostics-elapsed-ms": path.contains("bad-timing") ? "-999" : "2750"])!
         let body: String
         if path.contains("schema-error") { body = "{\"quietResetDuration\":20,\"sensitivity\":\"medium\",\"absoluteThreshold\":-35}" }
         else if path.contains("date-error") { body = "{\"code\":\"private-pairing-code\",\"expiresAt\":\"private-invalid-timestamp\"}" }
@@ -29,6 +30,49 @@ private final class DiagnosticsURLProtocol: URLProtocol, @unchecked Sendable {
 }
 
 final class DiagnosticsTests: XCTestCase {
+    @MainActor func testSlowRoutineRequestsBypassSamplingWithoutAddingFastRequestRows() {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let log = DiagnosticLog(directory: directory)
+        log.network(operation: "status", outcome: "ok", elapsedMS: 50)
+        log.network(operation: "status", outcome: "ok", elapsedMS: 60)
+        log.network(operation: "status", outcome: "ok", elapsedMS: 2500)
+        log.network(operation: "status", outcome: "ok", elapsedMS: 3000)
+        XCTAssertEqual(log.lines.count, 3)
+        XCTAssertTrue(log.lines[1].contains("elapsed_ms=2500"))
+        log.network(operation: "status", outcome: "ok", elapsedMS: 50, serverDiagnosticMS: 2100)
+        XCTAssertEqual(log.lines.count, 4)
+        XCTAssertTrue(log.lines.last!.contains("server_diagnostic_ms=2100"))
+    }
+    @MainActor func testResumeAndTimelineErrorsAreRetainedAndUntrustedEventsStayExcluded() {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let log = DiagnosticLog(directory: directory)
+        log.record("resume_alerts_failed", error: URLError(.timedOut))
+        log.record("timeline_failed", error: URLError(.notConnectedToInternet))
+        log.record("private-new-event")
+        log.network(operation: "resume_alerts", outcome: "ok", elapsedMS: 50)
+        XCTAssertEqual(log.lines.count, 3)
+        XCTAssertTrue(log.lines[0].contains("resume_alerts_failed"))
+        XCTAssertTrue(log.lines[1].contains("timeline_failed"))
+        XCTAssertTrue(log.lines[2].contains("operation=resume_alerts"))
+    }
+    @MainActor func testBackendJournalTimingIsParsedAndInvalidHeaderIsExcluded() async throws {
+        let config = URLSessionConfiguration.ephemeral; config.protocolClasses = [DiagnosticsURLProtocol.self]
+        let session = URLSession(configuration: config); defer { session.invalidateAndCancel() }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let log = DiagnosticLog(directory: directory)
+        let credential = DeviceCredential(deviceId: UUID(), secret: "private-token", role: .listener, registered: true)
+        for scenario in ["ok", "bad-timing"] {
+            let client = BackendClient(baseURL: URL(string: "https://private-host/\(scenario)")!, credential: credential, log: log, session: session)
+            try await client.register()
+        }
+        XCTAssertEqual(log.lines.count, 2)
+        XCTAssertTrue(log.lines[0].contains("server_diagnostic_ms=2750"))
+        XCTAssertFalse(log.lines[1].contains("server_diagnostic_ms="))
+        XCTAssertFalse(log.export.contains("private-token"))
+    }
     @MainActor func testAppendsPreserveExistingFileAndProtection() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
