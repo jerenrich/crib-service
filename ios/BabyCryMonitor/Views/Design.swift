@@ -32,3 +32,24 @@ struct PrimaryButton: View {
     let title: String; var destructive = false; var action: () -> Void
     var body: some View { Button(action: action) { Text(title).font(.headline).frame(maxWidth: .infinity).padding(.vertical, 18).background(destructive ? Palette.panel : Palette.mint, in: RoundedRectangle(cornerRadius: 18)).foregroundStyle(destructive ? Color.white : Palette.background) }.buttonStyle(.plain) }
 }
+
+/// A task for the other phone, presented as guidance rather than a local control.
+struct NurseryMonitoringInstruction: View {
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "iphone")
+                .font(.title3).foregroundStyle(Palette.amber)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Use the nursery iPhone")
+                    .font(.subheadline.weight(.semibold)).foregroundStyle(Palette.amber)
+                Text("Open Crib Service and tap **Start Monitoring**.")
+                    .font(.caption).foregroundStyle(Palette.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 52, alignment: .leading)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("nurseryMonitoringInstruction")
+    }
+}

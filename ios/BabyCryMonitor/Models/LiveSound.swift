@@ -59,3 +59,81 @@ public struct RemoteSoundState: Sendable {
         return (0..<3).contains(now.timeIntervalSince(receivedAt))
     }
 }
+
+/// One presentation state for every Parent screen. This is deliberately separate
+/// from server confirmation of commands, notification delivery and warning timers.
+public enum ParentMonitoringDisplayState: String, Codable, Sendable {
+    case monitoring = "Monitoring", standby = "Standby", stopped = "Stopped"
+    case unavailable = "Status unavailable", connectionLost = "Connection lost"
+    case unpaired = "Not paired", starting = "Starting…", pausing = "Pausing…"
+    case unverified = "Monitoring unverified"
+}
+
+public struct ParentMonitoringEvidence: Sendable {
+    private struct Heartbeat: Sendable {
+        var state: ParentMonitoringDisplayState
+        var version: Date
+        var observedAt: Date
+    }
+    private var heartbeat: Heartbeat?
+    private var liveAt: Date?
+    private var heartbeatBeforeLive: Date?
+    private var ignoreLiveUntil: Date?
+    public init() {}
+
+    public mutating func receiveHeartbeat(monitoring: Bool, microphoneActive: Bool,
+                                         version: Date, observedAt: Date, receivedAt: Date? = nil) {
+        guard heartbeat.map({ version >= $0.version }) ?? true else { return }
+        if !monitoring, liveAt != nil, version > (heartbeatBeforeLive ?? .distantPast),
+           heartbeat.map({ version > $0.version }) ?? true {
+            // A local Listener pause can race a level packet already on the wire.
+            // Wait out its challenge lifetime before accepting a later local restart.
+            ignoreLiveUntil = (receivedAt ?? observedAt).addingTimeInterval(3)
+        }
+        // Re-reading a cached heartbeat must never renew its freshness.
+        let time = heartbeat.flatMap { $0.version == version ? min($0.observedAt, observedAt) : nil } ?? observedAt
+        heartbeat = Heartbeat(state: monitoring ? .monitoring : microphoneActive ? .standby : .stopped,
+                              version: version, observedAt: time)
+    }
+    public func acceptsLive(at now: Date) -> Bool {
+        ignoreLiveUntil.map { now >= $0 } ?? true
+    }
+    public mutating func receiveLive(at now: Date) {
+        guard acceptsLive(at: now) else { return }
+        liveAt = now
+        // A previously known stopped heartbeat cannot undo this newer reading,
+        // even if a subsequent status fetch returns that same cached heartbeat.
+        heartbeatBeforeLive = heartbeat?.version
+    }
+    public mutating func pause(at now: Date) {
+        liveAt = nil; heartbeatBeforeLive = nil
+        // All challenges issued before confirmation expire within three seconds.
+        ignoreLiveUntil = now.addingTimeInterval(3)
+    }
+    public func state(at now: Date, statusAvailable: Bool) -> ParentMonitoringDisplayState {
+        if let liveAt {
+            let age = now.timeIntervalSince(liveAt)
+            let newerStop = heartbeat.map {
+                $0.state != .monitoring && $0.version > (heartbeatBeforeLive ?? .distantPast)
+            } ?? false
+            // Let the bounded lifetime of any in-flight level packet pass before
+            // accepting a newer stopped heartbeat. Continuing levels supersede it.
+            if newerStop && age >= 3 { return heartbeatState(at: now, available: statusAvailable) }
+            if (0...150).contains(age) { return .monitoring }
+            // Do not resurrect the old Standby/Stopped state when live evidence expires.
+            if heartbeat?.state != .monitoring { return statusAvailable ? .connectionLost : .unavailable }
+        }
+        return heartbeatState(at: now, available: statusAvailable)
+    }
+    private func heartbeatState(at now: Date, available: Bool) -> ParentMonitoringDisplayState {
+        guard available, let heartbeat else { return .unavailable }
+        return (-5...150).contains(now.timeIntervalSince(heartbeat.observedAt)) ? heartbeat.state : .connectionLost
+    }
+    public func canResume(at now: Date, statusAvailable: Bool) -> Bool {
+        state(at: now, statusAvailable: statusAvailable) == .standby &&
+        heartbeat.map { (-5...30).contains(now.timeIntervalSince($0.observedAt)) } == true
+    }
+    public var lastObservationAt: Date? {
+        [liveAt, heartbeat?.observedAt].compactMap { $0 }.max()
+    }
+}

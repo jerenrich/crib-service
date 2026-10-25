@@ -9,10 +9,11 @@ struct NightstandView: View {
     @State private var readiness = false
     @State private var detailsPresented = false
     @State private var timing = false
+    @State private var confirmStopMicrophone = false
     @ScaledMetric(relativeTo: .caption) private var chartChrome: CGFloat = 96
 
     private var listener: Bool { role == .listener }
-    private var soundLive: Bool { listener ? model.monitoring : model.remoteSound.isLive(at: model.now) && !(confirmedParentState && model.parentStatus?.monitoring == false) }
+    private var soundLive: Bool { listener ? model.monitoring : model.parentHasLiveMonitoring }
     private var frame: SoundLevelFrame? { model.remoteSound.frame }
     private var levels: [Double] { listener ? model.meter : frame?.levels ?? Array(repeating: -100, count: SoundLevelFrame.barCount) }
     private var notificationPositions: [CGFloat] {
@@ -25,8 +26,9 @@ struct NightstandView: View {
     private var alertDuration: TimeInterval { listener ? model.configuration.alertDuration : frame.flatMap { soundLive ? $0.alertDuration : nil } ?? model.parentStatus?.listenerConfiguration?.alertDuration ?? model.configuration.alertDuration }
     private var elapsed: TimeInterval? { listener ? model.snapshot.current.map { $0.duration(at: model.now) } : soundLive ? frame?.episodeDuration : nil }
     private var confirmedParentState: Bool { ["Monitoring", "Standby", "Stopped"].contains(model.nurseryConnection) }
-    private var standby: Bool { listener ? model.standby : confirmedParentState && model.parentStatus?.monitoring == false && model.parentStatus?.microphoneActive == true }
-    private var monitoringActive: Bool { listener ? model.monitoring || model.recoveringAudio : confirmedParentState && model.parentStatus?.monitoring == true }
+    private var standby: Bool { listener ? model.standby : model.parentMonitoringDisplayState == .standby }
+    private var monitoringActive: Bool { listener ? model.monitoring || model.recoveringAudio : model.parentDisplaysMonitoring }
+    private var parentStartUnavailable: Bool { !listener && model.paired && !monitoringActive && !model.canStartMonitoringRemotely && model.pendingMonitoringCommand == nil }
     private var busy: Bool { listener ? model.starting : model.requestingMonitoring || model.pendingMonitoringCommand != nil }
     private var currentState: CryState? { listener ? model.state : soundLive ? frame?.state : nil }
     private var listenerAlertFailed: Bool {
@@ -45,10 +47,10 @@ struct NightstandView: View {
         } else {
             if !model.paired || model.pendingMonitoringCommand != nil || model.monitoringControlError != nil { return model.nurseryConnection }
             if standby { return "Standby" }
-            if confirmedParentState && model.parentStatus?.monitoring == false { return "Stopped" }
+            if model.parentMonitoringDisplayState == .stopped { return "Stopped" }
             // A fresh sound frame can be displayed before the next heartbeat.
             if !soundLive {
-                if !model.parentOnline { return model.nurseryConnection == "Stopped" ? "Stopped" : "Monitoring unconfirmed" }
+                if !model.parentDisplaysMonitoring { return model.nurseryConnection == "Stopped" ? "Stopped" : "Monitoring unconfirmed" }
                 return "Live chart paused"
             }
         }
@@ -63,7 +65,7 @@ struct NightstandView: View {
         }
         if soundLive { return "Listening for sustained sound" }
         if !model.paired { return "Pair with the nursery iPhone to begin" }
-        if let last = model.parentStatus?.lastHeartbeat { return "\(model.parentOnline ? "Monitoring last confirmed" : "Last nursery update") \(last.formatted(.relative(presentation: .numeric)))" }
+        if let last = model.parentStatus?.lastHeartbeat { return "\(model.parentDisplaysMonitoring ? "Monitoring last confirmed" : "Last nursery update") \(last.formatted(.relative(presentation: .numeric)))" }
         return "Waiting for a confirmed Listener update"
     }
 
@@ -101,6 +103,12 @@ struct NightstandView: View {
                 .padding(.horizontal, 20)
                 .padding(.vertical, 8)
             }
+        }
+        .alert("Stop microphone?", isPresented: $confirmStopMicrophone) {
+            Button("Stop microphone", role: .destructive) { model.stop() }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("This turns off the nursery microphone. To resume monitoring, you may need to reopen the app on this iPhone. Leave it in Standby to resume from the Parent.")
         }
         .sheet(isPresented: $timing) { AlertTimingView() }
         .sheet(isPresented: $pairing) { PairingView() }
@@ -356,9 +364,9 @@ struct NightstandView: View {
 
     private var connectionRecovery: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Label(model.monitoringControlError != nil ? "Monitoring not confirmed" : model.parentOnline ? "Live chart paused" : model.nurseryConnection == "Stopped" ? "Nursery monitoring is stopped" : "Monitoring cannot be confirmed",
+            Label(model.monitoringControlError != nil ? "Monitoring not confirmed" : model.parentDisplaysMonitoring ? "Live chart paused" : model.nurseryConnection == "Stopped" ? "Nursery monitoring is stopped" : "Monitoring cannot be confirmed",
                   systemImage: "exclamationmark.triangle.fill").font(.headline).accessibilityIdentifier("connectionRecoveryHeading")
-            Text(model.monitoringControlError ?? (model.parentOnline
+            Text(model.monitoringControlError ?? (model.parentDisplaysMonitoring
                 ? "The nursery microphone was recently confirmed active, but live sound readings have paused. Retry to reconnect the chart."
                 : "Check internet on both phones. Reopen Crib Service on the nursery iPhone and check its microphone status. Then retry here."))
                 .font(.subheadline)
@@ -400,26 +408,30 @@ struct NightstandView: View {
 
     private var monitoringControls: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Button(action: toggleMonitoring) {
-                Label(controlTitle, systemImage: monitoringActive ? (listener ? "stop" : "pause") : "play")
-                    .font(.headline).fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, minHeight: 52)
-                    .foregroundStyle(Palette.lavender).background(Palette.panel, in: RoundedRectangle(cornerRadius: 18))
+            if parentStartUnavailable {
+                NurseryMonitoringInstruction()
+            } else {
+                Button(action: toggleMonitoring) {
+                    Label(controlTitle, systemImage: monitoringActive ? "pause" : "play")
+                        .font(.headline).fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, minHeight: 52)
+                        .foregroundStyle(Palette.lavender).background(Palette.panel, in: RoundedRectangle(cornerRadius: 18))
+                }
+                .disabled(!model.paired || busy || model.managingDevice)
+                .accessibilityIdentifier("nightstandMonitoringControl")
             }
-            .disabled(!model.paired || busy || model.managingDevice)
-            .accessibilityIdentifier("nightstandMonitoringControl")
             HStack(alignment: .top, spacing: 16) {
                 if !model.paired {
                     Button(listener ? "Pair with Parent" : "Set up for tonight") { if listener { pairing = true } else { readiness = true } }
                         .frame(minHeight: 44, alignment: .leading)
                 } else if listener && (standby || model.recoveringAudio) {
-                    Button("Stop microphone") { model.stop() }
+                    Button("Stop microphone") { confirmStopMicrophone = true }
                         .frame(minHeight: 44, alignment: .leading)
                         .disabled(model.starting || model.managingDevice)
                         .accessibilityIdentifier("nightstandStopMicrophone")
                 } else if !listener && model.paired && !confirmedParentState && model.pendingMonitoringCommand == nil {
                     // An unknown state must still allow cancelling repeating alerts.
-                    Button("Pause monitoring") { Task { await model.requestMonitoring(false) } }
+                    Button("Pause Monitoring") { Task { await model.requestMonitoring(false) } }
                         .frame(minHeight: 44, alignment: .leading)
                         .disabled(model.requestingMonitoring || model.managingDevice)
                 } else {
@@ -442,8 +454,7 @@ struct NightstandView: View {
     private var controlTitle: String {
         if listener && model.starting { return "Starting…" }
         if let command = model.pendingMonitoringCommand, !listener { return command.enabled ? "Starting…" : "Pausing…" }
-        if standby { return "Resume monitoring" }
-        return monitoringActive ? (listener ? "Stop Monitoring" : "Pause monitoring") : "Start Monitoring"
+        return monitoringActive ? "Pause Monitoring" : "Start Monitoring"
     }
 
     private func sendTestAlert() {
@@ -453,7 +464,7 @@ struct NightstandView: View {
 
     private func toggleMonitoring() {
         if listener {
-            if monitoringActive { model.stop() } else { Task { await model.start() } }
+            if monitoringActive { model.pauseMonitoring() } else { Task { await model.start() } }
         } else { Task { await model.requestMonitoring(!monitoringActive) } }
     }
 
@@ -473,7 +484,7 @@ struct NightstandView: View {
                 if let failure = model.snapshot.failedAlerts.first {
                     Text("Last alert delivery failed \(failure.failedAt.formatted(date: .abbreviated, time: .shortened)).").foregroundStyle(Palette.amber)
                 }
-                Text("You may lock the screen while monitoring or in Standby. Parent Pause keeps the microphone active and discards samples for remote resume. Stop on this iPhone releases the microphone.")
+                Text("You may lock the screen while monitoring or in Standby. Pause Monitoring on either iPhone keeps the microphone active and discards samples for remote resume. Stop microphone on this iPhone releases the microphone after confirmation.")
                 Text("Test alerts simulate the alert threshold without using the microphone. Check the receiving device to confirm delivery.")
             } else {
                 Text(model.notifications.status)
