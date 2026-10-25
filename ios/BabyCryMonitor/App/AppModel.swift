@@ -26,8 +26,9 @@ import UIKit
     var testPushStatus: String?
     private(set) var watchTestRunning = false
     private(set) var watchTestInterval = 5.0
-    private(set) var watchTestLoaded = false
-    private(set) var changingWatchTest = false
+    @ObservationIgnored private var watchTestRequestTask: Task<Void, Never>?
+    @ObservationIgnored private var nextWatchTestAt: Date?
+    @ObservationIgnored private var watchTestGeneration = 0
     private(set) var watchTestError: String?
     var pairingError: String?
     var pairingCode: PairingCode?
@@ -292,6 +293,7 @@ import UIKit
         publishWatch()
     }
     deinit {
+        watchTestRequestTask?.cancel()
         loopTask?.cancel(); networkTask?.cancel(); audioTask?.cancel(); immediateAlertTask?.cancel(); alertDeliveryTask?.cancel()
         settingsTask?.cancel(); heartbeatTask?.cancel()
         listenerStatusTask?.cancel(); parentRefreshTask?.cancel()
@@ -385,7 +387,7 @@ import UIKit
         parentStatus = nil; pairingCode = nil; credential = nil; uploadedToken = nil; loadCredential()
         nextParentRefreshAt = .distantPast
         testPushStatus = nil; latestTestEventID = nil
-        watchTestRunning = false; watchTestLoaded = false; watchTestError = nil
+        stopWatchTest(); watchTestError = nil
         hasPendingWatchToken = false; pendingWatchToken = nil
         publishWatch()
         if value == .parent { Task { await notifications.register(); await refreshParent() } }
@@ -404,7 +406,7 @@ import UIKit
         credential = nil; parentStatus = nil; pairingCode = nil; uploadedToken = nil
         nextParentRefreshAt = .distantPast
         testPushStatus = nil; latestTestEventID = nil
-        watchTestRunning = false; watchTestLoaded = false; watchTestError = nil
+        stopWatchTest(); watchTestError = nil
         hasPendingWatchToken = false; pendingWatchToken = nil
         loadCredential()
         publishWatch()
@@ -812,7 +814,9 @@ import UIKit
         }
     }
     func setAppActive(_ active: Bool) {
-        appActive = active; synchronizeLiveSound()
+        appActive = active
+        if !active { stopWatchTest() }
+        synchronizeLiveSound()
         observeBackgroundBenchmark()
     }
     func startBackgroundBenchmark() {
@@ -867,6 +871,7 @@ import UIKit
         configuration = config; engine.configure(config); persist()
     }
     private func updateLocalState() {
+        scheduleWatchTestIfDue()
         observeBackgroundBenchmark()
         now = currentTime(); let device = UIDevice.current
         #if DEBUG
@@ -949,6 +954,7 @@ import UIKit
         }
     }
     func tick() async {
+        scheduleWatchTestIfDue()
         #if DEBUG
         if ProcessInfo.processInfo.arguments.contains("--uitesting-offline") { return }
         #endif
@@ -1319,23 +1325,45 @@ import UIKit
             return false
         }
     }
-    func updateWatchTest(running: Bool? = nil, interval: Double? = nil) async {
-        guard role == .parent, !changingWatchTest else { return }
-        changingWatchTest = true
-        defer { changingWatchTest = false }
-        let revision = environmentRevision
-        do {
-            let client = try await registeredClient()
-            guard revision == environmentRevision else { return }
-            let status = try await client.watchTest(running: running, interval: Int((interval ?? watchTestInterval).rounded()))
-            guard revision == environmentRevision else { return }
-            watchTestRunning = status.running
-            watchTestInterval = Double(status.interval)
-            watchTestLoaded = true
-            watchTestError = nil
-        } catch {
-            guard revision == environmentRevision else { return }
-            watchTestError = error.localizedDescription
+    func startWatchTest(interval: Double) {
+        guard role == .parent, paired, appActive, !managingDevice else { return }
+        stopWatchTest()
+        setWatchTestInterval(interval)
+        watchTestError = nil
+        watchTestRunning = true
+        nextWatchTestAt = currentTime().addingTimeInterval(watchTestInterval)
+    }
+    func setWatchTestInterval(_ interval: Double) {
+        guard interval.isFinite else { return }
+        watchTestInterval = min(10, max(1, interval.rounded()))
+        if watchTestRunning { nextWatchTestAt = currentTime().addingTimeInterval(watchTestInterval) }
+    }
+    func stopWatchTest() {
+        watchTestRunning = false
+        nextWatchTestAt = nil
+        watchTestGeneration += 1
+        watchTestRequestTask?.cancel()
+    }
+    private func scheduleWatchTestIfDue() {
+        guard watchTestRunning else { return }
+        guard appActive, role == .parent, paired, !managingDevice else { stopWatchTest(); return }
+        guard watchTestRequestTask == nil, let due = nextWatchTestAt, currentTime() >= due else { return }
+        let generation = watchTestGeneration, revision = environmentRevision
+        // Start a new interval from this attempt; never replay missed timer ticks.
+        nextWatchTestAt = currentTime().addingTimeInterval(watchTestInterval)
+        watchTestRequestTask = Task { [weak self] in
+            guard let self else { return }
+            defer { self.watchTestRequestTask = nil }
+            do {
+                let client = try await self.registeredClient()
+                guard !Task.isCancelled, self.watchTestRunning, generation == self.watchTestGeneration,
+                      revision == self.environmentRevision else { return }
+                try await client.sendWatchTest()
+            } catch {
+                guard generation == self.watchTestGeneration, revision == self.environmentRevision else { return }
+                self.stopWatchTest()
+                self.watchTestError = "Test stopped: \(error.localizedDescription)"
+            }
         }
     }
 
@@ -1429,7 +1457,7 @@ import UIKit
             settingsDirty = false; defaults.set(false, forKey: "settingsDirty")
             engine = CrySessionManager(); configuration = engine.snapshot.configuration; persist()
             calibration = SoundCalibration(); testPushStatus = nil; latestTestEventID = nil
-            watchTestRunning = false; watchTestLoaded = false; watchTestError = nil
+            stopWatchTest(); watchTestError = nil
             hasPendingWatchToken = false; pendingWatchToken = nil
             if deleteDevice { role = nil; defaults.removeObject(forKey: "role"); uploadedToken = nil }
             deliveryStatus = "Pair a device to reconnect"; error = nil

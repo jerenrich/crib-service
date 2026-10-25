@@ -3,7 +3,6 @@ export interface Env {
  CF_VERSION_METADATA?: {id:string};
  DB: D1Database;
  ALERT_REMINDERS: DurableObjectNamespace;
- WATCH_TEST: DurableObjectNamespace;
  LIVE_SOUND: DurableObjectNamespace;
  APNS_KEY_ID: string;
  APNS_TEAM_ID: string;

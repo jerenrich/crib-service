@@ -1,5 +1,4 @@
-import {watchTest} from './watch-test';
-export {WatchTest} from './watch-test';
+import {retiredWatchTest,sendWatchTest} from './watch-test';
 import {requestMonitoring,completeMonitoring} from './monitoring';
 import {timeline} from './timeline';
 export {AlertReminders} from './reminders';
@@ -45,7 +44,8 @@ export default {
     const device=await latency.measure('authentication_ms',()=>authenticate(env,request));
     stage='rate_limit';
     // Separate budgets: a device's own polling must never delay a crying alert.
-    await latency.measure('rate_limit_ms',()=>rateLimit(env,alertUpload?'alert':'device',device.id,600,600));
+    const watchTestPush=route==='POST /v1/watch-test/push';
+    await latency.measure('rate_limit_ms',()=>rateLimit(env,watchTestPush?'watch-test-push':alertUpload?'alert':'device',device.id,watchTestPush?660:600,600));
     stage='handler';
     const special=await latency.measure('handler_ms',async()=>{switch(route){
      case 'POST /v1/pairing/create':result=await createPairing(env,device);break;
@@ -55,8 +55,9 @@ export default {
      case 'POST /v1/pairing/remove':result=await removeDeviceData(env,device);break;
      case 'POST /v1/device/delete':result=await removeDeviceData(env,device,true);break;
      case 'POST /v1/connection-alerts':result=await connectionPreferences(env,device,await body(request));break;
-     case 'GET /v1/watch-test':result=await watchTest(env,device);break;
-     case 'POST /v1/watch-test':result=await watchTest(env,device,await body(request));break;
+     case 'POST /v1/watch-test/push':result=await sendWatchTest(env,device,latency,requestId);break;
+     case 'GET /v1/watch-test':result=retiredWatchTest(device);break;
+     case 'POST /v1/watch-test':result=retiredWatchTest(device,await body(request));break;
      case 'POST /v1/test-push':{
       if(device.role!=='parent')throw new APIError(403,'Only the Parent can request a test.');
       await rateLimit(env,'test-push',device.id,6,600);

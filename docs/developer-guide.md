@@ -242,7 +242,8 @@ All authenticated calls use `Authorization: Bearer <device UUID>.<random secret>
 | `POST /v1/settings` | Paired device | Update shared configuration |
 | `POST /v1/alert/acknowledge` | Parent | Acknowledge episode alerts |
 | `POST /v1/alert/resume` | Parent | End the observed snooze early using `expectedUntil` in epoch milliseconds |
-| `GET /v1/watch-test` / `POST /v1/watch-test` | Parent | Read/start/update/stop the repeating Watch test; integer interval 1–10 seconds |
+| `POST /v1/watch-test/push` | Parent | Relay one iPhone-generated Watch test push; no server repeats or retry queue |
+| `GET /v1/watch-test` / `POST /v1/watch-test` | Parent | Retired timer compatibility: reports stopped, accepts Stop, rejects Start |
 | `POST /v1/test-push` | Parent | Request a marked real test through the paired Listener's alert path |
 | `POST /v1/connection-alerts` | Parent | Opt in/out of Listener connection notices |
 | `POST /v1/pairing/remove` | Paired device | Revoke pairing and clear shared server history |
@@ -602,3 +603,10 @@ Validation before release passed 120 Worker integration tests, TypeScript source
 Rollout completed: merged and pushed feature commit `f9d93eb` to `main`, then deployed Worker version `dd42f72a-048b-4c5a-ae6b-b9bb200cc336` with the new `WATCH_TEST` binding and Durable Object migration. No D1 migrations were pending. Two successful scheduled-maintenance records were verified for this deployed version. Deployment dry run, live temporary-device smoke checks (including the new Watch test controls) and deep verification of both signed apps passed. Temporary smoke-test devices were deleted without registering push tokens or sending notifications.
 
 Installed the signed development update in place and launched successfully on J14, J17 and Jordan’s Apple Watch. The Watch needed one connection retry. Read-back preferences confirmed retained Listener/Parent roles, accepted onboarding and pairing on both phones. Start Listener monitoring again after the update. Physical repeating-push presentation and wrist taps still require user observation. Build, deployment, smoke and device receipts are retained in the feature worktree’s ignored `.local/watch-test-rollout-2026-10-25/` directory.
+
+
+### Phone-controlled Watch test revision (25 October 2026)
+
+This supersedes the server timer implementation above. The Parent iPhone now owns the in-memory 1–10 second repeat timer and calls `POST /v1/watch-test/push` once per alert. Only one request may be in flight. Stop cancels locally without internet. Leaving the foreground, closing Settings, changing role/backend or unpairing stops the test; no running state is persisted and relaunch never resumes it. A failed request stops the test with a visible error. Slow requests never cause catch-up bursts.
+
+The Worker only relays each requested push directly to the current registered Watch. It creates no event/outbox rows, retries or alarms. Migration `v4-remove-watch-test-timer` deletes the retired `WatchTest` Durable Object class and all stored sessions/alarms. Old clients cannot restart it. Apple may still deliver an already submitted push during its short expiration window. Deploy this backend revision before installing the updated app.

@@ -283,11 +283,13 @@ final class AppModelTests: XCTestCase {
             if testRequestFails { throw URLError(.notConnectedToInternet) }
             requestedTest = true
         }
-        private var watchTestValue = WatchTestStatus(running: false, interval: 5)
-        func watchTest(running: Bool?, interval: Int) async throws -> WatchTestStatus {
+        private(set) var watchTestRequests = 0
+        var watchTestGate: RequestGate?
+        func setWatchTestGate(_ gate: RequestGate?) { watchTestGate = gate }
+        func sendWatchTest() async throws {
+            watchTestRequests += 1
+            await watchTestGate?.wait()
             if testRequestFails { throw URLError(.notConnectedToInternet) }
-            if let running { watchTestValue = WatchTestStatus(running: running, interval: running ? interval : 5) }
-            return watchTestValue
         }
         func connectionAlerts(_ enabled: Bool) async throws {
             connectionAlertPreferences.append(enabled)
@@ -690,26 +692,94 @@ final class AppModelTests: XCTestCase {
         XCTAssertFalse(fixture.model.monitoring); XCTAssertEqual(fixture.audio.starts, 0)
     }
 
-    @MainActor func testRepeatingWatchTestRestoresChangesAndStops() async throws {
+    @MainActor func testPhoneWatchTestIntervalChangesAndOfflineStop() async throws {
         let fixture = try Fixture(); fixture.model.selectRole(.parent)
-        await fixture.model.updateWatchTest()
-        XCTAssertTrue(fixture.model.watchTestLoaded)
+        await fixture.model.refreshParent()
+        fixture.model.startWatchTest(interval: 1)
+        await fixture.model.tick()
+        var requests = await fixture.backend.watchTestRequests
+        XCTAssertEqual(requests, 0)
+        fixture.time.now = fixture.time.now.addingTimeInterval(1)
+        await fixture.model.tick()
+        let first = await eventually { await fixture.backend.watchTestRequests == 1 }
+        XCTAssertTrue(first)
+        // Allow the completed request to install its next deadline.
+        for _ in 0..<10 { await Task.yield() }
+        fixture.model.setWatchTestInterval(10)
+        fixture.time.now = fixture.time.now.addingTimeInterval(9)
+        await fixture.model.tick()
+        requests = await fixture.backend.watchTestRequests; XCTAssertEqual(requests, 1)
+        fixture.time.now = fixture.time.now.addingTimeInterval(1)
+        await fixture.model.tick()
+        let second = await eventually { await fixture.backend.watchTestRequests == 2 }
+        XCTAssertTrue(second)
+        fixture.connectivity.available = false
+        fixture.model.stopWatchTest()
         XCTAssertFalse(fixture.model.watchTestRunning)
-        await fixture.model.updateWatchTest(running: true, interval: 1)
-        XCTAssertTrue(fixture.model.watchTestRunning)
-        XCTAssertEqual(fixture.model.watchTestInterval, 1)
-        await fixture.model.updateWatchTest(running: true, interval: 10)
-        await fixture.model.updateWatchTest()
-        XCTAssertEqual(fixture.model.watchTestInterval, 10)
+        fixture.time.now = fixture.time.now.addingTimeInterval(60)
+        await fixture.model.tick()
+        requests = await fixture.backend.watchTestRequests; XCTAssertEqual(requests, 2)
+    }
+    @MainActor func testPhoneWatchTestStopsOnBackgroundAndNeverAutomaticallyResumes() async throws {
+        let fixture = try Fixture(); fixture.model.selectRole(.parent)
+        await fixture.model.refreshParent()
+        fixture.model.startWatchTest(interval: 5)
+        fixture.model.setAppActive(false)
+        XCTAssertFalse(fixture.model.watchTestRunning)
+        fixture.time.now = fixture.time.now.addingTimeInterval(60)
+        fixture.model.setAppActive(true)
+        await fixture.model.tick()
+        let requests = await fixture.backend.watchTestRequests
+        XCTAssertEqual(requests, 0)
+        XCTAssertFalse(fixture.model.watchTestRunning)
+    }
+    @MainActor func testPhoneWatchTestNeverOverlapsOrContinuesAfterFailure() async throws {
+        let fixture = try Fixture(); fixture.model.selectRole(.parent)
+        await fixture.model.refreshParent()
+        let gate = RequestGate(); await fixture.backend.setWatchTestGate(gate)
+        fixture.model.startWatchTest(interval: 1)
+        fixture.time.now = fixture.time.now.addingTimeInterval(1)
+        await fixture.model.tick()
+        let sending = await eventually { await fixture.backend.watchTestRequests == 1 }
+        XCTAssertTrue(sending)
+        fixture.time.now = fixture.time.now.addingTimeInterval(60)
+        for _ in 0..<5 { await fixture.model.tick() }
+        var requests = await fixture.backend.watchTestRequests; XCTAssertEqual(requests, 1)
         await fixture.backend.setTestRequestFailure(true)
-        await fixture.model.updateWatchTest(running: false)
-        XCTAssertTrue(fixture.model.watchTestRunning) // Failed stop must remain visible and retryable.
-        XCTAssertNotNil(fixture.model.watchTestError)
-        XCTAssertFalse(fixture.model.changingWatchTest)
-        await fixture.backend.setTestRequestFailure(false)
-        await fixture.model.updateWatchTest(running: false)
+        await gate.open()
+        let stopped = await eventually { !fixture.model.watchTestRunning }
+        XCTAssertTrue(stopped); XCTAssertNotNil(fixture.model.watchTestError)
+        fixture.time.now = fixture.time.now.addingTimeInterval(60)
+        await fixture.model.tick()
+        requests = await fixture.backend.watchTestRequests; XCTAssertEqual(requests, 1)
+    }
+    @MainActor func testPhoneWatchTestStopIgnoresLateFailureAndDoesNotPersistRunningState() async throws {
+        let fixture = try Fixture(); fixture.model.selectRole(.parent)
+        await fixture.model.refreshParent()
+        let gate = RequestGate(); await fixture.backend.setWatchTestGate(gate)
+        fixture.model.startWatchTest(interval: 1)
+        fixture.time.now = fixture.time.now.addingTimeInterval(1)
+        await fixture.model.tick()
+        let sending = await eventually { await fixture.backend.watchTestRequests == 1 }
+        XCTAssertTrue(sending)
+        fixture.model.stopWatchTest()
+        await fixture.backend.setTestRequestFailure(true); await gate.open()
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertFalse(fixture.model.watchTestRunning); XCTAssertNil(fixture.model.watchTestError)
+        let reloaded = AppModel(defaults: fixture.defaults, metadataStore: try MetadataStore(directory: fixture.directory),
+                                audio: fixture.audio, notifications: fixture.notifications,
+                                keychain: Credentials(listener: fixture.listener, parent: fixture.parent), automaticallyStart: false)
+        XCTAssertFalse(reloaded.watchTestRunning)
+    }
+    @MainActor func testPhoneWatchTestStopsOnRoleChangeAndClampsInterval() async throws {
+        let fixture = try Fixture(); fixture.model.selectRole(.parent)
+        await fixture.model.refreshParent()
+        fixture.model.startWatchTest(interval: 0)
+        XCTAssertEqual(fixture.model.watchTestInterval, 1)
+        fixture.model.setWatchTestInterval(99)
+        XCTAssertEqual(fixture.model.watchTestInterval, 10)
+        fixture.model.selectRole(.listener)
         XCTAssertFalse(fixture.model.watchTestRunning)
-        XCTAssertNil(fixture.model.watchTestError)
     }
 
     @MainActor func testWatchTestRequiresFreshWatchRegistration() async throws {
