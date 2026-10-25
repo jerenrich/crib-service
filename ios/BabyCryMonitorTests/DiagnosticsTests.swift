@@ -234,6 +234,26 @@ final class DiagnosticsTests: XCTestCase {
             XCTAssertFalse(log.export.contains(value), value)
         }
     }
+    @MainActor func testParentStatusBenchmarkRecordsEachAttemptAndRedactsPayloads() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [DiagnosticsURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let log = DiagnosticLog(directory: directory)
+        log.benchmark.start()
+        let credential = DeviceCredential(deviceId: UUID(), secret: "private-credential", role: .parent, registered: true)
+        let client = BackendClient(baseURL: URL(string: "https://private-host/decode-error")!, credential: credential, log: log, session: session)
+        for _ in 0..<3 { do { _ = try await client.status() } catch { } }
+        XCTAssertEqual(log.benchmark.entries.filter { $0.kind == .requestStart }.count, 3)
+        XCTAssertEqual(log.benchmark.entries.filter { $0.kind == .requestEnd && $0.outcome == "decode_error" }.count, 3)
+        let report = log.benchmark.report
+        XCTAssertTrue(report.lowercased().contains("6705ae24-2863-49df-8dc5-5fa15b2d0418"))
+        for value in ["private-host", "private-credential", "private-response-body", credential.deviceId.uuidString] {
+            XCTAssertFalse(report.contains(value), value)
+        }
+    }
     @MainActor func testBackendDiagnosticsExcludeCredentialsURLsAndResponseBodies() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [DiagnosticsURLProtocol.self]
