@@ -7,6 +7,7 @@ public struct MonitoringConfiguration: Codable, Equatable, Sendable {
     public static let snoozeDurations: [TimeInterval] = [60, 120, 300, 600, 900]
     public var snoozeDuration: TimeInterval = 60
     public var quietResetDuration: TimeInterval = 20
+    public static let repeatIntervals: [TimeInterval] = [5, 2]
     public var repeatInterval: TimeInterval? = 5
     public var absoluteThreshold: Double = -35
     public init() {}
@@ -20,11 +21,12 @@ public struct MonitoringConfiguration: Codable, Equatable, Sendable {
         absoluteThreshold = try values.decode(Double.self, forKey: .absoluteThreshold)
         snoozeDuration = try values.decodeIfPresent(TimeInterval.self, forKey: .snoozeDuration) ?? 60
         // The server now owns reminders. Migrate the retired Off/15-second/2/5-minute choices.
-        repeatInterval = 5
+        let savedRepeat = try values.decodeIfPresent(TimeInterval.self, forKey: .repeatInterval)
+        repeatInterval = savedRepeat == 2 ? 2 : 5
     }
     public var isValid: Bool {
         alertDuration.isFinite && (5...3600).contains(alertDuration) && [10.0, 20, 30, 60].contains(quietResetDuration)
-        && repeatInterval == 5 && Self.snoozeDurations.contains(snoozeDuration)
+        && Self.repeatIntervals.contains(repeatInterval ?? 0) && Self.snoozeDurations.contains(snoozeDuration)
         && absoluteThreshold.isFinite && (-60 ... -10).contains(absoluteThreshold)
     }
 }

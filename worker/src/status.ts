@@ -62,5 +62,7 @@ export async function saveSettings(env:Env,device:Device,value:Record<string,unk
  const config=configuration(value);const pair=await pairFor(env,device);
  if(!pair)throw new APIError(409,'Pair before changing shared settings.');
  await env.DB.prepare('UPDATE devices SET config=? WHERE id=?').bind(JSON.stringify(config),pair.parent_id).run();
+ // Apply a faster cadence to an already active reminder timer immediately.
+ await scheduleReminders(env,pair.parent_id,true);
  return {ok:true};
 }

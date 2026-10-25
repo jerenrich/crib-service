@@ -134,6 +134,17 @@ final class CrySessionTests: XCTestCase {
             XCTAssertTrue(restored.isValid)
         }
     }
+    func testFrequentReminderSettingSurvivesRoundTrip() throws {
+        var config = MonitoringConfiguration()
+        config.repeatInterval = 2
+        XCTAssertTrue(config.isValid)
+        let restored = try JSONDecoder().decode(MonitoringConfiguration.self, from: JSONEncoder().encode(config))
+        XCTAssertEqual(restored, config)
+        config.repeatInterval = 1
+        XCTAssertFalse(config.isValid)
+        config.repeatInterval = nil
+        XCTAssertFalse(config.isValid)
+    }
     func testMissingSamplesDoNotCountAsCrying() {
         var s = Simulation(); s.run(60); s.time = s.time.addingTimeInterval(300); s.run(1)
         XCTAssertTrue(s.emitted.isEmpty); XCTAssertNil(s.engine.snapshot.current); XCTAssertEqual(s.engine.snapshot.history.count, 1)

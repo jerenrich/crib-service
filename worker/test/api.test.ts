@@ -678,7 +678,7 @@ describe('private operational diagnostics',()=>{
  });
 });
 
-describe('5-second reminders and acknowledgement mute',()=>{
+describe('configurable reminders and acknowledgement mute',()=>{
  async function ready() {
   const pair=await paired();await call('device/push-token',pair.parent,{token:'ab'.repeat(32)});
   // The simulated episode began five minutes ago, after this seeded pairing.
@@ -704,6 +704,31 @@ describe('5-second reminders and acknowledgement mute',()=>{
    const saved=await (await call('listener/status',parent,undefined,'GET')).json() as typeof status;
    expect(saved.configuration).toEqual({...defaultConfiguration,alertDuration:60,repeatInterval:5});
   }
+ });
+ it('shares frequent settings and re-arms an active timer at two seconds',async()=>{
+  const {parent,listener,event}=await ready();
+  expect((await call('settings',parent,{...defaultConfiguration,repeatInterval:2})).status).toBe(200);
+  const status=await (await call('listener/status',parent,undefined,'GET')).json() as {configuration:typeof defaultConfiguration};
+  expect(status.configuration.repeatInterval).toBe(2);
+  const config=await (await call('listener/heartbeat',listener,{listenerId:listener.deviceId,timestamp:new Date().toISOString(),monitoring:true,powerConnected:true,state:'crying',episodes:[],currentEpisode:{id:event.episodeId,startedAt:event.cryStartedAt}})).json() as typeof defaultConfiguration;
+  expect(config.repeatInterval).toBe(2);
+  const stub=testEnv.ALERT_REMINDERS.getByName(parent.deviceId);
+  const next=await runInDurableObject(stub,async(_instance,state)=>state.storage.getAlarm());
+  expect(next).toBeGreaterThan(Date.now());expect(next).toBeLessThanOrEqual(Date.now()+2000);
+  // The alarm's Worker runs in a separate isolate with its own clock and bindings.
+  await runDurableObjectAlarm(stub);
+  const following=await runInDurableObject(stub,async(_instance,state)=>state.storage.getAlarm());
+  expect(following).toBeGreaterThan(Date.now());expect(following).toBeLessThanOrEqual(Date.now()+2000);
+  advance(1);await runReminder(testEnv,parent.deviceId);expect(pushRequests).toHaveLength(1);
+  advance(1);mockPush();await runReminder(testEnv,parent.deviceId);expect(pushRequests).toHaveLength(2);
+  // Switching back must prevent another reminder before five seconds have passed.
+  expect((await call('settings',listener,{...defaultConfiguration,repeatInterval:5})).status).toBe(200);
+  advance(2);await runReminder(testEnv,parent.deviceId);expect(pushRequests).toHaveLength(2);
+  advance(3);mockPush();await runReminder(testEnv,parent.deviceId);expect(pushRequests).toHaveLength(3);
+ });
+ it('does not accept unsupported one-second reminders',async()=>{
+  const {parent}=await paired();
+  expect((await call('settings',parent,{...defaultConfiguration,repeatInterval:1})).status).toBe(400);
  });
  it('persists a timer and duplicate uploads do not postpone it',async()=>{
   const {parent,listener,event}=await ready();

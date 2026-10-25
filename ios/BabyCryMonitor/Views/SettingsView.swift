@@ -55,7 +55,11 @@ struct SettingsView: View {
                     Text("A fixed microphone level. −60 dBFS detects quieter sounds; −10 dBFS requires louder sounds. The threshold stays fixed as room noise changes. dBFS is a microphone reading, not a calibrated room loudness measurement. Other loud noises can also trigger detection.")
                 }
                 Section {
-                    LabeledContent("Repeat alerts", value: "Every 5 seconds")
+                    Picker("Repeat alerts", selection: setting(\.repeatInterval)) {
+                        Text("Standard · Every 5 seconds").tag(TimeInterval?.some(5))
+                        Text("Frequent · Every 2 seconds").tag(TimeInterval?.some(2))
+                    }
+                    .accessibilityIdentifier("repeatIntervalPicker")
                     Picker("Snooze after acknowledgement", selection: setting(\.snoozeDuration)) {
                         ForEach(MonitoringConfiguration.snoozeDurations, id: \.self) { value in
                             Text(alertDurationText(value)).tag(value)
@@ -65,7 +69,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Reminders")
                 } footer: {
-                    Text("Crying alerts repeat every 5 seconds until you snooze one on your iPhone or Watch, or the Listener confirms the quiet period. Acknowledging snoozes crying alerts for \(alertDurationText(model.configuration.snoozeDuration)). Snooze clears existing crying notifications on that device. Opening the app clears alerts that have settled or been snoozed. Connection-loss alerts stay on. Notification delivery depends on connectivity and your device settings.")
+                    Text("Crying alerts repeat every \(Int(model.configuration.repeatInterval ?? 5)) seconds until you snooze one on your iPhone or Watch, or the Listener confirms the quiet period. Acknowledging snoozes crying alerts for \(alertDurationText(model.configuration.snoozeDuration)). Snooze clears existing crying notifications on that device. Opening the app clears alerts that have settled or been snoozed. Connection-loss alerts stay on. Frequent alerts request more notifications; watchOS controls background wrist taps, so a tap every two seconds is not guaranteed. Notification delivery depends on connectivity and your device settings.")
                 }
                 Section("This iPhone") {
                     Picker("Mode", selection: Binding(get: { model.role ?? .listener }, set: { model.selectRole($0) })) { Text("Listener").tag(DeviceRole.listener); Text("Parent").tag(DeviceRole.parent) }

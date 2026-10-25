@@ -3,10 +3,14 @@ import type {Alert,Env,Heartbeat,StoredEvent} from './types';
 import {configuration} from './security';
 import {dispatchEvent} from './alerts';
 
-export const reminderInterval = 5000;
+// Keep legacy/absent settings at five seconds; frequent reminders are opt-in.
+async function reminderInterval(env:Env,parentId:string):Promise<number> {
+ const device=await env.DB.prepare('SELECT config FROM devices WHERE id=?').bind(parentId).first<{config:string}>();
+ return device&&configuration(JSON.parse(device.config)).repeatInterval===2?2000:5000;
+}
 
-export async function scheduleReminders(env:Env,parentId:string):Promise<void> {
- const response=await env.ALERT_REMINDERS.getByName(parentId).fetch('https://reminders.internal/schedule',{
+export async function scheduleReminders(env:Env,parentId:string,onlyIfScheduled=false):Promise<void> {
+ const response=await env.ALERT_REMINDERS.getByName(parentId).fetch(`https://reminders.internal/${onlyIfScheduled?'refresh':'schedule'}`,{
   method:'POST',body:parentId
  });
  if(!response.ok)throw new Error('Reminder scheduling unavailable.');
@@ -19,12 +23,13 @@ export class AlertReminders implements DurableObject {
  async fetch(request:Request):Promise<Response> {
   const parentId=await request.text();
   return this.ctx.blockConcurrencyWhile(async()=>{
+   if(new URL(request.url).pathname==='/refresh'&&await this.ctx.storage.getAlarm()===null)return new Response(null,{status:204});
    await this.ctx.storage.put('parentId',parentId);
    // Duplicate uploads must not postpone an already scheduled reminder.
    const device=await this.env.DB.prepare('SELECT alerts_muted_until FROM devices WHERE id=?').bind(parentId).first<{alerts_muted_until:number}>();
    if(device&&device.alerts_muted_until>Date.now())await this.ctx.storage.setAlarm(device.alerts_muted_until);
    else {
-    const next=Date.now()+reminderInterval,scheduled=await this.ctx.storage.getAlarm();
+    const next=Date.now()+await reminderInterval(this.env,parentId),scheduled=await this.ctx.storage.getAlarm();
     // Advance an older, slower timer without postponing any ready reminder.
     if(scheduled===null||scheduled>next)await this.ctx.storage.setAlarm(next);
    }
@@ -36,7 +41,8 @@ export class AlertReminders implements DurableObject {
    const parentId=await this.ctx.storage.get<string>('parentId');
    if(!parentId)return;
    // Re-arm before external work so a transient DB/APNs failure cannot end reminders.
-   await this.ctx.storage.setAlarm(Date.now()+reminderInterval);
+   await this.ctx.storage.setAlarm(Date.now()+5000);
+   await this.ctx.storage.setAlarm(Date.now()+await reminderInterval(this.env,parentId));
    if(!await runReminder(this.env,parentId)) {
     await this.ctx.storage.deleteAlarm();
     await this.ctx.storage.delete('parentId');
@@ -76,7 +82,7 @@ export async function runReminder(env:Env,parentId:string):Promise<boolean> {
   await dispatchEvent(env,previous.event_id);
   return true;
  }
- if(now-previous.created_at<reminderInterval)return true;
+ if(now-previous.created_at<(configuration(JSON.parse(pair.config)).repeatInterval ?? 5)*1000)return true;
  const source=JSON.parse(previous.payload) as Alert;
  const event:Alert={...source,eventId:crypto.randomUUID(),isRepeat:true,createdAt:new Date(now).toISOString()};
  // Keep the original measured duration: a reminder is not evidence of more crying.
