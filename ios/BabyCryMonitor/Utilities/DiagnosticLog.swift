@@ -9,6 +9,7 @@ import Observation
     private(set) var persistenceFailure: String?
     private let url: URL?
     private let batteryDrain: BatteryDrainLog
+    let benchmark: BackgroundBenchmark
     private var recent: [String: Date] = [:]
     private var watchTraceKeys: Set<String> = []
     private var persistedLineCount = 0
@@ -42,6 +43,7 @@ import Observation
         let folder = directory ?? (try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true))
         url = folder?.appendingPathComponent("diagnostics.txt")
         batteryDrain = BatteryDrainLog(directory: folder)
+        benchmark = BackgroundBenchmark(directory: folder)
         do {
             guard let folder, let url else { persistenceAvailable = false; return }
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -74,9 +76,12 @@ import Observation
         append(event + (code.map { " code=\($0)" } ?? "") + (details.isEmpty ? "" : " " + details))
     }
     func network(operation: String, outcome: String, status: Int? = nil, requestID: UUID? = nil,
-                 elapsedMS: Int, storageUnavailable: Bool = false, error: (any Error)? = nil, eventID: UUID? = nil) {
+                 elapsedMS: Int, storageUnavailable: Bool = false, error: (any Error)? = nil, eventID: UUID? = nil, benchmarkAttempt: UUID? = nil) {
         let operations: Set<String> = ["register", "pairing_create", "pairing_claim", "push_token", "watch_token", "heartbeat", "alert", "status", "timeline", "monitoring", "monitoring_complete", "settings", "acknowledge", "test_push", "connection_preferences", "unpair", "delete_device"]
         guard operations.contains(operation), ["ok", "http_error", "transport_error", "decode_error", "encode_error", "cancelled", "invalid_response"].contains(outcome) else { return }
+        if operation == "status" {
+            benchmark.requestFinished(benchmarkAttempt, outcome: outcome, requestID: requestID, status: status, elapsedMS: elapsedMS)
+        }
         // Routine successes are sampled; preserve a failure and its first recovery.
         let failureKey = "failure_\(operation)"
         let details = error.map { Self.errorDetails($0) } ?? ""

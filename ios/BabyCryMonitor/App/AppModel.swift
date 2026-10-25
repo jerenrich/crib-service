@@ -72,6 +72,7 @@ import UIKit
     let notifications: any NotificationProviding
     let watch: PhoneWatchBridge
     let log: DiagnosticLog
+    let refreshExperiment: BackgroundRefreshController?
     private var engine = CrySessionManager()
     @ObservationIgnored private var store: MetadataStore?
     @ObservationIgnored private let audio: any AudioLevelProviding
@@ -138,6 +139,7 @@ import UIKit
          makeClient: @escaping (URL, DeviceCredential) -> any BackendServing = { BackendClient(baseURL: $0, credential: $1) },
          currentTime: @escaping () -> Date = Date.init,
           heartbeatJitter: @escaping () -> Double = { Double.random(in: 0.9...1.1) }, automaticallyStart: Bool = true) {
+        self.refreshExperiment = automaticallyStart ? .shared : nil
         self.defaults = defaults; self.audio = audio; self.connectivity = connectivity; self.log = log
         self.liveSound = liveSound ?? LiveSoundStream(enabled: automaticallyStart)
         self.notifications = notifications; self.keychain = keychain; self.makeClient = makeClient
@@ -232,6 +234,17 @@ import UIKit
             engine.recordTimeline("monitoring_unverified", at: interruptedMonitoringAt ?? currentTime()); persist()
         }
         #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--refresh-experiment-start"), role == .parent {
+            startBackgroundBenchmark()
+            Task { await refreshExperiment?.setEnabled(true) }
+        }
+        if ProcessInfo.processInfo.arguments.contains("--benchmark-start"), role == .parent {
+            startBackgroundBenchmark()
+            if let argument = ProcessInfo.processInfo.arguments.first(where: { $0.hasPrefix("--benchmark-scenario=") }),
+               let scenario = BackgroundBenchmark.Scenario(rawValue: String(argument.dropFirst("--benchmark-scenario=".count))) {
+                log.benchmark.mark(scenario)
+            }
+        }
         if ProcessInfo.processInfo.arguments.contains("--uitesting-timeline") {
             seedTimelineForUITest()
             if ProcessInfo.processInfo.arguments.contains("--uitesting-monitoring-rejected") { parentStatus?.monitoring = false }
@@ -792,6 +805,22 @@ import UIKit
         appActive = active
         if !active { stopWatchTest() }
         synchronizeLiveSound()
+        observeBackgroundBenchmark()
+    }
+    func startBackgroundBenchmark() {
+        guard role == .parent else { return }
+        log.benchmark.start()
+        observeBackgroundBenchmark()
+    }
+    private func observeBackgroundBenchmark() {
+        let active = UIApplication.shared.applicationState == .active
+        refreshExperiment?.maintain(parent: role == .parent, foreground: active)
+        guard role == .parent else { log.benchmark.stop(); return }
+        let device = UIDevice.current
+        log.benchmark.observe(.init(active: active,
+            powered: device.batteryState == .unknown ? nil : device.batteryState == .charging || device.batteryState == .full,
+            lowPower: ProcessInfo.processInfo.isLowPowerModeEnabled, networkAvailable: connectivity.available,
+            battery: device.batteryLevel >= 0 ? Double(device.batteryLevel) : nil))
     }
     private func clearLiveSound() {
         liveSound.disconnect(); remoteSound = RemoteSoundState(); liveSoundConnected = false
@@ -831,6 +860,7 @@ import UIKit
     }
     private func updateLocalState() {
         scheduleWatchTestIfDue()
+        observeBackgroundBenchmark()
         now = currentTime(); let device = UIDevice.current
         #if DEBUG
         if ProcessInfo.processInfo.arguments.contains("--uitesting-live-sound") && !ProcessInfo.processInfo.arguments.contains("--uitesting-chart-paused") { seedLiveSoundFrameForUITest() }
@@ -1124,6 +1154,12 @@ import UIKit
             }
             parentStatus = status; paired = status.paired; defaults.set(paired, forKey: pairingKey)
             notificationsCheckedAt = checkedAt
+            // Only fresh Listener evidence may renew a hypothetical quiet deadline.
+            if status.paired, status.monitoring == true, status.state == .quiet,
+               let serverTime = status.serverTime, let heartbeat = status.lastHeartbeat,
+               (0...45).contains(serverTime.timeIntervalSince(heartbeat) + max(0, currentTime().timeIntervalSince(checkedAt))) {
+                log.benchmark.verifiedQuiet()
+            }
             if let relevance = status.notificationRelevance {
                 await notifications.cleanUpAlerts(using: relevance, deliveredBefore: checkedAt)
                 guard revision == environmentRevision, role == .parent else { return }

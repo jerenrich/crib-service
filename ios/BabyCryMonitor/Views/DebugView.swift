@@ -18,6 +18,7 @@ import Observation
 struct DebugView: View {
     @Environment(AppModel.self) private var model
     @State private var simulation = SimulationModel()
+    @State private var benchmarkReport: URL?
     var body: some View {
         Form {
             Section("Live diagnostics") {
@@ -38,6 +39,56 @@ struct DebugView: View {
                     Text("Sends a real, silent notification marked as a test to the paired Parent, even while monitoring is stopped.").font(.footnote)
                     if !model.paired { Text("Pair with a Parent first.").font(.footnote) }
                     if let status = model.testPushStatus { Text(status).font(.footnote) }
+                }
+            }
+            if model.role == .parent {
+                Section("Background benchmark · Optional") {
+                    Text(model.log.benchmark.enabled ? "Recording · Stops automatically after 24 hours" : "Not recording")
+                    Text("Observations saved: \(model.log.benchmark.entryCount)")
+                    if !model.log.benchmark.persistenceAvailable {
+                        Text("Storage unavailable. Export before closing the app.").foregroundStyle(.orange)
+                    }
+                    Picker("Test scenario", selection: Binding(get: { model.log.benchmark.scenario }, set: { model.log.benchmark.mark($0) })) {
+                        ForEach(BackgroundBenchmark.Scenario.allCases, id: \.self) { Text($0.title).tag($0) }
+                    }
+                    if model.log.benchmark.enabled {
+                        Button("Stop benchmark") { model.log.benchmark.stop() }
+                    } else {
+                        Button("Start 24-hour benchmark") { model.startBackgroundBenchmark() }
+                            .accessibilityIdentifier("startBackgroundBenchmark")
+                    }
+                    Button("Prepare benchmark report") {
+                        do {
+                            let url = FileManager.default.temporaryDirectory.appendingPathComponent("Crib-Service-Background-Benchmark-\(UUID().uuidString).txt")
+                            let report = model.log.benchmark.report + "\n\n" + (model.refreshExperiment?.log.report() ?? "")
+                            try report.write(to: url, atomically: true, encoding: .utf8)
+                            benchmarkReport = url
+                        } catch { model.error = "Could not prepare benchmark report. Try again." }
+                    }
+                    if let benchmarkReport { ShareLink("Share prepared benchmark report", item: benchmarkReport) }
+                    Text("Select a scenario before switching apps or locking the phone. Start a podcast, then return here to test playback with Monitor visible. The scenario is a manual label; this app cannot identify which other app you open.")
+                        .font(.footnote)
+                    Text("Records execution samples about every 5 seconds while executing, every existing status request, and simulated 30/60/120-second quiet deadlines. Adds no network requests or background runtime and creates no alarms. Gaps cannot prove why execution stopped. Reports remain local, retain up to 50,000 observations, and include timestamps, random run identifiers, battery/network state and server request references. Prepare a new report after each trial; review before sharing.")
+                        .font(.footnote)
+                }
+            }
+            if model.role == .parent, let experiment = model.refreshExperiment {
+                Section("Background App Refresh experiment") {
+                    Text(experiment.log.enabled ? "Enabled · 24-hour experiment" : "Off")
+                    LabeledContent("iOS background refresh", value: experiment.availability)
+                    if !experiment.registrationSucceeded { Text("Background task registration unavailable.").foregroundStyle(.orange) }
+                    if !experiment.log.persistenceAvailable { Text("Storage unavailable. Export before closing the app.").foregroundStyle(.orange) }
+                    Text("Recorded scheduler requests: \(experiment.log.attempts.count)")
+                    if let pending = experiment.log.pending, let earliest = pending.earliestBeginAt {
+                        Text("Pending · Earliest start \(earliest.formatted(date: .omitted, time: .standard))")
+                    }
+                    Button(experiment.log.enabled ? "Stop refresh experiment" : "Start 60-second refresh experiment") {
+                        Task {
+                            if !experiment.log.enabled { model.startBackgroundBenchmark() }
+                            await experiment.setEnabled(!experiment.log.enabled)
+                        }
+                    }.accessibilityIdentifier("backgroundRefreshExperiment")
+                    Text("Requests a short task no earlier than 60 seconds later. iOS chooses when or whether it runs. One pending request is preserved; after delivery the next is requested. The task only logs locally, without network requests or alarms. This changes background execution opportunities, so compare these trials separately from the baseline. Stops at 24 hours when the app next executes. Results are included in Prepare benchmark report above; pending requests are reported as not yet observed, rather than proven never delivered.").font(.footnote)
                 }
             }
             Section("Synthetic simulation · Local only") {
