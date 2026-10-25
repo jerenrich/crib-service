@@ -24,6 +24,11 @@ import UIKit
     var connectionRetryMessage: String?
     var sendingTestPush = false
     var testPushStatus: String?
+    private(set) var watchTestRunning = false
+    private(set) var watchTestInterval = 5.0
+    private(set) var watchTestLoaded = false
+    private(set) var changingWatchTest = false
+    private(set) var watchTestError: String?
     var pairingError: String?
     var pairingCode: PairingCode?
     var parentStatus: ParentStatus?
@@ -66,6 +71,7 @@ import UIKit
     let notifications: any NotificationProviding
     let watch: PhoneWatchBridge
     let log: DiagnosticLog
+    let refreshExperiment: BackgroundRefreshController?
     private var engine = CrySessionManager()
     @ObservationIgnored private var store: MetadataStore?
     @ObservationIgnored private let audio: any AudioLevelProviding
@@ -135,6 +141,7 @@ import UIKit
          makeClient: @escaping (URL, DeviceCredential) -> any BackendServing = { BackendClient(baseURL: $0, credential: $1) },
          currentTime: @escaping () -> Date = Date.init,
           heartbeatJitter: @escaping () -> Double = { Double.random(in: 0.9...1.1) }, automaticallyStart: Bool = true) {
+        self.refreshExperiment = automaticallyStart ? .shared : nil
         self.defaults = defaults; self.audio = audio; self.connectivity = connectivity; self.log = log
         self.liveSound = liveSound ?? LiveSoundStream(enabled: automaticallyStart)
         self.notifications = notifications; self.keychain = keychain; self.makeClient = makeClient
@@ -230,6 +237,17 @@ import UIKit
             engine.recordTimeline("monitoring_unverified", at: interruptedMonitoringAt ?? currentTime()); persist()
         }
         #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--refresh-experiment-start"), role == .parent {
+            startBackgroundBenchmark()
+            Task { await refreshExperiment?.setEnabled(true) }
+        }
+        if ProcessInfo.processInfo.arguments.contains("--benchmark-start"), role == .parent {
+            startBackgroundBenchmark()
+            if let argument = ProcessInfo.processInfo.arguments.first(where: { $0.hasPrefix("--benchmark-scenario=") }),
+               let scenario = BackgroundBenchmark.Scenario(rawValue: String(argument.dropFirst("--benchmark-scenario=".count))) {
+                log.benchmark.mark(scenario)
+            }
+        }
         if ProcessInfo.processInfo.arguments.contains("--uitesting-timeline") {
             seedTimelineForUITest()
             if ProcessInfo.processInfo.arguments.contains("--uitesting-monitoring-rejected") { parentStatus?.monitoring = false }
@@ -367,6 +385,7 @@ import UIKit
         parentStatus = nil; pairingCode = nil; credential = nil; uploadedToken = nil; loadCredential()
         nextParentRefreshAt = .distantPast
         testPushStatus = nil; latestTestEventID = nil
+        watchTestRunning = false; watchTestLoaded = false; watchTestError = nil
         hasPendingWatchToken = false; pendingWatchToken = nil
         publishWatch()
         if value == .parent { Task { await notifications.register(); await refreshParent() } }
@@ -385,6 +404,7 @@ import UIKit
         credential = nil; parentStatus = nil; pairingCode = nil; uploadedToken = nil
         nextParentRefreshAt = .distantPast
         testPushStatus = nil; latestTestEventID = nil
+        watchTestRunning = false; watchTestLoaded = false; watchTestError = nil
         hasPendingWatchToken = false; pendingWatchToken = nil
         loadCredential()
         publishWatch()
@@ -793,6 +813,22 @@ import UIKit
     }
     func setAppActive(_ active: Bool) {
         appActive = active; synchronizeLiveSound()
+        observeBackgroundBenchmark()
+    }
+    func startBackgroundBenchmark() {
+        guard role == .parent else { return }
+        log.benchmark.start()
+        observeBackgroundBenchmark()
+    }
+    private func observeBackgroundBenchmark() {
+        let active = UIApplication.shared.applicationState == .active
+        refreshExperiment?.maintain(parent: role == .parent, foreground: active)
+        guard role == .parent else { log.benchmark.stop(); return }
+        let device = UIDevice.current
+        log.benchmark.observe(.init(active: active,
+            powered: device.batteryState == .unknown ? nil : device.batteryState == .charging || device.batteryState == .full,
+            lowPower: ProcessInfo.processInfo.isLowPowerModeEnabled, networkAvailable: connectivity.available,
+            battery: device.batteryLevel >= 0 ? Double(device.batteryLevel) : nil))
     }
     private func clearLiveSound() {
         liveSound.disconnect(); remoteSound = RemoteSoundState(); liveSoundConnected = false
@@ -831,6 +867,7 @@ import UIKit
         configuration = config; engine.configure(config); persist()
     }
     private func updateLocalState() {
+        observeBackgroundBenchmark()
         now = currentTime(); let device = UIDevice.current
         #if DEBUG
         if ProcessInfo.processInfo.arguments.contains("--uitesting-live-sound") && !ProcessInfo.processInfo.arguments.contains("--uitesting-chart-paused") { seedLiveSoundFrameForUITest() }
@@ -1158,6 +1195,12 @@ import UIKit
             }
             parentStatus = status; paired = status.paired; defaults.set(paired, forKey: pairingKey)
             notificationsCheckedAt = checkedAt
+            // Only fresh Listener evidence may renew a hypothetical quiet deadline.
+            if status.paired, status.monitoring == true, status.state == .quiet,
+               let serverTime = status.serverTime, let heartbeat = status.lastHeartbeat,
+               (0...45).contains(serverTime.timeIntervalSince(heartbeat) + max(0, currentTime().timeIntervalSince(checkedAt))) {
+                log.benchmark.verifiedQuiet()
+            }
             if let relevance = status.notificationRelevance {
                 await notifications.cleanUpAlerts(using: relevance, deliveredBefore: checkedAt)
                 guard revision == environmentRevision, role == .parent else { return }
@@ -1276,6 +1319,26 @@ import UIKit
             return false
         }
     }
+    func updateWatchTest(running: Bool? = nil, interval: Double? = nil) async {
+        guard role == .parent, !changingWatchTest else { return }
+        changingWatchTest = true
+        defer { changingWatchTest = false }
+        let revision = environmentRevision
+        do {
+            let client = try await registeredClient()
+            guard revision == environmentRevision else { return }
+            let status = try await client.watchTest(running: running, interval: Int((interval ?? watchTestInterval).rounded()))
+            guard revision == environmentRevision else { return }
+            watchTestRunning = status.running
+            watchTestInterval = Double(status.interval)
+            watchTestLoaded = true
+            watchTestError = nil
+        } catch {
+            guard revision == environmentRevision else { return }
+            watchTestError = error.localizedDescription
+        }
+    }
+
     var canTestWatchAlert: Bool {
         role == .parent && paired && parentStatus?.watchPushRegistered == true && !sendingTestPush && !managingDevice
     }
@@ -1366,6 +1429,7 @@ import UIKit
             settingsDirty = false; defaults.set(false, forKey: "settingsDirty")
             engine = CrySessionManager(); configuration = engine.snapshot.configuration; persist()
             calibration = SoundCalibration(); testPushStatus = nil; latestTestEventID = nil
+            watchTestRunning = false; watchTestLoaded = false; watchTestError = nil
             hasPendingWatchToken = false; pendingWatchToken = nil
             if deleteDevice { role = nil; defaults.removeObject(forKey: "role"); uploadedToken = nil }
             deliveryStatus = "Pair a device to reconnect"; error = nil

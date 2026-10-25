@@ -37,3 +37,5 @@ Crib Service currently detects sustained sound levels, so other loud noises can 
 ---
 
 [Developer guide](docs/developer-guide.md) · [Device testing checklist](docs/readiness-validation.md) · [Privacy and diagnostics](docs/diagnostics-review.md)
+
+Watch alert testing mode is available in **Parent Settings → Watch alert testing mode**. Choose a frequency from 1–10 seconds and tap **Start Watch test**. Server timers send real test pushes directly to the registered Watch while the iPhone is locked; tap **Stop Watch test** in Settings to stop. Changing the slider updates a running test. Internet is required for these controls, and watchOS/Focus may delay or suppress wrist taps. Tests stop if the pairing changes or Watch registration is removed. Deploy the updated Worker (including its `WATCH_TEST` Durable Object binding and migration) before using this feature in the updated iOS app.

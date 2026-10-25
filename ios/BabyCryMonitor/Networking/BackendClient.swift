@@ -94,10 +94,16 @@ protocol BackendServing: AlertSending {
     func watchPushToken(_ token: String?) async throws
     func connectionAlerts(_ enabled: Bool) async throws
     func requestTestPush() async throws
+    func watchTest(running: Bool?, interval: Int) async throws -> WatchTestStatus
     func unpair() async throws
     func deleteDevice() async throws
 }
+struct WatchTestStatus: Codable, Equatable {
+    let running: Bool
+    let interval: Int
+}
 extension BackendServing {
+    func watchTest(running: Bool?, interval: Int) async throws -> WatchTestStatus { throw BackendError.message("Watch test mode requires an updated connection service.") }
     func resumeAlerts(until: Date) async throws { throw BackendError.message("Resume alerts requires an updated connection service.") }
     func setMonitoring(_ enabled: Bool, id: UUID) async throws -> MonitoringCommand { throw BackendError.message("Monitoring controls require an updated connection service.") }
     func completeMonitoring(_ id: UUID, succeeded: Bool) async throws { throw BackendError.message("Monitoring confirmation unavailable.") }
@@ -138,6 +144,11 @@ struct BackendClient: BackendServing {
     func pushToken(_ token: String) async throws { let _: EmptyResponse = try await request("/v1/device/push-token", body: ["token": token]) }
     func connectionAlerts(_ enabled: Bool) async throws { let _: EmptyResponse = try await request("/v1/connection-alerts", body: ["enabled": enabled]) }
     func requestTestPush() async throws { let _: AlertReceipt = try await request("/v1/test-push", body: [String:String]()) }
+    func watchTest(running: Bool?, interval: Int) async throws -> WatchTestStatus {
+        struct Control: Encodable { let running: Bool; let interval: Int }
+        if let running { return try await request("/v1/watch-test", body: Control(running: running, interval: interval)) }
+        return try await request("/v1/watch-test", method: "GET", body: Optional<String>.none)
+    }
     func unpair() async throws { let _: EmptyResponse = try await request("/v1/pairing/remove", body: [String:String]()) }
     func deleteDevice() async throws {
         // A lost success response leaves a revoked credential. Retrying deletion is safe.
@@ -160,14 +171,15 @@ struct BackendClient: BackendServing {
         let operation = ["/v1/device/register": "register", "/v1/pairing/create": "pairing_create", "/v1/pairing/claim": "pairing_claim",
                          "/v1/device/push-token": "push_token", "/v1/device/watch-push-token": "watch_token",
                          "/v1/listener/heartbeat": "heartbeat", "/v1/listener/event": "alert", "/v1/listener/status": "status",
-                         "/v1/timeline": "timeline", "/v1/monitoring": "monitoring", "/v1/monitoring/complete": "monitoring_complete", "/v1/settings": "settings", "/v1/alert/acknowledge": "acknowledge", "/v1/test-push": "test_push", "/v1/alert/resume": "resume_alerts",
+                         "/v1/timeline": "timeline", "/v1/monitoring": "monitoring", "/v1/monitoring/complete": "monitoring_complete", "/v1/settings": "settings", "/v1/alert/acknowledge": "acknowledge", "/v1/test-push": "test_push", "/v1/watch-test": "test_push", "/v1/alert/resume": "resume_alerts",
                          "/v1/connection-alerts": "connection_preferences", "/v1/pairing/remove": "unpair", "/v1/device/delete": "delete_device"][path] ?? "unknown"
         let started = Date()
+        let benchmarkAttempt = operation == "status" && credential.role == .parent ? await log?.benchmark.requestStarted() : nil
         let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
         do { if let body { request.httpBody = try encoder.encode(body) } }
         catch {
             await log?.network(operation: operation, outcome: "encode_error",
-                               elapsedMS: Int(Date().timeIntervalSince(started) * 1000), error: error, eventID: eventID)
+                               elapsedMS: Int(Date().timeIntervalSince(started) * 1000), error: error, eventID: eventID, benchmarkAttempt: benchmarkAttempt)
             throw error
         }
         let data: Data, rawResponse: URLResponse
@@ -175,18 +187,18 @@ struct BackendClient: BackendServing {
         catch {
             let code = (error as? URLError)?.code.rawValue
             await log?.network(operation: operation, outcome: code == URLError.cancelled.rawValue ? "cancelled" : "transport_error",
-                               status: code, elapsedMS: Int(Date().timeIntervalSince(started) * 1000), error: error, eventID: eventID)
+                               status: code, elapsedMS: Int(Date().timeIntervalSince(started) * 1000), error: error, eventID: eventID, benchmarkAttempt: benchmarkAttempt)
             throw error
         }
         guard let response = rawResponse as? HTTPURLResponse else {
-            await log?.network(operation: operation, outcome: "invalid_response", elapsedMS: Int(Date().timeIntervalSince(started) * 1000), eventID: eventID)
+            await log?.network(operation: operation, outcome: "invalid_response", elapsedMS: Int(Date().timeIntervalSince(started) * 1000), eventID: eventID, benchmarkAttempt: benchmarkAttempt)
             throw BackendError.message("Invalid server response.")
         }
         let requestID = response.value(forHTTPHeaderField: "x-request-id").flatMap(UUID.init(uuidString:))
         let storageUnavailable = response.value(forHTTPHeaderField: "x-diagnostics-status") == "unavailable"
         guard (200..<300).contains(response.statusCode) else {
             await log?.network(operation: operation, outcome: "http_error", status: response.statusCode, requestID: requestID,
-                               elapsedMS: Int(Date().timeIntervalSince(started) * 1000), storageUnavailable: storageUnavailable, eventID: eventID)
+                               elapsedMS: Int(Date().timeIntervalSince(started) * 1000), storageUnavailable: storageUnavailable, eventID: eventID, benchmarkAttempt: benchmarkAttempt)
             let reason = (try? JSONDecoder().decode(ErrorBody.self, from: data).error) ?? "Backend request failed (\(response.statusCode))."
             throw BackendError.response(response.statusCode, reason)
         }
@@ -204,11 +216,11 @@ struct BackendClient: BackendServing {
         do {
             let result = try decoder.decode(R.self, from: data)
             await log?.network(operation: operation, outcome: "ok", status: response.statusCode, requestID: requestID,
-                               elapsedMS: Int(Date().timeIntervalSince(started) * 1000), storageUnavailable: storageUnavailable, eventID: eventID)
+                               elapsedMS: Int(Date().timeIntervalSince(started) * 1000), storageUnavailable: storageUnavailable, eventID: eventID, benchmarkAttempt: benchmarkAttempt)
             return result
         } catch {
             await log?.network(operation: operation, outcome: "decode_error", status: response.statusCode, requestID: requestID,
-                               elapsedMS: Int(Date().timeIntervalSince(started) * 1000), storageUnavailable: storageUnavailable, error: error, eventID: eventID)
+                               elapsedMS: Int(Date().timeIntervalSince(started) * 1000), storageUnavailable: storageUnavailable, error: error, eventID: eventID, benchmarkAttempt: benchmarkAttempt)
             throw error
         }
     }

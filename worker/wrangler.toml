@@ -40,3 +40,11 @@ class_name = "LiveSound"
 [[migrations]]
 tag = "v2-live-sound"
 new_sqlite_classes = ["LiveSound"]
+
+[[durable_objects.bindings]]
+name = "WATCH_TEST"
+class_name = "WatchTest"
+
+[[migrations]]
+tag = "v3-watch-test"
+new_sqlite_classes = ["WatchTest"]

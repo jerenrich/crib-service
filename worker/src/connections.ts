@@ -2,6 +2,7 @@ import {timelineInsert,missingHeartbeat} from './timeline';
 import {APIError,requireRole,type Device,type Env} from './types';
 import {sendConnectionPush,type PushResult} from './apns';
 import {eventReference,recordDiagnostic} from './diagnostics';
+import {Latency} from './latency';
 
 export async function connectionPreferences(env:Env,device:Device,value:Record<string,unknown>) {
  requireRole(device,'parent');
@@ -56,8 +57,9 @@ export async function flushConnections(env:Env,requestId=crypto.randomUUID()) {
    await env.DB.prepare("UPDATE connection_notices SET status='cancelled',lease_until=NULL WHERE id=?").bind(id).run();continue;
   }
   const target=context.watch_push_token?'watch':'phone', token=context.watch_push_token??context.push_token;
+  const latency=new Latency();
   let result:PushResult={status:'blocked'};
-  if(token){try{result=await sendConnectionPush(env,token,id,notice.state,target);}catch{result={status:'retry'};}}
+  if(token){try{result=await sendConnectionPush(env,token,id,notice.state,target,latency);}catch{result={status:'retry'};}}
   if(result.reason==='invalid_device_token'&&token){
    const column=target==='watch'?'watch_push_token':'push_token';
    await env.DB.batch([
@@ -70,7 +72,7 @@ export async function flushConnections(env:Env,requestId=crypto.randomUUID()) {
     .bind(result.status==='retry'?'pending':result.status,now+Math.min(300000,2000*2**Math.min(notice.attempts,8)),result.status,new Date().toISOString(),id).run();
   }
   let eventRef:string|undefined;try{eventRef=await eventReference(env,id);}catch{/* Diagnostics cannot change delivery. */}
-  await recordDiagnostic(env,{requestId,started:now,operation:'dispatch',stage:'push',outcome:result.reason??result.status,eventRef,target,httpStatus:result.httpStatus});
+  await recordDiagnostic(env,{requestId,started:now,operation:'dispatch',stage:'push',outcome:result.reason??result.status,eventRef,target,httpStatus:result.httpStatus,attempt:notice.attempts,details:latency.details});
  }
  await env.DB.prepare('DELETE FROM connection_notices WHERE created_at<?').bind(now-7*86400000).run();
 }

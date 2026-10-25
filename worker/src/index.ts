@@ -1,3 +1,5 @@
+import {watchTest} from './watch-test';
+export {WatchTest} from './watch-test';
 import {requestMonitoring,completeMonitoring} from './monitoring';
 import {timeline} from './timeline';
 export {AlertReminders} from './reminders';
@@ -53,6 +55,8 @@ export default {
      case 'POST /v1/pairing/remove':result=await removeDeviceData(env,device);break;
      case 'POST /v1/device/delete':result=await removeDeviceData(env,device,true);break;
      case 'POST /v1/connection-alerts':result=await connectionPreferences(env,device,await body(request));break;
+     case 'GET /v1/watch-test':result=await watchTest(env,device);break;
+     case 'POST /v1/watch-test':result=await watchTest(env,device,await body(request));break;
      case 'POST /v1/test-push':{
       if(device.role!=='parent')throw new APIError(403,'Only the Parent can request a test.');
       await rateLimit(env,'test-push',device.id,6,600);

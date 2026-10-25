@@ -25,16 +25,16 @@ export function payload(alert:Alert,target:'phone'|'watch'='phone') {
  const unit=(value:number,name:string)=>`${value} ${name}${value===1?'':'s'}`;
  const duration=minutes>0?`${unit(minutes,'minute')}${seconds?` ${unit(seconds,'second')}`:''}`:unit(seconds,'second');
  const title=alert.isTest?'Test · Crib Service':alert.isRepeat?'Reminder · Check on baby':'Baby is crying';
- const body=alert.isRepeat&&!alert.isTest?'Crying was detected. Acknowledge this alert to snooze crying alerts for the duration chosen in Settings.':alert.isTest?`Test notification from your Listener. Simulated the ${duration} alert threshold.`:`Crying-like sound has continued for ${duration}. Started at ${new Date(alert.cryStartedAt).toISOString().slice(11,16)} UTC. Acknowledge to snooze crying alerts for the duration chosen in Settings.`;
+ const body=alert.isRepeat&&!alert.isTest?'Crying was detected. Acknowledge this alert to snooze crying alerts for the duration chosen in Settings.':alert.isTest&&alert.isRepeat?'Repeating Watch alert test. Use Stop Watch test in iPhone Settings to end the test.':alert.isTest?`Test notification from your Listener. Simulated the ${duration} alert threshold.`:`Crying-like sound has continued for ${duration}. Started at ${new Date(alert.cryStartedAt).toISOString().slice(11,16)} UTC. Acknowledge to snooze crying alerts for the duration chosen in Settings.`;
  return {aps:{alert:{title,body},category:'BABY_CRY_ALERT','thread-id':alert.episodeId,...(target==='watch'?{sound:'default','interruption-level':'time-sensitive'}:{})},eventId:alert.eventId,episodeId:alert.episodeId,cryStartedAt:alert.cryStartedAt,createdAt:alert.createdAt,durationSeconds:alert.durationSeconds,...(alert.isTest?{isTest:true}:{})};
 }
 export async function sendPush(env:Env,encryptedToken:string,alert:Alert,target:'phone'|'watch'='phone',latency=new Latency()):Promise<PushResult> {
  return sendNotification(env,encryptedToken,alert.eventId,payload(alert,target),target,alert.isRepeat?5:3600,alert.isRepeat?alert.episodeId:alert.eventId,latency);
 }
-export async function sendConnectionPush(env:Env,encryptedToken:string,id:string,state:'offline'|'stopped',target:'phone'|'watch'):Promise<PushResult> {
+export async function sendConnectionPush(env:Env,encryptedToken:string,id:string,state:'offline'|'stopped',target:'phone'|'watch',latency=new Latency()):Promise<PushResult> {
  const title=state==='stopped'?'Listener monitoring stopped':'Listener connection lost';
  const body=state==='stopped'?'The Listener reports that monitoring has stopped. Check the nursery phone.':'No Listener update for at least 3 minutes. Check power, internet, and monitoring.';
- return sendNotification(env,encryptedToken,id,{aps:{alert:{title,body},'thread-id':'listener-connection',...(target==='watch'?{sound:'default','interruption-level':'time-sensitive'}:{})},connectionState:state},target,180);
+ return sendNotification(env,encryptedToken,id,{aps:{alert:{title,body},'thread-id':'listener-connection',...(target==='watch'?{sound:'default','interruption-level':'time-sensitive'}:{})},connectionState:state},target,180,id,latency);
 }
 async function sendNotification(env:Env,encryptedToken:string,id:string,content:unknown,target:'phone'|'watch',expiration:number,collapseId=id,latency=new Latency()):Promise<PushResult> {
  // Errors before fetch are known not to have sent a notification and can safely retry.
