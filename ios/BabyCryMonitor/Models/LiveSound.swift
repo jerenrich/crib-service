@@ -82,8 +82,14 @@ public struct ParentMonitoringEvidence: Sendable {
     public init() {}
 
     public mutating func receiveHeartbeat(monitoring: Bool, microphoneActive: Bool,
-                                         version: Date, observedAt: Date) {
+                                         version: Date, observedAt: Date, receivedAt: Date? = nil) {
         guard heartbeat.map({ version >= $0.version }) ?? true else { return }
+        if !monitoring, liveAt != nil, version > (heartbeatBeforeLive ?? .distantPast),
+           heartbeat.map({ version > $0.version }) ?? true {
+            // A local Listener pause can race a level packet already on the wire.
+            // Wait out its challenge lifetime before accepting a later local restart.
+            ignoreLiveUntil = (receivedAt ?? observedAt).addingTimeInterval(3)
+        }
         // Re-reading a cached heartbeat must never renew its freshness.
         let time = heartbeat.flatMap { $0.version == version ? min($0.observedAt, observedAt) : nil } ?? observedAt
         heartbeat = Heartbeat(state: monitoring ? .monitoring : microphoneActive ? .standby : .stopped,

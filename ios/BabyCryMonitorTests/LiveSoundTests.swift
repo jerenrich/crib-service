@@ -89,6 +89,9 @@ final class ParentMonitoringEvidenceTests: XCTestCase {
         evidence.receiveHeartbeat(monitoring: false, microphoneActive: true,
             version: now.addingTimeInterval(1), observedAt: now.addingTimeInterval(1))
         evidence.receiveLive(at: now.addingTimeInterval(2))
+        XCTAssertFalse(evidence.acceptsLive(at: now.addingTimeInterval(2)), "An in-flight frame cannot undo a newly reported pause")
+        XCTAssertEqual(evidence.state(at: now.addingTimeInterval(3), statusAvailable: true), .standby)
+        evidence.receiveLive(at: now.addingTimeInterval(4))
         XCTAssertEqual(evidence.state(at: now.addingTimeInterval(6), statusAvailable: true), .monitoring)
         evidence.receiveHeartbeat(monitoring: false, microphoneActive: true,
             version: now.addingTimeInterval(7), observedAt: now.addingTimeInterval(7))

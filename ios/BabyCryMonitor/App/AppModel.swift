@@ -34,19 +34,21 @@ import UIKit
     var pairingCode: PairingCode?
     var parentStatus: ParentStatus? {
         didSet {
-            if parentStatus?.paired == false || (oldValue?.pairingID != nil && oldValue?.pairingID != parentStatus?.pairingID && parentStatus != nil) {
-                parentMonitoringEvidence = ParentMonitoringEvidence()
+            if parentStatus?.paired == false || (parentMonitoringPairingID != nil && parentMonitoringPairingID != parentStatus?.pairingID && parentStatus != nil) {
+                clearLiveSound()
             }
+            if let status = parentStatus { parentMonitoringPairingID = status.paired ? status.pairingID : nil }
             if let status = parentStatus, status.paired, let monitoring = status.monitoring, let heartbeat = status.lastHeartbeat {
                 let observedAt = status.serverTime.map { currentTime().addingTimeInterval(-max(0, $0.timeIntervalSince(heartbeat))) } ?? heartbeat
                 if observedAt <= currentTime().addingTimeInterval(5) {
                     parentMonitoringEvidence.receiveHeartbeat(monitoring: monitoring, microphoneActive: status.microphoneActive == true,
-                        version: heartbeat, observedAt: observedAt)
+                        version: heartbeat, observedAt: observedAt, receivedAt: currentTime())
                 }
             }
         }
     }
     private var parentMonitoringEvidence = ParentMonitoringEvidence()
+    private var parentMonitoringPairingID: String?
     private(set) var listenerPairStatus: ParentStatus?
     private(set) var listenerPairStatusReceivedAt: Date?
     var timeline: TimelineResponse?
@@ -289,18 +291,16 @@ import UIKit
             microphoneActive = role == .listener
             detectionPaused = paused && role == .listener
             monitoring = role == .listener && !paused
-            let status = ParentStatus(paired: true, pairingID: "ui-test-pair", watchPushRegistered: true, phonePushRegistered: true,
+            var status = ParentStatus(paired: true, pairingID: "ui-test-pair", watchPushRegistered: true, phonePushRegistered: true,
                 lastHeartbeat: now, monitoring: !paused, batteryLevel: 1, powerConnected: true,
                 state: .quiet, configuration: configuration, microphoneActive: true)
-            if role == .parent {
-                parentStatus = status
-                if ProcessInfo.processInfo.arguments.contains("--uitesting-microphone-off") {
-                    parentStatus?.monitoring = false; parentStatus?.microphoneActive = false
-                }
-                if ProcessInfo.processInfo.arguments.contains("--uitesting-listener-stale") {
-                    parentStatus?.lastHeartbeat = now.addingTimeInterval(-180)
-                }
+            if ProcessInfo.processInfo.arguments.contains("--uitesting-microphone-off") {
+                status.monitoring = false; status.microphoneActive = false
             }
+            if ProcessInfo.processInfo.arguments.contains("--uitesting-listener-stale") {
+                status.lastHeartbeat = now.addingTimeInterval(-180)
+            }
+            if role == .parent { parentStatus = status }
             else { listenerPairStatus = status; listenerPairStatusReceivedAt = now }
             seedLiveSoundFrameForUITest()
             if ProcessInfo.processInfo.arguments.contains("--uitesting-active-alert") {
@@ -887,7 +887,7 @@ import UIKit
     }
     private func clearLiveSound() {
         liveSound.disconnect(); remoteSound = RemoteSoundState(); liveSoundConnected = false
-        parentMonitoringEvidence = ParentMonitoringEvidence()
+        parentMonitoringEvidence = ParentMonitoringEvidence(); parentMonitoringPairingID = nil
     }
     private func synchronizeLiveSound() {
         #if DEBUG

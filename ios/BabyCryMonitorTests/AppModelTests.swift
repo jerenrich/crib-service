@@ -471,6 +471,22 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(fixture.model.canStartMonitoringRemotely)
     }
 
+    @MainActor func testRepairedListenerCannotInheritLivePresentationAfterStatusFailure() throws {
+        let fixture = try Fixture()
+        fixture.model.selectRole(.parent); fixture.model.paired = true
+        fixture.model.parentStatus = ParentStatus(paired: true, pairingID: "first", lastHeartbeat: fixture.time.now,
+            monitoring: false, configuration: MonitoringConfiguration(), microphoneActive: true)
+        fixture.liveSound.onFrame?(SoundLevelFrame(sampledAt: 100, levels: Array(repeating: -40, count: 120),
+            threshold: -45, state: .quiet, alertDuration: 30))
+        XCTAssertTrue(fixture.model.parentDisplaysMonitoring)
+        fixture.model.parentStatus = nil
+        XCTAssertTrue(fixture.model.parentDisplaysMonitoring)
+        fixture.model.parentStatus = ParentStatus(paired: true, pairingID: "second", lastHeartbeat: fixture.time.now,
+            monitoring: false, configuration: MonitoringConfiguration(), microphoneActive: false)
+        XCTAssertEqual(fixture.model.parentMonitoringDisplayState, .stopped)
+        XCTAssertFalse(fixture.model.parentHasLiveMonitoring)
+    }
+
     @MainActor func testPauseDiscardsLiveEvidenceAndIgnoresFramesAlreadyInFlight() async throws {
         let fixture = try Fixture()
         fixture.model.selectRole(.parent)
