@@ -204,7 +204,7 @@ import UIKit
         }
         if automaticallyStart {
             log.record("app_launched", code: DiagnosticLog.maximumLines)
-            log.record("alert_pipeline_ready", code: 5)
+            log.record("alert_pipeline_ready", code: 6)
             log.checkpointCoverage()
             if needsRestart { log.record("monitoring_recovered_after_relaunch") }
             // Local health and freshness must advance even while a request is suspended.

@@ -29,7 +29,7 @@ import UserNotifications
     override private init() {
         super.init()
         log.record("app_launched", code: DiagnosticLog.maximumLines)
-        log.record("alert_pipeline_ready", code: 5)
+        log.record("alert_pipeline_ready", code: 6)
         log.checkpointCoverage()
         if let data = UserDefaults.standard.data(forKey: "watchSnapshot") {
             do { snapshot = try JSONDecoder().decode(WatchSnapshot.self, from: data) }
@@ -134,6 +134,14 @@ import UserNotifications
     }
     func refresh() { send(WatchCommand(kind: .refresh)) }
 
+    var diagnosticApplicationState: WatchAlertTrace.ApplicationState {
+        switch WKApplication.shared().applicationState {
+        case .active: .active
+        case .inactive: .inactive
+        case .background: .background
+        @unknown default: .unknown
+        }
+    }
     func receive(_ value: WatchCryAlert) {
         alertState.receive(value)
     }

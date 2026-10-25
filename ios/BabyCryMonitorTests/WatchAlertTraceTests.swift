@@ -26,6 +26,21 @@ final class WatchAlertTraceTests: XCTestCase {
         XCTAssertEqual(WatchAlertTrace.key(in: "timestamp " + (try XCTUnwrap(legacy.entry))), legacy.key)
         XCTAssertFalse(try XCTUnwrap(WatchAlertTrace(alert: value, phase: .snapshotReceived).entry).contains("delivered_at_ms="))
     }
+    func testCallbackContextSeparatesLongLookFromPresentationAndBoundsTiming() throws {
+        let value = alert()
+        let entry = try XCTUnwrap(WatchAlertTrace(alert: value, phase: .foreground, observedAt: created, applicationState: .active,
+            timing: .init(presentationRequestMS: 0, mainActorWaitMS: 21, handlingMS: -1), interruptionLevel: 2).entry)
+        XCTAssertTrue(entry.contains("callback_scope=foreground_delegate"));XCTAssertTrue(entry.contains("presentation_request_ms=0"))
+        XCTAssertTrue(entry.contains("main_actor_wait_ms=21"));XCTAssertTrue(entry.contains("app_state=active"))
+        XCTAssertTrue(entry.contains("interruption_level=2"));XCTAssertFalse(entry.contains("app_handling_ms="))
+        for phase in [WatchAlertTrace.Phase.controllerActivated, .controllerDeactivated, .controllerReceived, .viewAppeared] {
+            let trace = WatchAlertTrace(alert: value, phase: phase, observedAt: created,
+                timing: .init(mainActorWaitMS: 3_600_001), interruptionLevel: 999)
+            let text = try XCTUnwrap(trace.entry)
+            XCTAssertTrue(text.contains("callback_scope=long_look"));XCTAssertFalse(text.contains("main_actor_wait_ms="))
+            XCTAssertFalse(text.contains("interruption_level="));XCTAssertEqual(WatchAlertTrace.key(in: "timestamp " + text), trace.key)
+        }
+    }
     func testOpeningLaterRetainsActualDeliveryTime() throws {
         let value = alert()
         let trace = WatchAlertTrace(alert: value, phase: .opened,

@@ -19,6 +19,8 @@ private final class DiagnosticsURLProtocol: URLProtocol, @unchecked Sendable {
         let requestID = path.contains("invalid-id") ? "private-token" : "6705ae24-2863-49df-8dc5-5fa15b2d0418"
         var headers = ["x-request-id": requestID, "x-diagnostics-status": "unavailable",
                        "x-diagnostics-elapsed-ms": path.contains("bad-timing") ? "-999" : "2750"]
+        if path.contains("queued-diagnostics") { headers["x-diagnostics-status"] = "queued" }
+        if path.contains("sampled-diagnostics") { headers["x-diagnostics-status"] = "sampled" }
         if path.contains("clock") {
             let remote = Int64((Date().timeIntervalSince1970 * 1000).rounded()) + 1000
             headers["x-server-received-at-ms"] = path.contains("bad-clock") ? "private-header" : String(remote)
@@ -54,6 +56,20 @@ final class DiagnosticsTests: XCTestCase {
         log.observeClock(DiagnosticClockSample(offsetMS: 10, uncertaintyMS: 5, sampledAt: Date(), source: .phoneBridge))
         log.observeClock(DiagnosticClockSample(offsetMS: 11, uncertaintyMS: 6, sampledAt: Date(), source: .phoneBridge))
         XCTAssertEqual(log.lines.filter { $0.contains("clock_estimate") }.count, 1)
+    }
+    @MainActor func testStatusJournalStatesRemainExplicitAndRejectArbitraryHeaderText() async throws {
+        let config = URLSessionConfiguration.ephemeral;config.protocolClasses = [DiagnosticsURLProtocol.self]
+        let session = URLSession(configuration: config);defer { session.invalidateAndCancel() }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let log = DiagnosticLog(directory: directory),credential = DeviceCredential(deviceId: UUID(), secret: "private", role: .parent, registered: true)
+        for state in ["queued", "sampled"] {
+            let client = BackendClient(baseURL: URL(string: "https://private-host/\(state)-diagnostics")!, credential: credential, log: log, session: session)
+            try await client.register()
+            XCTAssertTrue(log.lines.last!.contains("server_diagnostics=\(state)"))
+        }
+        log.network(operation: "status", outcome: "ok", elapsedMS: 2000, diagnosticState: "private-header")
+        XCTAssertFalse(log.export.contains("private-header"))
     }
     @MainActor func testCoverageCountsSamplingDeduplicationEvictionAndStorageRecovery() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

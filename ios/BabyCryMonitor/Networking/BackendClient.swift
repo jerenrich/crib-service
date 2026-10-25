@@ -203,11 +203,12 @@ struct BackendClient: BackendServing {
             remoteSentMS: response.value(forHTTPHeaderField: "x-server-sent-at-ms").flatMap(Int64.init))
         await log?.observeClock(clock)
         let requestID = response.value(forHTTPHeaderField: "x-request-id").flatMap(UUID.init(uuidString:))
-        let storageUnavailable = response.value(forHTTPHeaderField: "x-diagnostics-status") == "unavailable"
+        let diagnosticState = response.value(forHTTPHeaderField: "x-diagnostics-status")
+        let storageUnavailable = diagnosticState == "unavailable"
         let serverDiagnosticMS = response.value(forHTTPHeaderField: "x-diagnostics-elapsed-ms").flatMap(Int.init).flatMap { (0...3_600_000).contains($0) ? $0 : nil }
         guard (200..<300).contains(response.statusCode) else {
             await log?.network(operation: operation, outcome: "http_error", status: response.statusCode, requestID: requestID,
-                               elapsedMS: DiagnosticTiming.elapsedMS(since: started), storageUnavailable: storageUnavailable, eventID: eventID, benchmarkAttempt: benchmarkAttempt, serverDiagnosticMS: serverDiagnosticMS, metrics: metricsCollector.snapshot, clock: clock, monotonic: true, clientRequestID: clientRequestID)
+                               elapsedMS: DiagnosticTiming.elapsedMS(since: started), storageUnavailable: storageUnavailable, eventID: eventID, benchmarkAttempt: benchmarkAttempt, serverDiagnosticMS: serverDiagnosticMS, diagnosticState: diagnosticState, metrics: metricsCollector.snapshot, clock: clock, monotonic: true, clientRequestID: clientRequestID)
             let reason = (try? JSONDecoder().decode(ErrorBody.self, from: data).error) ?? "Backend request failed (\(response.statusCode))."
             throw BackendError.response(response.statusCode, reason)
         }
@@ -225,11 +226,11 @@ struct BackendClient: BackendServing {
         do {
             let result = try decoder.decode(R.self, from: data)
             await log?.network(operation: operation, outcome: "ok", status: response.statusCode, requestID: requestID,
-                               elapsedMS: DiagnosticTiming.elapsedMS(since: started), storageUnavailable: storageUnavailable, eventID: eventID, benchmarkAttempt: benchmarkAttempt, serverDiagnosticMS: serverDiagnosticMS, metrics: metricsCollector.snapshot, clock: clock, monotonic: true, clientRequestID: clientRequestID)
+                               elapsedMS: DiagnosticTiming.elapsedMS(since: started), storageUnavailable: storageUnavailable, eventID: eventID, benchmarkAttempt: benchmarkAttempt, serverDiagnosticMS: serverDiagnosticMS, diagnosticState: diagnosticState, metrics: metricsCollector.snapshot, clock: clock, monotonic: true, clientRequestID: clientRequestID)
             return result
         } catch {
             await log?.network(operation: operation, outcome: "decode_error", status: response.statusCode, requestID: requestID,
-                               elapsedMS: DiagnosticTiming.elapsedMS(since: started), storageUnavailable: storageUnavailable, error: error, eventID: eventID, benchmarkAttempt: benchmarkAttempt, serverDiagnosticMS: serverDiagnosticMS, metrics: metricsCollector.snapshot, clock: clock, monotonic: true, clientRequestID: clientRequestID)
+                               elapsedMS: DiagnosticTiming.elapsedMS(since: started), storageUnavailable: storageUnavailable, error: error, eventID: eventID, benchmarkAttempt: benchmarkAttempt, serverDiagnosticMS: serverDiagnosticMS, diagnosticState: diagnosticState, metrics: metricsCollector.snapshot, clock: clock, monotonic: true, clientRequestID: clientRequestID)
             throw error
         }
     }

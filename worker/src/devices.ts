@@ -20,10 +20,12 @@ function credentialFor(request:Request):{id:string;secret:string} {
  if(!match)throw new APIError(401,'Device authentication required.');
  return {id:uuid(match[1]),secret:match[2]};
 }
-export async function authenticate(env:Env,request:Request):Promise<Device> {
+export async function authenticate(env:Env,request:Request,latency?:Latency):Promise<Device> {
  const {id,secret}=credentialFor(request);
- const device=await env.DB.prepare('SELECT * FROM devices WHERE id=?').bind(id).first<Device>();
- if(!device||!constantTimeEqual(device.secret_hash,await sha256(secret)))throw new APIError(401,'Device authentication failed.');
+ const statement=env.DB.prepare('SELECT * FROM devices WHERE id=?').bind(id);
+ const device=latency?await latency.read<Device>('authentication_lookup_ms',statement):await statement.first<Device>();
+ const hash=latency?await latency.measure('authentication_hash_ms',()=>sha256(secret)):await sha256(secret);
+ if(!device||!constantTimeEqual(device.secret_hash,hash))throw new APIError(401,'Device authentication failed.');
  return device;
 }
 // One transaction/remote call instead of separate authentication and rate-limit

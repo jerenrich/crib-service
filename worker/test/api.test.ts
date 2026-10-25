@@ -1531,7 +1531,7 @@ describe('diagnostic gap regressions',()=>{
   try {
    expect((await call('monitoring',parent,{id:crypto.randomUUID(),enabled:false})).status).toBe(200);
    expect(await running).toBe(false);expect(reads).toBe(2);expect(pushRequests).toHaveLength(1);
-   expect(latency.details).toMatchObject({exit_reason:'monitoring_stopped',db_stages:{reminder_snapshot_ms:{calls:2,completed:1,hedges:1,hedge_wins:1,unfinished:1}}});
+   expect(latency.details).toMatchObject({exit_reason:'monitoring_stopped',db_stages:{reminder_snapshot_ms:{calls:2,completed:1,hedges:1,hedge_wins:1,unfinished:1,hedge_after_ms:250,hedge_timer_lag_ms:expect.any(Number)}}});
   }finally{release();await running;}
   expect((await env.DB.prepare('SELECT event_id FROM events').all()).results).toHaveLength(1);
  });
@@ -1544,13 +1544,19 @@ describe('diagnostic gap regressions',()=>{
   await runReminder({...testEnv,DB:db},parent.deviceId);expect(stopped).toBe(true);expect(pushRequests).toHaveLength(1);
   expect((await env.DB.prepare('SELECT event_id FROM events').all()).results).toHaveLength(1);
  });
- it('never hedges a slow committed delivery claim or sends twice',async()=>{
+ it('recovers a committed claim reply by ownership without repeating the write or push',async()=>{
   const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});mockPush();await call('listener/event',listener,alert(listener));
   vi.spyOn(Date,'now').mockReturnValue(Date.now()+10000);
   let release!:()=>void,entered!:()=>void,claims=0;const gate=new Promise<void>(r=>{release=r;}),ready=new Promise<void>(r=>{entered=r;});
   const db=interceptDB(async(sql,_args,method,execute)=>{const result=await execute();if(method==='batch'&&sql.startsWith('INSERT INTO events(')){claims++;entered();await gate;}return result;});
-  const running=runReminder({...testEnv,DB:db},parent.deviceId);await ready;
-  try {await new Promise(r=>setTimeout(r,1550));expect(claims).toBe(1);expect(pushRequests).toHaveLength(1);}finally{mockPush();release();await running;}
+  const {Latency}=await import('../src/latency');const latency=new Latency();mockPush();
+  const running=runReminder({...testEnv,DB:db},parent.deviceId,latency);await ready;
+  try {
+   expect(await Promise.race([running,new Promise<never>((_,reject)=>setTimeout(()=>reject(new Error('Committed claim still waited on its original reply')),1000))])).toBe(true);
+   expect(claims).toBe(1);expect(pushRequests).toHaveLength(2);
+   expect(latency.details).toMatchObject({claim_result_source:'receipt',claim_receipt_outcome:'matched',db_stages:{claim_ms:{calls:1,unfinished:1},claim_receipt_ms:{calls:1,completed:1}}});
+   const frozen=JSON.stringify(latency.details);release();await new Promise(r=>setTimeout(r,10));expect(JSON.stringify(latency.details)).toBe(frozen);
+  }finally{release();await running;}
   expect(pushRequests).toHaveLength(2);
  });
  it('claims an inserted reminder atomically before maintenance can observe it',async()=>{
@@ -1780,5 +1786,99 @@ describe('slow initial upload checkpoints',()=>{
  it('drops arbitrary correlation and stage strings at the privacy boundary',async()=>{
   const {safeTimingDetails}=await import('../src/latency');
   expect(safeTimingDetails({client_request_id:'private-marker',in_flight_span:'private-marker',in_flight_ms:-1} as unknown as import('../src/latency').TimingDetails)).toBeNull();
+ });
+});
+
+describe('status database pressure and journal isolation',()=>{
+ it('reads the complete status in two handler binding calls and retains limiter metadata',async()=>{
+  const {parent,listener}=await paired();
+  await call('listener/heartbeat',listener,{listenerId:listener.deviceId,timestamp:new Date().toISOString(),monitoring:true,powerConnected:true,state:'quiet',episodes:[]});
+  const response=await call('listener/status',parent,undefined,'GET'),value=await response.json() as {paired:boolean;monitoring:boolean};
+  expect(value).toMatchObject({paired:true,monitoring:true});
+  const row=await env.DB.prepare('SELECT details FROM diagnostics WHERE request_id=?').bind(response.headers.get('x-request-id')).first<{details:string}>();
+  const timing=JSON.parse(row!.details);expect(timing.db_calls).toBe(5);
+  expect(timing.db_stages.status_pair_ms).toMatchObject({calls:1,statements:1});expect(timing.db_stages.status_snapshot_ms).toMatchObject({calls:1,statements:5});
+  for(const key of ['ip_rate_limit_ms','device_rate_limit_ms','authentication_lookup_ms'])expect(timing.db_stages[key]).toMatchObject({calls:1,completed:1,statements:1});
+ });
+ it('does not return a stale nursery snapshot after pairing changes during lookup',async()=>{
+  const {parent}=await paired();let changed=false;
+  const db=interceptDB(async(sql,_args,method,execute)=>{if(method==='batch'&&sql==='SELECT * FROM heartbeats WHERE listener_id=?'){changed=true;await env.DB.prepare('DELETE FROM pairs WHERE parent_id=?').bind(parent.deviceId).run();}return execute();});
+  const response=await worker.fetch(new Request('https://monitor.test/v1/listener/status',{headers:{authorization:`Bearer ${parent.deviceId}.${parent.secret}`}}),{...testEnv,DB:db});
+  expect(changed).toBe(true);expect(await response.json()).toMatchObject({paired:false});
+ });
+ it('returns status even while its diagnostic write is stalled',async()=>{
+  const {parent}=await paired();const prior=(await env.DB.prepare('SELECT sequence FROM diagnostics').all()).results.length;vi.spyOn(Date,'now').mockReturnValue(Date.now()+60000);
+  let release!:()=>void,entered!:()=>void;const gate=new Promise<void>(r=>{release=r;}),ready=new Promise<void>(r=>{entered=r;}),jobs:Promise<unknown>[]=[];
+  const db=interceptDB(async(sql,_args,_method,execute)=>{if(sql.startsWith('INSERT INTO diagnostics')){entered();await gate;}return execute();});
+  const running=worker.fetch(new Request('https://monitor.test/v1/listener/status',{headers:{authorization:`Bearer ${parent.deviceId}.${parent.secret}`}}),{...testEnv,DB:db},{waitUntil:(job:Promise<unknown>)=>{jobs.push(job);}} as unknown as ExecutionContext);
+  await ready;
+  try {
+   const response=await Promise.race([running,new Promise<never>((_,reject)=>setTimeout(()=>reject(new Error('Status waited on telemetry')),1000))]);
+   expect(response.status).toBe(200);expect(response.headers.get('x-diagnostics-status')).toBe('queued');expect(response.headers.get('x-diagnostics-elapsed-ms')).toBe('0');
+   expect((await env.DB.prepare('SELECT request_id FROM diagnostics').all()).results).toHaveLength(prior);
+  }finally{release();await running;await Promise.all(jobs);}
+ });
+ it('releases unused Apple response bodies without delaying or changing known acceptance',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  let release!:()=>void;const gate=new Promise<void>(r=>{release=r;}),cancel=vi.fn(()=>gate);
+  pushResponses.push(new Response(new ReadableStream({cancel}),{status:200}));
+  try {
+   const response=await Promise.race([call('listener/event',listener,alert(listener)),new Promise<never>((_,reject)=>setTimeout(()=>reject(new Error('Acceptance waited on cleanup')),1000))]);
+   expect(await response.json()).toEqual({status:'sent'});expect(cancel).toHaveBeenCalledOnce();
+  }finally{release();}
+ });
+});
+
+describe('owned claim receipt suppression',()=>{
+ it('honors a Stop recorded while the committed claim reply is delayed',async()=>{
+  const {parent,listener}=await paired();await call('listener/event',listener,alert(listener));await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  const event=await env.DB.prepare('SELECT event_id FROM events').first<{event_id:string}>();
+  let release!:()=>void,entered!:()=>void;const gate=new Promise<void>(r=>{release=r;}),ready=new Promise<void>(r=>{entered=r;});
+  const db=interceptDB(async(sql,_args,method,execute)=>{const result=await execute();if(method==='batch'&&sql.startsWith('UPDATE events SET resolved_at=')){entered();await gate;}return result;});
+  const {dispatchEvent}=await import('../src/alerts'),{Latency}=await import('../src/latency');const latency=new Latency();
+  const running=dispatchEvent({...testEnv,DB:db},event!.event_id,undefined,latency);await ready;
+  try {
+   expect((await call('monitoring',parent,{id:crypto.randomUUID(),enabled:false})).status).toBe(200);
+   await Promise.race([running,new Promise<never>((_,reject)=>setTimeout(()=>reject(new Error('Stop receipt not observed')),1000))]);
+   expect(latency.details).toMatchObject({claim_result_source:'receipt',exit_reason:'acknowledged'});expect(pushRequests).toHaveLength(0);
+  }finally{release();await running;}
+ });
+ it('does not send after a claim lease expires while its original reply is delayed',async()=>{
+  const {parent,listener}=await paired();await call('listener/event',listener,alert(listener));await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  const event=await env.DB.prepare('SELECT event_id FROM events').first<{event_id:string}>();
+  let release!:()=>void,entered!:()=>void;const gate=new Promise<void>(r=>{release=r;}),ready=new Promise<void>(r=>{entered=r;});
+  const db=interceptDB(async(sql,_args,method,execute)=>{const result=await execute();if(method==='batch'&&sql.startsWith('UPDATE events SET resolved_at=')){entered();await gate;}return result;});
+  const {dispatchEvent}=await import('../src/alerts'),{Latency}=await import('../src/latency');const latency=new Latency();
+  const running=dispatchEvent({...testEnv,DB:db},event!.event_id,undefined,latency);await ready;
+  try {vi.spyOn(Date,'now').mockReturnValue(Date.now()+31000);await Promise.race([running,new Promise<never>((_,reject)=>setTimeout(()=>reject(new Error('Expired lease not observed')),1000))]);expect(pushRequests).toHaveLength(0);expect(latency.details.exit_reason).toBe('not_pending');}
+  finally{release();await running;}
+ });
+});
+
+describe('claim ownership across competing requests and token rotation',()=>{
+ it('cannot borrow another invocation’s committed claim while its own write is still pending',async()=>{
+  const {parent,listener}=await paired();await call('listener/event',listener,alert(listener));await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  const event=await env.DB.prepare('SELECT event_id FROM events').first<{event_id:string}>();
+  let release!:()=>void,entered!:()=>void;const gate=new Promise<void>(r=>{release=r;}),ready=new Promise<void>(r=>{entered=r;});
+  const db=interceptDB(async(sql,_args,method,execute)=>{if(method==='batch'&&sql.startsWith('UPDATE events SET resolved_at=')){entered();await gate;}return execute();});
+  const {dispatchEvent}=await import('../src/alerts'),{Latency}=await import('../src/latency');const latency=new Latency();
+  const first=dispatchEvent({...testEnv,DB:db},event!.event_id,undefined,latency);await ready;
+  try {
+   mockPush();await dispatchEvent(testEnv,event!.event_id);await new Promise(r=>setTimeout(r,300));
+   expect(pushRequests).toHaveLength(1);expect(latency.details.claim_receipt_outcome).toBe('missing');
+  }finally{release();await first;}
+  expect(pushRequests).toHaveLength(1);expect(latency.details.claim_result_source).toBe('reply');expect(latency.details.exit_reason).toBe('already_sent');
+ });
+ it('uses the current destination token when ownership proves a delayed committed claim',async()=>{
+  const {parent,listener}=await paired();await call('listener/event',listener,alert(listener));await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  const event=await env.DB.prepare('SELECT event_id FROM events').first<{event_id:string}>();
+  let release!:()=>void,entered!:()=>void;const gate=new Promise<void>(r=>{release=r;}),ready=new Promise<void>(r=>{entered=r;});
+  const db=interceptDB(async(sql,_args,method,execute)=>{const result=await execute();if(method==='batch'&&sql.startsWith('UPDATE events SET resolved_at=')){entered();await gate;}return result;});
+  const {dispatchEvent}=await import('../src/alerts');mockPush();const running=dispatchEvent({...testEnv,DB:db},event!.event_id);await ready;
+  try {
+   await env.DB.prepare('UPDATE devices SET push_token=? WHERE id=?').bind(await encryptToken(testEnv,'ef'.repeat(32)),parent.deviceId).run();
+   await Promise.race([running,new Promise<never>((_,reject)=>setTimeout(()=>reject(new Error('Owned claim did not progress')),1000))]);
+   expect(pushRequests).toHaveLength(1);expect(pushRequests[0].url).toContain('ef'.repeat(32));
+  }finally{release();await running;}
  });
 });

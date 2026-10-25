@@ -4,15 +4,30 @@ import Foundation
 struct WatchAlertTrace: Sendable {
     enum Phase: String, Sendable {
         case foreground, presented, opened, acknowledged, retained, hapticRequested = "haptic_requested"
+        case controllerActivated = "controller_activated", controllerDeactivated = "controller_deactivated"
         case controllerReceived = "controller_received", viewAppeared = "view_appeared", snapshotReceived = "snapshot_received"
     }
+    enum ApplicationState: String, Sendable { case active, inactive, background, unknown }
+    struct CallbackTiming: Sendable {
+        var presentationRequestMS: Int? = nil
+        var mainActorWaitMS: Int? = nil
+        var handlingMS: Int? = nil
+        var fields: String {
+            [("presentation_request_ms", presentationRequestMS), ("main_actor_wait_ms", mainActorWaitMS), ("app_handling_ms", handlingMS)]
+                .compactMap { key, value in value.flatMap { (0...3_600_000).contains($0) ? " \(key)=\($0)" : nil } }.joined()
+        }
+    }
+    let applicationState: ApplicationState?
+    let timing: CallbackTiming?
+    let interruptionLevel: Int?
     let alert: WatchCryAlert
     let phase: Phase
     let deliveredAt: Date?
     let observedAt: Date
 
-    init(alert: WatchCryAlert, phase: Phase, deliveredAt: Date? = nil, observedAt: Date = Date()) {
+    init(alert: WatchCryAlert, phase: Phase, deliveredAt: Date? = nil, observedAt: Date = Date(), applicationState: ApplicationState? = nil, timing: CallbackTiming? = nil, interruptionLevel: Int? = nil) {
         self.alert = alert; self.phase = phase; self.deliveredAt = deliveredAt; self.observedAt = observedAt
+        self.applicationState = applicationState; self.timing = timing; self.interruptionLevel = interruptionLevel
     }
 
     var key: String {
@@ -31,6 +46,18 @@ struct WatchAlertTrace: Sendable {
             result += " delivered_at_ms=\(delivered) delivery_age_ms=\(delivered - created) callback_lag_ms=\(observed - delivered)"
             if delivered < created || observed < delivered { result += " clock_order=check" }
         }
+        switch phase {
+        case .controllerReceived, .controllerActivated, .controllerDeactivated, .viewAppeared: result += " callback_scope=long_look"
+        case .foreground: result += " callback_scope=foreground_delegate"
+        case .opened, .acknowledged: result += " callback_scope=user_action"
+        case .retained: result += " callback_scope=history_observation"
+        case .snapshotReceived: result += " callback_scope=phone_bridge"
+        case .hapticRequested: result += " callback_scope=app_haptic_request"
+        case .presented: break
+        }
+        if let applicationState { result += " app_state=\(applicationState.rawValue)" }
+        if let timing { result += timing.fields }
+        if let interruptionLevel, (0...3).contains(interruptionLevel) { result += " interruption_level=\(interruptionLevel)" }
         return result
     }
 
