@@ -163,7 +163,7 @@ final class OnboardingUITests: XCTestCase {
         ready.tap()
         XCTAssertTrue(app.navigationBars["Tonight's check"].waitForExistence(timeout: 5))
         XCTAssertFalse(app.buttons["Start Monitoring"].exists)
-        XCTAssertFalse(app.buttons["Start on Nursery iPhone"].exists)
+        XCTAssertFalse(app.descendants(matching: .any)["nurseryMonitoringInstruction"].exists)
     }
 
     @MainActor func testLiveReadingsOfferPauseBeforeListenerStatusRefreshes() {
@@ -187,13 +187,17 @@ final class OnboardingUITests: XCTestCase {
             app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", state]
             app.launch()
             let control = app.buttons["nightstandMonitoringControl"]
-            XCTAssertTrue(control.waitForExistence(timeout: 5))
             if state == "--uitesting-standby" {
+                XCTAssertTrue(control.waitForExistence(timeout: 5))
                 XCTAssertEqual(control.label, "Start Monitoring")
                 XCTAssertTrue(control.isEnabled)
             } else {
-                XCTAssertEqual(control.label, "Start on Nursery iPhone")
-                XCTAssertFalse(control.isEnabled)
+                let instruction = app.descendants(matching: .any)["nurseryMonitoringInstruction"].firstMatch
+                XCTAssertTrue(instruction.waitForExistence(timeout: 5))
+                XCTAssertTrue(instruction.label.contains("Use the nursery iPhone"))
+                XCTAssertTrue(instruction.label.contains("Open Crib Service and tap Start Monitoring."))
+                XCTAssertFalse(control.exists)
+                XCTAssertFalse(app.buttons["nurseryMonitoringInstruction"].exists)
             }
             if state == "--uitesting-listener-stale" {
                 XCTAssertTrue(app.buttons["Pause Monitoring"].isEnabled, "Cancelling alerts must remain available")
@@ -360,15 +364,16 @@ final class OnboardingUITests: XCTestCase {
         XCTAssertTrue(app.buttons["Pause Monitoring"].isEnabled)
         XCTAssertEqual(chart.frame.minY, initialChartFrame.minY, accuracy: 1)
         XCTAssertEqual(chart.frame.height, initialChartFrame.height, accuracy: 1)
-        XCTAssertEqual(start.frame.minY, initialControlFrame.minY, accuracy: 1)
+        let instruction = app.descendants(matching: .any)["nurseryMonitoringInstruction"].firstMatch
+        XCTAssertEqual(instruction.frame.midY, initialControlFrame.midY, accuracy: 1)
         XCTAssertEqual(app.tabBars.firstMatch.frame.minY, initialTabFrame.minY, accuracy: 1)
         let details = app.buttons["nightstandDetails"]
         for _ in 0..<4 {
-            if details.isHittable && details.frame.maxY < start.frame.minY { break }
+            if details.isHittable && details.frame.maxY < instruction.frame.minY { break }
             app.scrollViews.firstMatch.swipeUp()
         }
         XCTAssertTrue(details.isHittable)
-        XCTAssertLessThan(details.frame.maxY, start.frame.minY)
+        XCTAssertLessThan(details.frame.maxY, instruction.frame.minY)
         details.tap()
         XCTAssertTrue(app.navigationBars["Monitoring details"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "could not be started or verified")).firstMatch.exists)

@@ -120,9 +120,13 @@ struct OvernightSetupView: View {
                 Button("Finish setup") { model.completeBedtimeSetup(); dismiss() }
                     .accessibilityIdentifier("finishBedtimeSetup")
             } else {
-                Button(model.pendingMonitoringCommand != nil || model.requestingMonitoring ? "Starting…" : model.canStartMonitoringRemotely ? "Start Monitoring" : "Start on Nursery iPhone") {
-                    Task { await model.requestMonitoring(true) }
-                }.disabled(!model.canStartMonitoringRemotely || model.pendingMonitoringCommand != nil || model.requestingMonitoring)
+                if !model.canStartMonitoringRemotely && model.pendingMonitoringCommand == nil && !model.requestingMonitoring {
+                    NurseryMonitoringInstruction()
+                } else {
+                    Button(model.pendingMonitoringCommand != nil || model.requestingMonitoring ? "Starting…" : "Start Monitoring") {
+                        Task { await model.requestMonitoring(true) }
+                    }.disabled(!model.canStartMonitoringRemotely || model.pendingMonitoringCommand != nil || model.requestingMonitoring)
+                }
                 if let error = model.monitoringControlError { Text(error).foregroundStyle(Palette.amber) }
                 Button(model.retryingConnection ? "Checking…" : "Retry connection") { Task { await model.retryConnection() } }
                     .disabled(model.retryingConnection)

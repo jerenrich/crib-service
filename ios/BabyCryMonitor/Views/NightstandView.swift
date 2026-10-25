@@ -408,15 +408,18 @@ struct NightstandView: View {
 
     private var monitoringControls: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Button(action: toggleMonitoring) {
-                Label(controlTitle, systemImage: monitoringActive ? "pause" : "play")
-                    .font(.headline).fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, minHeight: 52)
-                    .foregroundStyle(parentStartUnavailable ? Palette.muted : Palette.lavender).background(Palette.panel, in: RoundedRectangle(cornerRadius: 18))
+            if parentStartUnavailable {
+                NurseryMonitoringInstruction()
+            } else {
+                Button(action: toggleMonitoring) {
+                    Label(controlTitle, systemImage: monitoringActive ? "pause" : "play")
+                        .font(.headline).fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, minHeight: 52)
+                        .foregroundStyle(Palette.lavender).background(Palette.panel, in: RoundedRectangle(cornerRadius: 18))
+                }
+                .disabled(!model.paired || busy || model.managingDevice)
+                .accessibilityIdentifier("nightstandMonitoringControl")
             }
-            .disabled(!model.paired || busy || model.managingDevice || parentStartUnavailable)
-            .accessibilityIdentifier("nightstandMonitoringControl")
-            .accessibilityHint(parentStartUnavailable ? "Open Crib Service on the nursery iPhone and start monitoring there." : "")
             HStack(alignment: .top, spacing: 16) {
                 if !model.paired {
                     Button(listener ? "Pair with Parent" : "Set up for tonight") { if listener { pairing = true } else { readiness = true } }
@@ -451,7 +454,6 @@ struct NightstandView: View {
     private var controlTitle: String {
         if listener && model.starting { return "Starting…" }
         if let command = model.pendingMonitoringCommand, !listener { return command.enabled ? "Starting…" : "Pausing…" }
-        if parentStartUnavailable { return "Start on Nursery iPhone" }
         return monitoringActive ? "Pause Monitoring" : "Start Monitoring"
     }
 
