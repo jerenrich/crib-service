@@ -13,7 +13,7 @@ Crib Service is designed to wake Mom or Dad with an **Apple Watch alert when the
 1. **Leave an iPhone in the nursery.** Set it to Listener mode, keep it plugged in, and start monitoring.
 2. **Pair it with your iPhone.** Use Parent mode and connect your Apple Watch with the companion app.
 3. **Choose your wait.** Pick 1, 2, 3, 5, or 10 minutes, or a shorter 5- or 30-second delay. The timer starts after a few seconds of confirmed crying-like sound.
-4. **Get a tap on your wrist.** Alerts repeat every 5 seconds until you acknowledge one on your Watch or iPhone. The Snooze button pauses crying alerts for your chosen interval; a countdown and Resume alerts control let you end the snooze early.
+4. **Get a tap on your wrist.** Alerts repeat every 5 seconds until you snooze one on your Watch or iPhone, or the Listener confirms the configured quiet period. The Snooze button clears crying notifications on that device and pauses crying alerts for your chosen interval; a countdown and Resume alerts control let you end the snooze early.
 
 ### Made for the night shift
 
