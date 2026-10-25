@@ -1125,7 +1125,9 @@ describe('live sound relay',()=>{
   expect(await listener.next()).toEqual({type:'viewing',active:false});
   const parent=await open(a.parent),other=await open(b.parent);
   expect(await listener.next()).toEqual({type:'viewing',active:true});
-  const value=frame();listener.socket.send(JSON.stringify(value));
+  const base=frame();
+  const value={...base,levels:Array.from({length:120},(_,i)=>-80+i%40),notificationTimes:[base.sampledAt-25,base.sampledAt-3]};
+  listener.socket.send(JSON.stringify(value));
   expect(await parent.next()).toEqual(value);
   other.socket.send(JSON.stringify({type:'ping'}));
   expect(await other.next()).toEqual({type:'pong'});
@@ -1174,9 +1176,13 @@ describe('live sound relay',()=>{
  });
  it('rejects recordings, extra fields, invalid scales, and oversized windows',()=>{
   expect(soundFrame(frame()).levels).toHaveLength(32);
+  expect(soundFrame({...frame(),levels:Array(120).fill(-40)}).levels).toHaveLength(120);
   for(const value of [{...frame(),audio:'recording'},{...frame(),levels:[0]},
    {...frame(),levels:Array(32).fill(-101)},{...frame(),levels:Array(32).fill(NaN)},
-   {...frame(),threshold:-90},{...frame(),episodeStartedAt:Date.now()/1000+100}])expect(()=>soundFrame(value)).toThrow();
+   {...frame(),threshold:-90},{...frame(),episodeStartedAt:Date.now()/1000+100},
+   {...frame(),levels:Array(121).fill(-40)},{...frame(),notificationTimes:[Date.now()/1000-31]},
+   {...frame(),notificationTimes:[Date.now()/1000+1]},{...frame(),notificationTimes:[NaN]},
+   {...frame(),notificationTimes:Array(33).fill(Date.now()/1000)}])expect(()=>soundFrame(value)).toThrow();
  });
 });
 

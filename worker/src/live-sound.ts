@@ -8,19 +8,23 @@ export interface SoundFrame {
  type:'levels';sampledAt:number;levels:number[];threshold:number;
  state:'quiet'|'possibleCry'|'crying';episodeStartedAt?:number|null;alertDuration:number;
  requestID?:string;
+ notificationTimes?:number[];
 }
 
 export function soundFrame(value:unknown):SoundFrame {
  if(!value||typeof value!=='object'||Array.isArray(value))throw new APIError(400,'Invalid sound levels.');
  const v=value as Record<string,unknown>;
- if(Object.keys(v).some(k=>!['type','sampledAt','levels','threshold','state','episodeStartedAt','alertDuration','requestID'].includes(k))
+ if(Object.keys(v).some(k=>!['type','sampledAt','levels','threshold','state','episodeStartedAt','alertDuration','requestID','notificationTimes'].includes(k))
   ||v.type!=='levels'||typeof v.sampledAt!=='number'||!Number.isFinite(v.sampledAt)||v.sampledAt<0||v.sampledAt>32503680000
-  ||!Array.isArray(v.levels)||v.levels.length!==32||v.levels.some(n=>typeof n!=='number'||!Number.isFinite(n)||n < -100||n > 0)
+  ||!Array.isArray(v.levels)||![32,120].includes(v.levels.length)||v.levels.some(n=>typeof n!=='number'||!Number.isFinite(n)||n < -100||n > 0)
   ||typeof v.threshold!=='number'||!Number.isFinite(v.threshold)||v.threshold < -60||v.threshold > -10
   ||!['quiet','possibleCry','crying'].includes(String(v.state))
   ||typeof v.alertDuration!=='number'||!Number.isFinite(v.alertDuration)||v.alertDuration<5||v.alertDuration>3600
   ||(v.episodeStartedAt!=null&&(typeof v.episodeStartedAt!=='number'||!Number.isFinite(v.episodeStartedAt)||v.episodeStartedAt<0||v.episodeStartedAt>v.sampledAt)))
   throw new APIError(400,'Invalid sound levels.');
+ if(v.notificationTimes!==undefined&&(!Array.isArray(v.notificationTimes)||v.notificationTimes.length>32
+  ||v.notificationTimes.some(n=>typeof n!=='number'||!Number.isFinite(n)||n < (v.sampledAt as number)-30||n > (v.sampledAt as number))))
+  throw new APIError(400,'Invalid notification markers.');
  if(v.requestID!==undefined)uuid(v.requestID);
  return v as unknown as SoundFrame;
 }

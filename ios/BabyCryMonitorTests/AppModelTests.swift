@@ -292,7 +292,7 @@ final class AppModelTests: XCTestCase {
         fixture.model.selectRole(.parent)
         await fixture.model.refreshParent()
         XCTAssertEqual(fixture.liveSound.connectedDevice, fixture.parent.deviceId)
-        let frame = SoundLevelFrame(sampledAt: 100, levels: Array(repeating: -40, count: 32),
+        let frame = SoundLevelFrame(sampledAt: 100, levels: Array(repeating: -40, count: 120),
                                    threshold: -45, state: .quiet, alertDuration: 30)
         fixture.liveSound.onFrame?(frame)
         XCTAssertTrue(fixture.model.remoteSound.isLive(at: fixture.time.now))
@@ -300,7 +300,7 @@ final class AppModelTests: XCTestCase {
         fixture.time.now = fixture.time.now.addingTimeInterval(10)
         XCTAssertFalse(fixture.model.remoteSound.isLive(at: fixture.time.now))
         var latest = frame
-        latest.sampledAt += 10; latest.levels = Array(repeating: -30, count: 32)
+        latest.sampledAt += 10; latest.levels = Array(repeating: -30, count: 120)
         fixture.liveSound.onFrame?(latest)
         XCTAssertEqual(fixture.model.remoteSound.frame, latest)
         XCTAssertTrue(fixture.model.remoteSound.isLive(at: fixture.time.now))
@@ -326,7 +326,7 @@ final class AppModelTests: XCTestCase {
         await fixture.model.refreshParent()
         await fixture.model.requestMonitoring(true)
         let pending = try XCTUnwrap(fixture.model.pendingMonitoringCommand)
-        fixture.liveSound.onFrame?(SoundLevelFrame(sampledAt: 100, levels: Array(repeating: -40, count: 32),
+        fixture.liveSound.onFrame?(SoundLevelFrame(sampledAt: 100, levels: Array(repeating: -40, count: 120),
             threshold: -45, state: .crying, episodeStartedAt: 95, alertDuration: 30))
         XCTAssertTrue(fixture.model.remoteSound.isLive(at: fixture.time.now))
         XCTAssertEqual(fixture.model.pendingMonitoringCommand?.id, pending.id)

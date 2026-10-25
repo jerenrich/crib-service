@@ -8,13 +8,14 @@ struct SoundLevelChart: View {
     let monitoring: Bool
     var height: CGFloat = 88
     var color: Color = Palette.mint
+    var notificationPositions: [CGFloat] = []
 
     var body: some View {
         VStack(spacing: 12) {
             GeometryReader { geometry in
                 let triggerHeight = levelHeight(trigger, in: geometry.size.height)
                 ZStack(alignment: .bottom) {
-                    HStack(alignment: .bottom, spacing: 4) {
+                    HStack(alignment: .bottom, spacing: levels.count > 60 ? 1 : 4) {
                         ForEach(Array(levels.enumerated()), id: \.offset) { _, level in
                             let barHeight = max(3, levelHeight(level, in: geometry.size.height))
                             Capsule()
@@ -31,12 +32,33 @@ struct SoundLevelChart: View {
                                 .frame(height: barHeight)
                         }
                     }
+                    ForEach(Array(notificationPositions.enumerated()), id: \.offset) { _, position in
+                        let x = min(geometry.size.width - 8, max(8, position * geometry.size.width))
+                        VStack(spacing: 2) {
+                            Image(systemName: "bell.fill")
+                                .font(.system(size: 10, weight: .semibold))
+                            Rectangle().fill(Palette.amber).frame(width: 1)
+                        }
+                        .foregroundStyle(Palette.amber)
+                        .position(x: x, y: geometry.size.height / 2)
+                        .accessibilityHidden(true)
+                    }
                     thresholdLine(trigger, color: Palette.amber, dash: [6, 4], size: geometry.size)
                 }
                 .frame(width: geometry.size.width, height: geometry.size.height, alignment: .bottom)
                 .clipped()
             }
             .frame(height: height)
+
+            HStack {
+                Text("30 sec ago")
+                Spacer()
+                Label("Alert", systemImage: "bell.fill").foregroundStyle(Palette.amber)
+                Spacer()
+                Text("now")
+            }
+            .font(.caption2.monospacedDigit())
+            .foregroundStyle(Palette.muted)
 
             ViewThatFits(in: .horizontal) {
                 HStack {

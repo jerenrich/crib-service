@@ -7,7 +7,7 @@ import XCTest
 
 final class LiveSoundTests: XCTestCase {
     private func frame(at time: TimeInterval = 100) -> SoundLevelFrame {
-        SoundLevelFrame(sampledAt: time, levels: (0..<32).map { -80 + Double($0) },
+        SoundLevelFrame(sampledAt: time, levels: (0..<120).map { -80 + Double($0 % 20) },
                         threshold: -45, state: .crying, episodeStartedAt: 95, alertDuration: 30)
     }
     func testFramePreservesNurseryWindowAndAppliedThresholdThroughTransport() throws {
@@ -16,7 +16,7 @@ final class LiveSoundTests: XCTestCase {
         XCTAssertEqual(received, value)
         XCTAssertTrue(received.isValid)
         XCTAssertEqual(received.episodeDuration, 5)
-        XCTAssertEqual(received.levels.count, 32)
+        XCTAssertEqual(received.levels.count, 120)
     }
     func testInvalidLevelsThresholdsAndEpisodeDatesAreRejected() {
         var value = frame(); value.levels[0] = .nan; XCTAssertFalse(value.isValid)

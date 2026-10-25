@@ -1,9 +1,10 @@
 import Foundation
 
-/// The same 32 quarter-second RMS readings displayed by the nursery chart.
+/// The same 120 quarter-second RMS readings displayed by the nursery chart.
 /// This transient frame is never included in persisted history or alert payloads.
 public struct SoundLevelFrame: Codable, Equatable, Sendable {
-    public static let barCount = 32
+    public static let barCount = 120
+    public static let windowDuration: TimeInterval = 30
     public var type = "levels"
     public var sampledAt: TimeInterval
     public var levels: [Double]
@@ -12,12 +13,16 @@ public struct SoundLevelFrame: Codable, Equatable, Sendable {
     public var episodeStartedAt: TimeInterval?
     public var alertDuration: TimeInterval
     public var requestID: String?
+    /// Unix timestamps of alert notifications created within the visible chart window.
+    public var notificationTimes: [TimeInterval]?
 
     public var isValid: Bool {
         type == "levels" && sampledAt.isFinite && (0...32_503_680_000).contains(sampledAt) && levels.count == Self.barCount
         && levels.allSatisfy { $0.isFinite && (-100...0).contains($0) }
         && threshold.isFinite && (-60 ... -10).contains(threshold)
         && alertDuration.isFinite && (5...3600).contains(alertDuration)
+        && (notificationTimes?.count ?? 0) <= 32
+        && (notificationTimes ?? []).allSatisfy { $0.isFinite && $0 >= sampledAt - Self.windowDuration && $0 <= sampledAt }
         && (episodeStartedAt.map { $0.isFinite && $0 >= 0 && $0 <= sampledAt } ?? true)
         && (requestID.map { UUID(uuidString: $0) != nil } ?? true)
     }

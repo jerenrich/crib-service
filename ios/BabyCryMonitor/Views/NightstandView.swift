@@ -15,6 +15,12 @@ struct NightstandView: View {
     private var soundLive: Bool { listener ? model.monitoring : model.remoteSound.isLive(at: model.now) && !(confirmedParentState && model.parentStatus?.monitoring == false) }
     private var frame: SoundLevelFrame? { model.remoteSound.frame }
     private var levels: [Double] { listener ? model.meter : frame?.levels ?? Array(repeating: -100, count: SoundLevelFrame.barCount) }
+    private var notificationPositions: [CGFloat] {
+        let times = listener ? model.chartNotificationTimes.map(\.timeIntervalSince1970) : (frame?.notificationTimes ?? [])
+        return times.filter { (0...SoundLevelFrame.windowDuration).contains(frameTime - $0) }
+            .map { CGFloat(1 - (frameTime - $0) / SoundLevelFrame.windowDuration) }
+    }
+    private var frameTime: TimeInterval { listener ? (model.chartSampledAt ?? model.now).timeIntervalSince1970 : frame?.sampledAt ?? model.now.timeIntervalSince1970 }
     private var threshold: Double { listener ? model.threshold : frame?.threshold ?? model.parentStatus?.listenerConfiguration?.absoluteThreshold ?? model.threshold }
     private var alertDuration: TimeInterval { listener ? model.configuration.alertDuration : frame.flatMap { soundLive ? $0.alertDuration : nil } ?? model.parentStatus?.listenerConfiguration?.alertDuration ?? model.configuration.alertDuration }
     private var elapsed: TimeInterval? { listener ? model.snapshot.current.map { $0.duration(at: model.now) } : soundLive ? frame?.episodeDuration : nil }
@@ -165,7 +171,8 @@ struct NightstandView: View {
             }
             SoundLevelChart(levels: levels, trigger: threshold,
                 currentLevel: listener ? model.currentDBFS : levels.last ?? -100,
-                monitoring: soundLive, height: plotHeight, color: Palette.lavender)
+                monitoring: soundLive, height: plotHeight, color: Palette.lavender,
+                notificationPositions: notificationPositions)
             // Keep the episode row in the layout when the nursery becomes quiet.
             HStack(spacing: 12) {
                 Text("\(durationText(elapsed ?? 0)) / \(durationText(alertDuration))")

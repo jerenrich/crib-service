@@ -35,6 +35,8 @@ import UIKit
     var loadingTimeline = false
     var currentDBFS: Double = -100
     var meter: [Double] = Array(repeating: -100, count: SoundLevelFrame.barCount)
+    var chartNotificationTimes: [Date] = []
+    var chartSampledAt: Date?
     private(set) var remoteSound = RemoteSoundState()
     private(set) var liveSoundConnected = false
     var batteryLevel: Double?
@@ -516,6 +518,7 @@ import UIKit
         engine.suspend()
         if wasMonitoring { engine.recordTimeline("monitoring_paused", at: currentTime()) }
         meter = Array(repeating: -100, count: SoundLevelFrame.barCount); currentDBFS = -100
+        chartNotificationTimes.removeAll(); chartSampledAt = nil
         if standby { audioStatus = "Standby · Microphone active" }
         persist(); synchronizeLiveSound(); queueHeartbeat(); recordBatterySample()
         log.record("monitoring_paused")
@@ -702,6 +705,7 @@ import UIKit
         case .active:
             log.record("audio_active")
             meter = Array(repeating: -100, count: SoundLevelFrame.barCount); currentDBFS = -100
+            chartNotificationTimes.removeAll(); chartSampledAt = nil
             microphoneActive = true; monitoring = !detectionPaused
             detectionStartedAt = monitoring ? currentTime() : nil
             audioStatus = standby ? "Standby · Microphone active" : "Microphone active"
@@ -749,8 +753,11 @@ import UIKit
         let sample = AudioLevelSample(timestamp: sample.timestamp, dbFS: min(0, max(-100, sample.dbFS)))
         currentDBFS = sample.dbFS
         meter.append(sample.dbFS); meter = Array(meter.suffix(SoundLevelFrame.barCount))
+        chartSampledAt = sample.timestamp
         let before = state; let quietBefore = engine.detector.quietSince
         let events = engine.consume(sample, listenerId: credential.deviceId)
+        if !events.isEmpty { chartNotificationTimes.append(sample.timestamp) }
+        chartNotificationTimes.removeAll { sample.timestamp.timeIntervalSince($0) > SoundLevelFrame.windowDuration }
         if state != before {
             log.record(state == .crying ? "crying_started" : state == .possibleCry ? "possible_cry" : "crying_ended")
         }
@@ -765,7 +772,8 @@ import UIKit
             liveSound.publish(SoundLevelFrame(sampledAt: sample.timestamp.timeIntervalSince1970, levels: meter,
                 threshold: threshold, state: state,
                 episodeStartedAt: snapshot.current?.startedAt.timeIntervalSince1970,
-                alertDuration: configuration.alertDuration))
+                alertDuration: configuration.alertDuration,
+                notificationTimes: chartNotificationTimes.map(\.timeIntervalSince1970)))
         }
     }
     func setAppActive(_ active: Bool) {
