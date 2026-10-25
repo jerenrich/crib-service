@@ -2127,3 +2127,45 @@ describe('heartbeat journal isolation',()=>{
   }finally{release();await running;await Promise.all(jobs);}
  });
 });
+
+describe('heartbeat committed-save receipt recovery',()=>{
+ const beat=(listener:TestDevice)=>({listenerId:listener.deviceId,timestamp:new Date().toISOString(),monitoring:true,powerConnected:true,state:'quiet',episodes:[]});
+ const request=(listener:TestDevice)=>new Request('https://monitor.test/v1/listener/heartbeat',{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${listener.deviceId}.${listener.secret}`},body:JSON.stringify(beat(listener))});
+ it('proves its own atomic save while the original reply remains pending',async()=>{
+  const {listener}=await paired();let writes=0,release!:()=>void,entered!:()=>void;
+  const gate=new Promise<void>(r=>{release=r;}),ready=new Promise<void>(r=>{entered=r;});
+  const db=interceptDB(async(sql,_args,method,execute)=>{const result=await execute();if(method==='batch'&&sql.startsWith('INSERT INTO heartbeats')){writes++;entered();await gate;}return result;});
+  const work=worker.fetch(request(listener),{...testEnv,DB:db});await ready;
+  try {
+   const response=await Promise.race([work,new Promise<never>((_,reject)=>setTimeout(()=>reject(new Error('Waited for original committed save reply')),1200))]);
+   expect(await response.json()).toEqual(defaultConfiguration);expect(writes).toBe(1);
+   const row=await env.DB.prepare('SELECT details FROM diagnostics WHERE request_id=?').bind(response.headers.get('x-request-id')).first<{details:string}>(),timing=JSON.parse(row!.details);
+   expect(timing).toMatchObject({heartbeat_result_source:'receipt',heartbeat_receipt_outcome:'matched',db_stages:{heartbeat_storage_ms:{calls:1,unfinished:1},heartbeat_receipt_ms:{calls:1,completed:1,statements:1}}});
+   expect(timing.db_stages.heartbeat_storage_ms.sql_ms).toBeUndefined();
+   expect(timing).not.toHaveProperty('__heartbeatReceipt');
+  }finally{release();await work;}
+ });
+ it('recovers a committed save even if only its original response fails',async()=>{
+  const {listener}=await paired();let writes=0;
+  const db=interceptDB(async(sql,_args,method,execute)=>{const result=await execute();if(method==='batch'&&sql.startsWith('INSERT INTO heartbeats')){writes++;throw new Error('lost committed reply');}return result;});
+  expect((await worker.fetch(request(listener),{...testEnv,DB:db})).status).toBe(200);expect(writes).toBe(1);
+ });
+ it('does not borrow another heartbeat receipt when its write fails before commit',async()=>{
+  const {listener}=await paired();expect((await call('listener/heartbeat',listener,beat(listener))).status).toBe(200);
+  const before=await env.DB.prepare('SELECT metadata FROM heartbeats WHERE listener_id=?').bind(listener.deviceId).first<{metadata:string}>();let writes=0;
+  const db=interceptDB(async(sql,_args,method,execute)=>{if(method==='batch'&&sql.startsWith('INSERT INTO heartbeats')){writes++;throw new Error('save did not commit');}return execute();});
+  expect((await worker.fetch(request(listener),{...testEnv,DB:db})).status).toBe(503);expect(writes).toBe(1);
+  expect(await env.DB.prepare('SELECT metadata FROM heartbeats WHERE listener_id=?').bind(listener.deviceId).first()).toEqual(before);
+ });
+ it('refuses a removed pairing as proof of a delayed save whose reply later fails',async()=>{
+  const {listener}=await paired();let release!:()=>void,entered!:()=>void,proof!:()=>void;
+  const gate=new Promise<void>(r=>{release=r;}),ready=new Promise<void>(r=>{entered=r;}),proofDone=new Promise<void>(r=>{proof=r;});
+  const db=interceptDB(async(sql,_args,method,execute)=>{
+   const result=await execute();if(method==='batch'&&sql.startsWith('INSERT INTO heartbeats')){entered();await gate;throw new Error('late lost reply');}
+   if(method==='all'&&sql.includes("json_extract(h.metadata,'$.__heartbeatReceipt')"))proof();return result;
+  });
+  let complete=false;const work=worker.fetch(request(listener),{...testEnv,DB:db}).then(r=>{complete=true;return r;});await ready;
+  try {await env.DB.prepare('DELETE FROM pairs WHERE listener_id=?').bind(listener.deviceId).run();await proofDone;expect(complete).toBe(false);}
+  finally{release();expect((await work).status).toBe(503);}
+ });
+});
