@@ -15,7 +15,7 @@ struct SettingsView: View {
             Form {
                 Section("Settings status") { Text(model.settingsSyncStatus) }
                 Section {
-                    Picker("Alert after crying for", selection: setting(\.alertDuration)) {
+                    Picker("Alert after loud sound for", selection: setting(\.alertDuration)) {
                         ForEach(alertDurations, id: \.self) { value in
                             Text(alertDurationText(value)).tag(value)
                         }
@@ -28,7 +28,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Alert timing")
                 } footer: {
-                    Text("The timer starts after crying-like sound is confirmed. Sound is checked for a few seconds before the timer starts.")
+                    Text("The timer counts from the start of sustained loud sound, including the initial sound check. Brief noises are filtered out.")
                 }
                 Section {
                     Picker("Reset timer after quiet", selection: setting(\.quietResetDuration)) {
@@ -203,7 +203,7 @@ struct AlertTimingView: View {
                         }
                     }.pickerStyle(.inline).accessibilityIdentifier("quickAlertDuration")
                 } footer: {
-                    Text("The timer starts after a few seconds of confirmed crying-like sound.")
+                    Text("The timer counts from the start of sustained loud sound, including the initial sound check. Brief noises are filtered out.")
                 }
                 Section { Text(model.settingsSyncStatus) }
             }.navigationTitle("Alert timing")
