@@ -41,6 +41,18 @@ private final class DiagnosticsURLProtocol: URLProtocol, @unchecked Sendable {
 }
 
 final class DiagnosticsTests: XCTestCase {
+    @MainActor func testPhoneReceiptRetainsOSDateAndPriorityWithoutInventingDeliveryOrRepeatingHistory() {
+        let log = DiagnosticLog(directory: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
+        let event = UUID(), episode = UUID(), delivered = Date(timeIntervalSince1970: 1_700_000_000)
+        log.phoneNotification(eventID: event, episodeID: episode, deliveredAt: delivered, interruptionLevel: 2, phase: "retained")
+        log.phoneNotification(eventID: event, episodeID: episode, deliveredAt: delivered, interruptionLevel: 2, phase: "retained")
+        log.phoneNotification(eventID: event, episodeID: episode, deliveredAt: delivered, interruptionLevel: 2, phase: "private-phase")
+        log.phoneNotification(eventID: event, episodeID: episode, deliveredAt: delivered, interruptionLevel: 99, phase: "opened")
+        let entries = log.lines.filter { $0.contains("phone_notification") }
+        XCTAssertEqual(entries.count, 1)
+        XCTAssertTrue(entries[0].contains("delivered_at_ms=1700000000000 interruption_level=2"))
+        XCTAssertFalse(log.export.contains("private-phase"))
+    }
     @MainActor func testBackendClockHeadersAreConsumedAndInvalidSamplesClearTheEstimate() async throws {
         let config = URLSessionConfiguration.ephemeral;config.protocolClasses = [DiagnosticsURLProtocol.self]
         let session = URLSession(configuration: config);defer { session.invalidateAndCancel() }

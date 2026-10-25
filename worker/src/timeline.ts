@@ -62,13 +62,13 @@ export async function timeline(env:Env,device:Device) {
   env.DB.prepare(`SELECT payload FROM timeline_events WHERE parent_id=? AND listener_id=? AND pair_created_at=? AND occurred_at<?
    AND kind IN ('monitoring_started','monitoring_stopped','monitoring_paused','audio_interrupted','audio_resumed','monitoring_unverified','monitoring_observed','stopped_observed','standby_observed','heartbeat_missing','connection_restored','coverage_active','coverage_stopped','coverage_standby') ORDER BY occurred_at DESC,id DESC LIMIT 1`)
    .bind(pair.parent_id,pair.listener_id,pair.created_at,cutoff).first<{payload:string}>(),
-  env.DB.prepare(`SELECT episode_id,push_target,status,COALESCE(json_extract(payload,'$.isTest'),0) AS test,
+  env.DB.prepare(`SELECT episode_id,CASE WHEN delivery_state IS NOT NULL THEN 'both' ELSE push_target END AS push_target,status,COALESCE(json_extract(payload,'$.isTest'),0) AS test,
    COUNT(*) AS count,MIN(COALESCE(sent_at,json_extract(payload,'$.createdAt'))) AS first_at,
    MAX(COALESCE(sent_at,json_extract(payload,'$.createdAt'))) AS last_at
    FROM events WHERE parent_id=? AND listener_id=? AND created_at>=? AND
    COALESCE(sent_at,json_extract(payload,'$.createdAt'))>=? AND COALESCE(sent_at,json_extract(payload,'$.createdAt'))<=?
    AND (acknowledged_at IS NULL OR sent_at IS NOT NULL)
-   GROUP BY episode_id,push_target,status,test ORDER BY first_at DESC LIMIT 401`)
+   GROUP BY episode_id,CASE WHEN delivery_state IS NOT NULL THEN 'both' ELSE push_target END,status,test ORDER BY first_at DESC LIMIT 401`)
    .bind(pair.parent_id,pair.listener_id,pair.created_at,new Date(cutoff).toISOString(),new Date(now).toISOString())
    .all<{episode_id:string;push_target:string|null;status:string;test:number;count:number;first_at:string;last_at:string}>(),
   env.DB.prepare(`SELECT id,state,status,sent_at,created_at FROM connection_notices WHERE parent_id=? AND listener_id=? AND created_at>=? ORDER BY created_at DESC LIMIT 201`)

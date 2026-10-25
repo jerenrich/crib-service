@@ -10,7 +10,7 @@ enum ConnectionWarningNotification {
         content.title = "Monitoring connection check overdue"
         content.body = "No verified connection check for 3 minutes. Check both phones. Internet may be unavailable, or iOS may have paused Parent Mode. Open Crib Service to check."
         content.sound = .default
-        content.interruptionLevel = watch ? .timeSensitive : .active
+        content.interruptionLevel = .timeSensitive
         content.threadIdentifier = "parent-connection"
         content.userInfo = ["localConnectionWarning": true]
         return UNNotificationRequest(identifier: identifier, content: content,

@@ -332,7 +332,7 @@ private struct TimelineEventRow: View {
 }
 
 private extension TimelineEvent {
-    var destination: String { target == "watch" ? "Apple Watch" : target == "phone" ? "Parent iPhone" : "Receiver" }
+    var destination: String { target == "both" ? "Parent iPhone and Apple Watch" : target == "watch" ? "Apple Watch" : target == "phone" ? "Parent iPhone" : "Receiver" }
     var timelineTitle: String {
         switch kind {
         case "monitoring_observed": "Monitoring reported active"

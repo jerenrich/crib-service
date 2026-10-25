@@ -1,3 +1,4 @@
+import {deliverToBoth} from './dual-delivery';
 import {timelineInsert,missingHeartbeat} from './timeline';
 import {APIError,requireRole,type Device,type Env} from './types';
 import {sendConnectionPush,type PushResult} from './apns';
@@ -42,10 +43,13 @@ export async function flushConnections(env:Env,requestId=crypto.randomUUID()) {
  }
  // Recovery updates status/history quietly, including notices queued by older versions.
  await env.DB.prepare("UPDATE connection_notices SET status='cancelled',lease_until=NULL WHERE state='online' AND status IN ('pending','blocked')").run();
- const interrupted=await env.DB.prepare("UPDATE connection_notices SET status='uncertain',lease_until=NULL WHERE status='sending' AND lease_until<? RETURNING id,attempts").bind(now).all<{id:string;attempts:number}>();
+ const bothAccepted="delivery_state IS NOT NULL AND json_extract(delivery_state,'$.phone')='sent' AND json_extract(delivery_state,'$.watch')='sent'";
+ const interrupted=await env.DB.prepare(`UPDATE connection_notices SET status=CASE WHEN ${bothAccepted} THEN 'sent' ELSE 'uncertain' END,
+  sent_at=CASE WHEN ${bothAccepted} THEN COALESCE(sent_at,?) ELSE sent_at END,lease_until=NULL
+  WHERE status='sending' AND lease_until<? RETURNING id,attempts,status`).bind(new Date(now).toISOString(),now).all<{id:string;attempts:number;status:string}>();
  for(const notice of interrupted.results){
   let eventRef:string|undefined;try{eventRef=await eventReference(env,notice.id);}catch{/* Best effort. */}
-  await recordDiagnostic(env,{requestId,started:now,operation:'dispatch',stage:'claim',outcome:'dispatch_interrupted',eventRef,attempt:notice.attempts,details:{dispatch_source:'connection'}});
+  await recordDiagnostic(env,{requestId,started:now,operation:notice.status==='sent'?'dispatch_outcome':'dispatch',stage:'claim',outcome:notice.status==='sent'?'sent':'dispatch_interrupted',eventRef,attempt:notice.attempts,details:{dispatch_source:'connection'}});
  }
  const pending=await env.DB.prepare(`SELECT n.id FROM connection_notices n WHERE n.status IN ('pending','blocked') AND n.next_attempt<=? ORDER BY n.created_at LIMIT 25`).bind(now).all<{id:string}>();
  for(const {id} of pending.results){
@@ -54,7 +58,7 @@ export async function flushConnections(env:Env,requestId=crypto.randomUUID()) {
   try{eventRef=await eventReference(env,id);}catch{/* Best effort. */}
   const record=(outcome:Outcome,operation:'dispatch'|'dispatch_skip'='dispatch')=>recordDiagnostic(env,{requestId,started,operation,stage,outcome,eventRef,target,httpStatus:result?.httpStatus,attempt,details:latency.details});
   try {
-  const notice=await latency.read<{id:string;parent_id:string;listener_id:string;state:string;created_at:number;attempts:number}>('claim_ms',env.DB.prepare(`UPDATE connection_notices SET status='sending',lease_until=?,attempts=attempts+1 WHERE id=? AND status IN ('pending','blocked') RETURNING *`)
+  const notice=await latency.read<{id:string;parent_id:string;listener_id:string;state:string;created_at:number;attempts:number;delivery_state:string|null}>('claim_ms',env.DB.prepare(`UPDATE connection_notices SET status='sending',lease_until=?,attempts=attempts+1,delivery_state=COALESCE(delivery_state,CASE WHEN EXISTS(SELECT 1 FROM devices WHERE id=connection_notices.parent_id AND push_token IS NOT NULL AND watch_push_token IS NOT NULL) THEN '{"phone":"pending","watch":"pending"}' ELSE NULL END) WHERE id=? AND status IN ('pending','blocked') RETURNING *`)
    .bind(now+30000,id));
   if(!notice){latency.details.exit_reason='not_pending';await record('claim_skipped','dispatch_skip');continue;}
   attempt=notice.attempts;stage='storage';
@@ -66,6 +70,15 @@ export async function flushConnections(env:Env,requestId=crypto.randomUUID()) {
   if((notice.state!=='offline'&&notice.state!=='stopped')||!context?.connection_alerts||current!==notice.state||now-notice.created_at>600000){
    await latency.db('outcome_storage_ms',()=>env.DB.prepare("UPDATE connection_notices SET status='cancelled',lease_until=NULL WHERE id=?").bind(id).run());
    await record('notice_cancelled','dispatch_skip');continue;
+  }
+  if(notice.delivery_state){
+   const state=await deliverToBoth(env,{table:'connection_notices',id,parentId:notice.parent_id,attempt:notice.attempts,
+    state:notice.delivery_state,phoneToken:context.push_token,watchToken:context.watch_push_token,
+    requestId,eventRef,source:'connection',send:(destination,token,timing)=>sendConnectionPush(env,token,id,notice.state as 'offline'|'stopped',destination,timing)});
+   latency.details.push_outcome=state==='pending'?'retry':state;
+   await recordDiagnostic(env,{requestId,started,operation:'dispatch_outcome',stage:'storage',eventRef,attempt,
+    outcome:state==='pending'?'retry':state,details:latency.details});
+   continue;
   }
   target=context.watch_push_token?'watch':'phone';const token=context.watch_push_token??context.push_token;
   result={status:'blocked',reason:'no_push_token'};stage='push';

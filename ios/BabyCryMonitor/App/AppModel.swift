@@ -1150,7 +1150,7 @@ import UIKit
             }
             if alert.eventId == latestTestEventID {
                 if case .success(let receipt) = result, receipt.status == "sent" {
-                    testPushStatus = "APNs accepted the test push. Check your registered Apple Watch, or the Parent iPhone if Watch alerts are not set up."
+                    testPushStatus = "APNs accepted the test push. Check the Parent iPhone and any registered Apple Watch."
                     log.record("test_push_apns_accepted")
                 } else { testPushStatus = "Test push: \(deliveryStatus)" }
             }

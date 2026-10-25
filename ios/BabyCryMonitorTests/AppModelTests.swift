@@ -1316,7 +1316,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(changed.localConnectionDeadline)
     }
 
-    @MainActor func testLocalWarningNotificationHasSoundAndWatchTimeSensitiveHapticsWithoutCryActions() throws {
+    @MainActor func testLocalWarningNotificationIsTimeSensitiveOnPhoneAndWatchWithoutCryActions() throws {
         let now = Date()
         for watch in [false, true] {
             let request = ConnectionWarningNotification.request(deadline: now.addingTimeInterval(180), now: now, watch: watch)
@@ -1324,7 +1324,7 @@ final class AppModelTests: XCTestCase {
             XCTAssertEqual((request.trigger as? UNTimeIntervalNotificationTrigger)?.timeInterval, 180)
             XCTAssertFalse(try XCTUnwrap(request.trigger).repeats)
             XCTAssertNotNil(request.content.sound)
-            XCTAssertEqual(request.content.interruptionLevel, watch ? .timeSensitive : .active)
+            XCTAssertEqual(request.content.interruptionLevel, .timeSensitive)
             XCTAssertEqual(request.content.categoryIdentifier, "")
             XCTAssertNil(request.content.userInfo["eventId"])
             XCTAssertEqual(request.content.userInfo["localConnectionWarning"] as? Bool, true)

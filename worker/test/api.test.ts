@@ -70,6 +70,7 @@ describe('connection alerts, readiness and replacement',()=>{
   await stale();mockPush();await flushConnections(testEnv);await flushConnections(testEnv);
   expect(pushRequests).toHaveLength(1);
   const content=JSON.parse(String(pushRequests[0].init?.body));expect(content.connectionState).toBe('offline');expect(content.eventId).toBeUndefined();
+  expect(content.aps['interruption-level']).toBe('time-sensitive');expect(content.aps).not.toHaveProperty('sound');
   await call('listener/heartbeat',listener,beat(listener));await flushConnections(testEnv);await flushConnections(testEnv);
   expect(pushRequests).toHaveLength(1);
   expect((await env.DB.prepare('SELECT state FROM connection_states WHERE listener_id=?').bind(listener.deviceId).first<{state:string}>())?.state).toBe('online');
@@ -94,9 +95,10 @@ describe('connection alerts, readiness and replacement',()=>{
   await env.DB.prepare('UPDATE heartbeats SET received_at=?').bind(new Date(Date.now()-179000).toISOString()).run();
   await check();expect(pushRequests).toHaveLength(0);
   await env.DB.prepare('UPDATE heartbeats SET received_at=?').bind(new Date(Date.now()-181000).toISOString()).run();
-  mockPush();await check();await check();
-  expect(pushRequests).toHaveLength(1);expect(pushRequests[0].url).toContain('cd'.repeat(32));
-  const content=JSON.parse(String(pushRequests[0].init?.body));
+  mockPush(200,2);await check();await check();
+  expect(pushRequests).toHaveLength(2);
+  const content=JSON.parse(String(pushRequests.find(r=>r.url.includes('cd'.repeat(32)))!.init?.body));
+  expect(JSON.parse(String(pushRequests.find(r=>r.url.includes('ab'.repeat(32)))!.init?.body)).aps['interruption-level']).toBe('time-sensitive');
   expect(content.connectionState).toBe('offline');
   expect(content.aps.alert.title).toBe('Listener connection lost');
   expect(content.aps.sound).toBe('default');
@@ -126,8 +128,8 @@ describe('connection alerts, readiness and replacement',()=>{
   await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
   await call('listener/heartbeat',listener,beat(listener));
   if(state==='offline')await stale();else await call('listener/heartbeat',listener,beat(listener,false));
-  mockPush();await flushConnections(testEnv);
-  expect(pushRequests).toHaveLength(1);expect(pushRequests[0].url).toContain('cd'.repeat(32));
+  mockPush(200,2);await flushConnections(testEnv);
+  expect(pushRequests).toHaveLength(2);
   expect(JSON.parse(String(pushRequests[0].init?.body)).connectionState).toBe(state);
   await call('listener/heartbeat',listener,beat(listener));
   for(const status of ['pending','blocked']){
@@ -135,7 +137,7 @@ describe('connection alerts, readiness and replacement',()=>{
     .bind(crypto.randomUUID(),listener.deviceId,parent.deviceId,`${new Date().toISOString()}-${status}`,Date.now(),status,Date.now()+3600000).run();
   }
   await flushConnections(testEnv);await flushConnections(testEnv);
-  expect(pushRequests).toHaveLength(1);
+  expect(pushRequests).toHaveLength(2);
   const notices=await env.DB.prepare("SELECT status FROM connection_notices WHERE state='online'").all<{status:string}>();
   expect(notices.results.map(n=>n.status)).toEqual(['cancelled','cancelled']);
   expect((await env.DB.prepare('SELECT state FROM connection_states WHERE listener_id=?').bind(listener.deviceId).first<{state:string}>())?.state).toBe('online');
@@ -147,14 +149,20 @@ describe('connection alerts, readiness and replacement',()=>{
   await Promise.all([flushConnections(testEnv),flushConnections(testEnv)]);expect(pushRequests).toHaveLength(2);
   expect(pushRequests[0].init?.headers).toEqual(pushRequests[1].init?.headers);
  });
- it('falls back after an explicitly invalid Watch token without replaying uncertain sends',async()=>{
-  const {parent,listener}=await paired();await call('connection-alerts',parent,{enabled:true});
+ it('invalidates only the rejected connection destination and never replays the accepted phone warning',async()=>{
+  const {parent,listener}=await paired();
   await call('device/push-token',parent,{token:'ab'.repeat(32)});await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
   await call('listener/heartbeat',listener,beat(listener));await stale();
-  pushResponses.push(new Response(JSON.stringify({reason:'BadDeviceToken'}),{status:400}));await flushConnections(testEnv);
-  await env.DB.prepare('UPDATE connection_notices SET next_attempt=0').run();mockPush();await flushConnections(testEnv);
-  expect(pushRequests[0].url).toContain('cd'.repeat(32));expect(pushRequests[1].url).toContain('ab'.repeat(32));
-  expect(JSON.parse(String(pushRequests[1].init?.body)).aps.sound).toBeUndefined();
+  vi.mocked(fetch).mockImplementation(async(input,init)=>{
+   pushRequests.push({url:String(input),init});
+   return String(input).includes('cd'.repeat(32))?new Response(JSON.stringify({reason:'BadDeviceToken'}),{status:400}):new Response(null,{status:200});
+  });
+  await flushConnections(testEnv);
+  await env.DB.prepare('UPDATE connection_notices SET next_attempt=0').run();await flushConnections(testEnv);
+  expect(pushRequests).toHaveLength(2);
+  expect(await env.DB.prepare('SELECT watch_push_token FROM devices WHERE id=?').bind(parent.deviceId).first()).toMatchObject({watch_push_token:null});
+  const saved=await env.DB.prepare('SELECT delivery_state FROM connection_notices').first<{delivery_state:string}>();
+  expect(JSON.parse(saved!.delivery_state)).toEqual({phone:'sent',watch:'blocked'});
  });
  it('keeps desired settings separate from settings reported by the Listener',async()=>{
   const {parent,listener}=await paired();const desired={...defaultConfiguration,alertDuration:30};
@@ -377,19 +385,23 @@ describe('direct Apple Watch alerts',()=>{
   status=await (await call('listener/status',parent,undefined,'GET')).json() as {watchPushRegistered:boolean};
   expect(status.watchPushRegistered).toBe(false);
  });
- it('sends one haptic-capable Watch notification under the Watch topic',async()=>{
+ it.each([false,true])('sends a Time Sensitive alert to both registered devices once (test=%s)',async(isTest)=>{
   const {parent,listener}=await paired();
   await call('device/push-token',parent,{token:'ab'.repeat(32)});
   await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
-  const event={...alert(listener),isTest:true};mockPush();
+  const event={...alert(listener),...(isTest?{isTest:true}:{})};mockPush(200,2);
   expect(await (await call('listener/event',listener,event)).json()).toEqual({status:'sent'});
   await call('listener/event',listener,event);await flushPending(testEnv);
-  expect(pushRequests).toHaveLength(1);
-  expect(pushRequests[0].url).toContain('cd'.repeat(32));
-  expect(new Headers(pushRequests[0].init?.headers).get('apns-topic')).toBe('com.example.BabyCryMonitor.watchkitapp');
-  expect(JSON.parse(String(pushRequests[0].init?.body))).toMatchObject({aps:{sound:'default',category:'BABY_CRY_ALERT','interruption-level':'time-sensitive'},eventId:event.eventId,createdAt:event.createdAt,isTest:true});
-  const status=await (await call('listener/status',parent,undefined,'GET')).json() as {alerts:{deliveryTarget:string}[]};
-  expect(status.alerts[0].deliveryTarget).toBe('watch');
+  expect(pushRequests).toHaveLength(2);
+  for(const target of ['phone','watch']){
+   const request=pushRequests.find(r=>r.url.includes((target==='phone'?'ab':'cd').repeat(32)))!;
+   expect(new Headers(request.init?.headers).get('apns-topic')).toBe(testEnv.APNS_BUNDLE_ID+(target==='watch'?'.watchkitapp':''));
+   const content=JSON.parse(String(request.init?.body));
+   expect(content).toMatchObject({aps:{category:'BABY_CRY_ALERT','interruption-level':'time-sensitive'},eventId:event.eventId,createdAt:event.createdAt});
+   if(target==='watch')expect(content.aps.sound).toBe('default');else expect(content.aps).not.toHaveProperty('sound');
+  }
+  const status=await (await call('listener/status',parent,undefined,'GET')).json() as {alerts:{deliveryTarget:string;deliveryState:unknown}[]};
+  expect(status.alerts[0]).toMatchObject({deliveryTarget:'both',deliveryState:{phone:'sent',watch:'sent'}});
  });
  it('keeps an accepted phone alert on the phone when a Watch registers later',async()=>{
   const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
@@ -398,30 +410,98 @@ describe('direct Apple Watch alerts',()=>{
   await call('listener/event',listener,event);await flushPending(testEnv);
   expect(pushRequests).toHaveLength(1);expect(pushRequests[0].url).toContain('ab'.repeat(32));
  });
- it('preserves the Watch destination after explicit rejection, without duplicating to iPhone',async()=>{
+ it.each(['phone','watch'] as const)('retries only the explicitly rejected %s destination without duplicating its accepted partner',async(rejected)=>{
   const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
   await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
-  const event=alert(listener);mockPush(503);await call('listener/event',listener,event);
-  await env.DB.prepare('UPDATE events SET next_attempt=0 WHERE event_id=?').bind(event.eventId).run();mockPush();
-  await flushPending(testEnv);
-  expect(pushRequests).toHaveLength(2);expect(pushRequests.every(r=>r.url.includes('cd'.repeat(32)))).toBe(true);
+  let reject=true;
+  vi.mocked(fetch).mockImplementation(async(input,init)=>{
+   pushRequests.push({url:String(input),init});
+   const failing=String(input).includes((rejected==='phone'?'ab':'cd').repeat(32))&&reject;
+   return new Response(failing?JSON.stringify({reason:'ServiceUnavailable'}):null,{status:failing?503:200});
+  });
+  const event=alert(listener);expect(await (await call('listener/event',listener,event)).json()).toEqual({status:'pending'});
+  reject=false;await env.DB.prepare('UPDATE events SET next_attempt=0 WHERE event_id=?').bind(event.eventId).run();
+  await Promise.all([flushPending(testEnv),flushPending(testEnv)]);
+  expect(pushRequests).toHaveLength(3);
+  expect(pushRequests.filter(r=>r.url.includes((rejected==='phone'?'ab':'cd').repeat(32)))).toHaveLength(2);
+  expect(await env.DB.prepare('SELECT status,delivery_state FROM events WHERE event_id=?').bind(event.eventId).first()).toMatchObject({status:'sent',delivery_state:JSON.stringify({phone:'sent',watch:'sent'})});
  });
- it('falls back to the phone only after the Watch token is explicitly rejected as invalid',async()=>{
+ it('keeps phone acceptance when the Watch token is invalid and retries only a replacement Watch token',async()=>{
   const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
   await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
-  const event=alert(listener);pushResponses.push(new Response(JSON.stringify({reason:'Unregistered'}),{status:410}));
-  expect(await (await call('listener/event',listener,event)).json()).toEqual({status:'pending'});
-  mockPush();await flushPending(testEnv);
-  expect(pushRequests).toHaveLength(2);expect(pushRequests[1].url).toContain('ab'.repeat(32));
-  expect(JSON.parse(String(pushRequests[1].init?.body)).aps).not.toHaveProperty('sound');
+  vi.mocked(fetch).mockImplementation(async(input,init)=>{
+   pushRequests.push({url:String(input),init});
+   return String(input).includes('cd'.repeat(32))?new Response(JSON.stringify({reason:'Unregistered'}),{status:410}):new Response(null,{status:200});
+  });
+  const event=alert(listener);expect(await (await call('listener/event',listener,event)).json()).toEqual({status:'blocked'});
+  await call('device/watch-push-token',parent,{token:'ef'.repeat(32)});await flushPending(testEnv);
+  expect(pushRequests).toHaveLength(3);expect(pushRequests.filter(r=>r.url.includes('ab'.repeat(32)))).toHaveLength(1);
+  expect(pushRequests[2].url).toContain('ef'.repeat(32));
  });
- it('does not replay an uncertain Watch delivery on the phone',async()=>{
+ it('does not replay an uncertain Watch delivery or the accepted phone delivery',async()=>{
   const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
   await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
-  const event=alert(listener);pushResponses.push(new Error('connection lost'));
-  expect(await (await call('listener/event',listener,event)).json()).toEqual({status:'uncertain'});
+  vi.mocked(fetch).mockImplementation(async(input,init)=>{
+   pushRequests.push({url:String(input),init});if(String(input).includes('cd'.repeat(32)))throw new Error('connection lost');
+   return new Response(null,{status:200});
+  });
+  const event=alert(listener);expect(await (await call('listener/event',listener,event)).json()).toEqual({status:'uncertain'});
   await call('device/watch-push-token',parent,{token:null});await flushPending(testEnv);
-  expect(pushRequests).toHaveLength(1);
+  expect(pushRequests).toHaveLength(2);
+  const saved=await env.DB.prepare('SELECT delivery_state FROM events WHERE event_id=?').bind(event.eventId).first<{delivery_state:string}>();
+  expect(JSON.parse(saved!.delivery_state)).toEqual({phone:'sent',watch:'uncertain'});
+ });
+ it.each(['snooze','stop','resolve'] as const)('suppresses a pending second destination after %s',async(action)=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
+  vi.mocked(fetch).mockImplementation(async(input,init)=>{
+   pushRequests.push({url:String(input),init});const reject=String(input).includes('cd'.repeat(32));
+   return new Response(reject?JSON.stringify({reason:'ServiceUnavailable'}):null,{status:reject?503:200});
+  });
+  await env.DB.prepare('UPDATE pairs SET created_at=? WHERE parent_id=?').bind(Date.now()-3600000,parent.deviceId).run();
+  const event=alert(listener);await call('listener/event',listener,event);
+  if(action==='snooze')expect((await call('alert/acknowledge',parent,{eventId:event.eventId})).status).toBe(200);
+  if(action==='stop')expect((await call('monitoring',parent,{id:crypto.randomUUID(),enabled:false})).status).toBe(200);
+  if(action==='resolve')expect((await call('listener/heartbeat',listener,{listenerId:listener.deviceId,timestamp:new Date().toISOString(),monitoring:true,powerConnected:true,state:'quiet',episodes:[{id:event.episodeId,startedAt:event.cryStartedAt,endedAt:new Date().toISOString(),quietConfirmed:true}]})).status).toBe(200);
+  await env.DB.prepare('UPDATE events SET next_attempt=0 WHERE event_id=?').bind(event.eventId).run();await flushPending(testEnv);
+  expect(pushRequests).toHaveLength(2);
+ });
+ it('sends a new reminder to both destinations with the original event identity per delivery',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
+  const event=alert(listener);mockPush(200,2);await call('listener/event',listener,event);
+  await env.DB.prepare('UPDATE events SET created_at=? WHERE event_id=?').bind(Date.now()-6000,event.eventId).run();
+  mockPush(200,2);await runReminder(testEnv,parent.deviceId);
+  expect(pushRequests).toHaveLength(4);
+  const repeat=pushRequests.slice(2).map(r=>JSON.parse(String(r.init?.body)));
+  expect(repeat[0].eventId).toBe(repeat[1].eventId);expect(repeat[0].eventId).not.toBe(event.eventId);
+  expect(repeat.every(p=>p.aps['interruption-level']==='time-sensitive')).toBe(true);
+ });
+ it('preserves a replacement token registered during rejection without replaying the other destination',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
+  vi.mocked(fetch).mockImplementation(async(input,init)=>{
+   pushRequests.push({url:String(input),init});
+   if(String(input).includes('cd'.repeat(32))){
+    await call('device/watch-push-token',parent,{token:'ef'.repeat(32)});
+    return new Response(JSON.stringify({reason:'Unregistered'}),{status:410});
+   }
+   return new Response(null,{status:200});
+  });
+  const event=alert(listener);expect(await (await call('listener/event',listener,event)).json()).toEqual({status:'pending'});
+  await env.DB.prepare('UPDATE events SET next_attempt=0 WHERE event_id=?').bind(event.eventId).run();await flushPending(testEnv);
+  expect(pushRequests).toHaveLength(3);expect(pushRequests[2].url).toContain('ef'.repeat(32));
+ });
+ it.each([true,false])('recovers an interrupted aggregate without replaying sends (both accepted=%s)',async(bothAccepted)=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
+  const event={...alert(listener),isTest:true};mockPush(200,2);await call('listener/event',listener,event);
+  const state={phone:'sent',watch:bothAccepted?'sent':'pending'};
+  await env.DB.prepare("UPDATE events SET status='sending',sent_at=NULL,lease_until=0,delivery_state=? WHERE event_id=?")
+   .bind(JSON.stringify(state),event.eventId).run();
+  await flushPending(testEnv);expect(pushRequests).toHaveLength(2);
+  const saved=await env.DB.prepare('SELECT status,sent_at FROM events WHERE event_id=?').bind(event.eventId).first<{status:string;sent_at:string|null}>();
+  expect(saved!.status).toBe(bothAccepted?'sent':'uncertain');expect(Boolean(saved!.sent_at)).toBe(bothAccepted);
  });
  it('does not reawaken an acknowledged episode when the Watch registers',async()=>{
   const {parent,listener}=await paired();const event=alert(listener);
@@ -470,6 +550,7 @@ describe('APNs and durable idempotent alerts',()=>{
  });
  it('omits audible sound and signs an ES256 provider JWT',async()=>{
   const notification=payload(alert(device('listener')));expect(notification.aps).not.toHaveProperty('sound');
+  expect(notification.aps['interruption-level']).toBe('time-sensitive');
   expect(notification.aps.alert.title).toBe('Baby is crying');
   expect(notification).not.toHaveProperty('isTest');
   const timed=(durationSeconds:number)=>payload({...alert(device('listener')),durationSeconds}).aps.alert.body;
@@ -1816,6 +1897,7 @@ describe('Listener-originated silent alarm experiment',()=>{
   expect(content.eventId).toBe(receipt.eventId);
   expect(content.isTest).toBe(true);expect(content.silentAlarmTest).toBe(true);
   expect(content.aps['content-available']).toBe(1);
+  expect(content.aps['interruption-level']).toBe('time-sensitive');
   expect(content.aps.alert.title).toContain('Test');
   expect(content.aps.sound).toBeUndefined();
   expect(content.aps.category).toBe('SILENT_ALARM_TEST');
@@ -1867,16 +1949,17 @@ describe('optional overnight silent Watch alarms',()=>{
   expect(bodies.find(b=>!b.silentCryAlarm)?.aps.sound).toBe('default');
   expect(bodies[0].eventId).toBe(bodies[1].eventId);
  });
- it('keeps the original Watch notification successful if the additional phone push fails',async()=>{
+ it('retains Watch acceptance while retrying a rejected phone delivery with the optional alarm enabled',async()=>{
   const {parent,listener}=await setup();await call('silent-watch-alarms',parent,{enabled:true});
   fanout(200,503);const event=alert(listener);
-  const response=await call('listener/event',listener,event);
-  expect(response.status).toBe(200);expect(await response.json()).toEqual({status:'sent'});
-  expect(pushRequests).toHaveLength(2);
-  expect(await env.DB.prepare('SELECT status,push_target FROM events WHERE event_id=?').bind(event.eventId).first()).toMatchObject({status:'sent',push_target:'watch'});
-  expect(await env.DB.prepare("SELECT outcome FROM diagnostics WHERE operation='silent_cry_alarm_dispatch'").first()).toMatchObject({outcome:'apns_503'});
+  expect(await (await call('listener/event',listener,event)).json()).toEqual({status:'pending'});
+  const row=await env.DB.prepare('SELECT delivery_state FROM events WHERE event_id=?').bind(event.eventId).first<{delivery_state:string}>();
+  expect(JSON.parse(row!.delivery_state)).toEqual({phone:'pending',watch:'sent'});
+  fanout();await env.DB.prepare('UPDATE events SET next_attempt=0 WHERE event_id=?').bind(event.eventId).run();await flushPending(testEnv);
+  expect(pushRequests).toHaveLength(3);
+  expect(pushRequests.filter(r=>new Headers(r.init?.headers).get('apns-topic')!.endsWith('.watchkitapp'))).toHaveLength(1);
  });
- it('returns the original send while an auxiliary send is stalled',async()=>{
+ it('submits and persists Watch acceptance while the phone send is stalled',async()=>{
   const {parent,listener}=await setup();await call('silent-watch-alarms',parent,{enabled:true});
   const event=alert(listener);
   await env.DB.prepare('INSERT INTO events(event_id,episode_id,listener_id,parent_id,is_repeat,payload,created_at) VALUES(?,?,?,?,?,?,?)')
@@ -1888,11 +1971,17 @@ describe('optional overnight silent Watch alarms',()=>{
    if(!(init?.headers as Record<string,string>)['apns-topic'].endsWith('.watchkitapp')){phoneEntered=true;await gate;}
    return new Response('',{status:200});
   }));
+  const running=dispatchEvent(testEnv,event.eventId,undefined,undefined,{background:{waitUntil:job=>{jobs.push(job);}}});
   try{
-   await dispatchEvent(testEnv,event.eventId,undefined,undefined,{background:{waitUntil:job=>{jobs.push(job);}}});
-   expect(phoneEntered).toBe(true);expect(jobs).toHaveLength(1);
-   expect(await env.DB.prepare('SELECT status FROM events WHERE event_id=?').bind(event.eventId).first()).toMatchObject({status:'sent'});
-  }finally{release();await Promise.all(jobs);}
+   let state:Record<string,string>|undefined;
+   for(let i=0;i<100;i++){
+    const row=await env.DB.prepare('SELECT delivery_state FROM events WHERE event_id=?').bind(event.eventId).first<{delivery_state:string}>();
+    state=row?.delivery_state?JSON.parse(row.delivery_state):undefined;
+    if(state?.watch==='sent')break;
+    await new Promise(r=>setTimeout(r,5));
+   }
+   expect(phoneEntered).toBe(true);expect(pushRequests).toHaveLength(2);expect(state?.watch).toBe('sent');
+  }finally{release();await running;await Promise.all(jobs);}
  });
  it('adds processing to the existing phone notification without duplicating it when Watch routing is absent',async()=>{
   const {parent,listener}=await setup();await call('device/watch-push-token',parent,{token:null});
@@ -1904,13 +1993,14 @@ describe('optional overnight silent Watch alarms',()=>{
  });
  it('does not add alarms when disabled, for tests, or for acknowledged events',async()=>{
   const {parent,listener}=await setup();fanout();
-  await call('listener/event',listener,alert(listener));expect(pushRequests).toHaveLength(1);
+  await call('listener/event',listener,alert(listener));expect(pushRequests).toHaveLength(2);
   await call('silent-watch-alarms',parent,{enabled:true});
   const test={...alert(listener),isTest:true};await call('listener/event',listener,test);
-  expect(pushRequests).toHaveLength(2);
-  const event=alert(listener);await call('listener/event',listener,event);expect(pushRequests).toHaveLength(4);
+  expect(pushRequests).toHaveLength(4);
+  expect(pushRequests.map(r=>JSON.parse(String(r.init?.body))).some(b=>b.silentCryAlarm)).toBe(false);
+  const event=alert(listener);await call('listener/event',listener,event);expect(pushRequests).toHaveLength(6);
   await call('alert/acknowledge',parent,{eventId:event.eventId});
-  await dispatchEvent(testEnv,event.eventId);expect(pushRequests).toHaveLength(4);
+  await dispatchEvent(testEnv,event.eventId);expect(pushRequests).toHaveLength(6);
   await call('silent-watch-alarms',parent,{enabled:false});
   expect((await (await call('listener/status',parent,undefined,'GET')).json() as {silentWatchAlarmsEnabled:boolean}).silentWatchAlarmsEnabled).toBe(false);
  });
@@ -2125,5 +2215,47 @@ describe('heartbeat journal isolation',()=>{
    expect(response.headers.get('x-diagnostics-status')).toBe('queued');expect(response.headers.get('x-diagnostics-elapsed-ms')).toBe('0');
    expect((await env.DB.prepare('SELECT * FROM heartbeats WHERE listener_id=?').bind(listener.deviceId).all()).results).toHaveLength(1);
   }finally{release();await running;await Promise.all(jobs);}
+ });
+});
+
+describe('heartbeat committed-save receipt recovery',()=>{
+ const beat=(listener:TestDevice)=>({listenerId:listener.deviceId,timestamp:new Date().toISOString(),monitoring:true,powerConnected:true,state:'quiet',episodes:[]});
+ const request=(listener:TestDevice)=>new Request('https://monitor.test/v1/listener/heartbeat',{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${listener.deviceId}.${listener.secret}`},body:JSON.stringify(beat(listener))});
+ it('proves its own atomic save while the original reply remains pending',async()=>{
+  const {listener}=await paired();let writes=0,release!:()=>void,entered!:()=>void;
+  const gate=new Promise<void>(r=>{release=r;}),ready=new Promise<void>(r=>{entered=r;});
+  const db=interceptDB(async(sql,_args,method,execute)=>{const result=await execute();if(method==='batch'&&sql.startsWith('INSERT INTO heartbeats')){writes++;entered();await gate;}return result;});
+  const work=worker.fetch(request(listener),{...testEnv,DB:db});await ready;
+  try {
+   const response=await Promise.race([work,new Promise<never>((_,reject)=>setTimeout(()=>reject(new Error('Waited for original committed save reply')),1200))]);
+   expect(await response.json()).toEqual(defaultConfiguration);expect(writes).toBe(1);
+   const row=await env.DB.prepare('SELECT details FROM diagnostics WHERE request_id=?').bind(response.headers.get('x-request-id')).first<{details:string}>(),timing=JSON.parse(row!.details);
+   expect(timing).toMatchObject({heartbeat_result_source:'receipt',heartbeat_receipt_outcome:'matched',db_stages:{heartbeat_storage_ms:{calls:1,unfinished:1},heartbeat_receipt_ms:{calls:1,completed:1,statements:1}}});
+   expect(timing.db_stages.heartbeat_storage_ms.sql_ms).toBeUndefined();
+   expect(timing).not.toHaveProperty('__heartbeatReceipt');
+  }finally{release();await work;}
+ });
+ it('recovers a committed save even if only its original response fails',async()=>{
+  const {listener}=await paired();let writes=0;
+  const db=interceptDB(async(sql,_args,method,execute)=>{const result=await execute();if(method==='batch'&&sql.startsWith('INSERT INTO heartbeats')){writes++;throw new Error('lost committed reply');}return result;});
+  expect((await worker.fetch(request(listener),{...testEnv,DB:db})).status).toBe(200);expect(writes).toBe(1);
+ });
+ it('does not borrow another heartbeat receipt when its write fails before commit',async()=>{
+  const {listener}=await paired();expect((await call('listener/heartbeat',listener,beat(listener))).status).toBe(200);
+  const before=await env.DB.prepare('SELECT metadata FROM heartbeats WHERE listener_id=?').bind(listener.deviceId).first<{metadata:string}>();let writes=0;
+  const db=interceptDB(async(sql,_args,method,execute)=>{if(method==='batch'&&sql.startsWith('INSERT INTO heartbeats')){writes++;throw new Error('save did not commit');}return execute();});
+  expect((await worker.fetch(request(listener),{...testEnv,DB:db})).status).toBe(503);expect(writes).toBe(1);
+  expect(await env.DB.prepare('SELECT metadata FROM heartbeats WHERE listener_id=?').bind(listener.deviceId).first()).toEqual(before);
+ });
+ it('refuses a removed pairing as proof of a delayed save whose reply later fails',async()=>{
+  const {listener}=await paired();let release!:()=>void,entered!:()=>void,proof!:()=>void;
+  const gate=new Promise<void>(r=>{release=r;}),ready=new Promise<void>(r=>{entered=r;}),proofDone=new Promise<void>(r=>{proof=r;});
+  const db=interceptDB(async(sql,_args,method,execute)=>{
+   const result=await execute();if(method==='batch'&&sql.startsWith('INSERT INTO heartbeats')){entered();await gate;throw new Error('late lost reply');}
+   if(method==='all'&&sql.includes("json_extract(h.metadata,'$.__heartbeatReceipt')"))proof();return result;
+  });
+  let complete=false;const work=worker.fetch(request(listener),{...testEnv,DB:db}).then(r=>{complete=true;return r;});await ready;
+  try {await env.DB.prepare('DELETE FROM pairs WHERE listener_id=?').bind(listener.deviceId).run();await proofDone;expect(complete).toBe(false);}
+  finally{release();expect((await work).status).toBe(503);}
  });
 });

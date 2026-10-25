@@ -1,3 +1,4 @@
+import {deliverToBoth} from './dual-delivery';
 import {acceptedDelivery,queueAcceptedDelivery,type AcceptedDelivery} from './accepted-delivery';
 import {stoppedMonitoringSQL} from './monitoring';
 import {scheduleReminders} from './reminders';
@@ -76,13 +77,13 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  let stage:Stage='claim',eventRef:string|undefined,attempt:number|undefined,target:'phone'|'watch'|undefined;
  let pushResult:PushResult|undefined;
  let auxiliary:Promise<void>|undefined;
- const record=(outcome:Outcome,httpStatus?:number,operation:'dispatch'|'dispatch_skip'='dispatch')=>recordDiagnostic(env,{requestId,started:now,operation,stage,outcome,eventRef,attempt,target,httpStatus,details:latency.details});
+ const record=(outcome:Outcome,httpStatus?:number,operation:'dispatch'|'dispatch_skip'|'dispatch_outcome'='dispatch')=>recordDiagnostic(env,{requestId,started:now,operation,stage,outcome,eventRef,attempt,target,httpStatus,details:latency.details});
  try {
  // Diagnostic computation is best effort, just like journal writes.
  try { eventRef=latency.eventRef??await eventReference(env,eventId);latency.eventRef=eventRef; } catch { /* No diagnostic identity available. */ }
  // Tombstones also suppress an offline outbox upload after its episode settled.
  const claimId=crypto.randomUUID();
- type Destination={token:string|null;phone_token:string|null;silent_watch_alarms:number};
+ type Destination={token:string|null;phone_token:string|null;watch_token:string|null;silent_watch_alarms:number};
  type Receipt=StoredEvent & Destination & {pair_current:number};
  const claim=await latency.confirmedClaim<StoredEvent|Destination,Receipt>(()=>env.DB.batch<StoredEvent|Destination>([...(options.insert?[options.insert]:[]),env.DB.prepare(`UPDATE events SET resolved_at=COALESCE(resolved_at,(SELECT r.resolved_at FROM resolved_episodes r
   JOIN pairs p ON p.parent_id=r.parent_id AND p.listener_id=r.listener_id AND p.created_at=r.pair_created_at
@@ -102,12 +103,12 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  AND CAST(ROUND((julianday(json_extract(events.payload,'$.createdAt'))-2440587.5)*86400000) AS INTEGER)<=m.created_at)
  OR (is_repeat=1 AND EXISTS(SELECT 1 FROM events prior WHERE prior.parent_id=events.parent_id AND prior.episode_id=events.episode_id AND prior.acknowledged_at IS NOT NULL AND prior.created_at>=events.created_at))
  )`).bind(new Date(now).toISOString(),eventId,now,now),
- env.DB.prepare("UPDATE events SET status='sending',lease_until=?,claim_id=?,attempts=attempts+1,push_target=COALESCE(push_target,CASE WHEN (SELECT watch_push_token FROM devices WHERE id=events.parent_id) IS NOT NULL THEN 'watch' ELSE 'phone' END) WHERE event_id=? AND status='pending' AND acknowledged_at IS NULL AND resolved_at IS NULL AND next_attempt<=? RETURNING *").bind(now+30000,claimId,eventId,now),
+ env.DB.prepare("UPDATE events SET status='sending',lease_until=?,claim_id=?,attempts=attempts+1,delivery_state=COALESCE(delivery_state,CASE WHEN push_target IS NULL AND EXISTS(SELECT 1 FROM devices WHERE id=events.parent_id AND push_token IS NOT NULL AND watch_push_token IS NOT NULL) THEN '{\"phone\":\"pending\",\"watch\":\"pending\"}' ELSE NULL END),push_target=COALESCE(push_target,CASE WHEN (SELECT watch_push_token FROM devices WHERE id=events.parent_id) IS NOT NULL THEN 'watch' ELSE 'phone' END) WHERE event_id=? AND status='pending' AND acknowledged_at IS NULL AND resolved_at IS NULL AND next_attempt<=? RETURNING *").bind(now+30000,claimId,eventId,now),
  // Read the selected token in the claim transaction, avoiding another remote
  // round trip. A losing claimant must still return before using this result.
- env.DB.prepare(`SELECT CASE e.push_target WHEN 'watch' THEN d.watch_push_token ELSE d.push_token END AS token,d.push_token AS phone_token,d.silent_watch_alarms
+ env.DB.prepare(`SELECT CASE e.push_target WHEN 'watch' THEN d.watch_push_token ELSE d.push_token END AS token,d.push_token AS phone_token,d.watch_push_token AS watch_token,d.silent_watch_alarms
   FROM events e JOIN devices d ON d.id=e.parent_id WHERE e.event_id=? AND e.status='sending'`).bind(eventId)]),
- ()=>env.DB.prepare(`SELECT e.*,CASE e.push_target WHEN 'watch' THEN d.watch_push_token ELSE d.push_token END AS token,d.push_token AS phone_token,d.silent_watch_alarms,
+ ()=>env.DB.prepare(`SELECT e.*,CASE e.push_target WHEN 'watch' THEN d.watch_push_token ELSE d.push_token END AS token,d.push_token AS phone_token,d.watch_push_token AS watch_token,d.silent_watch_alarms,
  EXISTS(SELECT 1 FROM pairs p WHERE p.parent_id=e.parent_id AND p.listener_id=e.listener_id) AS pair_current
  FROM events e JOIN devices d ON d.id=e.parent_id WHERE e.event_id=? AND e.claim_id=?`).bind(eventId,claimId).all<Receipt>());
  const claims=claim.source==='reply'?claim.results:undefined;
@@ -151,6 +152,18 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  }
  const column=target==='watch'?'watch_push_token':'push_token';
  const parent=claim.source==='receipt'?claim.receipt:claims![offset+3].results[0] as Destination|undefined;
+ if(event.delivery_state&&parent){
+  stage='push';
+  const alert=JSON.parse(event.payload) as Alert;
+  const status=await deliverToBoth(env,{table:'events',id:eventId,parentId:event.parent_id,attempt:event.attempts,
+   state:event.delivery_state,phoneToken:parent.phone_token,watchToken:parent.watch_token,requestId,eventRef,
+   source:latency.details.dispatch_source,
+   send:(destination,token,timing)=>sendPush(env,token,alert,destination,timing,parent.silent_watch_alarms===1&&!alert.isTest)});
+  latency.details.push_outcome=status==='pending'?'retry':status;
+  stage='storage';target=undefined;
+  await record(status==='pending'?'retry':status,undefined,'dispatch_outcome');
+  return;
+ }
  if(!parent?.token){
   // A token upload can race with this read. Decide blocked/pending in the same
   // database statement that releases the claim, so either ordering can recover.
@@ -269,10 +282,16 @@ export async function flushPending(env:Env,requestId=crypto.randomUUID(),latency
  // Expire diagnostic data before delivery work so a broken push path cannot defer expiry.
  try { await latency.measure('maintenance_expiry_ms',()=>env.DB.prepare('DELETE FROM diagnostics WHERE recorded_at<?').bind(Date.now()-7*86400000).run()); }
  catch { await recordDiagnostic(env,{requestId,started:Date.now(),operation:'maintenance',stage:'cleanup',outcome:'diagnostic_cleanup_failed'}); }
- const interrupted=await latency.measure('maintenance_recovery_ms',()=>env.DB.prepare("UPDATE events SET status='uncertain',last_error='dispatch_interrupted',lease_until=NULL WHERE status='sending' AND lease_until<? RETURNING event_id,attempts,push_target").bind(Date.now()).all<{event_id:string;attempts:number;push_target:'phone'|'watch'|null}>());
+ const bothAccepted="delivery_state IS NOT NULL AND json_extract(delivery_state,'$.phone')='sent' AND json_extract(delivery_state,'$.watch')='sent'";
+ const interrupted=await latency.measure('maintenance_recovery_ms',()=>env.DB.prepare(`UPDATE events SET
+  status=CASE WHEN ${bothAccepted} THEN 'sent' ELSE 'uncertain' END,
+  last_error=CASE WHEN ${bothAccepted} THEN NULL ELSE 'dispatch_interrupted' END,
+  sent_at=CASE WHEN ${bothAccepted} THEN COALESCE(sent_at,?) ELSE sent_at END,lease_until=NULL
+  WHERE status='sending' AND lease_until<? RETURNING event_id,attempts,push_target,status`)
+  .bind(new Date().toISOString(),Date.now()).all<{event_id:string;attempts:number;push_target:'phone'|'watch'|null;status:string}>());
  for(const event of interrupted.results) {
   let eventRef:string|undefined;try {eventRef=await eventReference(env,event.event_id);}catch{/* Best effort. */}
-  await recordDiagnostic(env,{requestId,started:Date.now(),operation:'dispatch',stage:'claim',outcome:'dispatch_interrupted',eventRef,attempt:event.attempts,target:event.push_target??undefined});
+  await recordDiagnostic(env,{requestId,started:Date.now(),operation:event.status==='sent'?'dispatch_outcome':'dispatch',stage:'claim',outcome:event.status==='sent'?'sent':'dispatch_interrupted',eventRef,attempt:event.attempts,target:event.status==='sent'?undefined:event.push_target??undefined});
  }
  const events=await latency.measure('maintenance_pending_ms',()=>env.DB.prepare("SELECT event_id FROM events WHERE status='pending' AND acknowledged_at IS NULL AND resolved_at IS NULL AND next_attempt<=? ORDER BY created_at LIMIT 25").bind(Date.now()).all<{event_id:string}>());
  // Bound recovery fan-out to leave capacity for proof reads and connection notices.

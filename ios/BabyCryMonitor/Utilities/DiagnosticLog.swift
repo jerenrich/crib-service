@@ -21,6 +21,7 @@ import Observation
     let benchmark: BackgroundBenchmark
     private var recent: [String: Date] = [:]
     private var watchTraceKeys: Set<String> = []
+    private var phoneReceiptKeys: Set<String> = []
     private var persistedLineCount = 0
     private var storagePrepared = false
     private static let timestampStyle = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
@@ -138,6 +139,15 @@ import Observation
             "\(now) notification_cleanup event_id=\(removal.eventID.uuidString.lowercased()) episode_id=\(removal.episodeID.uuidString.lowercased()) reason=\(removal.reason.rawValue) location=\(removal.pending ? "pending" : "delivered") action=removal_requested" + DiagnosticCorrelation.fields(reference: removal.reference, attempt: removal.attempt)
         }
         if !entries.isEmpty { appendLines(entries) }
+    }
+    func phoneNotification(eventID: UUID, episodeID: UUID, deliveredAt: Date, interruptionLevel: Int, phase: String) {
+        guard ["foreground", "opened", "retained"].contains(phase), (0...3).contains(interruptionLevel) else { return }
+        let delivered = deliveredAt.timeIntervalSince1970 * 1000
+        guard delivered.isFinite, abs(delivered) < 9e15 else { return }
+        let key = "\(eventID)|\(phase)"
+        guard phoneReceiptKeys.insert(key).inserted else { return }
+        if phoneReceiptKeys.count > 512 { phoneReceiptKeys = [key] }
+        append("phone_notification phase=\(phase) event_id=\(eventID.uuidString.lowercased()) episode_id=\(episodeID.uuidString.lowercased()) delivered_at_ms=\(Int64(delivered.rounded())) interruption_level=\(interruptionLevel)")
     }
     private var coverageFields: String {
         "scope=process process_id=\(processID.uuidString.lowercased()) sampled_records=\(sampledRecords) deduplicated_records=\(deduplicatedRecords) evicted_records=\(evictedRecords) read_failures=\(readFailures) write_failures=\(writeFailures) write_recoveries=\(writeRecoveries)"

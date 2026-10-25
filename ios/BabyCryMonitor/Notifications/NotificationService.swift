@@ -38,10 +38,12 @@ extension NotificationProviding {
         ])
     }
     func cleanUpAlerts(using relevance: NotificationRelevance, deliveredBefore: Date) async {
-        await NotificationCleanup.removeIrrelevant(using: relevance, deliveredBefore: deliveredBefore, log: log)
+        await NotificationCleanup.removeIrrelevant(using: relevance, deliveredBefore: deliveredBefore,
+            beforeRemoving: { [weak self] in self?.recordDelivered($0) }, log: log)
     }
     func dismissCryingAlerts(testEventID: UUID?) async {
-        await NotificationCleanup.dismissCryingAlerts(testEventID: testEventID, log: log)
+        await NotificationCleanup.dismissCryingAlerts(testEventID: testEventID,
+            beforeRemoving: { [weak self] in self?.recordDelivered($0) }, log: log)
     }
     func register() async {
         #if DEBUG
@@ -57,6 +59,7 @@ extension NotificationProviding {
             // permission even though our iPhone payloads deliberately omit sound.
             let allowed = try await center.requestAuthorization(options: [.alert, .badge, .sound])
             let settings = await center.notificationSettings()
+            recordDelivered(await center.deliveredNotifications())
             log?.record("notification_alert_permission", code: settings.alertSetting.rawValue)
             log?.record("notification_sound_permission", code: settings.soundSetting.rawValue)
             log?.record("notification_time_sensitive_permission", code: settings.timeSensitiveSetting.rawValue)
@@ -76,6 +79,7 @@ extension NotificationProviding {
         content.title = "Simulation · Baby is still crying"
         content.body = "Synthetic episode reached \(Int(alert.durationSeconds)) seconds."
         content.sound = nil
+        content.interruptionLevel = .timeSensitive
         content.categoryIdentifier = WatchNotification.category
         content.userInfo = ["eventId": alert.eventId.uuidString, "episodeId": alert.episodeId.uuidString, "isTest": true]
         do {
@@ -89,6 +93,7 @@ extension NotificationProviding {
         try await ConnectionWarningNotification.apply(deadline: deadline)
     }
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
+        await recordReceipt(Self.receipt(notification), phase: "foreground")
         if let request = SilentCryAlarmRequest(payload: notification.request.content.userInfo) {
             if #available(iOS 26.0, *) { _ = await SilentCryAlarmService.shared.receive(request) }
         }
@@ -101,6 +106,7 @@ extension NotificationProviding {
             ? [.banner, .list, .sound] : [.banner, .list]
     }
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
+        await recordReceipt(Self.receipt(response.notification), phase: "opened")
         if response.actionIdentifier == WatchNotification.acknowledge,
            let rawID = response.notification.request.content.userInfo["eventId"] as? String,
            let id = UUID(uuidString: rawID) {
@@ -111,6 +117,20 @@ extension NotificationProviding {
         await refresh()
     }
     private func acknowledge(_ id: UUID) async { await onAcknowledge?(id) }
+    private nonisolated static func receipt(_ notification: UNNotification) -> (UUID, UUID, Date, Int)? {
+        let info = notification.request.content.userInfo
+        guard let event = (info["eventId"] as? String).flatMap(UUID.init(uuidString:)),
+              let episode = (info["episodeId"] as? String).flatMap(UUID.init(uuidString:)) else { return nil }
+        return (event, episode, notification.date, Int(notification.request.content.interruptionLevel.rawValue))
+    }
+    private func recordReceipt(_ receipt: (UUID, UUID, Date, Int)?, phase: String) {
+        guard let receipt else { return }
+        log?.phoneNotification(eventID: receipt.0, episodeID: receipt.1, deliveredAt: receipt.2,
+            interruptionLevel: receipt.3, phase: phase)
+    }
+    private func recordDelivered(_ notifications: [UNNotification]) {
+        for notification in notifications { recordReceipt(Self.receipt(notification), phase: "retained") }
+    }
     private func refresh() { onAlert?() }
 }
 @MainActor final class AppDelegate: NSObject, UIApplicationDelegate {
