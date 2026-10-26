@@ -38,7 +38,7 @@ export async function sendPush(env:Env,encryptedToken:string,alert:Alert,target:
   // AlarmKit is additive: retain the phone's normal sound/haptic request so
   // Apple can forward an alert while the separate direct Watch copy also alerts.
   ...(silentCryAlarm&&target==='phone'&&!alert.isTest?{silentCryAlarm:true,...(alarmCycle?{alarmCycleId:alarmCycle}:{}),aps:{...content.aps,'content-available':1}}:{})
- },target,alert.isRepeat?5:3600,collapseID,latency,schedule);
+ },target,alert.isRepeat?15:3600,collapseID,latency,schedule);
 }
 export async function sendSilentCryAlarmPush(env:Env,encryptedToken:string,alert:Alert,latency=new Latency(),alarmCycle?:string):Promise<PushResult> {
  latency.details.alarm_wake_requested=true;

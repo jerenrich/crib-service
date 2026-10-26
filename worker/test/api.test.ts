@@ -995,7 +995,7 @@ describe('configurable reminders and acknowledgement mute',()=>{
   expect(reminder.eventId).not.toBe(event.eventId);expect(reminder.episodeId).toBe(event.episodeId);
   expect(reminder.aps.alert.title).toContain('Reminder');expect(reminder.aps.alert.body).toContain('Settings');
   const headers=pushRequests[1].init?.headers as Record<string,string>;
-  expect(Number(headers['apns-expiration'])).toBe(Math.floor(Date.now()/1000)+5);
+  expect(Number(headers['apns-expiration'])).toBe(Math.floor(Date.now()/1000)+15);
   expect(headers['apns-collapse-id']).toBe(`phone:${reminder.eventId}`);
   advance(5);mockPush();await runReminder(testEnv,parent.deviceId);expect(pushRequests).toHaveLength(3);
   const later=JSON.parse(String(pushRequests[2].init?.body));
@@ -1703,7 +1703,7 @@ describe('phone-controlled Watch push test',()=>{
   expect(new Set(contents.map(content=>content.eventId)).size).toBe(7);
   const headers=pushRequests[0].init?.headers as Record<string,string>;
   expect(headers['apns-topic']).toMatch(/watchkitapp$/);
-  expect(Number(headers['apns-expiration'])).toBeLessThanOrEqual(Math.floor(Date.now()/1000)+5);
+  expect(Number(headers['apns-expiration'])).toBeLessThanOrEqual(Math.floor(Date.now()/1000)+15);
   expect((await env.DB.prepare('SELECT * FROM events').all()).results).toHaveLength(0);
   await worker.scheduled({} as ScheduledController,testEnv);expect(pushRequests).toHaveLength(7);
  });
