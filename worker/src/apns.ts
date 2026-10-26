@@ -15,28 +15,30 @@ export function payload(alert:Alert) {
  const duration=minutes>0?`${unit(minutes,'minute')}${seconds?` ${unit(seconds,'second')}`:''}`:unit(seconds,'second');
  const title=alert.isTest?'Test · Crib Service':alert.isRepeat?'Reminder · Check on baby':'Baby is crying';
  const body=alert.isRepeat&&!alert.isTest?'Crying was detected. Acknowledge this alert to snooze crying alerts for the duration chosen in Settings.':alert.isTest&&alert.isRepeat?'Repeating Watch alert test. Use Stop Watch test in iPhone Settings to end the test.':alert.isTest?`Test notification from your Listener. Simulated the ${duration} alert threshold.`:`Crying-like sound has continued for ${duration}. Started at ${new Date(alert.cryStartedAt).toISOString().slice(11,16)} UTC. Acknowledge to snooze crying alerts for the duration chosen in Settings.`;
- // Keep presentation metadata identical across the companion devices. Omitting
- // sound on both tests the observed companion lights-and-sirens mismatch.
- return {aps:{alert:{title,body},category:'BABY_CRY_ALERT','thread-id':alert.episodeId,'interruption-level':'time-sensitive'},eventId:alert.eventId,episodeId:alert.episodeId,cryStartedAt:alert.cryStartedAt,createdAt:alert.createdAt,durationSeconds:alert.durationSeconds,...(alert.isTest?{isTest:true}:{})};
+ // Keep alerting metadata identical so both devices request system sound/haptics.
+ // Device Silent Mode can mute audio while preserving Watch notification taps.
+ return {aps:{alert:{title,body},category:'BABY_CRY_ALERT','thread-id':alert.episodeId,'interruption-level':'time-sensitive',sound:'default'},eventId:alert.eventId,episodeId:alert.episodeId,cryStartedAt:alert.cryStartedAt,createdAt:alert.createdAt,durationSeconds:alert.durationSeconds,...(alert.isTest?{isTest:true}:{})};
 }
 export async function sendPush(env:Env,encryptedToken:string,alert:Alert,target:'phone'|'watch'='phone',latency=new Latency(),silentCryAlarm=false,schedule?:PushSchedule):Promise<PushResult> {
  const diagnosticRef=latency.eventRef,deliveryAttempt=latency.deliveryAttempt;
  const correlation=diagnosticRef&&/^[0-9a-f]{64}$/.test(diagnosticRef)&&deliveryAttempt!==undefined&&Number.isSafeInteger(deliveryAttempt)&&deliveryAttempt>0&&deliveryAttempt<=1_000_000?{diagnosticRef,deliveryAttempt}:{};
  const content=payload(alert);
+ const {sound:_sound,...silentAPS}=content.aps;
  return sendNotification(env,encryptedToken,alert.eventId,{...content,...correlation,
-  ...(silentCryAlarm&&target==='phone'&&!alert.isTest?{silentCryAlarm:true,aps:{...content.aps,'content-available':1}}:{})
+  ...(silentCryAlarm&&target==='phone'&&!alert.isTest?{silentCryAlarm:true,aps:{...silentAPS,'content-available':1}}:{})
  },target,alert.isRepeat?5:3600,alert.isRepeat?alert.episodeId:alert.eventId,latency,schedule);
 }
 export async function sendSilentCryAlarmPush(env:Env,encryptedToken:string,alert:Alert,latency=new Latency()):Promise<PushResult> {
  const content=payload(alert);
+ const {sound:_sound,...silentAPS}=content.aps;
  // Separate APNs request ID, preserving event/episode identity for acknowledgement.
  return sendNotification(env,encryptedToken,crypto.randomUUID(),{...content,silentCryAlarm:true,
-  aps:{...content.aps,'content-available':1}},'phone',60,alert.episodeId,latency);
+  aps:{...silentAPS,'content-available':1}},'phone',60,alert.episodeId,latency);
 }
 export async function sendConnectionPush(env:Env,encryptedToken:string,id:string,state:'offline'|'stopped',target:'phone'|'watch',latency=new Latency()):Promise<PushResult> {
  const title=state==='stopped'?'Listener monitoring stopped':'Listener connection lost';
  const body=state==='stopped'?'The Listener reports that monitoring has stopped. Check the nursery phone.':'No Listener update for at least 3 minutes. Check power, internet, and monitoring.';
- return sendNotification(env,encryptedToken,id,{aps:{alert:{title,body},'thread-id':'listener-connection','interruption-level':'time-sensitive'},connectionState:state},target,180,id,latency);
+ return sendNotification(env,encryptedToken,id,{aps:{alert:{title,body},'thread-id':'listener-connection','interruption-level':'time-sensitive',sound:'default'},connectionState:state},target,180,id,latency);
 }
 // A user-visible, soundless notification also requests background execution.
 // It is deliberately separate from ordinary crying and Watch notification routing.

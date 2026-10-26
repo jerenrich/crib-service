@@ -135,7 +135,7 @@ describe('connection alerts, readiness and replacement',()=>{
   await stale();mockPush();await flushConnections(testEnv);await flushConnections(testEnv);
   expect(pushRequests).toHaveLength(1);
   const content=JSON.parse(String(pushRequests[0].init?.body));expect(content.connectionState).toBe('offline');expect(content.eventId).toBeUndefined();
-  expect(content.aps['interruption-level']).toBe('time-sensitive');expect(content.aps).not.toHaveProperty('sound');
+  expect(content.aps['interruption-level']).toBe('time-sensitive');expect(content.aps.sound).toBe('default');
   await call('listener/heartbeat',listener,beat(listener));await flushConnections(testEnv);await flushConnections(testEnv);
   expect(pushRequests).toHaveLength(1);
   expect((await env.DB.prepare('SELECT state FROM connection_states WHERE listener_id=?').bind(listener.deviceId).first<{state:string}>())?.state).toBe('online');
@@ -167,7 +167,7 @@ describe('connection alerts, readiness and replacement',()=>{
   expect(content.connectionState).toBe('offline');
   expect(content.aps).toEqual(JSON.parse(String(pushRequests.find(r=>r.url.includes('ab'.repeat(32)))!.init?.body)).aps);
   expect(content.aps.alert.title).toBe('Listener connection lost');
-  expect(content.aps).not.toHaveProperty('sound');
+  expect(content.aps.sound).toBe('default');
   expect(content.aps['interruption-level']).toBe('time-sensitive');
   expect((await env.DB.prepare('SELECT status FROM connection_notices').first<{status:string}>())?.status).toBe('sent');
  });
@@ -465,7 +465,7 @@ describe('direct Apple Watch alerts',()=>{
    expect(new Headers(request.init?.headers).get('apns-topic')).toBe(testEnv.APNS_BUNDLE_ID+(target==='watch'?'.watchkitapp':''));
    const content=JSON.parse(String(request.init?.body));
    expect(content).toMatchObject({aps:{category:'BABY_CRY_ALERT','interruption-level':'time-sensitive'},eventId:event.eventId,createdAt:event.createdAt});
-   expect(content.aps).not.toHaveProperty('sound');
+   expect(content.aps.sound).toBe('default');
   }
   const [phone,watch]=pushRequests.map(r=>({headers:new Headers(r.init?.headers),body:JSON.parse(String(r.init?.body))}));
   expect(phone.body.aps).toEqual(watch.body.aps);
@@ -547,7 +547,7 @@ describe('direct Apple Watch alerts',()=>{
   const repeat=pushRequests.slice(2).map(r=>JSON.parse(String(r.init?.body)));
   expect(repeat[0].eventId).toBe(repeat[1].eventId);expect(repeat[0].eventId).not.toBe(event.eventId);
   expect(repeat.every(p=>p.aps['interruption-level']==='time-sensitive')).toBe(true);
-  expect(repeat[0].aps).toEqual(repeat[1].aps);expect(repeat[0].aps).not.toHaveProperty('sound');
+  expect(repeat[0].aps).toEqual(repeat[1].aps);expect(repeat[0].aps.sound).toBe('default');
   for(const request of pushRequests.slice(2)){
    const headers=new Headers(request.init?.headers);
    expect(headers.get('apns-id')).toBe(repeat[0].eventId);expect(headers.get('apns-collapse-id')).toBe(event.episodeId);
@@ -672,7 +672,7 @@ describe('APNs and durable idempotent alerts',()=>{
   const notification=JSON.parse(String(pushRequests[0].init?.body));
   expect(notification.aps.alert.title).toBe('Test · Crib Service');
   expect(notification.aps.alert.body).toContain('Simulated');
-  expect(notification.aps).not.toHaveProperty('sound');
+  expect(notification.aps.sound).toBe('default');
   expect(notification.isTest).toBe(true);
   const status=await (await call('listener/status',parent,undefined,'GET')).json() as {alerts:(Alert&{status:string})[];monitoring:boolean;episodes:unknown[]};
   expect(status.alerts[0]).toMatchObject({eventId:event.eventId,isTest:true,status:'sent'});
@@ -699,8 +699,8 @@ describe('APNs and durable idempotent alerts',()=>{
   }
   expect(await (await call('listener/event',listener,event)).json()).toEqual({status:'sent'});
  });
- it('omits audible sound and signs an ES256 provider JWT',async()=>{
-  const notification=payload(alert(device('listener')));expect(notification.aps).not.toHaveProperty('sound');
+ it('requests default sound with Time Sensitive priority',async()=>{
+  const notification=payload(alert(device('listener')));expect(notification.aps.sound).toBe('default');
   expect(notification.aps['interruption-level']).toBe('time-sensitive');
   expect(notification.aps.alert.title).toBe('Baby is crying');
   expect(notification).not.toHaveProperty('isTest');
@@ -2105,7 +2105,7 @@ describe('optional overnight silent Watch alarms',()=>{
   const bodies=pushRequests.map(r=>JSON.parse(String(r.init?.body)));
   expect(bodies.find(b=>b.silentCryAlarm)?.aps['content-available']).toBe(1);
   expect(bodies.find(b=>b.silentCryAlarm)?.aps.sound).toBeUndefined();
-  expect(bodies.find(b=>!b.silentCryAlarm)?.aps).not.toHaveProperty('sound');
+  expect(bodies.find(b=>!b.silentCryAlarm)?.aps.sound).toBe('default');
   expect(bodies[0].eventId).toBe(bodies[1].eventId);
  });
  it('retains Watch acceptance while retrying a rejected phone delivery with the optional alarm enabled',async()=>{
@@ -2492,7 +2492,7 @@ describe('Watch-only notification trial',()=>{
   expect(pushRequests).toHaveLength(1);
   const headers=new Headers(pushRequests[0].init?.headers),body=JSON.parse(String(pushRequests[0].init?.body));
   expect(headers.get('apns-topic')).toBe(testEnv.APNS_BUNDLE_ID+'.watchkitapp');expect(headers.get('apns-collapse-id')).toBe(event.eventId);
-  expect(body.aps).not.toHaveProperty('sound');expect(body.aps['interruption-level']).toBe('time-sensitive');expect(body.silentCryAlarm).toBeUndefined();
+  expect(body.aps.sound).toBe('default');expect(body.aps['interruption-level']).toBe('time-sensitive');expect(body.silentCryAlarm).toBeUndefined();
   expect(await env.DB.prepare('SELECT status,delivery_mode,delivery_state,push_target FROM events WHERE event_id=?').bind(event.eventId).first())
    .toEqual({status:'sent',delivery_mode:'watch_only',delivery_state:null,push_target:'watch'});
   const row=await env.DB.prepare("SELECT details FROM diagnostics WHERE operation='dispatch' AND target='watch' AND outcome='sent'").first<{details:string}>();
@@ -2558,7 +2558,7 @@ describe('phone head-start trial delivery',()=>{
  }
  const upload=(listener:TestDevice,event:Alert,configured:Env)=>worker.fetch(new Request('https://monitor.test/v1/listener/event',{method:'POST',
   headers:{'content-type':'application/json',authorization:`Bearer ${listener.deviceId}.${listener.secret}`},body:JSON.stringify(event)}),configured);
- it('separates actual request starts while retaining matching IDs, Time Sensitive and the soundless phone payload',async()=>{
+ it('separates actual request starts while retaining matching IDs, Time Sensitive and matching default sound',async()=>{
   const {parent,listener}=await setup(),event={...alert(listener),isTest:true},times=new Map<string,number>(),external=globalThis.fetch;
   vi.stubGlobal('fetch',vi.fn((input:string|URL|Request,init?:RequestInit)=>{times.set(new Headers(init?.headers).get('apns-topic')!,performance.now());return external(input,init);}));mockPush(200,2);
   expect(await (await upload(listener,event,{...testEnv,WATCH_PHONE_HEAD_START_PARENT_ID:parent.deviceId,WATCH_PHONE_HEAD_START_MS:'500'})).json()).toEqual({status:'sent'});
@@ -2566,7 +2566,7 @@ describe('phone head-start trial delivery',()=>{
   expect(pushRequests).toHaveLength(2);
   const [phone,watch]=pushRequests.map(request=>({headers:new Headers(request.init?.headers),body:JSON.parse(String(request.init?.body))}));
   expect(phone.headers.get('apns-collapse-id')).toBe(watch.headers.get('apns-collapse-id'));expect(phone.headers.get('apns-id')).toBe(watch.headers.get('apns-id'));
-  expect(phone.body.aps.sound).toBeUndefined();expect(watch.body.aps.sound).toBeUndefined();
+  expect(phone.body.aps.sound).toBe('default');expect(watch.body.aps.sound).toBe('default');
   expect(phone.body.aps['interruption-level']).toBe('time-sensitive');expect(watch.body.aps['interruption-level']).toBe('time-sensitive');
   const rows=await env.DB.prepare("SELECT details FROM diagnostics WHERE operation='dispatch' AND target='watch'").all<{details:string}>();
   const details=JSON.parse(rows.results[0].details);expect(details).toMatchObject({coordination_mode:'phone_head_start',phone_head_start_ms:500,phone_head_start_wait_outcome:'head_start_elapsed'});
