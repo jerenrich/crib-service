@@ -93,9 +93,13 @@ extension NotificationProviding {
         try await ConnectionWarningNotification.apply(deadline: deadline)
     }
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
+        let alarmCallback = notification.request.content.userInfo["silentCryAlarm"] as? Bool == true
+            ? SilentCryAlarmRequest.Callback(payload: notification.request.content.userInfo) : nil
         await recordReceipt(Self.receipt(notification), phase: "foreground")
-        if let request = SilentCryAlarmRequest(payload: notification.request.content.userInfo) {
-            if #available(iOS 26.0, *) { _ = await SilentCryAlarmService.shared.receive(request) }
+        if let alarmCallback {
+            if #available(iOS 26.0, *) {
+                _ = await SilentCryAlarmService.shared.receive(alarmCallback, source: .foregroundNotification)
+            }
         }
         if let request = SilentAlarmTestRequest(payload: notification.request.content.userInfo) {
             if #available(iOS 26.0, *) { _ = await SilentAlarmExperiment.shared.receive(request) }
@@ -136,8 +140,10 @@ extension NotificationProviding {
 @MainActor final class AppDelegate: NSObject, UIApplicationDelegate {
     var notifications: (any NotificationProviding)?
     func application(_ application: UIApplication, didReceiveRemoteNotification userInfo: [AnyHashable: Any]) async -> UIBackgroundFetchResult {
-        if let request = SilentCryAlarmRequest(payload: userInfo) {
-            if #available(iOS 26.0, *) { return await SilentCryAlarmService.shared.receive(request) ? .newData : .noData }
+        if userInfo["silentCryAlarm"] as? Bool == true {
+            if #available(iOS 26.0, *) {
+                return await SilentCryAlarmService.shared.receive(.init(payload: userInfo), source: .remoteNotification) ? .newData : .noData
+            }
             return .noData
         }
         guard let request = SilentAlarmTestRequest(payload: userInfo) else { return .noData }

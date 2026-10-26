@@ -42,4 +42,35 @@ final class SilentCryAlarmRequestTests: XCTestCase {
         XCTAssertFalse(eligible(stopped: now)); XCTAssertFalse(eligible(at: now.addingTimeInterval(61)))
         XCTAssertTrue(eligible(muted: now.addingTimeInterval(-1), localMuted: now.addingTimeInterval(-1)))
     }
+    func testRejectedPayloadDiagnosticsMatchAcceptanceIncludingExpiredCallbacks() {
+        var test = payload(); test["isTest"] = true
+        var ordinary = payload(); ordinary.removeValue(forKey: "silentCryAlarm")
+        var malformed = payload(); malformed["episodeId"] = "private-payload"
+        var badDate = payload(); badDate["createdAt"] = "private-payload"
+        let cases: [([AnyHashable: Any], SilentCryAlarmRequest.Rejection?)] = [
+            (payload(), nil), (payload(age: 60), nil), (payload(age: -5), nil),
+            (payload(age: 61), .stale), (payload(age: -6), .stale),
+            (test, .test), (ordinary, .notRequested), (malformed, .malformed), (badDate, .malformed)
+        ]
+        for (value, reason) in cases {
+            XCTAssertEqual(SilentCryAlarmRequest.payloadRejection(value, now: now), reason)
+            XCTAssertEqual(SilentCryAlarmRequest(payload: value, now: now) != nil, reason == nil)
+        }
+    }
+    func testEligibilityDiagnosticsDistinguishUnknownRelevanceFromSnoozeAndStaleStatus() throws {
+        let request = try XCTUnwrap(SilentCryAlarmRequest(payload: payload(), now: now))
+        func reason(relevance: NotificationRelevance? = NotificationRelevance(), muted: Date? = nil,
+                    localMuted: Date? = nil, stopped: Date? = nil, at: Date? = nil) -> SilentCryAlarmRequest.Rejection? {
+            request.ineligibilityReason(enabled: true, serverEnabled: true, paired: true, relevance: relevance,
+                mutedUntil: muted, localMutedUntil: localMuted, stoppedBefore: stopped, now: at ?? now)
+        }
+        let relevant = NotificationRelevance(cryEpisodeIDs: [episode])
+        XCTAssertEqual(reason(relevance: nil), .relevanceUnknown)
+        XCTAssertEqual(reason(), .irrelevant)
+        XCTAssertEqual(reason(relevance: relevant, muted: now.addingTimeInterval(1)), .serverMuted)
+        XCTAssertEqual(reason(relevance: relevant, localMuted: now.addingTimeInterval(1)), .locallyMuted)
+        XCTAssertEqual(reason(relevance: relevant, stopped: now), .stopped)
+        XCTAssertEqual(reason(relevance: relevant, at: now.addingTimeInterval(61)), .stale)
+        XCTAssertNil(reason(relevance: relevant, muted: now, localMuted: now))
+    }
 }

@@ -176,6 +176,40 @@ import Observation
         guard ["received", "scheduled", "ignored", "duplicate", "failed", "snoozed", "ack_pending", "acknowledged"].contains(phase) else { return }
         append("silent_cry_alarm phase=\(phase) app_active=\(appActive)" + (eventID.map { " event_id=\($0.uuidString.lowercased())" } ?? ""))
     }
+    #if os(iOS)
+    func silentCryAlarmAttempt(phase: String, stage: SilentCryAlarmRequest.Stage, source: SilentCryAlarmRequest.Source,
+                               attemptID: UUID, eventID: UUID?, episodeID: UUID? = nil,
+                               reason: SilentCryAlarmRequest.Rejection? = nil, elapsedMS: Int,
+                               appActive: Bool, protectedDataAvailable: Bool, backgroundTimeRemaining: Double,
+                               requestAgeMS: Int? = nil, callbackAt: Date? = nil, error: (any Error)? = nil) {
+        guard ["entered", "started", "completed", "rejected", "duplicate", "scheduled", "failed", "cancelled"].contains(phase) else { return }
+        var entry = "silent_cry_alarm_attempt phase=\(phase) stage=\(stage.rawValue) source=\(source.rawValue) attempt_id=\(attemptID.uuidString.lowercased()) elapsed_ms=\(max(0, elapsedMS)) app_active=\(appActive) protected_data_available=\(protectedDataAvailable)"
+        if let eventID { entry += " event_id=\(eventID.uuidString.lowercased())" }
+        if let episodeID { entry += " episode_id=\(episodeID.uuidString.lowercased())" }
+        if let reason { entry += " reason=\(reason.rawValue)" }
+        if let requestAgeMS { entry += " request_age_ms=\(requestAgeMS)" }
+        if let callbackAt {
+            let value = callbackAt.timeIntervalSince1970 * 1000
+            if value.isFinite, abs(value) < 9e15 { entry += " callback_at_ms=\(Int64(value.rounded()))" }
+        }
+        // UIKit uses a very large value when no finite deadline is reported.
+        if backgroundTimeRemaining.isFinite, (0...86_400).contains(backgroundTimeRemaining) {
+            entry += " background_remaining_ms=\(Int(backgroundTimeRemaining * 1000))"
+        } else { entry += " background_remaining_ms=unknown" }
+        if let error { entry += " " + Self.errorDetails(error) }
+        append(entry)
+    }
+    func silentCryAlarmReadiness(source: SilentCryAlarmRequest.ObservationSource, enabled: Bool,
+                                 authorization: SilentCryAlarmRequest.Authorization, assetAvailable: Bool,
+                                 credentialsAvailable: Bool, acknowledgementPending: Bool, locallyMuted: Bool, alarmCount: Int?,
+                                 appActive: Bool, protectedDataAvailable: Bool, error: (any Error)? = nil) {
+        let checksPassed = enabled && authorization == .authorized && assetAvailable && credentialsAvailable && !acknowledgementPending && !locallyMuted && alarmCount != nil
+        var entry = "silent_cry_alarm_readiness source=\(source.rawValue) enabled=\(enabled) authorization=\(authorization.rawValue) asset_available=\(assetAvailable) credentials_available=\(credentialsAvailable) acknowledgement_pending=\(acknowledgementPending) locally_muted=\(locallyMuted) local_checks_passed=\(checksPassed) app_active=\(appActive) protected_data_available=\(protectedDataAvailable) server_eligibility=unchecked push_execution=unverified scheduling=untested"
+        entry += alarmCount.map { " alarm_count=\(max(0, $0))" } ?? " alarm_count=unknown"
+        if let error { entry += " " + Self.errorDetails(error) }
+        append(entry)
+    }
+    #endif
     func watchAlert(_ trace: WatchAlertTrace) {
         watchAlerts([trace])
     }

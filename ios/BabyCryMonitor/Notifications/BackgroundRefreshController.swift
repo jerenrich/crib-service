@@ -103,6 +103,9 @@ import UIKit
         }
         Task { @MainActor in
             log.expireIfNeeded()
+            if isParent(), #available(iOS 26.0, *) {
+                SilentCryAlarmService.shared.observeReadiness(source: .backgroundRefresh, force: true)
+            }
             if log.enabled, isParent() { await schedule(at: Date()) }
             else { scheduler.cancel() }
             if log.attempts.first(where: { $0.id == id })?.status == .delivered {
