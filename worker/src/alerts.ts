@@ -85,6 +85,8 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  try { eventRef=latency.eventRef??await eventReference(env,eventId);latency.eventRef=eventRef; } catch { /* No diagnostic identity available. */ }
  // Tombstones also suppress an offline outbox upload after its episode settled.
  const claimId=crypto.randomUUID();
+ // Only fresh, unclaimed events opt in. Preserve any prior dual-target receipt.
+ const watchOnlySQL="parent_id=? AND push_target IS NULL AND delivery_state IS NULL AND EXISTS(SELECT 1 FROM devices WHERE id=events.parent_id AND watch_push_token IS NOT NULL)";
  type Destination={token:string|null;phone_token:string|null;watch_token:string|null;silent_watch_alarms:number};
  type Receipt=StoredEvent & Destination & {pair_current:number};
  const claim=await latency.confirmedClaim<StoredEvent|Destination,Receipt>(()=>env.DB.batch<StoredEvent|Destination>([...(options.insert?[options.insert]:[]),env.DB.prepare(`UPDATE events SET resolved_at=COALESCE(resolved_at,(SELECT r.resolved_at FROM resolved_episodes r
@@ -105,7 +107,13 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  AND CAST(ROUND((julianday(json_extract(events.payload,'$.createdAt'))-2440587.5)*86400000) AS INTEGER)<=m.created_at)
  OR (is_repeat=1 AND EXISTS(SELECT 1 FROM events prior WHERE prior.parent_id=events.parent_id AND prior.episode_id=events.episode_id AND prior.acknowledged_at IS NOT NULL AND prior.created_at>=events.created_at))
  )`).bind(new Date(now).toISOString(),eventId,now,now),
- env.DB.prepare("UPDATE events SET status='sending',lease_until=?,claim_id=?,attempts=attempts+1,delivery_state=COALESCE(delivery_state,CASE WHEN push_target IS NULL AND EXISTS(SELECT 1 FROM devices WHERE id=events.parent_id AND push_token IS NOT NULL AND watch_push_token IS NOT NULL) THEN '{\"phone\":\"pending\",\"watch\":\"pending\"}' ELSE NULL END),push_target=COALESCE(push_target,CASE WHEN (SELECT watch_push_token FROM devices WHERE id=events.parent_id) IS NOT NULL THEN 'watch' ELSE 'phone' END) WHERE event_id=? AND status='pending' AND acknowledged_at IS NULL AND resolved_at IS NULL AND next_attempt<=? RETURNING *").bind(now+30000,claimId,eventId,now),
+ env.DB.prepare(`UPDATE events SET status='sending',lease_until=?,claim_id=?,attempts=attempts+1,
+  delivery_mode=COALESCE(delivery_mode,CASE WHEN ${watchOnlySQL} THEN 'watch_only' END),
+  delivery_state=CASE WHEN delivery_mode='watch_only' OR (${watchOnlySQL}) THEN NULL
+   ELSE COALESCE(delivery_state,CASE WHEN push_target IS NULL AND EXISTS(SELECT 1 FROM devices WHERE id=events.parent_id AND push_token IS NOT NULL AND watch_push_token IS NOT NULL)
+    THEN '{"phone":"pending","watch":"pending"}' ELSE NULL END) END,
+  push_target=COALESCE(push_target,CASE WHEN (SELECT watch_push_token FROM devices WHERE id=events.parent_id) IS NOT NULL THEN 'watch' ELSE 'phone' END)
+  WHERE event_id=? AND status='pending' AND acknowledged_at IS NULL AND resolved_at IS NULL AND next_attempt<=? RETURNING *`).bind(now+30000,claimId,env.WATCH_ONLY_PARENT_ID??'',env.WATCH_ONLY_PARENT_ID??'',eventId,now),
  // Read the selected token in the claim transaction, avoiding another remote
  // round trip. A losing claimant must still return before using this result.
  env.DB.prepare(`SELECT CASE e.push_target WHEN 'watch' THEN d.watch_push_token ELSE d.push_token END AS token,d.push_token AS phone_token,d.watch_push_token AS watch_token,d.silent_watch_alarms
@@ -152,6 +160,10 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  if(now-Date.parse((JSON.parse(event.payload) as Alert).createdAt)>86400000){
   await latency.db('outcome_storage_ms',()=>env.DB.prepare("UPDATE events SET status='failed',last_error='expired_event',lease_until=NULL WHERE event_id=?").bind(eventId).run());await record('expired_event');return;
  }
+ if(event.delivery_mode==='watch_only'){
+  latency.details.notification_route='watch_only';
+  latency.details.phone_suppressed=target==='watch';latency.details.phone_fallback=target==='phone';
+ }
  const column=target==='watch'?'watch_push_token':'push_token';
  const parent=claim.source==='receipt'?claim.receipt:claims![offset+3].results[0] as Destination|undefined;
  if(event.delivery_state&&parent){
@@ -178,7 +190,7 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  }
  stage='push';
  const alert=JSON.parse(event.payload) as Alert;
- const silentAlarm=parent.silent_watch_alarms===1&&!alert.isTest;
+ const silentAlarm=parent.silent_watch_alarms===1&&!alert.isTest&&event.delivery_mode!=='watch_only';
  // The original send and its receipt never depend on the auxiliary phone send.
  const primary=sendPush(env,parent.token,alert,target,latency,silentAlarm);
  if(silentAlarm&&target==='watch'&&parent.phone_token){

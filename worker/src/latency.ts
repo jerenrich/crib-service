@@ -39,6 +39,7 @@ export interface TimingDetails {
  journal_failures_before_write?:number;status_successes_sampled?:number;
  late_write_kind?:'claim'|'heartbeat';recovered_after_ms?:number;
  coordination_mode?:'phone_head_start';phone_head_start_ms?:number;phone_head_start_cap_ms?:number;phone_head_start_observed_ms?:number;
+ notification_route?:'watch_only';phone_suppressed?:boolean;phone_fallback?:boolean;
  phone_head_start_wait_outcome?:'head_start_elapsed'|'phone_unavailable'|'wait_cap';
  durable_outcome?:boolean;outcome_recovery?:boolean;outcome_queue_age_ms?:number;
 }
@@ -253,6 +254,9 @@ export function safeTimingDetails(value:TimingDetails|undefined):string|null {
  }
  for(const name of ['durable_outcome','outcome_recovery'] as const)if(typeof value[name]==='boolean')safe[name]=value[name];
  if(value.coordination_mode==='phone_head_start')safe.coordination_mode=value.coordination_mode;
+ if(value.notification_route==='watch_only')safe.notification_route=value.notification_route;
+ if(typeof value.phone_suppressed==='boolean')safe.phone_suppressed=value.phone_suppressed;
+ if(typeof value.phone_fallback==='boolean')safe.phone_fallback=value.phone_fallback;
  if(['head_start_elapsed','phone_unavailable','wait_cap'].includes(value.phone_head_start_wait_outcome!))safe.phone_head_start_wait_outcome=value.phone_head_start_wait_outcome;
  if(['claim','heartbeat'].includes(value.late_write_kind!))safe.late_write_kind=value.late_write_kind;
  if(['reply','receipt'].includes(value.claim_result_source!))safe.claim_result_source=value.claim_result_source;

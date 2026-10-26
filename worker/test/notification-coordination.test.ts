@@ -72,9 +72,11 @@ describe('pair-scoped coordination settings and diagnostics',()=>{
  });
  it('does not retain arbitrary coordination modes, identifiers or outcomes',()=>{
   const unsafe={coordination_mode:'private-parent-id',phone_head_start_wait_outcome:'private-payload',phone_head_start_ms:Infinity,
-   phone_head_start_observed_ms:-1,spans:{coordination_wait_ms:NaN}} as unknown as TimingDetails;
+   phone_head_start_observed_ms:-1,notification_route:'private-route',phone_suppressed:'private-value',phone_fallback:1,spans:{coordination_wait_ms:NaN}} as unknown as TimingDetails;
   expect(safeTimingDetails(unsafe)).toBeNull();
   expect(JSON.parse(safeTimingDetails({coordination_mode:'phone_head_start',phone_head_start_wait_outcome:'wait_cap',phone_head_start_ms:350,phone_head_start_cap_ms:500})!))
    .toMatchObject({coordination_mode:'phone_head_start',phone_head_start_wait_outcome:'wait_cap',phone_head_start_ms:350,phone_head_start_cap_ms:500});
+  expect(JSON.parse(safeTimingDetails({notification_route:'watch_only',phone_suppressed:true,phone_fallback:false})!))
+   .toEqual({notification_route:'watch_only',phone_suppressed:true,phone_fallback:false});
  });
 });

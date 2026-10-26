@@ -2467,6 +2467,80 @@ describe('durable dual destination receipts',()=>{
  });
 });
 
+describe('Watch-only notification trial',()=>{
+ async function setup(watch=true){
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  if(watch)await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
+  return {parent,listener,configured:{...testEnv,WATCH_ONLY_PARENT_ID:parent.deviceId}};
+ }
+ const upload=(listener:TestDevice,event:Alert,configured:Env)=>worker.fetch(new Request('https://monitor.test/v1/listener/event',{method:'POST',
+  headers:{'content-type':'application/json',authorization:`Bearer ${listener.deviceId}.${listener.secret}`},body:JSON.stringify(event)}),configured);
+ it('sends only a Time Sensitive Watch push, suppresses the auxiliary phone copy and removes head-start waiting',async()=>{
+  const {parent,listener,configured}=await setup();await call('silent-watch-alarms',parent,{enabled:true});
+  const event=alert(listener);mockPush();
+  expect(await (await upload(listener,event,{...configured,WATCH_PHONE_HEAD_START_PARENT_ID:parent.deviceId,WATCH_PHONE_HEAD_START_MS:'500'})).json()).toEqual({status:'sent'});
+  expect(pushRequests).toHaveLength(1);
+  const headers=new Headers(pushRequests[0].init?.headers),body=JSON.parse(String(pushRequests[0].init?.body));
+  expect(headers.get('apns-topic')).toBe(testEnv.APNS_BUNDLE_ID+'.watchkitapp');expect(headers.get('apns-collapse-id')).toBe(event.eventId);
+  expect(body.aps).toMatchObject({sound:'default','interruption-level':'time-sensitive'});expect(body.silentCryAlarm).toBeUndefined();
+  expect(await env.DB.prepare('SELECT status,delivery_mode,delivery_state,push_target FROM events WHERE event_id=?').bind(event.eventId).first())
+   .toEqual({status:'sent',delivery_mode:'watch_only',delivery_state:null,push_target:'watch'});
+  const row=await env.DB.prepare("SELECT details FROM diagnostics WHERE operation='dispatch' AND target='watch' AND outcome='sent'").first<{details:string}>();
+  const details=JSON.parse(row!.details);expect(details).toMatchObject({notification_route:'watch_only',phone_suppressed:true,phone_fallback:false});
+  expect(details.coordination_mode).toBeUndefined();expect(details.spans.coordination_wait_ms).toBeUndefined();
+  await upload(listener,event,configured);expect(pushRequests).toHaveLength(1);
+ });
+ it('keeps ordinary phone delivery when no Watch is registered',async()=>{
+  const {listener,configured}=await setup(false),event={...alert(listener),isTest:true};mockPush();
+  expect(await (await upload(listener,event,configured)).json()).toEqual({status:'sent'});
+  expect(pushRequests).toHaveLength(1);expect(new Headers(pushRequests[0].init?.headers).get('apns-topic')).toBe(testEnv.APNS_BUNDLE_ID);
+  expect(await env.DB.prepare('SELECT delivery_mode FROM events WHERE event_id=?').bind(event.eventId).first()).toEqual({delivery_mode:null});
+ });
+ it('leaves other Parents on dual delivery',async()=>{
+  const {listener}=await setup(),event={...alert(listener),isTest:true};mockPush(200,2);
+  await upload(listener,event,{...testEnv,WATCH_ONLY_PARENT_ID:crypto.randomUUID()});expect(pushRequests).toHaveLength(2);
+ });
+ it('pins retryable Watch delivery across trial rollback without adding a phone send',async()=>{
+  const {listener,configured}=await setup(),event={...alert(listener),isTest:true};mockPush(503);
+  expect(await (await upload(listener,event,configured)).json()).toEqual({status:'pending'});
+  await env.DB.prepare('UPDATE events SET next_attempt=0 WHERE event_id=?').bind(event.eventId).run();mockPush();
+  await dispatchEvent(testEnv,event.eventId);expect(pushRequests).toHaveLength(2);
+  expect(pushRequests.every(r=>new Headers(r.init?.headers).get('apns-topic')!.endsWith('.watchkitapp'))).toBe(true);
+  expect(await env.DB.prepare('SELECT status,attempts,delivery_mode FROM events WHERE event_id=?').bind(event.eventId).first()).toEqual({status:'sent',attempts:2,delivery_mode:'watch_only'});
+ });
+ it('never retries an uncertain Watch send or falls back to the phone for ambiguous transport',async()=>{
+  const {listener,configured}=await setup(),event={...alert(listener),isTest:true};pushResponses.push(new Error('ambiguous'));
+  expect(await (await upload(listener,event,configured)).json()).toEqual({status:'uncertain'});
+  await dispatchEvent(configured,event.eventId);expect(pushRequests).toHaveLength(1);
+ });
+ it('falls back to the phone only after Apple definitively invalidates the Watch token',async()=>{
+  const {listener,configured}=await setup(),event={...alert(listener),isTest:true};pushResponses.push({body:JSON.stringify({reason:'Unregistered'}),status:410});
+  expect(await (await upload(listener,event,configured)).json()).toEqual({status:'pending'});mockPush();
+  await dispatchEvent(configured,event.eventId);expect(pushRequests).toHaveLength(2);
+  expect(new Headers(pushRequests[1].init?.headers).get('apns-topic')).toBe(testEnv.APNS_BUNDLE_ID);
+  const row=await env.DB.prepare("SELECT details FROM diagnostics WHERE operation='dispatch' AND target='phone' AND outcome='sent'").first<{details:string}>();
+  expect(JSON.parse(row!.details)).toMatchObject({notification_route:'watch_only',phone_suppressed:false,phone_fallback:true});
+ });
+ it('keeps reminders Watch-only and checkpoints their acceptance without adding a phone delivery',async()=>{
+  const {parent,listener,configured}=await setup();mockPush();await upload(listener,alert(listener),configured);
+  vi.spyOn(Date,'now').mockReturnValue(Date.now()+10000);mockPush();
+  const receipts:import('../src/accepted-delivery').AcceptedDelivery[]=[];
+  await runReminder(configured,parent.deviceId,undefined,undefined,{accepted:async receipt=>{receipts.push(receipt);}});
+  expect(pushRequests).toHaveLength(2);expect(receipts).toHaveLength(1);expect(receipts[0].dual).toBeUndefined();
+  const {persistAcceptedDelivery}=await import('../src/accepted-delivery');await persistAcceptedDelivery(configured,receipts[0]);
+  await dispatchEvent(testEnv,receipts[0].eventId);expect(pushRequests).toHaveLength(2);
+  expect(await env.DB.prepare('SELECT status,delivery_mode FROM events WHERE event_id=?').bind(receipts[0].eventId).first()).toEqual({status:'sent',delivery_mode:'watch_only'});
+ });
+ it('preserves existing dual-target state when the trial is enabled during a retry',async()=>{
+  const {listener,configured}=await setup(),event={...alert(listener),isTest:true};mockPush(200,2);await upload(listener,event,testEnv);
+  await env.DB.prepare("UPDATE events SET status='pending',next_attempt=0,delivery_state=? WHERE event_id=?").bind(JSON.stringify({phone:'sent',watch:'pending'}),event.eventId).run();mockPush();
+  await dispatchEvent(configured,event.eventId);expect(pushRequests).toHaveLength(3);
+  expect(new Headers(pushRequests[2].init?.headers).get('apns-topic')).toBe(testEnv.APNS_BUNDLE_ID+'.watchkitapp');
+  expect(await env.DB.prepare('SELECT delivery_mode,delivery_state FROM events WHERE event_id=?').bind(event.eventId).first())
+   .toEqual({delivery_mode:null,delivery_state:JSON.stringify({phone:'sent',watch:'sent'})});
+ });
+});
+
 describe('phone head-start trial delivery',()=>{
  async function setup(){
   const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});

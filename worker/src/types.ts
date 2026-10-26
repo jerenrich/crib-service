@@ -12,6 +12,7 @@ export interface Env {
  APNS_ENVIRONMENT: 'development' | 'production';
  WATCH_PHONE_HEAD_START_PARENT_ID?:string;
  WATCH_PHONE_HEAD_START_MS?:string;
+ WATCH_ONLY_PARENT_ID?:string;
  TOKEN_ENCRYPTION_KEY: string;
  PAIRING_PEPPER: string;
 }
@@ -21,6 +22,6 @@ export const defaultConfiguration: Configuration = {alertDuration:5, quietResetD
 export interface Episode {id:string; startedAt:string; endedAt?:string|null; alertSentAt?:string|null; quietConfirmed?:boolean}
 export interface Heartbeat {listenerId:string; timestamp:string; monitoring:boolean; microphoneActive?:boolean; batteryLevel?:number|null; powerConnected:boolean; state:'quiet'|'possibleCry'|'crying'; currentEpisode?:Episode|null; episodes:Episode[]; appliedConfiguration?:Configuration;timelineEvents?:TimelineEvent[]}
 export interface Alert { eventId:string; episodeId:string; listenerId:string; type:'sustained_cry'; cryStartedAt:string; durationSeconds:number; createdAt:string; isRepeat:boolean; isTest?:boolean }
-export interface StoredEvent {event_id:string; episode_id:string; listener_id:string; parent_id:string; payload:string; status:string; attempts:number; next_attempt:number; lease_until:number|null; created_at:number; acknowledged_at:string|null; resolved_at:string|null; push_target:'phone'|'watch'|null; last_error:string|null;claim_id?:string|null;delivery_state?:string|null}
+export interface StoredEvent {event_id:string; episode_id:string; listener_id:string; parent_id:string; payload:string; status:string; attempts:number; next_attempt:number; lease_until:number|null; created_at:number; acknowledged_at:string|null; resolved_at:string|null; push_target:'phone'|'watch'|null; last_error:string|null;claim_id?:string|null;delivery_state?:string|null;delivery_mode?:'watch_only'|null}
 export class APIError extends Error { constructor(public status:number, message:string) {super(message)} }
 export function requireRole(device:Device, role:Device['role']) {if (device.role !== role) throw new APIError(403,'This device role cannot use this endpoint.');}
