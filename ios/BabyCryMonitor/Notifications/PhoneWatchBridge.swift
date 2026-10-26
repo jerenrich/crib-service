@@ -58,6 +58,18 @@ import Observation
     }
     nonisolated func session(_ session: WCSession, didReceiveMessage message: [String: Any], replyHandler: @escaping @Sendable ([String: Any]) -> Void) {
         let receivedAt = Date()
+        if message["diagnosticClockProbe"] as? Bool == true {
+            // Timing-only live reply: never wait for a status fetch or issue a
+            // backend request. Cached application contexts cannot provide this bound.
+            Task { @MainActor in
+                var reply: [String: Any] = ["clockReceivedAtMS": DiagnosticTiming.milliseconds(receivedAt) ?? 0]
+                if let sample = self.log?.latestClockSample, sample.ageMS(at: Date()) != nil,
+                   let data = try? JSONEncoder().encode(sample) { reply["diagnosticClock"] = data }
+                reply["clockSentAtMS"] = DiagnosticTiming.milliseconds(Date()) ?? 0
+                replyHandler(reply)
+            }
+            return
+        }
         guard let data = message["command"] as? Data, let command = decodeCommand(data) else {
             replyHandler([:]); return
         }

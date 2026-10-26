@@ -111,3 +111,29 @@ describe('one-write ownership receipt recovery',()=>{
   expect(writes).toBe(1);expect(reads).toBe(1);expect(latency.details.claim_receipt_outcome).toBe('error');
  });
 });
+
+describe('late physical write diagnostics',()=>{
+ it.each(['claim','heartbeat'] as const)('retains the recovered %s reply metrics without altering the logical trace',async kind=>{
+  const latency=new Latency(),write=deferred<D1Result<{id:number}>[]>(),rows:TimingDetails[]=[],tasks:Promise<unknown>[]=[];
+  latency.observeLateWrites({waitUntil:work=>{tasks.push(work);}},async details=>{rows.push(details);});
+  await latency.confirmedWrite(kind,()=>write.promise,async()=>result(2),5);
+  const frozen=JSON.stringify(latency.details);expect(rows).toHaveLength(0);expect(tasks).toHaveLength(1);
+  write.resolve([result(1)]);await Promise.all(tasks);
+  expect(rows).toHaveLength(1);expect(rows[0].late_write_kind).toBe(kind);expect(rows[0].recovered_after_ms).toBeGreaterThanOrEqual(0);
+  expect(rows[0].db_stages?.[kind==='claim'?'claim_ms':'heartbeat_storage_ms']).toMatchObject({completed:1,statements:1,sql_ms:2,attempts:2,retries:1});
+  expect(JSON.stringify(latency.details)).toBe(frozen);
+ });
+ it('retains a late transport failure without exposing exception text or failing the accepted claim',async()=>{
+  const latency=new Latency(),write=deferred<D1Result<{id:number}>[]>(),tasks:Promise<unknown>[]=[],rows:TimingDetails[]=[];
+  latency.observeLateWrites({waitUntil:work=>{tasks.push(work);}},async details=>{rows.push(details);throw new Error('journal failure');});
+  await latency.confirmedClaim(()=>write.promise,async()=>result(2),5);
+  const frozen=JSON.stringify(latency.details);write.reject(new Error('D1_ERROR: timed out private-marker'));await Promise.all(tasks);
+  expect(rows[0]).toMatchObject({late_write_kind:'claim',error_kind:'d1_timeout',failed_span:'claim_ms'});
+  expect(JSON.stringify(rows)).not.toContain('private-marker');expect(JSON.stringify(latency.details)).toBe(frozen);
+ });
+ it('does no background journal work when the normal reply wins',async()=>{
+  const latency=new Latency(),record=vi.fn(),waitUntil=vi.fn();latency.observeLateWrites({waitUntil},record);
+  await latency.confirmedClaim(async()=>[result(1)],async()=>result(2),5);
+  expect(record).not.toHaveBeenCalled();expect(waitUntil).not.toHaveBeenCalled();
+ });
+});

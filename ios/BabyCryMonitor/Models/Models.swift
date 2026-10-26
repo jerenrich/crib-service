@@ -63,12 +63,16 @@ public struct CryAlert: Identifiable, Codable, Equatable, Sendable {
     public let createdAt: Date
     public let isRepeat: Bool
     public let isTest: Bool?
+    // Persisted locally only. Missing on an old outbox entry preserves its old
+    // second-rounded wire metadata, so an upgrade cannot break UUID deduplication.
+    let wireTimestampVersion: Int?
     public var id: UUID { eventId }
     public init(eventId: UUID = UUID(), episodeId: UUID, listenerId: UUID, cryStartedAt: Date, durationSeconds: Double, createdAt: Date, isRepeat: Bool, isTest: Bool? = nil) {
         self.eventId = eventId; self.episodeId = episodeId; self.listenerId = listenerId
         self.type = "sustained_cry"; self.cryStartedAt = cryStartedAt; self.durationSeconds = durationSeconds
         self.createdAt = createdAt; self.isRepeat = isRepeat
         self.isTest = isTest
+        self.wireTimestampVersion = 1
     }
 }
 public struct PendingAlert: Codable, Sendable {

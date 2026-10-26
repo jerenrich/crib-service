@@ -30,19 +30,39 @@ export class AlertReminders implements DurableObject {
  private async hasOutcomes():Promise<boolean> {
   return (await this.ctx.storage.list({prefix:outcomePrefix,limit:1})).size>0;
  }
- private async accept(delivery:AcceptedDelivery):Promise<void> {
-  // Commit locally before letting the alarm finish. A restart can persist this
-  // result without sending APNs again, even if the D1 write never replied.
-  const started=performance.now();await this.ctx.storage.put(outcomePrefix+delivery.eventId,delivery);
-  this.queueTiming(delivery,started);
-  this.rememberAccepted(delivery);
-  this.freshOutcomes.add(delivery.eventId);
+ private identity(delivery:AcceptedDelivery):string {
+  // Legacy receipts predate checkpoint IDs and remain recoverable after rollout.
+  return delivery.checkpointId??`${delivery.eventId}/${delivery.attempt}/${delivery.sentAt}`;
+ }
+ private async accept(delivery:AcceptedDelivery,external=false):Promise<void> {
+  const started=performance.now();
+  await this.ctx.blockConcurrencyWhile(async()=>{
+   const applied=await this.ctx.storage.transaction(async transaction=>{
+    const key=outcomePrefix+delivery.eventId;
+    const existing=await transaction.get<AcceptedDelivery>(key)??this.recentAccepted.get(delivery.eventId);
+    // A delayed/retried checkpoint cannot replace a newer owned attempt or the
+    // first result for the same attempt. Checkpointing never authorizes replay.
+    if(existing&&existing.attempt>=delivery.attempt)return false;
+    const saved=await transaction.get<string|number>(['parentId','interval']);
+    const interval=saved.get('interval')===2000?2000:5000;
+    await transaction.put({[key]:delivery,parentId:delivery.parentId,interval});
+    const scheduled=await transaction.getAlarm(),next=Date.now()+interval;
+    if(scheduled===null||scheduled>next){await transaction.put('dueAt',next);await transaction.setAlarm(next);}
+    return true;
+   });
+   if(applied){
+    this.queueTiming(delivery,started);this.rememberAccepted(delivery);this.freshOutcomes.add(this.identity(delivery));
+    if(external)this.revision++;
+   }
+  });
  }
  private queueTiming(delivery:AcceptedDelivery,started:number):void {
   const details=delivery.diagnostic.details??={},spans=details.spans??={};
   spans.outcome_queue_ms=Math.max(0,performance.now()-started);
  }
  private rememberAccepted(delivery:AcceptedDelivery):void {
+  const previous=this.recentAccepted.get(delivery.eventId);
+  if(previous&&previous.attempt>=delivery.attempt)return;
   this.recentAccepted.set(delivery.eventId,delivery);
   if(this.recentAccepted.size>128)this.recentAccepted.delete(this.recentAccepted.keys().next().value!);
  }
@@ -63,10 +83,19 @@ export class AlertReminders implements DurableObject {
   const entries=[...outcomes];
   // Reserve connection capacity for the next snapshot/claim and its proof read.
   for(let index=0;index<entries.length;index+=2)await Promise.all(entries.slice(index,index+2).map(async([key,saved])=>{
-   const delivery=this.recentAccepted.get(saved.eventId)??saved;
+   const cached=this.recentAccepted.get(saved.eventId);
+   const delivery=cached&&this.identity(cached)===this.identity(saved)?cached:saved;
    this.rememberAccepted(delivery);
-   const recovery=!this.freshOutcomes.delete(delivery.eventId);
-   try {await persistAcceptedDelivery(this.env,delivery,recovery);await this.ctx.storage.delete(key);}
+   const recovery=!this.freshOutcomes.delete(this.identity(delivery));
+   try {
+    await persistAcceptedDelivery(this.env,delivery,recovery);
+    // A D1 flush can outlive a newer attempt's checkpoint. Delete only the
+    // specific receipt that finished, under a short local transaction.
+    await this.ctx.storage.transaction(async transaction=>{
+     const current=await transaction.get<AcceptedDelivery>(key);
+     if(current&&this.identity(current)===this.identity(delivery))await transaction.delete(key);
+    });
+   }
    catch {/* Keep the receipt for the next alarm; never retry the Apple send. */}
   }));
  }
@@ -82,20 +111,7 @@ export class AlertReminders implements DurableObject {
   try {
   if(new URL(request.url).pathname==='/accepted'){
    const delivery=await request.json<AcceptedDelivery>();
-   const queueStarted=performance.now();
-   await this.ctx.blockConcurrencyWhile(async()=>{
-    // Initial uploads may not have a timer yet. Commit the receipt and its
-    // recovery alarm together so a reset cannot leave an orphaned outbox item.
-    await this.ctx.storage.transaction(async transaction=>{
-     const saved=await transaction.get<string|number>(['parentId','interval']);
-     const interval=saved.get('interval')===2000?2000:5000;
-     await transaction.put({[outcomePrefix+delivery.eventId]:delivery,parentId:delivery.parentId,interval});
-     const scheduled=await transaction.getAlarm(),next=Date.now()+interval;
-     if(scheduled===null||scheduled>next){await transaction.put('dueAt',next);await transaction.setAlarm(next);}
-    });
-    this.queueTiming(delivery,queueStarted);this.rememberAccepted(delivery);this.freshOutcomes.add(delivery.eventId);
-    this.revision++;
-   });
+   await this.accept(delivery,true);
    this.ctx.waitUntil(this.flushOutcomes().catch(()=>{}));
    return new Response(null,{status:204});
   }
@@ -215,7 +231,8 @@ export async function runReminder(env:Env,parentId:string,latency=new Latency(),
  // acknowledgement/resolution or authorize a retry of an uncertain APNs call.
  if(['sending','uncertain'].includes(previous.status)&&delivery.acceptedFor){
   const accepted=await delivery.acceptedFor(previous.event_id);
-  if(accepted?.parentId===parentId&&accepted.attempt===previous.attempts)previous={...previous,status:'sent'};
+  if(accepted?.parentId===parentId&&accepted.attempt===previous.attempts
+   &&(!accepted.dual||Object.values(accepted.dual.states).every(state=>state==='sent')))previous={...previous,status:'sent'};
  }
  // Preserve ordinary retry/backoff for an event not yet submitted.
  if(previous.acknowledged_at===null&&['pending','blocked','sending'].includes(previous.status)) {

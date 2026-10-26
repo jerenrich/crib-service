@@ -2004,8 +2004,9 @@ describe('slow initial upload checkpoints',()=>{
  });
  it('cancels fast checkpoints and keeps a started journal alive until it finishes',async()=>{
   const {Latency}=await import('../src/latency'),{startAlertProgress}=await import('../src/alert-progress');const jobs:Promise<unknown>[]=[];
-  const stop=startAlertProgress(testEnv,{waitUntil:job=>jobs.push(job)},crypto.randomUUID(),Date.now(),new Latency(),()=> 'handler',5);stop();await Promise.all(jobs);
-  await new Promise(r=>setTimeout(r,15));expect((await env.DB.prepare('SELECT sequence FROM diagnostics').all()).results).toHaveLength(0);
+  const requestId=crypto.randomUUID();
+  const stop=startAlertProgress(testEnv,{waitUntil:job=>jobs.push(job)},requestId,Date.now(),new Latency(),()=> 'handler',5);stop();await Promise.all(jobs);
+  await new Promise(r=>setTimeout(r,15));expect((await env.DB.prepare('SELECT sequence FROM diagnostics WHERE request_id=?').bind(requestId).all()).results).toHaveLength(0);
   let release!:()=>void,entered!:()=>void;const gate=new Promise<void>(r=>{release=r;}),ready=new Promise<void>(r=>{entered=r;});
   const db=interceptDB(async(sql,_args,_method,execute)=>{if(sql.startsWith('INSERT INTO diagnostics')){entered();await gate;}return execute();});let finished=false;
   const slow=startAlertProgress({...testEnv,DB:db},{waitUntil:job=>{jobs.push(job);void job.then(()=>{finished=true;});}},crypto.randomUUID(),Date.now(),new Latency(),()=> 'handler',5);await ready;
@@ -2405,5 +2406,63 @@ describe('heartbeat committed-save receipt recovery',()=>{
   let complete=false;const work=worker.fetch(request(listener),{...testEnv,DB:db}).then(r=>{complete=true;return r;});await ready;
   try {await env.DB.prepare('DELETE FROM pairs WHERE listener_id=?').bind(listener.deviceId).run();await proofDone;expect(complete).toBe(false);}
   finally{release();expect((await work).status).toBe(503);}
+ });
+});
+
+describe('durable dual destination receipts',()=>{
+ async function setup() {
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});mockPush(200,2);const event=alert(listener);await call('listener/event',listener,event);
+  return {parent,listener,event};
+ }
+ it('lets the next two-device reminder run while its predecessor outcome is stalled',async()=>{
+  const {parent}=await setup();let now=Date.now()+10000;vi.spyOn(Date,'now').mockImplementation(()=>now);
+  let release!:()=>void,entered!:()=>void;const gate=new Promise<void>(r=>{release=r;}),ready=new Promise<void>(r=>{entered=r;});
+  const db=interceptDB(async(sql,_args,method,execute)=>{if(sql.startsWith('WITH states AS MATERIALIZED')&&method==='run'){entered();await gate;}return execute();});
+  const {AlertReminders}=await import('../src/reminders');const state=reminderContext(parent.deviceId),instance=new AlertReminders(state.ctx,{...testEnv,DB:db});
+  mockPush(200,2);await instance.alarm();await ready;
+  try{
+   expect(pushRequests).toHaveLength(4);expect([...state.values.keys()].filter(k=>k.startsWith('accepted/'))).toHaveLength(1);
+   now+=5000;mockPush(200,2);await instance.alarm();expect(pushRequests).toHaveLength(6);
+   const ids=pushRequests.map(r=>JSON.parse(String(r.init?.body)).eventId);expect(new Set(ids).size).toBe(3);
+   for(const id of new Set(ids))expect(ids.filter(value=>value===id)).toHaveLength(2);
+   expect(JSON.stringify([...state.values.values()])).not.toMatch(/abababababababab|cdcdcdcdcdcdcdcd/);
+   await env.DB.prepare('UPDATE events SET acknowledged_at=?').bind(new Date(now).toISOString()).run();
+  }finally{release();await state.drain();}
+  await instance.alarm();await state.drain();expect([...state.values.keys()].filter(k=>k.startsWith('accepted/'))).toHaveLength(0);
+  const rows=await env.DB.prepare("SELECT target,http_status,details FROM diagnostics WHERE operation='dispatch' AND target IS NOT NULL AND json_extract(details,'$.durable_outcome')=1").all<{target:string;http_status:number;details:string}>();
+  expect(rows.results).toHaveLength(4);expect(rows.results.every(row=>row.http_status===200)).toBe(true);
+ });
+ it.each(['retry','uncertain'] as const)('recovers accepted phone and %s Watch outcomes atomically after restart',async outcome=>{
+  const {parent,event}=await setup();const states=JSON.stringify({phone:'pending',watch:'pending'});
+  await env.DB.prepare("UPDATE events SET status='sending',attempts=2,delivery_state=? WHERE event_id=?").bind(states,event.eventId).run();
+  const receipts:import('../src/accepted-delivery').AcceptedDelivery[]=[];
+  const send=vi.fn(async(target:'phone'|'watch')=>target==='phone'?{status:'sent' as const,httpStatus:200}:{status:outcome,reason:outcome==='retry'?'apns_503' as const:'transport_unknown' as const});
+  const result=await deliverToBoth(testEnv,{table:'events',id:event.eventId,parentId:parent.deviceId,attempt:2,state:states,phoneToken:'secret-phone',watchToken:'secret-watch',requestId:crypto.randomUUID(),send,
+   accepted:async receipt=>{receipts.push(receipt);},aggregate:{requestId:crypto.randomUUID(),started:Date.now(),operation:'dispatch',stage:'storage',outcome:'sent'}});
+  expect(result).toBe(outcome==='retry'?'pending':'uncertain');expect(receipts).toHaveLength(1);expect(JSON.stringify(receipts)).not.toMatch(/secret-phone|secret-watch/);
+  await env.DB.prepare("UPDATE events SET status='uncertain',last_error='dispatch_interrupted',acknowledged_at=? WHERE event_id=?").bind(new Date().toISOString(),event.eventId).run();
+  const {persistAcceptedDelivery}=await import('../src/accepted-delivery');await persistAcceptedDelivery(testEnv,receipts[0],true);
+  const row=await env.DB.prepare('SELECT status,delivery_state,acknowledged_at FROM events WHERE event_id=?').bind(event.eventId).first<{status:string;delivery_state:string;acknowledged_at:string}>();
+  expect(row!.status).toBe(result);expect(row!.acknowledged_at).not.toBeNull();expect(JSON.parse(row!.delivery_state)).toEqual({phone:'sent',watch:outcome==='retry'?'pending':'uncertain'});
+  await env.DB.prepare("UPDATE events SET status='sending',attempts=3 WHERE event_id=?").bind(event.eventId).run();send.mockClear();send.mockResolvedValue({status:'sent',httpStatus:200});
+  await deliverToBoth(testEnv,{table:'events',id:event.eventId,parentId:parent.deviceId,attempt:3,state:row!.delivery_state,phoneToken:'phone',watchToken:'watch',requestId:crypto.randomUUID(),send});
+  expect(send).toHaveBeenCalledTimes(outcome==='retry'?1:0);if(outcome==='retry')expect(send.mock.calls[0][0]).toBe('watch');
+ });
+ it('does not delete a newer receipt when the old attempt finishes after its D1 commit',async()=>{
+  const {parent,event}=await setup();const {acceptedDelivery}=await import('../src/accepted-delivery');
+  const first=acceptedDelivery(event.eventId,parent.deviceId,1,0,{requestId:crypto.randomUUID(),started:Date.now(),operation:'dispatch',stage:'storage',outcome:'sent'});
+  const second=acceptedDelivery(event.eventId,parent.deviceId,2,0,first.diagnostic);
+  const state=reminderContext(parent.deviceId);state.values.set('accepted/'+event.eventId,first);
+  let release!:()=>void,entered!:()=>void;const gate=new Promise<void>(r=>{release=r;}),ready=new Promise<void>(r=>{entered=r;});let count=0;
+  const db=interceptDB(async(sql,_args,method,execute)=>{const result=await execute();if(sql.startsWith("UPDATE events SET status='sent'")&&method==='run'&&count++===0){entered();await gate;}return result;});
+  const {AlertReminders}=await import('../src/reminders');const instance=new AlertReminders(state.ctx,{...testEnv,DB:db});
+  const post=(receipt:typeof first)=>instance.fetch(new Request('https://reminders.internal/accepted',{method:'POST',body:JSON.stringify(receipt)}));
+  await post(first);await ready;await post(second);await post(first);
+  try{expect((state.values.get('accepted/'+event.eventId) as typeof first).checkpointId).toBe(second.checkpointId);}
+  finally{release();await state.drain();}
+  expect((state.values.get('accepted/'+event.eventId) as typeof first).checkpointId).toBe(second.checkpointId);
+  await env.DB.prepare('UPDATE events SET acknowledged_at=?').bind(new Date().toISOString()).run();await instance.alarm();await state.drain();
+  expect(state.values.has('accepted/'+event.eventId)).toBe(false);
  });
 });

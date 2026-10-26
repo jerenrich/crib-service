@@ -7,7 +7,7 @@ import {APIError,requireRole,type Alert,type Device,type Env,type StoredEvent} f
 import {alert as validateAlert,uuid,configuration} from './security';
 import {pairFor} from './devices';
 import {sendPush,sendSilentCryAlarmPush,type PushResult} from './apns';
-import {eventReference,recordDiagnostic,PushPreparationError,type Outcome,type Stage} from './diagnostics';
+import {eventReference,recordDiagnostic,observeLateWrites,PushPreparationError,type Outcome,type Stage} from './diagnostics';
 export async function receiveAlert(env:Env,device:Device,value:Record<string,unknown>,requestId=crypto.randomUUID(),latency=new Latency(),background?:Pick<ExecutionContext,'waitUntil'>) {
  latency.details.dispatch_source='upload';
  const {alert,pair,record}=await latency.measure('alert_prepare_ms',async()=>{
@@ -74,6 +74,7 @@ export interface DispatchOptions {
 }
 export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.randomUUID(),latency=new Latency(),options:DispatchOptions={}):Promise<void> {
  const now=Date.now();
+ observeLateWrites(env,latency,options.background,requestId,now);
  let stage:Stage='claim',eventRef:string|undefined,attempt:number|undefined,target:'phone'|'watch'|undefined;
  let pushResult:PushResult|undefined;
  let auxiliary:Promise<void>|undefined;
@@ -155,13 +156,17 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  if(event.delivery_state&&parent){
   stage='push';
   const alert=JSON.parse(event.payload) as Alert;
+  let checkpointed=false;
   const status=await deliverToBoth(env,{table:'events',id:eventId,parentId:event.parent_id,attempt:event.attempts,
    state:event.delivery_state,phoneToken:parent.phone_token,watchToken:parent.watch_token,requestId,eventRef,
    source:latency.details.dispatch_source,
+   accepted:options.accepted?async delivery=>{await latency.measure('outcome_queue_ms',()=>options.accepted!(delivery));checkpointed=true;}:undefined,
+   aggregate:{requestId,started:now,operation:'dispatch',stage:'storage',outcome:'sent',eventRef,attempt,details:latency.progressDetails()},
    send:(destination,token,timing)=>sendPush(env,token,alert,destination,timing,parent.silent_watch_alarms===1&&!alert.isTest)});
   latency.details.push_outcome=status==='pending'?'retry':status;
   stage='storage';target=undefined;
-  await record(status==='pending'?'retry':status,undefined,'dispatch_outcome');
+  // The checkpoint's background persister owns the aggregate and target journals.
+  if(!checkpointed)await record(status==='pending'?'retry':status,undefined,'dispatch_outcome');
   return;
  }
  if(!parent?.token){

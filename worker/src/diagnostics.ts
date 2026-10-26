@@ -18,7 +18,7 @@ const routes = {
  'POST /v1/connection-alerts':'connection_preferences','POST /v1/test-push':'test_push',
  'GET /v1/live-sound':'live_sound'
 } as const;
-export type Operation = typeof routes[keyof typeof routes] | 'unknown_route' | 'status_journal' | 'heartbeat_journal' | 'alert_progress' | 'dispatch' | 'dispatch_outcome' | 'dispatch_skip' | 'reminder_prepare' | 'maintenance' | 'reminder_schedule' | 'reminder_alarm' | 'watch_test_dispatch' | 'silent_alarm_test_dispatch' | 'silent_cry_alarm_dispatch';
+export type Operation = typeof routes[keyof typeof routes] | 'unknown_route' | 'status_journal' | 'heartbeat_journal' | 'alert_progress' | 'database_late_reply' | 'dispatch' | 'dispatch_outcome' | 'dispatch_skip' | 'reminder_prepare' | 'maintenance' | 'reminder_schedule' | 'reminder_alarm' | 'watch_test_dispatch' | 'silent_alarm_test_dispatch' | 'silent_cry_alarm_dispatch';
 export type Stage = 'validation' | 'rate_limit' | 'authentication' | 'handler' | 'claim' | 'push' | 'storage' | 'cleanup';
 export type Outcome = 'ok' | 'rejected' | 'internal_error' | 'sent' | 'retry' | 'blocked' | 'uncertain' | 'failed'
  | 'expired_event' | 'no_push_token' | 'transport_unknown' | 'invalid_device_token' | 'provider_configuration'
@@ -59,4 +59,15 @@ export async function recordDiagnostic(env:Env,value:Diagnostic):Promise<boolean
   reportedJournalFailures=Math.max(reportedJournalFailures,observedFailures);
   return true;
  } catch { journalFailures=Math.min(Number.MAX_SAFE_INTEGER,journalFailures+1);return false; }
+}
+
+// No new query on the normal path. A recovered write is kept alive only within
+// the platform's background lifetime; missing late rows remain explicitly unknown.
+export function observeLateWrites(env:Env,latency:import('./latency').Latency,background:Pick<ExecutionContext,'waitUntil'>|undefined,requestId:string,started:number):void {
+ if(!background)return;
+ latency.observeLateWrites(background,async details=>{
+  await recordDiagnostic(env,{requestId,started,operation:'database_late_reply',stage:details.late_write_kind==='claim'?'claim':'storage',
+   outcome:details.error_kind?'internal_error':'ok',eventRef:latency.eventRef,attempt:latency.deliveryAttempt,
+   details:{...details,dispatch_source:latency.details.dispatch_source,client_request_id:latency.details.client_request_id,colo:latency.details.colo}});
+ });
 }

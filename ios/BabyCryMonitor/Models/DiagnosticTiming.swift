@@ -115,3 +115,9 @@ struct DiagnosticNotificationRemoval: Sendable {
     let reason: NotificationRemovalReason
     let pending: Bool
 }
+
+/// Fixed failure stages keep unavailable Watch calibration diagnosable.
+enum DiagnosticClockCalibration: String {
+    case ok, unreachable, transport, relativeUnavailable = "relative_unavailable"
+    case phoneUnavailable = "phone_unavailable", stalePhone = "stale_phone"
+}

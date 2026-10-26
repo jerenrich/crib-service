@@ -24,12 +24,13 @@ import UserNotifications
     @ObservationIgnored private var connectionWarningUpdatePending = false
     @ObservationIgnored private var recoveringNotificationHistory = false
     private static let scheduledWarningKey = "scheduledConnectionWarningDeadline"
+    @ObservationIgnored private var lastClockProbeAt: ContinuousClock.Instant?
     private let alertState = WatchAlertState()
 
     override private init() {
         super.init()
         log.record("app_launched", code: DiagnosticLog.maximumLines)
-        log.record("alert_pipeline_ready", code: 7)
+        log.record("alert_pipeline_ready", code: 8)
         log.checkpointCoverage()
         if let data = UserDefaults.standard.data(forKey: "watchSnapshot") {
             do { snapshot = try JSONDecoder().decode(WatchSnapshot.self, from: data) }
@@ -136,7 +137,37 @@ import UserNotifications
         log.record("push_registration_failed", error: error)
         alertSetup.fail("Could not register this Watch with Apple. Check its internet connection, then tap Retry setup.")
     }
-    func refresh() { send(WatchCommand(kind: .refresh)) }
+    func refresh() {
+        calibrateClockIfNeeded()
+        send(WatchCommand(kind: .refresh))
+    }
+
+    private func calibrateClockIfNeeded() {
+        guard WCSession.isSupported(), WCSession.default.activationState == .activated,
+              WCSession.default.isReachable else { log.clockCalibration(.unreachable); return }
+        let started = ContinuousClock.now
+        if let lastClockProbeAt, lastClockProbeAt.duration(to: started) < .seconds(60) { return }
+        lastClockProbeAt = started
+        let sentAt = Date()
+        WCSession.default.sendMessage(["diagnosticClockProbe": true], replyHandler: { @Sendable reply in
+            let finishedAt = Date()
+            let relative = DiagnosticClockSample.estimate(localStarted: sentAt, localFinished: finishedAt,
+                monotonicMS: DiagnosticTiming.elapsedMS(since: started),
+                remoteReceivedMS: (reply["clockReceivedAtMS"] as? NSNumber)?.int64Value,
+                remoteSentMS: (reply["clockSentAtMS"] as? NSNumber)?.int64Value)
+            let phone = (reply["diagnosticClock"] as? Data).flatMap { try? JSONDecoder().decode(DiagnosticClockSample.self, from: $0) }
+            let phoneSent = (reply["clockSentAtMS"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue / 1000) }
+            let sample = relative.flatMap { relative in phoneSent.flatMap { phone?.bridged(to: relative, phoneSentAt: $0) } }
+            let outcome: DiagnosticClockCalibration = relative == nil ? .relativeUnavailable : phone == nil ? .phoneUnavailable : sample == nil ? .stalePhone : .ok
+            Task { @MainActor in
+                self.log.clockCalibration(outcome)
+                // An older live reply must not replace a newer estimate.
+                if self.log.latestClockSample.map({ $0.sampledAt > finishedAt }) != true { self.log.observeClock(sample) }
+            }
+        }, errorHandler: { @Sendable _ in
+            Task { @MainActor in self.log.clockCalibration(.transport) }
+        })
+    }
 
     var diagnosticApplicationState: WatchAlertTrace.ApplicationState {
         switch WKApplication.shared().applicationState {

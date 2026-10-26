@@ -122,13 +122,19 @@ import Observation
         if !details.isEmpty { entry += " " + details }
         append(entry)
     }
+    func clockCalibration(_ outcome: DiagnosticClockCalibration) {
+        let now = Date(), key = "clock_calibration_\(outcome.rawValue)"
+        guard recent[key].map({ now.timeIntervalSince($0) >= 60 }) ?? true else { return }
+        recent[key] = now
+        append("clock_calibration outcome=\(outcome.rawValue)")
+    }
     func observeClock(_ sample: DiagnosticClockSample?) {
         latestClockSample = sample?.isValid == true ? sample : nil
         // HTTP samples share the network row. The Watch has no such row, so
-        // retain one bridge estimate per 15 minutes using existing exchanges.
+        // retain one bridge estimate per 5 minutes using bounded live exchanges.
         if let sample = latestClockSample, sample.source == .phoneBridge {
             let now = Date(),key = "watch_clock_estimate"
-            if recent[key].map({ now.timeIntervalSince($0) >= 900 }) ?? true {
+            if recent[key].map({ now.timeIntervalSince($0) >= 300 }) ?? true {
                 recent[key] = now; append("clock_estimate" + sample.fields)
             }
         }

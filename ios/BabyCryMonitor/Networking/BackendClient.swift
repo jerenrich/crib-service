@@ -129,7 +129,7 @@ struct BackendClient: BackendServing {
     func status() async throws -> ParentStatus { try await request("/v1/listener/status", method: "GET", body: Optional<String>.none) }
     func timeline() async throws -> TimelineResponse { try await request("/v1/timeline", method: "GET", body: Optional<String>.none) }
     func heartbeat(_ value: Heartbeat) async throws -> MonitoringConfiguration { try await request("/v1/listener/heartbeat", body: value) }
-    func send(_ alert: CryAlert) async throws -> AlertReceipt { try await request("/v1/listener/event", body: alert, eventID: alert.eventId) }
+    func send(_ alert: CryAlert) async throws -> AlertReceipt { try await request("/v1/listener/event", body: AlertUpload(alert: alert), eventID: alert.eventId) }
     func setMonitoring(_ enabled: Bool, id: UUID) async throws -> MonitoringCommand {
         struct Request: Encodable { let id: UUID; let enabled: Bool }
         return try await request("/v1/monitoring", body: Request(id: id, enabled: enabled))

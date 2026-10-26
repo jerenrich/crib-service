@@ -13,7 +13,7 @@ import {connectionPreferences,flushConnections} from './connections';
 import {createPairing,claimPairing} from './pairing';
 import {receiveAlert,acknowledge,resumeAlerts,flushPending} from './alerts';
 import {saveHeartbeat,listenerStatus,saveSettings} from './status';
-import {operationFor,recordDiagnostic,type Stage} from './diagnostics';
+import {operationFor,recordDiagnostic,observeLateWrites,type Stage} from './diagnostics';
 import {queueStatusDiagnostic,queueHeartbeatDiagnostic} from './status-diagnostics';
 import {startAlertProgress} from './alert-progress';
 import {Latency} from './latency';
@@ -21,6 +21,7 @@ import {Latency} from './latency';
 export default {
  async fetch(request:Request,env:Env,ctx?:ExecutionContext):Promise<Response> {
   const requestId=crypto.randomUUID(),started=Date.now(),latency=new Latency();
+  observeLateWrites(env,latency,ctx,requestId,started);
   latency.details.colo=typeof request.cf?.colo==='string'?request.cf.colo:undefined;
   let operation=operationFor('', ''),stage:Stage='validation',stopProgress:(()=>void)|undefined;
   const respond=async(result:unknown,status:number,outcome:'ok'|'rejected'|'internal_error')=>{

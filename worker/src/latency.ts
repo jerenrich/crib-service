@@ -37,10 +37,27 @@ export interface TimingDetails {
  observed_attempts?:number; next_attempt_at_ms?:number;
  preparation_started_at_ms?:number; preparation_finished_at_ms?:number;
  journal_failures_before_write?:number;status_successes_sampled?:number;
+ late_write_kind?:'claim'|'heartbeat';recovered_after_ms?:number;
  durable_outcome?:boolean;outcome_recovery?:boolean;outcome_queue_age_ms?:number;
 }
 export class Latency {
  readonly details:TimingDetails={spans:{}};
+ private lateObserver?:{background:Pick<ExecutionContext,'waitUntil'>;record:(details:TimingDetails)=>Promise<unknown>};
+ observeLateWrites(background:Pick<ExecutionContext,'waitUntil'>,record:(details:TimingDetails)=>Promise<unknown>):void {
+  this.lateObserver={background,record};
+ }
+ private async lateWrite(kind:'claim'|'heartbeat',started:number,recoveredAfter:number,results?:D1Result<unknown>[],error?:unknown):Promise<void> {
+  if(!this.lateObserver)return;
+  // Independent trace: a late physical reply must not mutate the logical send's
+  // frozen spans. Only provider metrics and fixed error categories survive.
+  const late=new Latency(),stage=kind==='claim'?'claim_ms':'heartbeat_storage_ms';
+  late.details.spans![stage]=Math.max(0,performance.now()-started);
+  late.details.late_write_kind=kind;late.details.recovered_after_ms=recoveredAfter;
+  late.databaseStarted(stage);
+  if(results)late.databaseCompleted(stage,results);
+  else {late.metric(stage,'errors');late.failure(error,stage);}
+  try{await this.lateObserver.record(late.progressDetails());}catch{/* Best effort only. */}
+ }
  private active?:{name:Span;started:number};
  private failureCause:unknown;
  private hasFailure=false;
@@ -115,6 +132,7 @@ export class Latency {
   const resultField=kind==='claim'?'claim_result_source':'heartbeat_result_source',proofField=kind==='claim'?'claim_receipt_outcome':'heartbeat_receipt_outcome';
   return this.measure(stage,()=>new Promise((resolve,reject)=>{
    let settled=false,proofStarted=false,proofDone=false,writeFailed=false,writeError:unknown;
+   const writeAt=performance.now();let recoveredAfter=0,writeTask:Promise<void>|undefined;
    let proofAt=0,timer:ReturnType<typeof setTimeout>|undefined;
    const clear=()=>{if(timer!==undefined)clearTimeout(timer);};
    const rejected=()=>{if(!settled){settled=true;clear();reject(writeError);}};
@@ -130,7 +148,10 @@ export class Latency {
       if(row){
        this.details[proofField]='matched';this.details[resultField]='receipt';
        if(!writeFailed)this.metric(stage,'unfinished');
-       settled=true;clear();resolve({source:'receipt',receipt:row});
+       recoveredAfter=Math.max(0,performance.now()-writeAt);
+       settled=true;clear();
+       if(!writeFailed&&writeTask&&this.lateObserver)this.lateObserver.background.waitUntil(writeTask);
+       resolve({source:'receipt',receipt:row});
       }else{this.details[proofField]='missing';if(writeFailed)rejected();}
      }catch{
       if(settled)return;
@@ -141,14 +162,15 @@ export class Latency {
    };
    this.databaseStarted(stage);
    timer=setTimeout(prove,afterMs);
-   void (async()=>{
+   writeTask=(async()=>{
     try {
-     const results=await write();if(settled)return;
+     const results=await write();
+     if(settled){await this.lateWrite(kind,writeAt,recoveredAfter,results);return;}
      this.databaseCompleted(stage,results);this.details[resultField]='reply';
      if(proofStarted&&!proofDone){this.metric(proofStage,'unfinished');this.details.spans![proofStage]=Math.max(0,performance.now()-proofAt);}
      settled=true;clear();resolve({source:'reply',results});
     }catch(error){
-     if(settled)return;
+     if(settled){await this.lateWrite(kind,writeAt,recoveredAfter,undefined,error);return;}
      writeFailed=true;writeError=error;this.metric(stage,'errors');
      // A transport failure need not imply rollback. Check this request's own
      // committed ownership once; absence/error still fails closed.
@@ -224,10 +246,11 @@ export function safeTimingDetails(value:TimingDetails|undefined):string|null {
   if(Object.keys(metrics).length)stages[name]=metrics;
  }
  if(Object.keys(stages).length)safe.db_stages=stages;
- for(const name of ['db_calls','db_sql_ms','db_rows_read','db_rows_written','db_attempts','provider_token_age_s','apns_started_at_ms','apns_response_at_ms','observed_attempts','next_attempt_at_ms','preparation_started_at_ms','preparation_finished_at_ms','journal_failures_before_write','outcome_queue_age_ms','in_flight_ms','status_successes_sampled'] as const){
+ for(const name of ['db_calls','db_sql_ms','db_rows_read','db_rows_written','db_attempts','provider_token_age_s','apns_started_at_ms','apns_response_at_ms','observed_attempts','next_attempt_at_ms','preparation_started_at_ms','preparation_finished_at_ms','journal_failures_before_write','outcome_queue_age_ms','in_flight_ms','status_successes_sampled','recovered_after_ms'] as const){
   if(number(value[name]))safe[name]=value[name];
  }
  for(const name of ['durable_outcome','outcome_recovery'] as const)if(typeof value[name]==='boolean')safe[name]=value[name];
+ if(['claim','heartbeat'].includes(value.late_write_kind!))safe.late_write_kind=value.late_write_kind;
  if(['reply','receipt'].includes(value.claim_result_source!))safe.claim_result_source=value.claim_result_source;
  if(['reply','receipt'].includes(value.heartbeat_result_source!))safe.heartbeat_result_source=value.heartbeat_result_source;
  if(['matched','missing','error'].includes(value.claim_receipt_outcome!))safe.claim_receipt_outcome=value.claim_receipt_outcome;
