@@ -1,5 +1,15 @@
 # Readiness release checks
 
+## Distinct reminders and dismissal cleanup — 26 October 2026
+
+Crying and standard test pushes no longer set an episode `thread-id`. Each reminder uses its own event UUID for its collapse ID, with the existing phone/Watch prefixes retained where applicable. Retries of the same event retain their identity. Reminder cadence, the separate forwarded/direct paths, and the additive AlarmKit behavior remain intact. This prevents episode-wide notification replacement; increased physical vibration frequency is not established by automated checks.
+
+The updated iPhone and Watch categories request explicit dismissal callbacks. When the OS reports one, the app removes received crying/test notifications on that device up to the dismissal cutoff. It does not acknowledge or snooze an episode, remove pending notifications, or clear connection warnings. Ignoring a notification or flicking away a banner does not trigger this callback. watchOS can still group notifications by app; its Notification Grouping setting must be Off to disable visual grouping completely.
+
+Source `546f1f2`, including main's additive alarm fix, was merged and pushed to `main` and deployed at **2026-10-26T16:29:37.205821Z** as Worker **`36368162-2d13-48a8-8168-1365924d3806`**, serving 100% of traffic. Readback verified unchanged bindings, all five secret bindings, development APNs configuration and the existing standalone probe variable. The minute cron remains configured; no D1 migrations were pending. Both TypeScript checks, all **304 backend tests**, all **306 iPhone unit tests**, the Worker dry run, signed combined iPhone/Watch build and deep signature verification passed.
+
+The Parent app was installed in place and launched on J17; the exact embedded Watch companion was installed and launched on the paired Watch. Readback confirms J17 retained Parent role, pairing and enabled silent Watch alarms; the Watch reports Parent mode, pairing and push registration. Listener J14 did not need an update and was not reinstalled or restarted. The backend health check and all **80 live smoke checks** passed. Temporary registrations and shared metadata were deleted through the authenticated API, without registering push tokens or sending notifications. Physical vibration and clear-one/clear-history behavior still need observation on the Watch. Local evidence is retained under `.local/ungrouped-alerts-rollout-2026-10-26/`.
+
 ## Additive crying alert delivery — 26 October 2026
 
 The intended real-cry policy is to request all three paths: a silent-tone AlarmKit alarm when enabled and authorized, a normal phone notification that Apple can forward to the Watch, and a separate direct Watch notification. Duplicate wrist alerts are intentional. AlarmKit must not remove the normal notification's sound/haptic request or replace either notification route. Snooze, Stop, quiet resolution, permissions and device connectivity still apply.
