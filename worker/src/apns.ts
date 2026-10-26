@@ -24,7 +24,6 @@ export async function sendPush(env:Env,encryptedToken:string,alert:Alert,target:
  const diagnosticRef=latency.eventRef,deliveryAttempt=latency.deliveryAttempt;
  const correlation=diagnosticRef&&/^[0-9a-f]{64}$/.test(diagnosticRef)&&deliveryAttempt!==undefined&&Number.isSafeInteger(deliveryAttempt)&&deliveryAttempt>0&&deliveryAttempt<=1_000_000?{diagnosticRef,deliveryAttempt}:{};
  const content=payload(alert);
- const {sound:_sound,...silentAPS}=content.aps;
  // Transport and notification identities are separate controls. The logical
  // payload identity remains shared so acknowledging either copy handles one event.
  const requestID=identity.distinctRequestID?crypto.randomUUID():alert.eventId;
@@ -33,15 +32,16 @@ export async function sendPush(env:Env,encryptedToken:string,alert:Alert,target:
  const collapseID=identity.separateCollapseIDs?`${target}:${collapseBase}`:collapseBase;
  if(identity.separateCollapseIDs){latency.details.apns_collapse_mode='target_scoped';latency.details.apns_collapse_basis=alert.isRepeat?'episode':'event';}
  return sendNotification(env,encryptedToken,requestID,{...content,...correlation,
-  ...(silentCryAlarm&&target==='phone'&&!alert.isTest?{silentCryAlarm:true,aps:{...silentAPS,'content-available':1}}:{})
+  // AlarmKit is additive: retain the phone's normal sound/haptic request so
+  // Apple can forward an alert while the separate direct Watch copy also alerts.
+  ...(silentCryAlarm&&target==='phone'&&!alert.isTest?{silentCryAlarm:true,aps:{...content.aps,'content-available':1}}:{})
  },target,alert.isRepeat?5:3600,collapseID,latency,schedule);
 }
 export async function sendSilentCryAlarmPush(env:Env,encryptedToken:string,alert:Alert,latency=new Latency()):Promise<PushResult> {
  const content=payload(alert);
- const {sound:_sound,...silentAPS}=content.aps;
  // Separate APNs request ID, preserving event/episode identity for acknowledgement.
  return sendNotification(env,encryptedToken,crypto.randomUUID(),{...content,silentCryAlarm:true,
-  aps:{...silentAPS,'content-available':1}},'phone',60,alert.episodeId,latency);
+  aps:{...content.aps,'content-available':1}},'phone',60,alert.episodeId,latency);
 }
 export async function sendConnectionPush(env:Env,encryptedToken:string,id:string,state:'offline'|'stopped',target:'phone'|'watch',latency=new Latency()):Promise<PushResult> {
  const title=state==='stopped'?'Listener monitoring stopped':'Listener connection lost';

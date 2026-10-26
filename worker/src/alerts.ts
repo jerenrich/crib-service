@@ -85,8 +85,10 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  try { eventRef=latency.eventRef??await eventReference(env,eventId);latency.eventRef=eventRef; } catch { /* No diagnostic identity available. */ }
  // Tombstones also suppress an offline outbox upload after its episode settled.
  const claimId=crypto.randomUUID();
- // Only fresh, unclaimed events opt in. Preserve any prior dual-target receipt.
- const watchOnlySQL="parent_id=? AND push_target IS NULL AND delivery_state IS NULL AND EXISTS(SELECT 1 FROM devices WHERE id=events.parent_id AND watch_push_token IS NOT NULL)";
+ // Routing experiments are test-only. Real cries retain both phone forwarding
+ // and direct Watch delivery, with AlarmKit added to the phone notification.
+ // Preserve any prior delivery receipt so accepted pushes are never replayed.
+ const watchOnlySQL="parent_id=? AND push_target IS NULL AND delivery_state IS NULL AND COALESCE(json_extract(payload,'$.isTest'),0)=1 AND EXISTS(SELECT 1 FROM devices WHERE id=events.parent_id AND watch_push_token IS NOT NULL)";
  // Marked tests alone opt in. Pin the selected phone using the existing target
  // and single-target state, so disabling the flag cannot add a Watch on retry.
  // An existing Watch-only opt-in wins if both settings name the same Parent.

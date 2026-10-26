@@ -2112,7 +2112,7 @@ describe('optional overnight silent Watch alarms',()=>{
   expect(pushRequests).toHaveLength(2);
   const bodies=pushRequests.map(r=>JSON.parse(String(r.init?.body)));
   expect(bodies.find(b=>b.silentCryAlarm)?.aps['content-available']).toBe(1);
-  expect(bodies.find(b=>b.silentCryAlarm)?.aps.sound).toBeUndefined();
+  expect(bodies.find(b=>b.silentCryAlarm)?.aps.sound).toBe('default');
   expect(bodies.find(b=>!b.silentCryAlarm)?.aps.sound).toBe('default');
   expect(bodies[0].eventId).toBe(bodies[1].eventId);
  });
@@ -2156,7 +2156,47 @@ describe('optional overnight silent Watch alarms',()=>{
   await call('listener/event',listener,alert(listener));expect(pushRequests).toHaveLength(1);
   const body=JSON.parse(String(pushRequests[0].init?.body));
   expect(body.silentCryAlarm).toBe(true);expect(body.aps['content-available']).toBe(1);
-  expect(body.aps.category).toBe('BABY_CRY_ALERT');expect(body.aps.sound).toBeUndefined();
+  expect(body.aps.category).toBe('BABY_CRY_ALERT');expect(body.aps.sound).toBe('default');
+ });
+ it('preserves phone forwarding, AlarmKit processing and direct Watch delivery for initial alerts and reminders',async()=>{
+  const {parent,listener}=await setup();await call('silent-watch-alarms',parent,{enabled:true});
+  // Experimental routing must never suppress a real crying notification.
+  const configured={...testEnv,WATCH_ONLY_PARENT_ID:parent.deviceId,PHONE_ONLY_TEST_PARENT_ID:parent.deviceId};
+  fanout();const initial=alert(listener);
+  await worker.fetch(new Request('https://monitor.test/v1/listener/event',{method:'POST',
+   headers:{'content-type':'application/json',authorization:`Bearer ${listener.deviceId}.${listener.secret}`},body:JSON.stringify(initial)}),configured);
+  vi.spyOn(Date,'now').mockReturnValue(Date.now()+10000);
+  await runReminder(configured,parent.deviceId);
+  expect(pushRequests).toHaveLength(4);
+  const pairs=new Map<string,typeof pushRequests>();
+  for(const request of pushRequests){
+   const body=JSON.parse(String(request.init?.body));
+   pairs.set(body.eventId,[...(pairs.get(body.eventId)??[]),request]);
+  }
+  expect(pairs.size).toBe(2);
+  for(const [id,requests] of pairs){
+   expect(requests).toHaveLength(2);
+   for(const request of requests){
+    const headers=new Headers(request.init?.headers),body=JSON.parse(String(request.init?.body));
+    const watch=headers.get('apns-topic')===testEnv.APNS_BUNDLE_ID+'.watchkitapp';
+    expect(body).toMatchObject({eventId:id,episodeId:initial.episodeId,
+     aps:{sound:'default',category:'BABY_CRY_ALERT','interruption-level':'time-sensitive'}});
+    expect(body.silentCryAlarm).toBe(watch?undefined:true);
+    expect(body.aps['content-available']).toBe(watch?undefined:1);
+    expect(headers.get('apns-collapse-id')).toBe(`${watch?'watch':'phone'}:${id===initial.eventId?id:initial.episodeId}`);
+   }
+  }
+ });
+ it('preserves normal phone alerting on the auxiliary AlarmKit path for a legacy Watch-target claim',async()=>{
+  const {parent,listener}=await setup();await call('silent-watch-alarms',parent,{enabled:true});
+  const event=alert(listener);
+  await env.DB.prepare('INSERT INTO events(event_id,episode_id,listener_id,parent_id,is_repeat,payload,created_at,push_target) VALUES(?,?,?,?,?,?,?,?)')
+   .bind(event.eventId,event.episodeId,listener.deviceId,parent.deviceId,0,JSON.stringify(event),Date.now(),'watch').run();
+  fanout();await dispatchEvent(testEnv,event.eventId);
+  expect(pushRequests).toHaveLength(2);
+  const phone=pushRequests.find(r=>new Headers(r.init?.headers).get('apns-topic')===testEnv.APNS_BUNDLE_ID)!;
+  expect(JSON.parse(String(phone.init?.body))).toMatchObject({eventId:event.eventId,silentCryAlarm:true,
+   aps:{sound:'default','content-available':1,'interruption-level':'time-sensitive'}});
  });
  it('does not add alarms when disabled, for tests, or for acknowledged events',async()=>{
   const {parent,listener}=await setup();fanout();
@@ -2495,11 +2535,11 @@ describe('Watch-only notification trial',()=>{
   headers:{'content-type':'application/json',authorization:`Bearer ${listener.deviceId}.${listener.secret}`},body:JSON.stringify(event)}),configured);
  it('sends only a Time Sensitive Watch push, suppresses the auxiliary phone copy and removes head-start waiting',async()=>{
   const {parent,listener,configured}=await setup();await call('silent-watch-alarms',parent,{enabled:true});
-  const event=alert(listener);mockPush();
+  const event={...alert(listener),isTest:true};mockPush();
   expect(await (await upload(listener,event,{...configured,WATCH_PHONE_HEAD_START_PARENT_ID:parent.deviceId,WATCH_PHONE_HEAD_START_MS:'500'})).json()).toEqual({status:'sent'});
   expect(pushRequests).toHaveLength(1);
   const headers=new Headers(pushRequests[0].init?.headers),body=JSON.parse(String(pushRequests[0].init?.body));
-  expect(headers.get('apns-topic')).toBe(testEnv.APNS_BUNDLE_ID+'.watchkitapp');expect(headers.get('apns-collapse-id')).toBe(`watch:${event.eventId}`);
+  expect(headers.get('apns-topic')).toBe(testEnv.APNS_BUNDLE_ID+'.watchkitapp');expect(headers.get('apns-collapse-id')).toBe(event.eventId);
   expect(body.aps.sound).toBe('default');expect(body.aps['interruption-level']).toBe('time-sensitive');expect(body.silentCryAlarm).toBeUndefined();
   expect(await env.DB.prepare('SELECT status,delivery_mode,delivery_state,push_target FROM events WHERE event_id=?').bind(event.eventId).first())
    .toEqual({status:'sent',delivery_mode:'watch_only',delivery_state:null,push_target:'watch'});
@@ -2539,15 +2579,15 @@ describe('Watch-only notification trial',()=>{
   const row=await env.DB.prepare("SELECT details FROM diagnostics WHERE operation='dispatch' AND target='phone' AND outcome='sent'").first<{details:string}>();
   expect(JSON.parse(row!.details)).toMatchObject({notification_route:'watch_only',phone_suppressed:false,phone_fallback:true});
  });
- it('keeps reminders Watch-only and checkpoints their acceptance without adding a phone delivery',async()=>{
-  const {parent,listener,configured}=await setup();mockPush();await upload(listener,alert(listener),configured);
-  vi.spyOn(Date,'now').mockReturnValue(Date.now()+10000);mockPush();
+ it('keeps real alerts and reminders on both destinations despite a Watch-only test flag',async()=>{
+  const {parent,listener,configured}=await setup();mockPush(200,2);await upload(listener,alert(listener),configured);
+  vi.spyOn(Date,'now').mockReturnValue(Date.now()+10000);mockPush(200,2);
   const receipts:import('../src/accepted-delivery').AcceptedDelivery[]=[];
   await runReminder(configured,parent.deviceId,undefined,undefined,{accepted:async receipt=>{receipts.push(receipt);}});
-  expect(pushRequests).toHaveLength(2);expect(receipts).toHaveLength(1);expect(receipts[0].dual).toBeUndefined();
+  expect(pushRequests).toHaveLength(4);expect(receipts).toHaveLength(1);expect(receipts[0].dual?.states).toEqual({phone:'sent',watch:'sent'});
   const {persistAcceptedDelivery}=await import('../src/accepted-delivery');await persistAcceptedDelivery(configured,receipts[0]);
-  await dispatchEvent(testEnv,receipts[0].eventId);expect(pushRequests).toHaveLength(2);
-  expect(await env.DB.prepare('SELECT status,delivery_mode FROM events WHERE event_id=?').bind(receipts[0].eventId).first()).toEqual({status:'sent',delivery_mode:'watch_only'});
+  await dispatchEvent(testEnv,receipts[0].eventId);expect(pushRequests).toHaveLength(4);
+  expect(await env.DB.prepare('SELECT status,delivery_mode FROM events WHERE event_id=?').bind(receipts[0].eventId).first()).toEqual({status:'sent',delivery_mode:null});
  });
  it('preserves existing dual-target state when the trial is enabled during a retry',async()=>{
   const {listener,configured}=await setup(),event={...alert(listener),isTest:true};mockPush(200,2);await upload(listener,event,testEnv);
