@@ -1,3 +1,4 @@
+import {phoneHeadStartFor} from './notification-coordination';
 import {deliverToBoth} from './dual-delivery';
 import {acceptedDelivery,queueAcceptedDelivery,type AcceptedDelivery} from './accepted-delivery';
 import {stoppedMonitoringSQL} from './monitoring';
@@ -158,11 +159,12 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
   const alert=JSON.parse(event.payload) as Alert;
   let checkpointed=false;
   const status=await deliverToBoth(env,{table:'events',id:eventId,parentId:event.parent_id,attempt:event.attempts,
+   phoneHeadStartMS:phoneHeadStartFor(env,event.parent_id),
    state:event.delivery_state,phoneToken:parent.phone_token,watchToken:parent.watch_token,requestId,eventRef,
    source:latency.details.dispatch_source,
    accepted:options.accepted?async delivery=>{await latency.measure('outcome_queue_ms',()=>options.accepted!(delivery));checkpointed=true;}:undefined,
    aggregate:{requestId,started:now,operation:'dispatch',stage:'storage',outcome:'sent',eventRef,attempt,details:latency.progressDetails()},
-   send:(destination,token,timing)=>sendPush(env,token,alert,destination,timing,parent.silent_watch_alarms===1&&!alert.isTest)});
+   send:(destination,token,timing,schedule)=>sendPush(env,token,alert,destination,timing,parent.silent_watch_alarms===1&&!alert.isTest,schedule)});
   latency.details.push_outcome=status==='pending'?'retry':status;
   stage='storage';target=undefined;
   // The checkpoint's background persister owns the aggregate and target journals.

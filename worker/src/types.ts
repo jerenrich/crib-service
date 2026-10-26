@@ -10,6 +10,8 @@ export interface Env {
  APNS_PRIVATE_KEY: string;
  APNS_BUNDLE_ID: string;
  APNS_ENVIRONMENT: 'development' | 'production';
+ WATCH_PHONE_HEAD_START_PARENT_ID?:string;
+ WATCH_PHONE_HEAD_START_MS?:string;
  TOKEN_ENCRYPTION_KEY: string;
  PAIRING_PEPPER: string;
 }

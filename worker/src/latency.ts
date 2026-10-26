@@ -3,7 +3,7 @@ export const spans = ['rate_limit_ms','authentication_ms','authentication_hash_m
  'token_decrypt_ms','provider_sign_ms','apns_fetch_ms','apns_body_ms','outcome_storage_ms','reminder_prepare_ms',
  'reminder_schedule_ms','reminder_snapshot_ms','reminder_pair_ms','reminder_control_ms','reminder_latest_ms','reminder_heartbeat_ms','reminder_original_ms','reminder_insert_ms','alarm_lag_ms','generated_to_dispatch_ms',
  'pair_ms','event_lookup_ms','event_insert_ms','event_reload_ms','event_episode_ms','response_read_ms','claim_observe_ms',
- 'alarm_state_ms','alarm_arm_ms','alarm_finalize_ms','schedule_read_ms','schedule_state_ms','journal_ms','outcome_queue_ms',
+ 'alarm_state_ms','alarm_arm_ms','alarm_finalize_ms','schedule_read_ms','schedule_state_ms','journal_ms','outcome_queue_ms','coordination_wait_ms',
  'maintenance_expiry_ms','maintenance_recovery_ms','maintenance_pending_ms','maintenance_dispatch_ms','maintenance_schedule_ms','maintenance_cleanup_ms','maintenance_connections_ms'] as const;
 export type Span = typeof spans[number];
 export const appleReasons = ['BadCollapseId','BadDeviceToken','BadExpirationDate','BadMessageId','BadPriority','BadTopic',
@@ -38,6 +38,8 @@ export interface TimingDetails {
  preparation_started_at_ms?:number; preparation_finished_at_ms?:number;
  journal_failures_before_write?:number;status_successes_sampled?:number;
  late_write_kind?:'claim'|'heartbeat';recovered_after_ms?:number;
+ coordination_mode?:'phone_head_start';phone_head_start_ms?:number;phone_head_start_cap_ms?:number;phone_head_start_observed_ms?:number;
+ phone_head_start_wait_outcome?:'head_start_elapsed'|'phone_unavailable'|'wait_cap';
  durable_outcome?:boolean;outcome_recovery?:boolean;outcome_queue_age_ms?:number;
 }
 export class Latency {
@@ -246,10 +248,12 @@ export function safeTimingDetails(value:TimingDetails|undefined):string|null {
   if(Object.keys(metrics).length)stages[name]=metrics;
  }
  if(Object.keys(stages).length)safe.db_stages=stages;
- for(const name of ['db_calls','db_sql_ms','db_rows_read','db_rows_written','db_attempts','provider_token_age_s','apns_started_at_ms','apns_response_at_ms','observed_attempts','next_attempt_at_ms','preparation_started_at_ms','preparation_finished_at_ms','journal_failures_before_write','outcome_queue_age_ms','in_flight_ms','status_successes_sampled','recovered_after_ms'] as const){
+ for(const name of ['db_calls','db_sql_ms','db_rows_read','db_rows_written','db_attempts','provider_token_age_s','apns_started_at_ms','apns_response_at_ms','observed_attempts','next_attempt_at_ms','preparation_started_at_ms','preparation_finished_at_ms','journal_failures_before_write','outcome_queue_age_ms','in_flight_ms','status_successes_sampled','recovered_after_ms','phone_head_start_ms','phone_head_start_cap_ms','phone_head_start_observed_ms'] as const){
   if(number(value[name]))safe[name]=value[name];
  }
  for(const name of ['durable_outcome','outcome_recovery'] as const)if(typeof value[name]==='boolean')safe[name]=value[name];
+ if(value.coordination_mode==='phone_head_start')safe.coordination_mode=value.coordination_mode;
+ if(['head_start_elapsed','phone_unavailable','wait_cap'].includes(value.phone_head_start_wait_outcome!))safe.phone_head_start_wait_outcome=value.phone_head_start_wait_outcome;
  if(['claim','heartbeat'].includes(value.late_write_kind!))safe.late_write_kind=value.late_write_kind;
  if(['reply','receipt'].includes(value.claim_result_source!))safe.claim_result_source=value.claim_result_source;
  if(['reply','receipt'].includes(value.heartbeat_result_source!))safe.heartbeat_result_source=value.heartbeat_result_source;

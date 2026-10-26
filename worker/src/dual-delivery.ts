@@ -1,3 +1,4 @@
+import {PhoneHeadStart,type PushSchedule} from './notification-coordination';
 import type {Env} from './types';
 import type {PushResult} from './apns';
 import {acceptedDelivery,type AcceptedDelivery} from './accepted-delivery';
@@ -16,10 +17,14 @@ export async function deliverToBoth(env:Env,options:{
  source?:Latency['details']['dispatch_source'];
  accepted?:(delivery:AcceptedDelivery)=>Promise<void>;
  aggregate?:Diagnostic;
- send:(target:Target,token:string,timing:Latency)=>Promise<PushResult>;
+ phoneHeadStartMS?:number;
+ send:(target:Target,token:string,timing:Latency,schedule?:PushSchedule)=>Promise<PushResult>;
 }):Promise<State> {
  const {table,id,parentId,attempt}=options,key=table==='events'?'event_id':'id';
  const states=JSON.parse(options.state) as Record<Target,State>;
+ const eligible=(target:Target)=>!!(target==='phone'?options.phoneToken:options.watchToken)&&['pending','blocked'].includes(states[target]);
+ const headStart=table==='events'&&eligible('phone')&&eligible('watch')&&options.phoneHeadStartMS
+  &&options.phoneHeadStartMS>=1&&options.phoneHeadStartMS<=500?new PhoneHeadStart(options.phoneHeadStartMS):undefined;
  const durable=table==='events'&&options.accepted&&options.aggregate;
  type Prepared={target:Target;token:string|null;started:number;timing:Latency;result:PushResult;state:State};
  const persistTarget=async({target,token,started,timing,result,state}:Prepared)=>{
@@ -56,8 +61,9 @@ export async function deliverToBoth(env:Env,options:{
   timing.deliveryAttempt=attempt;timing.details.dispatch_source=options.source;
   let result:PushResult={status:'blocked',reason:'no_push_token'};
   if(token){
-   try{result=await options.send(target,token,timing);}
+   try{result=await options.send(target,token,timing,headStart?.schedule(target,timing));}
    catch(error){timing.failure(error);result={status:'retry',reason:error instanceof PushPreparationError?error.code:'apns_configuration'};}
+   finally{if(target==='phone')headStart?.phoneFinished();}
   }
   timing.details.push_outcome=result.status;
   const state:State=result.status==='retry'?'pending':result.status;

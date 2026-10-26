@@ -1,3 +1,4 @@
+import type {PushSchedule} from './notification-coordination';
 import {decryptToken} from './security';
 import type {Alert,Env} from './types';
 import {PushPreparationError,type Outcome} from './diagnostics';
@@ -16,13 +17,13 @@ export function payload(alert:Alert,target:'phone'|'watch'='phone') {
  const body=alert.isRepeat&&!alert.isTest?'Crying was detected. Acknowledge this alert to snooze crying alerts for the duration chosen in Settings.':alert.isTest&&alert.isRepeat?'Repeating Watch alert test. Use Stop Watch test in iPhone Settings to end the test.':alert.isTest?`Test notification from your Listener. Simulated the ${duration} alert threshold.`:`Crying-like sound has continued for ${duration}. Started at ${new Date(alert.cryStartedAt).toISOString().slice(11,16)} UTC. Acknowledge to snooze crying alerts for the duration chosen in Settings.`;
  return {aps:{alert:{title,body},category:'BABY_CRY_ALERT','thread-id':alert.episodeId,'interruption-level':'time-sensitive',...(target==='watch'?{sound:'default'}:{})},eventId:alert.eventId,episodeId:alert.episodeId,cryStartedAt:alert.cryStartedAt,createdAt:alert.createdAt,durationSeconds:alert.durationSeconds,...(alert.isTest?{isTest:true}:{})};
 }
-export async function sendPush(env:Env,encryptedToken:string,alert:Alert,target:'phone'|'watch'='phone',latency=new Latency(),silentCryAlarm=false):Promise<PushResult> {
+export async function sendPush(env:Env,encryptedToken:string,alert:Alert,target:'phone'|'watch'='phone',latency=new Latency(),silentCryAlarm=false,schedule?:PushSchedule):Promise<PushResult> {
  const diagnosticRef=latency.eventRef,deliveryAttempt=latency.deliveryAttempt;
  const correlation=diagnosticRef&&/^[0-9a-f]{64}$/.test(diagnosticRef)&&deliveryAttempt!==undefined&&Number.isSafeInteger(deliveryAttempt)&&deliveryAttempt>0&&deliveryAttempt<=1_000_000?{diagnosticRef,deliveryAttempt}:{};
  const content=payload(alert,target);
  return sendNotification(env,encryptedToken,alert.eventId,{...content,...correlation,
   ...(silentCryAlarm&&target==='phone'&&!alert.isTest?{silentCryAlarm:true,aps:{...content.aps,'content-available':1}}:{})
- },target,alert.isRepeat?5:3600,alert.isRepeat?alert.episodeId:alert.eventId,latency);
+ },target,alert.isRepeat?5:3600,alert.isRepeat?alert.episodeId:alert.eventId,latency,schedule);
 }
 export async function sendSilentCryAlarmPush(env:Env,encryptedToken:string,alert:Alert,latency=new Latency()):Promise<PushResult> {
  const content=payload(alert,'phone');
@@ -44,16 +45,18 @@ export async function sendSilentAlarmTestPush(env:Env,encryptedToken:string,aler
  }};
  return sendNotification(env,encryptedToken,alert.eventId,content,'phone',60,alert.eventId,latency);
 }
-async function sendNotification(env:Env,encryptedToken:string,id:string,content:unknown,target:'phone'|'watch',expiration:number,collapseId=id,latency=new Latency()):Promise<PushResult> {
+async function sendNotification(env:Env,encryptedToken:string,id:string,content:unknown,target:'phone'|'watch',expiration:number,collapseId=id,latency=new Latency(),schedule?:PushSchedule):Promise<PushResult> {
  // Errors before fetch are known not to have sent a notification and can safely retry.
  let deviceToken:string,jwt:string;
  try {deviceToken=await latency.measure('token_decrypt_ms',()=>decryptToken(env,encryptedToken));}catch{throw new PushPreparationError('token_decryption');}
  try {jwt=await latency.measure('provider_sign_ms',()=>apnsToken(env,latency));}catch{throw new PushPreparationError('provider_signing');}
  if(!['development','production'].includes(env.APNS_ENVIRONMENT))throw new PushPreparationError('apns_environment');
  const host=env.APNS_ENVIRONMENT==='production'?'api.push.apple.com':'api.sandbox.push.apple.com';
+ if(schedule?.beforeRequest)await schedule.beforeRequest();
  let response:Response;
  const signal=AbortSignal.timeout(10000);
  latency.details.apns_environment=env.APNS_ENVIRONMENT as 'development'|'production';
+ schedule?.requestStarted?.();
  latency.details.apns_started_at_ms=Date.now();
  try {
   response=await latency.measure('apns_fetch_ms',()=>fetch(`https://${host}/3/device/${deviceToken}`,{method:'POST',headers:{authorization:`bearer ${jwt}`,'apns-topic':env.APNS_BUNDLE_ID+(target==='watch'?'.watchkitapp':''),'apns-push-type':'alert','apns-priority':'10','apns-id':id,'apns-collapse-id':collapseId,'apns-expiration':String(Math.floor(Date.now()/1000)+expiration),'content-type':'application/json'},body:JSON.stringify(content),signal}));

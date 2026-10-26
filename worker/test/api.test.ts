@@ -2466,3 +2466,52 @@ describe('durable dual destination receipts',()=>{
   expect(state.values.has('accepted/'+event.eventId)).toBe(false);
  });
 });
+
+describe('phone head-start trial delivery',()=>{
+ async function setup(){
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
+  return {parent,listener};
+ }
+ const upload=(listener:TestDevice,event:Alert,configured:Env)=>worker.fetch(new Request('https://monitor.test/v1/listener/event',{method:'POST',
+  headers:{'content-type':'application/json',authorization:`Bearer ${listener.deviceId}.${listener.secret}`},body:JSON.stringify(event)}),configured);
+ it('separates actual request starts while retaining matching IDs, Time Sensitive and the soundless phone payload',async()=>{
+  const {parent,listener}=await setup(),event={...alert(listener),isTest:true},times=new Map<string,number>(),external=globalThis.fetch;
+  vi.stubGlobal('fetch',vi.fn((input:string|URL|Request,init?:RequestInit)=>{times.set(new Headers(init?.headers).get('apns-topic')!,performance.now());return external(input,init);}));mockPush(200,2);
+  expect(await (await upload(listener,event,{...testEnv,WATCH_PHONE_HEAD_START_PARENT_ID:parent.deviceId,WATCH_PHONE_HEAD_START_MS:'500'})).json()).toEqual({status:'sent'});
+  const phoneTopic=testEnv.APNS_BUNDLE_ID,watchTopic=phoneTopic+'.watchkitapp';expect(times.get(watchTopic)!-times.get(phoneTopic)!).toBeGreaterThanOrEqual(499);
+  expect(pushRequests).toHaveLength(2);
+  const [phone,watch]=pushRequests.map(request=>({headers:new Headers(request.init?.headers),body:JSON.parse(String(request.init?.body))}));
+  expect(phone.headers.get('apns-collapse-id')).toBe(watch.headers.get('apns-collapse-id'));expect(phone.headers.get('apns-id')).toBe(watch.headers.get('apns-id'));
+  expect(phone.body.aps.sound).toBeUndefined();expect(watch.body.aps.sound).toBe('default');
+  expect(phone.body.aps['interruption-level']).toBe('time-sensitive');expect(watch.body.aps['interruption-level']).toBe('time-sensitive');
+  const rows=await env.DB.prepare("SELECT details FROM diagnostics WHERE operation='dispatch' AND target='watch'").all<{details:string}>();
+  const details=JSON.parse(rows.results[0].details);expect(details).toMatchObject({coordination_mode:'phone_head_start',phone_head_start_ms:500,phone_head_start_wait_outcome:'head_start_elapsed'});
+  expect(details.phone_head_start_observed_ms).toBeGreaterThanOrEqual(499);
+ });
+ it('sends to the Watch while the phone APNs response remains stalled',async()=>{
+  const {parent,listener}=await setup(),event={...alert(listener),isTest:true};let release!:()=>void,seenWatch!:()=>void,phoneReturned=false;
+  const gate=new Promise<void>(r=>{release=r;}),watchStarted=new Promise<void>(r=>{seenWatch=r;});
+  vi.stubGlobal('fetch',vi.fn(async(input:string|URL|Request,init?:RequestInit)=>{
+   pushRequests.push({url:String(input),init});
+   if(new Headers(init?.headers).get('apns-topic')!.endsWith('.watchkitapp'))seenWatch();
+   else {await gate;phoneReturned=true;}
+   return new Response('',{status:200});
+  }));
+  const running=upload(listener,event,{...testEnv,WATCH_PHONE_HEAD_START_PARENT_ID:parent.deviceId,WATCH_PHONE_HEAD_START_MS:'350'});
+  let timer:ReturnType<typeof setTimeout>|undefined;
+  try {
+   await Promise.race([watchStarted,new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new Error('Watch held behind phone response')),3000);})]);
+   expect(phoneReturned).toBe(false);expect(pushRequests).toHaveLength(2);
+  }finally{if(timer!==undefined)clearTimeout(timer);release();await running;}
+ });
+ it.each(['phone','watch'] as const)('does not replay an accepted %s target or wait on its retry',async accepted=>{
+  const {parent,listener}=await setup(),event={...alert(listener),isTest:true};mockPush(200,2);await call('listener/event',listener,event);
+  const states={phone:'pending',watch:'pending'};states[accepted]='sent';
+  await env.DB.prepare("UPDATE events SET status='sending',attempts=2,delivery_state=? WHERE event_id=?").bind(JSON.stringify(states),event.eventId).run();
+  const send=vi.fn(async()=>({status:'sent' as const,httpStatus:200}));
+  await deliverToBoth(testEnv,{table:'events',id:event.eventId,parentId:parent.deviceId,attempt:2,state:JSON.stringify(states),phoneToken:'phone',watchToken:'watch',requestId:crypto.randomUUID(),phoneHeadStartMS:350,send});
+  expect(send).toHaveBeenCalledTimes(1);expect(send.mock.calls[0]).toHaveLength(4);
+  expect((send.mock.calls as unknown as unknown[][])[0][0]).toBe(accepted==='phone'?'watch':'phone');
+  expect((send.mock.calls as unknown as unknown[][])[0][3]).toBeUndefined();
+ });
+});
