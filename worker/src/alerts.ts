@@ -87,6 +87,11 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  const claimId=crypto.randomUUID();
  // Only fresh, unclaimed events opt in. Preserve any prior dual-target receipt.
  const watchOnlySQL="parent_id=? AND push_target IS NULL AND delivery_state IS NULL AND EXISTS(SELECT 1 FROM devices WHERE id=events.parent_id AND watch_push_token IS NOT NULL)";
+ // Marked tests alone opt in. Pin the selected phone using the existing target
+ // and single-target state, so disabling the flag cannot add a Watch on retry.
+ // An existing Watch-only opt-in wins if both settings name the same Parent.
+ const phoneOnlyParent=env.PHONE_ONLY_TEST_PARENT_ID===env.WATCH_ONLY_PARENT_ID?'':env.PHONE_ONLY_TEST_PARENT_ID??'';
+ const phoneOnlySQL="parent_id=? AND push_target IS NULL AND delivery_state IS NULL AND COALESCE(json_extract(payload,'$.isTest'),0)=1 AND EXISTS(SELECT 1 FROM devices WHERE id=events.parent_id AND push_token IS NOT NULL)";
  type Destination={token:string|null;phone_token:string|null;watch_token:string|null;silent_watch_alarms:number};
  type Receipt=StoredEvent & Destination & {pair_current:number};
  const claim=await latency.confirmedClaim<StoredEvent|Destination,Receipt>(()=>env.DB.batch<StoredEvent|Destination>([...(options.insert?[options.insert]:[]),env.DB.prepare(`UPDATE events SET resolved_at=COALESCE(resolved_at,(SELECT r.resolved_at FROM resolved_episodes r
@@ -109,11 +114,11 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  )`).bind(new Date(now).toISOString(),eventId,now,now),
  env.DB.prepare(`UPDATE events SET status='sending',lease_until=?,claim_id=?,attempts=attempts+1,
   delivery_mode=COALESCE(delivery_mode,CASE WHEN ${watchOnlySQL} THEN 'watch_only' END),
-  delivery_state=CASE WHEN delivery_mode='watch_only' OR (${watchOnlySQL}) THEN NULL
+  delivery_state=CASE WHEN delivery_mode='watch_only' OR (${watchOnlySQL}) OR (${phoneOnlySQL}) THEN NULL
    ELSE COALESCE(delivery_state,CASE WHEN push_target IS NULL AND EXISTS(SELECT 1 FROM devices WHERE id=events.parent_id AND push_token IS NOT NULL AND watch_push_token IS NOT NULL)
     THEN '{"phone":"pending","watch":"pending"}' ELSE NULL END) END,
-  push_target=COALESCE(push_target,CASE WHEN (SELECT watch_push_token FROM devices WHERE id=events.parent_id) IS NOT NULL THEN 'watch' ELSE 'phone' END)
-  WHERE event_id=? AND status='pending' AND acknowledged_at IS NULL AND resolved_at IS NULL AND next_attempt<=? RETURNING *`).bind(now+30000,claimId,env.WATCH_ONLY_PARENT_ID??'',env.WATCH_ONLY_PARENT_ID??'',eventId,now),
+  push_target=COALESCE(push_target,CASE WHEN ${phoneOnlySQL} THEN 'phone' WHEN (SELECT watch_push_token FROM devices WHERE id=events.parent_id) IS NOT NULL THEN 'watch' ELSE 'phone' END)
+  WHERE event_id=? AND status='pending' AND acknowledged_at IS NULL AND resolved_at IS NULL AND next_attempt<=? RETURNING *`).bind(now+30000,claimId,env.WATCH_ONLY_PARENT_ID??'',env.WATCH_ONLY_PARENT_ID??'',phoneOnlyParent,phoneOnlyParent,eventId,now),
  // Read the selected token in the claim transaction, avoiding another remote
  // round trip. A losing claimant must still return before using this result.
  env.DB.prepare(`SELECT CASE e.push_target WHEN 'watch' THEN d.watch_push_token ELSE d.push_token END AS token,d.push_token AS phone_token,d.watch_push_token AS watch_token,d.silent_watch_alarms
@@ -166,6 +171,9 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  }
  const column=target==='watch'?'watch_push_token':'push_token';
  const parent=claim.source==='receipt'?claim.receipt:claims![offset+3].results[0] as Destination|undefined;
+ if(!event.delivery_state&&target==='phone'&&event.parent_id===phoneOnlyParent&&(JSON.parse(event.payload) as Alert).isTest){
+  latency.details.notification_route='phone_only_test';latency.details.watch_suppressed=!!parent?.watch_token;
+ }
  if(event.delivery_state&&parent){
   stage='push';
   const alert=JSON.parse(event.payload) as Alert;

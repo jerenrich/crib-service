@@ -2551,6 +2551,60 @@ describe('Watch-only notification trial',()=>{
  });
 });
 
+describe('phone-only marked-test forwarding control',()=>{
+ async function setup(phone=true){
+  const {parent,listener}=await paired();
+  if(phone)await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
+  return {parent,listener,configured:{...testEnv,PHONE_ONLY_TEST_PARENT_ID:parent.deviceId}};
+ }
+ const upload=(listener:TestDevice,event:Alert,configured:Env)=>worker.fetch(new Request('https://monitor.test/v1/listener/event',{method:'POST',
+  headers:{'content-type':'application/json',authorization:`Bearer ${listener.deviceId}.${listener.secret}`},body:JSON.stringify(event)}),configured);
+ it.each([true,false])('isolates marked tests while preserving ordinary dual delivery (test=%s)',async(isTest)=>{
+  const {parent,listener,configured}=await setup(),event={...alert(listener),...(isTest?{isTest:true}:{})};mockPush(200,isTest?1:2);
+  expect(await (await upload(listener,event,configured)).json()).toEqual({status:'sent'});
+  await upload(listener,event,configured);expect(pushRequests).toHaveLength(isTest?1:2);
+  if(isTest){
+   const request=pushRequests[0],headers=new Headers(request.init?.headers),body=JSON.parse(String(request.init?.body));
+   expect(headers.get('apns-topic')).toBe(testEnv.APNS_BUNDLE_ID);expect(headers.get('apns-collapse-id')).toBe(event.eventId);
+   expect(body).toMatchObject({isTest:true,aps:{sound:'default',category:'BABY_CRY_ALERT','interruption-level':'time-sensitive'}});
+   expect(await env.DB.prepare('SELECT push_target,delivery_state FROM events WHERE event_id=?').bind(event.eventId).first()).toEqual({push_target:'phone',delivery_state:null});
+   const row=await env.DB.prepare("SELECT details FROM diagnostics WHERE target='phone' AND operation='dispatch'").first<{details:string}>();
+   expect(JSON.parse(row!.details)).toMatchObject({notification_route:'phone_only_test',watch_suppressed:true});
+  }
+ });
+ it('does not affect other Parents',async()=>{
+  const {listener}=await setup();mockPush(200,2);await upload(listener,{...alert(listener),isTest:true},{...testEnv,PHONE_ONLY_TEST_PARENT_ID:crypto.randomUUID()});expect(pushRequests).toHaveLength(2);
+ });
+ it('keeps a retry phone-only after the trial is disabled',async()=>{
+  const {listener,configured}=await setup(),event={...alert(listener),isTest:true};mockPush(503);await upload(listener,event,configured);
+  await env.DB.prepare('UPDATE events SET next_attempt=0 WHERE event_id=?').bind(event.eventId).run();mockPush();await dispatchEvent(testEnv,event.eventId);
+  expect(pushRequests).toHaveLength(2);expect(pushRequests.every(r=>new Headers(r.init?.headers).get('apns-topic')===testEnv.APNS_BUNDLE_ID)).toBe(true);
+ });
+ it('preserves an already selected dual-target retry',async()=>{
+  const {listener,configured}=await setup(),event={...alert(listener),isTest:true};mockPush(200,2);await upload(listener,event,testEnv);
+  await env.DB.prepare("UPDATE events SET status='pending',next_attempt=0,delivery_state=? WHERE event_id=?").bind(JSON.stringify({phone:'sent',watch:'pending'}),event.eventId).run();mockPush();await dispatchEvent(configured,event.eventId);
+  expect(pushRequests).toHaveLength(3);expect(new Headers(pushRequests[2].init?.headers).get('apns-topic')).toBe(testEnv.APNS_BUNDLE_ID+'.watchkitapp');
+ });
+ it('keeps Watch delivery if no phone token is available',async()=>{
+  const {listener,configured}=await setup(false);mockPush();await upload(listener,{...alert(listener),isTest:true},configured);
+  expect(pushRequests).toHaveLength(1);expect(new Headers(pushRequests[0].init?.headers).get('apns-topic')).toBe(testEnv.APNS_BUNDLE_ID+'.watchkitapp');
+ });
+ it('never sends the Watch a fallback after uncertain phone transport',async()=>{
+  const {listener,configured}=await setup(),event={...alert(listener),isTest:true};pushResponses.push(new Error('network timeout'));
+  expect(await (await upload(listener,event,configured)).json()).toEqual({status:'uncertain'});await dispatchEvent(configured,event.eventId);expect(pushRequests).toHaveLength(1);
+ });
+ it('allows a Watch fallback only after a definitive phone token rejection',async()=>{
+  const {listener,configured}=await setup(),event={...alert(listener),isTest:true};pushResponses.push({body:JSON.stringify({reason:'Unregistered'}),status:410});
+  await upload(listener,event,configured);mockPush();await dispatchEvent(configured,event.eventId);
+  expect(pushRequests).toHaveLength(2);expect(new Headers(pushRequests[1].init?.headers).get('apns-topic')).toBe(testEnv.APNS_BUNDLE_ID+'.watchkitapp');
+ });
+ it('leaves an explicit Watch-only trial in control if flags conflict',async()=>{
+  const {parent,listener,configured}=await setup();mockPush();await upload(listener,{...alert(listener),isTest:true},{...configured,WATCH_ONLY_PARENT_ID:parent.deviceId});
+  expect(pushRequests).toHaveLength(1);expect(new Headers(pushRequests[0].init?.headers).get('apns-topic')).toBe(testEnv.APNS_BUNDLE_ID+'.watchkitapp');
+ });
+});
+
 describe('phone head-start trial delivery',()=>{
  async function setup(){
   const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
