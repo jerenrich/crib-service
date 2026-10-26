@@ -49,6 +49,27 @@ final class NotificationCleanupTests: XCTestCase {
         XCTAssertFalse(NotificationCleanup.shouldDismiss(content(isTest: true), testEventID: event))
         XCTAssertFalse(NotificationCleanup.shouldDismiss(content(event: event), testEventID: event))
     }
+    func testExplicitDismissalClearsReceivedCryAndTestHistoryAcrossEpisodesButPreservesNewArrivals() {
+        let cutoff = Date()
+        for notification in [content(), content(), content(isTest: true)] {
+            XCTAssertTrue(NotificationCleanup.shouldClearReceived(notification, deliveredAt: cutoff.addingTimeInterval(-60), deliveredBefore: cutoff))
+            XCTAssertTrue(NotificationCleanup.shouldClearReceived(notification, deliveredAt: cutoff, deliveredBefore: cutoff))
+            XCTAssertFalse(NotificationCleanup.shouldClearReceived(notification, deliveredAt: cutoff.addingTimeInterval(0.001), deliveredBefore: cutoff))
+        }
+        let connection = content(); connection.categoryIdentifier = "listener-connection"
+        XCTAssertFalse(NotificationCleanup.shouldClearReceived(connection, deliveredAt: cutoff, deliveredBefore: cutoff))
+        let malformed = content(); malformed.userInfo = [:]
+        XCTAssertFalse(NotificationCleanup.shouldClearReceived(malformed, deliveredAt: cutoff, deliveredBefore: cutoff))
+    }
+    @MainActor func testClearingHistoryIsLoggedSeparatelyFromSnoozing() {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let log = DiagnosticLog(directory: directory)
+        log.notificationRemovals([NotificationCleanup.removal(content(), reason: .cleared, pending: false)].compactMap { $0 })
+        XCTAssertEqual(log.lines.count, 1)
+        XCTAssertTrue(log.lines[0].contains("reason=cleared location=delivered action=removal_requested"))
+        XCTAssertFalse(log.export.contains("snoozed"))
+    }
     func testCompleteSnapshotKeepsActiveAlertsAndConcurrentDeliveryAndClearsSettledOnes() {
         let cutoff = Date(), episode = UUID(), test = UUID()
         let relevance = NotificationRelevance(cryEpisodeIDs: [episode], testEventIDs: [test])

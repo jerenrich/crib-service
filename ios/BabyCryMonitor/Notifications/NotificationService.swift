@@ -34,7 +34,7 @@ extension NotificationProviding {
         UNUserNotificationCenter.current().delegate = self
         let action = UNNotificationAction(identifier: "OPEN_CRY", title: "Open nursery", options: [.foreground])
         UNUserNotificationCenter.current().setNotificationCategories([
-            UNNotificationCategory(identifier: WatchNotification.category, actions: [UNNotificationAction(identifier: WatchNotification.acknowledge, title: "Snooze", options: [.foreground]), action], intentIdentifiers: [], options: [])
+            UNNotificationCategory(identifier: WatchNotification.category, actions: [UNNotificationAction(identifier: WatchNotification.acknowledge, title: "Snooze", options: [.foreground]), action], intentIdentifiers: [], options: [.customDismissAction])
         ])
     }
     func cleanUpAlerts(using relevance: NotificationRelevance, deliveredBefore: Date) async {
@@ -118,6 +118,13 @@ extension NotificationProviding {
         content.sound == nil ? [.banner, .list] : [.banner, .list, .sound]
     }
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
+        let cutoff = Date()
+        if response.actionIdentifier == UNNotificationDismissActionIdentifier {
+            if response.notification.request.content.categoryIdentifier == WatchNotification.category {
+                await clearReceivedCryingAlerts(deliveredBefore: cutoff)
+            }
+            return
+        }
         await recordReceipt(Self.receipt(response.notification), phase: "opened")
         if response.actionIdentifier == WatchNotification.acknowledge,
            let rawID = response.notification.request.content.userInfo["eventId"] as? String,
@@ -129,6 +136,10 @@ extension NotificationProviding {
         await refresh()
     }
     private func acknowledge(_ id: UUID) async { await onAcknowledge?(id) }
+    private func clearReceivedCryingAlerts(deliveredBefore: Date) async {
+        await NotificationCleanup.clearReceivedCryingAlerts(deliveredBefore: deliveredBefore,
+            beforeRemoving: { [weak self] in self?.recordDelivered($0) }, log: log)
+    }
     private nonisolated static func receipt(_ notification: UNNotification) -> (UUID, UUID, Date, Int)? {
         let info = notification.request.content.userInfo
         guard let event = (info["eventId"] as? String).flatMap(UUID.init(uuidString:)),

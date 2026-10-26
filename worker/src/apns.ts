@@ -18,7 +18,7 @@ export function payload(alert:Alert) {
  const body=alert.isRepeat&&!alert.isTest?'Crying was detected. Acknowledge this alert to snooze crying alerts for the duration chosen in Settings.':alert.isTest&&alert.isRepeat?'Repeating Watch alert test. Use Stop Watch test in iPhone Settings to end the test.':alert.isTest?`Test notification from your Listener. Simulated the ${duration} alert threshold.`:`Crying-like sound has continued for ${duration}. Started at ${new Date(alert.cryStartedAt).toISOString().slice(11,16)} UTC. Acknowledge to snooze crying alerts for the duration chosen in Settings.`;
  // Keep alerting metadata identical so both devices request system sound/haptics.
  // Device Silent Mode can mute audio while preserving Watch notification taps.
- return {aps:{alert:{title,body},category:'BABY_CRY_ALERT','thread-id':alert.episodeId,'interruption-level':'time-sensitive',sound:'default'},eventId:alert.eventId,episodeId:alert.episodeId,cryStartedAt:alert.cryStartedAt,createdAt:alert.createdAt,durationSeconds:alert.durationSeconds,...(alert.isTest?{isTest:true}:{})};
+ return {aps:{alert:{title,body},category:'BABY_CRY_ALERT','interruption-level':'time-sensitive',sound:'default'},eventId:alert.eventId,episodeId:alert.episodeId,cryStartedAt:alert.cryStartedAt,createdAt:alert.createdAt,durationSeconds:alert.durationSeconds,...(alert.isTest?{isTest:true}:{})};
 }
 export async function sendPush(env:Env,encryptedToken:string,alert:Alert,target:'phone'|'watch'='phone',latency=new Latency(),silentCryAlarm=false,schedule?:PushSchedule,identity:PushIdentityOptions={}):Promise<PushResult> {
  const diagnosticRef=latency.eventRef,deliveryAttempt=latency.deliveryAttempt;
@@ -29,9 +29,11 @@ export async function sendPush(env:Env,encryptedToken:string,alert:Alert,target:
  // payload identity remains shared so acknowledging either copy handles one event.
  const requestID=identity.distinctRequestID?crypto.randomUUID():alert.eventId;
  if(identity.distinctRequestID){latency.details.apns_id_mode='distinct_request';latency.details.apns_request_id=requestID;}
- const collapseBase=alert.isRepeat?alert.episodeId:alert.eventId;
+ // Every repeat is a new notification. Only retries of the same event share an
+ // identity; episode-wide replacement could merge distinct reminders.
+ const collapseBase=alert.eventId;
  const collapseID=identity.separateCollapseIDs?`${target}:${collapseBase}`:collapseBase;
- if(identity.separateCollapseIDs){latency.details.apns_collapse_mode='target_scoped';latency.details.apns_collapse_basis=alert.isRepeat?'episode':'event';}
+ if(identity.separateCollapseIDs){latency.details.apns_collapse_mode='target_scoped';latency.details.apns_collapse_basis='event';}
  return sendNotification(env,encryptedToken,requestID,{...content,...correlation,
   ...(silentCryAlarm&&target==='phone'&&!alert.isTest?{silentCryAlarm:true,aps:{...silentAPS,'content-available':1}}:{})
  },target,alert.isRepeat?5:3600,collapseID,latency,schedule);

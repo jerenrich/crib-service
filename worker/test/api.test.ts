@@ -558,7 +558,8 @@ describe('direct Apple Watch alerts',()=>{
   for(const request of pushRequests.slice(2)){
    const headers=new Headers(request.init?.headers);
    const target=headers.get('apns-topic')!.endsWith('.watchkitapp')?'watch':'phone';
-   expect(headers.get('apns-id')).toBe(repeat[0].eventId);expect(headers.get('apns-collapse-id')).toBe(`${target}:${event.episodeId}`);
+   expect(headers.get('apns-id')).toBe(repeat[0].eventId);expect(headers.get('apns-collapse-id')).toBe(`${target}:${repeat[0].eventId}`);
+   expect(repeat[0].aps['thread-id']).toBeUndefined();
   }
  });
  it('preserves a replacement token registered during rejection without replaying the other destination',async()=>{
@@ -995,8 +996,13 @@ describe('configurable reminders and acknowledgement mute',()=>{
   expect(reminder.aps.alert.title).toContain('Reminder');expect(reminder.aps.alert.body).toContain('Settings');
   const headers=pushRequests[1].init?.headers as Record<string,string>;
   expect(Number(headers['apns-expiration'])).toBe(Math.floor(Date.now()/1000)+5);
-  expect(headers['apns-collapse-id']).toBe(`phone:${event.episodeId}`);
+  expect(headers['apns-collapse-id']).toBe(`phone:${reminder.eventId}`);
   advance(5);mockPush();await runReminder(testEnv,parent.deviceId);expect(pushRequests).toHaveLength(3);
+  const later=JSON.parse(String(pushRequests[2].init?.body));
+  expect(later.episodeId).toBe(event.episodeId);expect(later.eventId).not.toBe(reminder.eventId);
+  const collapseIDs=pushRequests.map(r=>new Headers(r.init?.headers).get('apns-collapse-id'));
+  expect(new Set(collapseIDs).size).toBe(3);
+  for(const r of pushRequests)expect(JSON.parse(String(r.init?.body)).aps['thread-id']).toBeUndefined();
  });
  it('creates only one reminder for a source event under concurrent work',async()=>{
   const {parent}=await ready();advance(5);mockPush();
@@ -2631,7 +2637,7 @@ describe('distinct APNs request ID marked-test control',()=>{
    expect(r.headers.get('apns-id')).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
    expect(r.headers.get('apns-collapse-id')).toBe(event.eventId);
    expect(r.body).toMatchObject({eventId:event.eventId,episodeId:event.episodeId,isTest:true,
-    aps:{sound:'default',category:'BABY_CRY_ALERT','thread-id':event.episodeId,'interruption-level':'time-sensitive'}});
+    aps:{sound:'default',category:'BABY_CRY_ALERT','interruption-level':'time-sensitive'}});
   }
   expect(requests[0].body).toEqual(requests[1].body);
   const rows=await env.DB.prepare("SELECT target,details FROM diagnostics WHERE operation='dispatch' AND target IS NOT NULL").all<{target:string;details:string}>();
@@ -2674,20 +2680,21 @@ describe('separate collapse IDs for crying alerts and scoped marked tests',()=>{
   const {listener,configured}=await setup(),event={...alert(listener),...(isTest?{isTest:true}:{}),isRepeat};mockPush(200,2);
   expect(await (await upload(listener,event,isTest?configured:testEnv)).json()).toEqual({status:'sent'});
   const requests=pushRequests.map(r=>({headers:new Headers(r.init?.headers),body:JSON.parse(String(r.init?.body))}));expect(requests).toHaveLength(2);
-  const base=isRepeat?event.episodeId:event.eventId;
+  const base=event.eventId;
   for(const r of requests){
    const target=r.headers.get('apns-topic')!.endsWith('.watchkitapp')?'watch':'phone';
    expect(r.headers.get('apns-collapse-id')).toBe(`${target}:${base}`);
    expect(new TextEncoder().encode(r.headers.get('apns-collapse-id')!).length).toBeLessThanOrEqual(64);
    expect(r.headers.get('apns-id')).toBe(event.eventId);
    expect(r.body.isTest).toBe(isTest?true:undefined);
+   expect(r.body.aps['thread-id']).toBeUndefined();
    expect(r.body).toMatchObject({eventId:event.eventId,episodeId:event.episodeId,
-    aps:{sound:'default',category:'BABY_CRY_ALERT','thread-id':event.episodeId,'interruption-level':'time-sensitive'}});
+    aps:{sound:'default',category:'BABY_CRY_ALERT','interruption-level':'time-sensitive'}});
   }
   expect(requests[0].body).toEqual(requests[1].body);
   const rows=await env.DB.prepare("SELECT details FROM diagnostics WHERE operation='dispatch' AND target IS NOT NULL").all<{details:string}>();
   expect(rows.results).toHaveLength(2);
-  for(const row of rows.results)expect(JSON.parse(row.details)).toMatchObject({apns_collapse_mode:'target_scoped',apns_collapse_basis:isRepeat?'episode':'event'});
+  for(const row of rows.results)expect(JSON.parse(row.details)).toMatchObject({apns_collapse_mode:'target_scoped',apns_collapse_basis:'event'});
  });
  it.each(['other_parent','disabled'] as const)('preserves matching collapse IDs for marked tests (%s)',async mode=>{
   const {listener,configured}=await setup(),event={...alert(listener),isTest:true};mockPush(200,2);
@@ -2703,6 +2710,18 @@ describe('separate collapse IDs for crying alerts and scoped marked tests',()=>{
   expect(pushRequests).toHaveLength(3);
   const headers=new Headers(pushRequests[2].init?.headers);expect(headers.get('apns-topic')).toBe(testEnv.APNS_BUNDLE_ID+'.watchkitapp');
   expect(headers.get('apns-collapse-id')).toBe(rollback?event.eventId:`watch:${event.eventId}`);
+ });
+ it('retains a reminder identity on retry without replacing other reminders or replaying its accepted sibling',async()=>{
+  const {listener}=await setup(),event={...alert(listener),isRepeat:true};mockPush();mockPush(503);
+  await upload(listener,event,testEnv);
+  const first=pushRequests.map(r=>new Headers(r.init?.headers));
+  expect(first.map(h=>h.get('apns-collapse-id'))).toEqual([`phone:${event.eventId}`,`watch:${event.eventId}`]);
+  await env.DB.prepare('UPDATE events SET next_attempt=0 WHERE event_id=?').bind(event.eventId).run();mockPush();
+  await dispatchEvent(testEnv,event.eventId);expect(pushRequests).toHaveLength(3);
+  const retry=new Headers(pushRequests[2].init?.headers);
+  expect(retry.get('apns-collapse-id')).toBe(first[1].get('apns-collapse-id'));
+  expect(retry.get('apns-id')).toBe(event.eventId);
+  expect(retry.get('apns-topic')).toBe(testEnv.APNS_BUNDLE_ID+'.watchkitapp');
  });
  it('never replays an uncertain target or its accepted sibling',async()=>{
   const {listener,configured}=await setup(),event={...alert(listener),isTest:true};mockPush();pushResponses.push(new Error('ambiguous'));

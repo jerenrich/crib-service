@@ -105,7 +105,7 @@ struct DiagnosticNetworkTiming: Sendable {
 }
 
 enum NotificationRemovalReason: String, Sendable {
-    case snoozed, testAcknowledged = "test_acknowledged", noLongerRelevant = "no_longer_relevant"
+    case snoozed, cleared, testAcknowledged = "test_acknowledged", noLongerRelevant = "no_longer_relevant"
 }
 struct DiagnosticNotificationRemoval: Sendable {
     let eventID: UUID

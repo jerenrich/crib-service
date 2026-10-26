@@ -26,7 +26,7 @@ import UserNotifications
         UNUserNotificationCenter.current().delegate = self
         let action = UNNotificationAction(identifier: WatchNotification.acknowledge, title: "Snooze", options: [.foreground])
         UNUserNotificationCenter.current().setNotificationCategories([
-            UNNotificationCategory(identifier: WatchNotification.category, actions: [action], intentIdentifiers: [], options: [])
+            UNNotificationCategory(identifier: WatchNotification.category, actions: [action], intentIdentifiers: [], options: [.customDismissAction])
         ])
         #if !WATCH_MINIMAL_NOTIFICATIONS
         _ = WatchModel.shared
@@ -70,6 +70,13 @@ import UserNotifications
         }
     }
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
+        let cutoff = Date()
+        if response.actionIdentifier == UNNotificationDismissActionIdentifier {
+            if response.notification.request.content.categoryIdentifier == WatchNotification.category {
+                await WatchModel.shared.clearReceivedNotifications(deliveredBefore: cutoff)
+            }
+            return
+        }
         let alert = WatchCryAlert.notification(response.notification.request.content)
         let acknowledge = response.actionIdentifier == WatchNotification.acknowledge
         let deliveredAt = response.notification.date, observedAt = Date(), callbackID = UUID()

@@ -180,6 +180,10 @@ import UserNotifications
     func receive(_ value: WatchCryAlert) {
         alertState.receive(value)
     }
+    func clearReceivedNotifications(deliveredBefore: Date) async {
+        await NotificationCleanup.clearReceivedCryingAlerts(deliveredBefore: deliveredBefore,
+            beforeRemoving: { [weak self] in self?.recordDeliveredNotifications($0) }, log: log)
+    }
     func handleNotification(_ value: WatchCryAlert, acknowledging: Bool) {
         alertState.handleNotification(value, acknowledging: acknowledging)
         if acknowledging {

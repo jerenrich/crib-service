@@ -3,6 +3,28 @@ import UserNotifications
 
 /// Delete only our crying/test category; connection warnings and other notices survive.
 enum NotificationCleanup {
+    /// Clearing history never acknowledges an episode or removes pending alerts.
+    /// Capture the cutoff at dismissal entry so newly arriving alerts survive.
+    @MainActor static func clearReceivedCryingAlerts(deliveredBefore: Date,
+                                                    beforeRemoving: (([UNNotification]) -> Void)? = nil, log: DiagnosticLog? = nil) async {
+        let center = UNUserNotificationCenter.current()
+        let delivered = await center.deliveredNotifications()
+        beforeRemoving?(delivered)
+        var removals: [DiagnosticNotificationRemoval] = []
+        let identifiers = delivered.compactMap { notification -> String? in
+            guard shouldClearReceived(notification.request.content, deliveredAt: notification.date,
+                                      deliveredBefore: deliveredBefore) else { return nil }
+            if let removal = removal(notification.request.content, reason: .cleared, pending: false) { removals.append(removal) }
+            return notification.request.identifier
+        }
+        center.removeDeliveredNotifications(withIdentifiers: identifiers)
+        log?.notificationRemovals(removals)
+    }
+
+    static func shouldClearReceived(_ content: UNNotificationContent, deliveredAt: Date, deliveredBefore: Date) -> Bool {
+        deliveredAt <= deliveredBefore && identity(content) != nil
+    }
+
     @MainActor static func removeIrrelevant(using relevance: NotificationRelevance, deliveredBefore: Date,
                                            beforeRemoving: (([UNNotification]) -> Void)? = nil, log: DiagnosticLog? = nil) async {
         let center = UNUserNotificationCenter.current()
