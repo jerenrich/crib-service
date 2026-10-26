@@ -161,8 +161,10 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  latency.details.spans!.generated_to_dispatch_ms=Math.max(0,now-event.created_at);
  stage='storage';
  const alert=JSON.parse(event.payload) as Alert;
+ // Keep forwarded phone and direct Watch copies distinct for crying alerts,
+ // including reminders. Both copies still acknowledge the same logical event.
  const identity={distinctRequestID:alert.isTest===true&&env.DISTINCT_APNS_ID_TEST_PARENT_ID===event.parent_id,
-  separateCollapseIDs:alert.isTest===true&&env.SEPARATE_COLLAPSE_ID_TEST_PARENT_ID===event.parent_id};
+  separateCollapseIDs:!alert.isTest||env.SEPARATE_COLLAPSE_ID_TEST_PARENT_ID===event.parent_id};
  // No replay after uncertain transport or a worker death during APNs dispatch. APNs does
  // not offer an exactly-once receipt transaction with D1. Surface uncertainty explicitly.
  if(now-Date.parse(alert.createdAt)>86400000){

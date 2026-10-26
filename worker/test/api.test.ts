@@ -469,8 +469,10 @@ describe('direct Apple Watch alerts',()=>{
   }
   const [phone,watch]=pushRequests.map(r=>({headers:new Headers(r.init?.headers),body:JSON.parse(String(r.init?.body))}));
   expect(phone.body.aps).toEqual(watch.body.aps);
-  for(const key of ['apns-id','apns-collapse-id','apns-priority','apns-push-type'])expect(phone.headers.get(key)).toBe(watch.headers.get(key));
-  expect(phone.headers.get('apns-id')).toBe(event.eventId);expect(phone.headers.get('apns-collapse-id')).toBe(event.eventId);
+  for(const key of ['apns-id','apns-priority','apns-push-type'])expect(phone.headers.get(key)).toBe(watch.headers.get(key));
+  expect(phone.headers.get('apns-id')).toBe(event.eventId);
+  expect(phone.headers.get('apns-collapse-id')).toBe(isTest?event.eventId:`phone:${event.eventId}`);
+  expect(watch.headers.get('apns-collapse-id')).toBe(isTest?event.eventId:`watch:${event.eventId}`);
   const status=await (await call('listener/status',parent,undefined,'GET')).json() as {alerts:{deliveryTarget:string;deliveryState:unknown}[]};
   expect(status.alerts[0]).toMatchObject({deliveryTarget:'both',deliveryState:{phone:'sent',watch:'sent'}});
  });
@@ -495,6 +497,11 @@ describe('direct Apple Watch alerts',()=>{
   await Promise.all([flushPending(testEnv),flushPending(testEnv)]);
   expect(pushRequests).toHaveLength(3);
   expect(pushRequests.filter(r=>r.url.includes((rejected==='phone'?'ab':'cd').repeat(32)))).toHaveLength(2);
+  for(const request of pushRequests){
+   const headers=new Headers(request.init?.headers),target=headers.get('apns-topic')!.endsWith('.watchkitapp')?'watch':'phone';
+   expect(headers.get('apns-collapse-id')).toBe(`${target}:${event.eventId}`);
+   expect(headers.get('apns-id')).toBe(event.eventId);
+  }
   expect(await env.DB.prepare('SELECT status,delivery_state FROM events WHERE event_id=?').bind(event.eventId).first()).toMatchObject({status:'sent',delivery_state:JSON.stringify({phone:'sent',watch:'sent'})});
  });
  it('keeps phone acceptance when the Watch token is invalid and retries only a replacement Watch token',async()=>{
@@ -550,7 +557,8 @@ describe('direct Apple Watch alerts',()=>{
   expect(repeat[0].aps).toEqual(repeat[1].aps);expect(repeat[0].aps.sound).toBe('default');
   for(const request of pushRequests.slice(2)){
    const headers=new Headers(request.init?.headers);
-   expect(headers.get('apns-id')).toBe(repeat[0].eventId);expect(headers.get('apns-collapse-id')).toBe(event.episodeId);
+   const target=headers.get('apns-topic')!.endsWith('.watchkitapp')?'watch':'phone';
+   expect(headers.get('apns-id')).toBe(repeat[0].eventId);expect(headers.get('apns-collapse-id')).toBe(`${target}:${event.episodeId}`);
   }
  });
  it('preserves a replacement token registered during rejection without replaying the other destination',async()=>{
@@ -987,7 +995,7 @@ describe('configurable reminders and acknowledgement mute',()=>{
   expect(reminder.aps.alert.title).toContain('Reminder');expect(reminder.aps.alert.body).toContain('Settings');
   const headers=pushRequests[1].init?.headers as Record<string,string>;
   expect(Number(headers['apns-expiration'])).toBe(Math.floor(Date.now()/1000)+5);
-  expect(headers['apns-collapse-id']).toBe(event.episodeId);
+  expect(headers['apns-collapse-id']).toBe(`phone:${event.episodeId}`);
   advance(5);mockPush();await runReminder(testEnv,parent.deviceId);expect(pushRequests).toHaveLength(3);
  });
  it('creates only one reminder for a source event under concurrent work',async()=>{
@@ -2491,7 +2499,7 @@ describe('Watch-only notification trial',()=>{
   expect(await (await upload(listener,event,{...configured,WATCH_PHONE_HEAD_START_PARENT_ID:parent.deviceId,WATCH_PHONE_HEAD_START_MS:'500'})).json()).toEqual({status:'sent'});
   expect(pushRequests).toHaveLength(1);
   const headers=new Headers(pushRequests[0].init?.headers),body=JSON.parse(String(pushRequests[0].init?.body));
-  expect(headers.get('apns-topic')).toBe(testEnv.APNS_BUNDLE_ID+'.watchkitapp');expect(headers.get('apns-collapse-id')).toBe(event.eventId);
+  expect(headers.get('apns-topic')).toBe(testEnv.APNS_BUNDLE_ID+'.watchkitapp');expect(headers.get('apns-collapse-id')).toBe(`watch:${event.eventId}`);
   expect(body.aps.sound).toBe('default');expect(body.aps['interruption-level']).toBe('time-sensitive');expect(body.silentCryAlarm).toBeUndefined();
   expect(await env.DB.prepare('SELECT status,delivery_mode,delivery_state,push_target FROM events WHERE event_id=?').bind(event.eventId).first())
    .toEqual({status:'sent',delivery_mode:'watch_only',delivery_state:null,push_target:'watch'});
@@ -2654,7 +2662,7 @@ describe('distinct APNs request ID marked-test control',()=>{
  });
 });
 
-describe('separate collapse ID marked-test control',()=>{
+describe('separate collapse IDs for crying alerts and scoped marked tests',()=>{
  async function setup(){
   const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
   await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
@@ -2662,9 +2670,9 @@ describe('separate collapse ID marked-test control',()=>{
  }
  const upload=(listener:TestDevice,event:Alert,configured:Env)=>worker.fetch(new Request('https://monitor.test/v1/listener/event',{method:'POST',
   headers:{'content-type':'application/json',authorization:`Bearer ${listener.deviceId}.${listener.secret}`},body:JSON.stringify(event)}),configured);
- it.each([false,true])('separates notification IDs while retaining one logical event and transport-ID policy (repeat=%s)',async isRepeat=>{
-  const {listener,configured}=await setup(),event={...alert(listener),isTest:true,isRepeat};mockPush(200,2);
-  expect(await (await upload(listener,event,configured)).json()).toEqual({status:'sent'});
+ it.each([{isTest:false,isRepeat:false},{isTest:false,isRepeat:true},{isTest:true,isRepeat:false},{isTest:true,isRepeat:true}])('separates notification IDs while retaining one logical event and transport-ID policy (test=$isTest, repeat=$isRepeat)',async({isTest,isRepeat})=>{
+  const {listener,configured}=await setup(),event={...alert(listener),...(isTest?{isTest:true}:{}),isRepeat};mockPush(200,2);
+  expect(await (await upload(listener,event,isTest?configured:testEnv)).json()).toEqual({status:'sent'});
   const requests=pushRequests.map(r=>({headers:new Headers(r.init?.headers),body:JSON.parse(String(r.init?.body))}));expect(requests).toHaveLength(2);
   const base=isRepeat?event.episodeId:event.eventId;
   for(const r of requests){
@@ -2672,7 +2680,8 @@ describe('separate collapse ID marked-test control',()=>{
    expect(r.headers.get('apns-collapse-id')).toBe(`${target}:${base}`);
    expect(new TextEncoder().encode(r.headers.get('apns-collapse-id')!).length).toBeLessThanOrEqual(64);
    expect(r.headers.get('apns-id')).toBe(event.eventId);
-   expect(r.body).toMatchObject({eventId:event.eventId,episodeId:event.episodeId,isTest:true,
+   expect(r.body.isTest).toBe(isTest?true:undefined);
+   expect(r.body).toMatchObject({eventId:event.eventId,episodeId:event.episodeId,
     aps:{sound:'default',category:'BABY_CRY_ALERT','thread-id':event.episodeId,'interruption-level':'time-sensitive'}});
   }
   expect(requests[0].body).toEqual(requests[1].body);
@@ -2680,8 +2689,8 @@ describe('separate collapse ID marked-test control',()=>{
   expect(rows.results).toHaveLength(2);
   for(const row of rows.results)expect(JSON.parse(row.details)).toMatchObject({apns_collapse_mode:'target_scoped',apns_collapse_basis:isRepeat?'episode':'event'});
  });
- it.each(['real','other_parent','disabled'] as const)('preserves matching collapse IDs for %s alerts',async mode=>{
-  const {listener,configured}=await setup(),event={...alert(listener),...(mode==='real'?{}:{isTest:true})};mockPush(200,2);
+ it.each(['other_parent','disabled'] as const)('preserves matching collapse IDs for marked tests (%s)',async mode=>{
+  const {listener,configured}=await setup(),event={...alert(listener),isTest:true};mockPush(200,2);
   await upload(listener,event,mode==='disabled'?testEnv:mode==='other_parent'?{...configured,SEPARATE_COLLAPSE_ID_TEST_PARENT_ID:crypto.randomUUID()}:configured);
   expect(pushRequests).toHaveLength(2);
   for(const r of pushRequests)expect(new Headers(r.init?.headers).get('apns-collapse-id')).toBe(event.eventId);
@@ -2700,13 +2709,17 @@ describe('separate collapse ID marked-test control',()=>{
   expect(await (await upload(listener,event,configured)).json()).toEqual({status:'uncertain'});
   await dispatchEvent(configured,event.eventId);await dispatchEvent(testEnv,event.eventId);expect(pushRequests).toHaveLength(2);
  });
- it('acknowledges both notification copies as one test without snoozing real alerts',async()=>{
-  const {parent,listener,configured}=await setup(),event={...alert(listener),isTest:true};mockPush(200,2);await upload(listener,event,configured);
+ it.each([false,true])('acknowledges both notification copies once and only snoozes real crying alerts (test=%s)',async isTest=>{
+  const {parent,listener,configured}=await setup(),event={...alert(listener),...(isTest?{isTest:true}:{})};mockPush(200,2);await upload(listener,event,isTest?configured:testEnv);
+  let mutedUntil:number|undefined;
   for(const request of pushRequests){
    const body=JSON.parse(String(request.init?.body));expect((await call('alert/acknowledge',parent,{eventId:body.eventId})).status).toBe(200);
+   const mute=await env.DB.prepare('SELECT alerts_muted_until FROM devices WHERE id=?').bind(parent.deviceId).first<{alerts_muted_until:number}>();
+   if(mutedUntil!==undefined)expect(mute!.alerts_muted_until).toBe(mutedUntil);
+   mutedUntil=mute!.alerts_muted_until;
   }
-  expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM timeline_events WHERE kind='test_acknowledged'").first()).toEqual({n:1});
-  expect(await env.DB.prepare('SELECT alerts_muted_until FROM devices WHERE id=?').bind(parent.deviceId).first()).toEqual({alerts_muted_until:0});
+  expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM timeline_events WHERE kind=?').bind(isTest?'test_acknowledged':'alert_acknowledged').first()).toEqual({n:1});
+  if(isTest)expect(mutedUntil).toBe(0);else expect(mutedUntil!-Date.now()).toBeGreaterThan(59000);
   expect((await env.DB.prepare('SELECT acknowledged_at FROM events WHERE event_id=?').bind(event.eventId).first<{acknowledged_at:string}>())!.acknowledged_at).toBeTruthy();
  });
 });
