@@ -5,6 +5,9 @@ import type {Latency} from './latency';
 // Apple allows reuse across topics and servers. Rotate at 50 minutes, inside
 // its 20–60 minute window, using one persistent authority per signing key.
 const reuseSeconds=3000;
+// A response may cross the refresh deadline in transit. Apple accepts tokens
+// for an hour; reserve one minute for the actual send, without extending caching.
+const usableSeconds=3540;
 interface TokenRecord {identity:string;token:string;issuedAt:number;reference:string}
 interface TokenReply {record:TokenRecord;reused:boolean}
 function privateKey(env:Env):string {return env.APNS_PRIVATE_KEY.replace(/\\n/g,'\n').replace(/-----[^-]+-----/g,'').replace(/\s/g,'');}
@@ -12,8 +15,8 @@ function configuration(env:Env):string {
  if(!env.APNS_KEY_ID||!env.APNS_TEAM_ID||!env.APNS_PRIVATE_KEY||!env.APNS_BUNDLE_ID)throw new Error('APNs configuration missing');
  return JSON.stringify([env.APNS_KEY_ID,env.APNS_TEAM_ID,privateKey(env)]);
 }
-function valid(record:TokenRecord|undefined,identity:string,now:number):record is TokenRecord {
- return !!record&&record.identity===identity&&Number.isSafeInteger(record.issuedAt)&&record.issuedAt<=now&&now-record.issuedAt<reuseSeconds&&
+function valid(record:TokenRecord|undefined,identity:string,now:number,maxAge=reuseSeconds):record is TokenRecord {
+ return !!record&&record.identity===identity&&Number.isSafeInteger(record.issuedAt)&&record.issuedAt<=now&&now-record.issuedAt<maxAge&&
   typeof record.token==='string'&&record.token.length<4096&&record.token.split('.').length===3&&/^[0-9a-f]{64}$/.test(record.reference);
 }
 function base64url(value:Uint8Array):string {return btoa(String.fromCharCode(...value)).replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');}
@@ -87,7 +90,7 @@ export class ProviderTokenCache {
   });
   if(!response.ok)throw new Error('APNs token authority unavailable');
   const reply=await response.json() as TokenReply;
-  if(!valid(reply.record,identity,Math.floor(Date.now()/1000))||typeof reply.reused!=='boolean')throw new Error('APNs token authority response invalid');
+  if(!valid(reply.record,identity,Math.floor(Date.now()/1000),usableSeconds)||typeof reply.reused!=='boolean')throw new Error('APNs token authority response invalid');
   // No local signing fallback: a coordinator outage must not create token churn.
   return reply;
  }

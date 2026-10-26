@@ -59,6 +59,45 @@ describe('persistent APNs provider tokens',()=>{
   let finished=false;const pending=new ProviderTokenCache().get(a.testEnv).then(token=>{finished=true;return token;});
   await started;expect(finished).toBe(false);release();await pending;expect(a.put).toHaveBeenCalledTimes(1);
  });
+ it('accepts a response crossing the refresh deadline, then refreshes on the next lookup',async()=>{
+  const a=authority(),start=Math.floor(Date.now()/1000)*1000;
+  vi.spyOn(Date,'now').mockReturnValue(start);
+  const first=await new ProviderTokenCache().get(a.testEnv);
+  vi.mocked(Date.now).mockReturnValue(start+2999_000);
+  const fetch=a.fetch.getMockImplementation()!;
+  a.fetch.mockImplementationOnce(async(input,init)=>{
+   const response=await fetch(input,init);
+   vi.mocked(Date.now).mockReturnValue(start+3001_000);
+   return response;
+  });
+  const client=new ProviderTokenCache();
+  expect(await client.get(a.testEnv)).toBe(first);
+  expect(await client.get(a.testEnv)).not.toBe(first);
+  expect(a.put).toHaveBeenCalledTimes(2);
+ });
+ it('rejects a response too close to Apple expiry and clears the failed lookup for a fresh attempt',async()=>{
+  const a=authority(),start=Math.floor(Date.now()/1000)*1000;
+  vi.spyOn(Date,'now').mockReturnValue(start);
+  await new ProviderTokenCache().get(a.testEnv);
+  const fetch=a.fetch.getMockImplementation()!;
+  a.fetch.mockImplementationOnce(async(input,init)=>{
+   const response=await fetch(input,init);
+   vi.mocked(Date.now).mockReturnValue(start+3540_000);
+   return response;
+  });
+  const client=new ProviderTokenCache();
+  await expect(client.get(a.testEnv)).rejects.toThrow('authority response invalid');
+  await expect(client.get(a.testEnv)).resolves.toEqual(expect.any(String));
+  expect(a.put).toHaveBeenCalledTimes(2);
+ });
+ it('coalesces concurrent cold requests through the real Durable Object binding',async()=>{
+  const stub=env.APNS_PROVIDER_TOKENS.get(env.APNS_PROVIDER_TOKENS.newUniqueId());
+  const isolated={...env,APNS_PROVIDER_TOKENS:{getByName:()=>stub}} as unknown as Env;
+  const tokens=await Promise.all(Array.from({length:12},()=>new ProviderTokenCache().get(isolated)));
+  expect(new Set(tokens).size).toBe(1);
+  const persisted=await runInDurableObject(stub,async(_instance,state)=>state.storage.get<{token:string}>('token'));
+  expect(persisted?.token).toBe(tokens[0]);
+ });
  it('does not rotate early if a clock moves backwards',async()=>{
   const a=authority(),start=Date.now();vi.spyOn(Date,'now').mockReturnValue(start);
   await new ProviderTokenCache().get(a.testEnv);a.restart();
