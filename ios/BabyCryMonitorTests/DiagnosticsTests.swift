@@ -93,6 +93,15 @@ final class DiagnosticsTests: XCTestCase {
         XCTAssertTrue(entries[0].contains("delivered_at_ms=1700000000000 interruption_level=2"))
         XCTAssertFalse(log.export.contains("private-phase"))
     }
+    @MainActor func testPhoneForegroundReceiptRecordsSoundDecisionAndAppContext() {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let log = DiagnosticLog(directory: directory)
+        log.phoneNotification(eventID: UUID(), episodeID: UUID(), deliveredAt: Date(), interruptionLevel: 2,
+            phase: "foreground", payloadHasSound: true, presentationOptions: 26,
+            applicationState: 0, protectedDataAvailable: true)
+        XCTAssertTrue(log.export.contains("payload_has_sound=true presentation_options=26 application_state=0 protected_data_available=true"))
+    }
     @MainActor func testBackendClockHeadersAreConsumedAndInvalidSamplesClearTheEstimate() async throws {
         let config = URLSessionConfiguration.ephemeral;config.protocolClasses = [DiagnosticsURLProtocol.self]
         let session = URLSession(configuration: config);defer { session.invalidateAndCancel() }

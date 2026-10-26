@@ -4,6 +4,16 @@ import UserNotifications
 @testable import BabyCryMonitor
 
 final class NotificationCleanupTests: XCTestCase {
+    func testForegroundPresentationHonorsPayloadSoundForCryAndConnectionAlerts() {
+        let notification = content()
+        XCTAssertEqual(NotificationService.foregroundOptions(for: notification), [.banner, .list])
+        notification.sound = .default
+        XCTAssertEqual(NotificationService.foregroundOptions(for: notification), [.banner, .list, .sound])
+        notification.userInfo = ["localConnectionWarning": true]
+        XCTAssertTrue(NotificationService.foregroundOptions(for: notification).contains(.sound))
+        notification.sound = nil
+        XCTAssertFalse(NotificationService.foregroundOptions(for: notification).contains(.sound))
+    }
     @MainActor func testCleanupLogsOnlyValidatedIdentityAndTheActualRemovalRequest() {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

@@ -146,14 +146,21 @@ import Observation
         }
         if !entries.isEmpty { appendLines(entries) }
     }
-    func phoneNotification(eventID: UUID, episodeID: UUID, deliveredAt: Date, interruptionLevel: Int, phase: String) {
+    func phoneNotification(eventID: UUID, episodeID: UUID, deliveredAt: Date, interruptionLevel: Int, phase: String,
+        payloadHasSound: Bool? = nil, presentationOptions: UInt? = nil, applicationState: Int? = nil,
+        protectedDataAvailable: Bool? = nil) {
         guard ["foreground", "opened", "retained"].contains(phase), (0...3).contains(interruptionLevel) else { return }
         let delivered = deliveredAt.timeIntervalSince1970 * 1000
         guard delivered.isFinite, abs(delivered) < 9e15 else { return }
         let key = "\(eventID)|\(phase)"
         guard phoneReceiptKeys.insert(key).inserted else { return }
         if phoneReceiptKeys.count > 512 { phoneReceiptKeys = [key] }
-        append("phone_notification phase=\(phase) event_id=\(eventID.uuidString.lowercased()) episode_id=\(episodeID.uuidString.lowercased()) delivered_at_ms=\(Int64(delivered.rounded())) interruption_level=\(interruptionLevel)")
+        var context = ""
+        if let payloadHasSound { context += " payload_has_sound=\(payloadHasSound)" }
+        if let presentationOptions { context += " presentation_options=\(presentationOptions)" }
+        if let applicationState, (0...2).contains(applicationState) { context += " application_state=\(applicationState)" }
+        if let protectedDataAvailable { context += " protected_data_available=\(protectedDataAvailable)" }
+        append("phone_notification phase=\(phase) event_id=\(eventID.uuidString.lowercased()) episode_id=\(episodeID.uuidString.lowercased()) delivered_at_ms=\(Int64(delivered.rounded())) interruption_level=\(interruptionLevel)" + context)
     }
     private var coverageFields: String {
         "scope=process process_id=\(processID.uuidString.lowercased()) sampled_records=\(sampledRecords) deduplicated_records=\(deduplicatedRecords) evicted_records=\(evictedRecords) read_failures=\(readFailures) write_failures=\(writeFailures) write_recoveries=\(writeRecoveries)"

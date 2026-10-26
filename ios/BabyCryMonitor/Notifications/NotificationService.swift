@@ -56,7 +56,7 @@ extension NotificationProviding {
             // Watch notification settings can mirror this authorization. The iOS target
             // also needs the Time Sensitive entitlement; the Watch entitlement alone
             // does not enable that setting on the companion. Request sound
-            // permission even though our iPhone payloads deliberately omit sound.
+            // permission so matching phone/Watch payloads can request system sound.
             let allowed = try await center.requestAuthorization(options: [.alert, .badge, .sound])
             let settings = await center.notificationSettings()
             recordDelivered(await center.deliveredNotifications())
@@ -93,9 +93,13 @@ extension NotificationProviding {
         try await ConnectionWarningNotification.apply(deadline: deadline)
     }
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
+        let content = notification.request.content
+        let isSilentTest = SilentAlarmTestRequest(payload: content.userInfo) != nil
+        let options: UNNotificationPresentationOptions = isSilentTest ? [] : Self.foregroundOptions(for: content)
         let alarmCallback = notification.request.content.userInfo["silentCryAlarm"] as? Bool == true
             ? SilentCryAlarmRequest.Callback(payload: notification.request.content.userInfo) : nil
-        await recordReceipt(Self.receipt(notification), phase: "foreground")
+        await recordReceipt(Self.receipt(notification), phase: "foreground", payloadHasSound: content.sound != nil,
+            presentationOptions: options.rawValue)
         if let alarmCallback {
             if #available(iOS 26.0, *) {
                 _ = await SilentCryAlarmService.shared.receive(alarmCallback, source: .foregroundNotification)
@@ -106,8 +110,12 @@ extension NotificationProviding {
             return []
         }
         await refresh()
-        return notification.request.content.userInfo["localConnectionWarning"] as? Bool == true
-            ? [.banner, .list, .sound] : [.banner, .list]
+        return options
+    }
+    nonisolated static func foregroundOptions(for content: UNNotificationContent) -> UNNotificationPresentationOptions {
+        // Honor the payload on both devices. Always dropping .sound here changes
+        // the phone's forwarded bulletin even when APNs metadata matches.
+        content.sound == nil ? [.banner, .list] : [.banner, .list, .sound]
     }
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
         await recordReceipt(Self.receipt(response.notification), phase: "opened")
@@ -127,10 +135,14 @@ extension NotificationProviding {
               let episode = (info["episodeId"] as? String).flatMap(UUID.init(uuidString:)) else { return nil }
         return (event, episode, notification.date, Int(notification.request.content.interruptionLevel.rawValue))
     }
-    private func recordReceipt(_ receipt: (UUID, UUID, Date, Int)?, phase: String) {
+    private func recordReceipt(_ receipt: (UUID, UUID, Date, Int)?, phase: String,
+        payloadHasSound: Bool? = nil, presentationOptions: UInt? = nil) {
         guard let receipt else { return }
         log?.phoneNotification(eventID: receipt.0, episodeID: receipt.1, deliveredAt: receipt.2,
-            interruptionLevel: receipt.3, phase: phase)
+            interruptionLevel: receipt.3, phase: phase, payloadHasSound: payloadHasSound,
+            presentationOptions: presentationOptions,
+            applicationState: phase == "foreground" ? UIApplication.shared.applicationState.rawValue : nil,
+            protectedDataAvailable: phase == "foreground" ? UIApplication.shared.isProtectedDataAvailable : nil)
     }
     private func recordDelivered(_ notifications: [UNNotification]) {
         for notification in notifications { recordReceipt(Self.receipt(notification), phase: "retained") }
