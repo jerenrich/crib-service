@@ -3,6 +3,8 @@ import {requestMonitoring,completeMonitoring} from './monitoring';
 import {timeline} from './timeline';
 export {AlertReminders} from './reminders';
 export {LiveSound} from './live-sound';
+export {ProviderTokens} from './provider-token';
+import {providerTokens} from './provider-token';
 import {openLiveSound} from './live-sound';
 import {APIError,type Env} from './types';
 import {body,rateLimit} from './security';
@@ -67,6 +69,14 @@ export default {
      case 'POST /v1/pairing/claim':result=await claimPairing(env,device,await body(request),ip);break;
      case 'POST /v1/device/push-token':result=await savePushToken(env,device,await body(request));break;
      case 'POST /v1/device/watch-push-token':result=await saveWatchPushToken(env,device,await body(request));break;
+     case 'POST /v1/diagnostics/apns':{
+      if(device.role!=='parent')throw new APIError(403,'Only the Parent can check push readiness.');
+      await rateLimit(env,'apns-readiness',device.id,6,600);
+      // Check the persistent authority without sending a notification or
+      // returning its bearer token. This never forces a token rotation.
+      await latency.measure('provider_sign_ms',()=>providerTokens.get(env,latency,true));
+      result={ready:true,tokenRef:latency.details.provider_token_ref,ageSeconds:latency.details.provider_token_age_s,source:latency.details.provider_token_source};break;
+     }
      case 'POST /v1/silent-watch-alarms':result=await saveSilentWatchAlarms(env,device,await body(request));break;
      case 'POST /v1/pairing/remove':result=await removeDeviceData(env,device);break;
      case 'POST /v1/device/delete':result=await removeDeviceData(env,device,true);break;

@@ -49,3 +49,11 @@ new_sqlite_classes = ["WatchTest"]
 [[migrations]]
 tag = "v4-remove-watch-test-timer"
 deleted_classes = ["WatchTest"]
+
+[[durable_objects.bindings]]
+name = "APNS_PROVIDER_TOKENS"
+class_name = "ProviderTokens"
+
+[[migrations]]
+tag = "v5-provider-tokens"
+new_sqlite_classes = ["ProviderTokens"]

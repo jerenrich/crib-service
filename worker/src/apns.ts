@@ -2,23 +2,11 @@ import {decryptToken} from './security';
 import type {Alert,Env} from './types';
 import {PushPreparationError,type Outcome} from './diagnostics';
 import {Latency,appleReasons,type AppleReason} from './latency';
+import {providerTokens} from './provider-token';
 
 export type PushResult = {status:'sent'|'retry'|'blocked'|'uncertain'|'failed';reason?:Outcome;httpStatus?:number};
-let cache: {identity:string;token:string;expires:number}|undefined;
-function base64url(value:Uint8Array):string {return btoa(String.fromCharCode(...value)).replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');}
-function encodedJSON(value:unknown):string {return base64url(new TextEncoder().encode(JSON.stringify(value)));}
 export async function apnsToken(env:Env,latency?:Latency):Promise<string> {
- if(!env.APNS_KEY_ID||!env.APNS_TEAM_ID||!env.APNS_PRIVATE_KEY||!env.APNS_BUNDLE_ID)throw new Error('APNs configuration missing');
- const identity=`${env.APNS_KEY_ID}|${env.APNS_TEAM_ID}|${env.APNS_PRIVATE_KEY}`;
- const now=Math.floor(Date.now()/1000);
- if(latency){latency.details.provider_token_cached=cache?.identity===identity&&cache.expires>now;latency.details.provider_token_age_s=latency.details.provider_token_cached?now-(cache!.expires-3000):0;}
- if(cache?.identity===identity&&cache.expires>now)return cache.token;
- const pem=env.APNS_PRIVATE_KEY.replace(/\\n/g,'\n').replace(/-----[^-]+-----/g,'').replace(/\s/g,'');
- const key=await crypto.subtle.importKey('pkcs8',Uint8Array.from(atob(pem),c=>c.charCodeAt(0)),{name:'ECDSA',namedCurve:'P-256'},false,['sign']);
- const input=`${encodedJSON({alg:'ES256',kid:env.APNS_KEY_ID})}.${encodedJSON({iss:env.APNS_TEAM_ID,iat:now})}`;
- const signature=await crypto.subtle.sign({name:'ECDSA',hash:'SHA-256'},key,new TextEncoder().encode(input));
- const token=`${input}.${base64url(new Uint8Array(signature))}`;
- cache={identity,token,expires:now+3000};return token;
+ return providerTokens.get(env,latency);
 }
 export function payload(alert:Alert,target:'phone'|'watch'='phone') {
  const minutes=Math.floor(alert.durationSeconds/60);const seconds=Math.floor(alert.durationSeconds%60);

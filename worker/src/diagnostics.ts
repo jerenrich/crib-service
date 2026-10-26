@@ -4,6 +4,7 @@ import {safeTimingDetails,type TimingDetails} from './latency';
 const routes = {
  'POST /v1/device/register':'register', 'POST /v1/device/push-token':'push_token',
  'POST /v1/device/watch-push-token':'watch_token', 'POST /v1/pairing/create':'pairing_create',
+ 'POST /v1/diagnostics/apns':'apns_readiness',
  'POST /v1/pairing/claim':'pairing_claim', 'POST /v1/listener/heartbeat':'heartbeat',
  'POST /v1/listener/event':'alert', 'GET /v1/listener/status':'status', 'GET /v1/timeline':'timeline',
  'POST /v1/monitoring':'monitoring', 'POST /v1/monitoring/complete':'monitoring_complete',

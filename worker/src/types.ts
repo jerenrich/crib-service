@@ -4,6 +4,7 @@ export interface Env {
  DB: D1Database;
  ALERT_REMINDERS: DurableObjectNamespace;
  LIVE_SOUND: DurableObjectNamespace;
+ APNS_PROVIDER_TOKENS: DurableObjectNamespace;
  APNS_KEY_ID: string;
  APNS_TEAM_ID: string;
  APNS_PRIVATE_KEY: string;

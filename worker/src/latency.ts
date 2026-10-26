@@ -23,6 +23,7 @@ export interface TimingDetails {
  db_calls?:number; db_sql_ms?:number; db_rows_read?:number; db_rows_written?:number; db_attempts?:number;
  apns_reason?:AppleReason; apns_environment?:'development'|'production';
  transport?:'timeout'|'network'; provider_token_cached?:boolean; provider_token_age_s?:number;
+ provider_token_source?:'memory'|'in_flight'|'coordinator_reused'|'coordinator_created';provider_token_ref?:string;
  apns_started_at_ms?:number; apns_response_at_ms?:number; apns_unique_id?:string; colo?:string;
  error_kind?:'d1_overloaded'|'d1_timeout'|'d1_error'|'other';
  failed_span?:Span;
@@ -240,6 +241,8 @@ export function safeTimingDetails(value:TimingDetails|undefined):string|null {
  if(typeof value.colo==='string'&&/^[A-Z]{3}$/.test(value.colo))safe.colo=value.colo;
  if(['d1_overloaded','d1_timeout','d1_error','other'].includes(value.error_kind!))safe.error_kind=value.error_kind;
  if(typeof value.provider_token_cached==='boolean')safe.provider_token_cached=value.provider_token_cached;
+ if(['memory','in_flight','coordinator_reused','coordinator_created'].includes(value.provider_token_source!))safe.provider_token_source=value.provider_token_source;
+ if(typeof value.provider_token_ref==='string'&&/^[0-9a-f]{64}$/.test(value.provider_token_ref))safe.provider_token_ref=value.provider_token_ref;
  if(spans.includes(value.failed_span!))safe.failed_span=value.failed_span;
  if(['upload','reminder','maintenance','connection','watch_test'].includes(value.dispatch_source!))safe.dispatch_source=value.dispatch_source;
  if(['pending','sending','sent','blocked','uncertain','failed'].includes(value.observed_status!))safe.observed_status=value.observed_status;

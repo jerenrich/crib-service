@@ -4,6 +4,7 @@ import {beforeAll,afterEach,beforeEach,describe,it,expect,vi} from 'vitest';
 import worker from '../src/index';
 import {defaultConfiguration,type Env,type Alert} from '../src/types';
 import {payload,apnsToken} from '../src/apns';
+import {ProviderTokenCache,providerTokens} from '../src/provider-token';
 import {encryptToken,decryptToken,sha256} from '../src/security';
 import {flushPending,dispatchEvent} from '../src/alerts';
 import {eventReference,recordDiagnostic} from '../src/diagnostics';
@@ -36,9 +37,7 @@ function mockPush(status=200,times=1){
 
 beforeAll(async()=>{
  await applyD1Migrations(env.DB,env.TEST_MIGRATIONS);
- const key=await crypto.subtle.generateKey({name:'ECDSA',namedCurve:'P-256'},true,['sign','verify']) as CryptoKeyPair;
- const pem=btoa(String.fromCharCode(...new Uint8Array(await crypto.subtle.exportKey('pkcs8',key.privateKey) as ArrayBuffer)));
- testEnv={...env,APNS_KEY_ID:'TESTKEY',APNS_TEAM_ID:'TESTTEAM',APNS_PRIVATE_KEY:`-----BEGIN PRIVATE KEY-----\n${pem}\n-----END PRIVATE KEY-----`,APNS_BUNDLE_ID:'com.example.BabyCryMonitor',APNS_ENVIRONMENT:'development'};
+ testEnv={...env};
 });
 beforeEach(async()=>{
  await env.DB.batch(['resolved_episodes','monitoring_commands','alert_snoozes','timeline_events','diagnostics','connection_notices','connection_states','events','heartbeats','pairs','pairing_codes','devices','rate_limits'].map(table=>env.DB.prepare(`DELETE FROM ${table}`)));
@@ -51,6 +50,23 @@ beforeEach(async()=>{
  }));
 });
 afterEach(()=>{try{expect(pushResponses).toHaveLength(0);}finally{vi.unstubAllGlobals();vi.restoreAllMocks();}});
+
+describe('APNs readiness diagnostics',()=>{
+ it('requires a Parent, returns only safe reuse evidence, sends no pushes and enforces its budget',async()=>{
+  expect((await call('diagnostics/apns')).status).toBe(401);
+  const parent=device('parent'),listener=device('listener');await register(parent);await register(listener);
+  expect((await call('diagnostics/apns',listener)).status).toBe(403);
+  let reference:string|undefined;
+  for(let i=0;i<6;i++){
+   const response=await call('diagnostics/apns',parent);expect(response.status).toBe(200);
+   const result=await response.json() as {ready:boolean;tokenRef:string;ageSeconds:number;source:string};
+   expect(Object.keys(result).sort()).toEqual(['ageSeconds','ready','source','tokenRef']);
+   expect(result.ready).toBe(true);expect(result.tokenRef).toMatch(/^[0-9a-f]{64}$/);
+   if(reference)expect(result.tokenRef).toBe(reference);reference=result.tokenRef;
+  }
+  expect((await call('diagnostics/apns',parent)).status).toBe(429);expect(pushRequests).toHaveLength(0);
+ });
+});
 
 describe('connection alerts, readiness and replacement',()=>{
  const beat=(listener:TestDevice,monitoring=true,appliedConfiguration=defaultConfiguration)=>({listenerId:listener.deviceId,timestamp:new Date().toISOString(),monitoring,powerConnected:true,state:'quiet',episodes:[],appliedConfiguration});
@@ -393,6 +409,7 @@ describe('direct Apple Watch alerts',()=>{
   expect(await (await call('listener/event',listener,event)).json()).toEqual({status:'sent'});
   await call('listener/event',listener,event);await flushPending(testEnv);
   expect(pushRequests).toHaveLength(2);
+  expect(new Headers(pushRequests[0].init?.headers).get('authorization')).toBe(new Headers(pushRequests[1].init?.headers).get('authorization'));
   for(const target of ['phone','watch']){
    const request=pushRequests.find(r=>r.url.includes((target==='phone'?'ab':'cd').repeat(32)))!;
    expect(new Headers(request.init?.headers).get('apns-topic')).toBe(testEnv.APNS_BUNDLE_ID+(target==='watch'?'.watchkitapp':''));
@@ -1144,6 +1161,13 @@ describe('alert delivery regressions',()=>{
   expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM timeline_events WHERE kind='alert_acknowledged'").first()).toEqual({n:0});
  });
  it('retains snoozes by their end time through cleanup and expires them afterward',async()=>{
+  // This test intentionally travels a day backwards. Start with independent
+  // token state rather than treating a real clock-regression refusal as a
+  // notification or snooze failure. Other tests cover that refusal explicitly.
+  const stub=env.APNS_PROVIDER_TOKENS.get(env.APNS_PROVIDER_TOKENS.newUniqueId());
+  const isolated={...testEnv,APNS_PROVIDER_TOKENS:{getByName:()=>stub}} as unknown as Env;
+  const tokenCache=new ProviderTokenCache();
+  vi.spyOn(providerTokens,'get').mockImplementation((_env,latency,checkAuthority)=>tokenCache.get(isolated,latency,checkAuthority));
   const {parent,listener}=await paired();
   const now=Date.now(),start=now-86400000-600000,until=start+900000;
   await env.DB.prepare('UPDATE pairs SET created_at=?').bind(start-3600000).run();
