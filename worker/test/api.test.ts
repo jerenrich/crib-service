@@ -2189,7 +2189,8 @@ describe('optional overnight silent Watch alarms',()=>{
      aps:{sound:'default',category:'BABY_CRY_ALERT','interruption-level':'time-sensitive'}});
     expect(body.silentCryAlarm).toBe(watch?undefined:true);
     expect(body.aps['content-available']).toBe(watch?undefined:1);
-    expect(headers.get('apns-collapse-id')).toBe(`${watch?'watch':'phone'}:${id===initial.eventId?id:initial.episodeId}`);
+    expect(headers.get('apns-collapse-id')).toBe(`${watch?'watch':'phone'}:${id}`);
+    expect(body.aps['thread-id']).toBeUndefined();
    }
   }
  });
