@@ -57,7 +57,14 @@ export async function sendSilentAlarmTestPush(env:Env,encryptedToken:string,aler
  }};
  return sendNotification(env,encryptedToken,alert.eventId,content,'phone',60,alert.eventId,latency);
 }
-async function sendNotification(env:Env,encryptedToken:string,id:string,content:unknown,target:'phone'|'watch',expiration:number,collapseId=id,latency=new Latency(),schedule?:PushSchedule):Promise<PushResult> {
+// Fixed, separate topic for the standalone proof of concept. Reuse the existing
+// provider-token authority so the experiment cannot introduce JWT churn.
+export async function sendWatchLatencyProbe(env:Env,encryptedToken:string,eventId:string,createdAt:string,latency:Latency):Promise<PushResult> {
+ return sendNotification(env,encryptedToken,eventId,{aps:{alert:{title:'Test · Wrist Probe',body:'Standalone direct Watch notification'},
+  sound:'default','interruption-level':'time-sensitive'},eventId,createdAt,isTest:true},'watch',60,eventId,latency,undefined,
+  'com.jordanerenrich.cribservice.latencyprobe');
+}
+async function sendNotification(env:Env,encryptedToken:string,id:string,content:unknown,target:'phone'|'watch',expiration:number,collapseId=id,latency=new Latency(),schedule?:PushSchedule,topic?:string):Promise<PushResult> {
  // Errors before fetch are known not to have sent a notification and can safely retry.
  let deviceToken:string,jwt:string;
  try {deviceToken=await latency.measure('token_decrypt_ms',()=>decryptToken(env,encryptedToken));}catch{throw new PushPreparationError('token_decryption');}
@@ -71,7 +78,7 @@ async function sendNotification(env:Env,encryptedToken:string,id:string,content:
  schedule?.requestStarted?.();
  latency.details.apns_started_at_ms=Date.now();
  try {
-  response=await latency.measure('apns_fetch_ms',()=>fetch(`https://${host}/3/device/${deviceToken}`,{method:'POST',headers:{authorization:`bearer ${jwt}`,'apns-topic':env.APNS_BUNDLE_ID+(target==='watch'?'.watchkitapp':''),'apns-push-type':'alert','apns-priority':'10','apns-id':id,'apns-collapse-id':collapseId,'apns-expiration':String(Math.floor(Date.now()/1000)+expiration),'content-type':'application/json'},body:JSON.stringify(content),signal}));
+  response=await latency.measure('apns_fetch_ms',()=>fetch(`https://${host}/3/device/${deviceToken}`,{method:'POST',headers:{authorization:`bearer ${jwt}`,'apns-topic':topic??env.APNS_BUNDLE_ID+(target==='watch'?'.watchkitapp':''),'apns-push-type':'alert','apns-priority':'10','apns-id':id,'apns-collapse-id':collapseId,'apns-expiration':String(Math.floor(Date.now()/1000)+expiration),'content-type':'application/json'},body:JSON.stringify(content),signal}));
   latency.details.apns_response_at_ms=Date.now();
   latency.details.apns_unique_id=response.headers.get('apns-unique-id')??undefined;
  }catch{latency.details.transport=signal.aborted?'timeout':'network';return {status:'uncertain',reason:'transport_unknown'};}

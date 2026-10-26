@@ -64,6 +64,15 @@ describe('bounded phone-first coordination',()=>{
 });
 
 describe('pair-scoped coordination settings and diagnostics',()=>{
+ it('limits the corrected trial to marked tests and rejects overlapping experiments',()=>{
+  const configured={PHONE_HEAD_START_TEST_PARENT_ID:'parent'} as Env;
+  expect(phoneHeadStartFor(configured,'parent',true)).toBe(500);
+  expect(phoneHeadStartFor(configured,'parent')).toBe(0);
+  expect(phoneHeadStartFor(configured,'other',true)).toBe(0);
+  for(const key of ['WATCH_ONLY_PARENT_ID','PHONE_ONLY_TEST_PARENT_ID','DISTINCT_APNS_ID_TEST_PARENT_ID','SEPARATE_COLLAPSE_ID_TEST_PARENT_ID']){
+   expect(phoneHeadStartFor({...configured,[key]:'parent'},'parent',true)).toBe(0);
+  }
+ });
  it('requires an exact Parent opt-in and a small valid delay',()=>{
   const base={WATCH_PHONE_HEAD_START_PARENT_ID:'parent',WATCH_PHONE_HEAD_START_MS:'350'} as Env;
   expect(phoneHeadStartFor(base,'parent')).toBe(350);expect(phoneHeadStartFor(base,'other')).toBe(0);

@@ -2724,6 +2724,52 @@ describe('separate collapse IDs for crying alerts and scoped marked tests',()=>{
  });
 });
 
+describe('standalone Watch probe',()=>{
+ const request=(d?:TestDevice,configured:Env=testEnv)=>worker.fetch(new Request('https://monitor.test/v1/watch-latency-probe/push',{
+  method:'POST',headers:d?{authorization:`Bearer ${d.deviceId}.${d.secret}`}:{}}),configured);
+ it('requires authentication, a Parent and exact experiment opt-in',async()=>{
+  expect((await request()).status).toBe(401);
+  const parent=device('parent'),listener=device('listener');await register(parent);await register(listener);
+  expect((await request(parent)).status).toBe(403);
+  expect((await request(listener,{...testEnv,WATCH_LATENCY_PROBE_PARENT_ID:listener.deviceId})).status).toBe(403);
+  expect((await request(parent,{...testEnv,WATCH_LATENCY_PROBE_PARENT_ID:crypto.randomUUID()})).status).toBe(403);
+  expect(pushRequests).toHaveLength(0);
+ });
+ it('sends once to the fixed standalone topic, reuses the provider JWT and creates no nursery events',async()=>{
+  const parent=device('parent');await register(parent);await call('device/push-token',parent,{token:'ef'.repeat(32)});
+  const configured={...testEnv,WATCH_LATENCY_PROBE_PARENT_ID:parent.deviceId};
+  const jwt=await apnsToken(configured);mockPush();
+  const response=await request(parent,configured),result=await response.json() as {eventId:string;createdAt:string;accepted:boolean};
+  expect(response.status).toBe(200);expect(result.accepted).toBe(true);expect(pushRequests).toHaveLength(1);
+  const push=pushRequests[0],headers=new Headers(push.init?.headers),body=JSON.parse(String(push.init?.body));
+  expect(push.url).toBe('https://api.sandbox.push.apple.com/3/device/'+'ef'.repeat(32));
+  expect(headers.get('apns-topic')).toBe('com.jordanerenrich.cribservice.latencyprobe');
+  expect(headers.get('authorization')).toBe('bearer '+jwt);
+  expect(headers.get('apns-collapse-id')).toBe(result.eventId);expect(headers.get('apns-id')).toBe(result.eventId);
+  expect(body).toMatchObject({eventId:result.eventId,createdAt:result.createdAt,isTest:true,aps:{sound:'default','interruption-level':'time-sensitive'}});
+  expect(body.aps.category).toBeUndefined();expect(body.aps['thread-id']).toBeUndefined();
+  expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM events').first()).toEqual({n:0});
+ });
+ it('rejects a real pairing even if its ID was accidentally configured',async()=>{
+  const {parent}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  expect((await request(parent,{...testEnv,WATCH_LATENCY_PROBE_PARENT_ID:parent.deviceId})).status).toBe(409);
+  expect(pushRequests).toHaveLength(0);
+ });
+ it('reports an uncertain send without retries or an outbox',async()=>{
+  const parent=device('parent');await register(parent);await call('device/push-token',parent,{token:'ef'.repeat(32)});
+  pushResponses.push(new Error('transport unknown'));
+  const response=await request(parent,{...testEnv,WATCH_LATENCY_PROBE_PARENT_ID:parent.deviceId});
+  expect(await response.json()).toMatchObject({status:'uncertain',accepted:false});expect(pushRequests).toHaveLength(1);
+  expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM events').first()).toEqual({n:0});
+ });
+ it('limits the probe to six isolated attempts per ten minutes',async()=>{
+  const parent=device('parent');await register(parent);await call('device/push-token',parent,{token:'ef'.repeat(32)});
+  const configured={...testEnv,WATCH_LATENCY_PROBE_PARENT_ID:parent.deviceId};mockPush(200,6);
+  for(let i=0;i<6;i++)expect((await request(parent,configured)).status).toBe(200);
+  expect((await request(parent,configured)).status).toBe(429);expect(pushRequests).toHaveLength(6);
+ });
+});
+
 describe('phone head-start trial delivery',()=>{
  async function setup(){
   const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
@@ -2734,7 +2780,7 @@ describe('phone head-start trial delivery',()=>{
  it('separates actual request starts while retaining matching IDs, Time Sensitive and matching default sound',async()=>{
   const {parent,listener}=await setup(),event={...alert(listener),isTest:true},times=new Map<string,number>(),external=globalThis.fetch;
   vi.stubGlobal('fetch',vi.fn((input:string|URL|Request,init?:RequestInit)=>{times.set(new Headers(init?.headers).get('apns-topic')!,performance.now());return external(input,init);}));mockPush(200,2);
-  expect(await (await upload(listener,event,{...testEnv,WATCH_PHONE_HEAD_START_PARENT_ID:parent.deviceId,WATCH_PHONE_HEAD_START_MS:'500'})).json()).toEqual({status:'sent'});
+  expect(await (await upload(listener,event,{...testEnv,PHONE_HEAD_START_TEST_PARENT_ID:parent.deviceId})).json()).toEqual({status:'sent'});
   const phoneTopic=testEnv.APNS_BUNDLE_ID,watchTopic=phoneTopic+'.watchkitapp';expect(times.get(watchTopic)!-times.get(phoneTopic)!).toBeGreaterThanOrEqual(499);
   expect(pushRequests).toHaveLength(2);
   const [phone,watch]=pushRequests.map(request=>({headers:new Headers(request.init?.headers),body:JSON.parse(String(request.init?.body))}));
@@ -2760,6 +2806,15 @@ describe('phone head-start trial delivery',()=>{
    await Promise.race([watchStarted,new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new Error('Watch held behind phone response')),3000);})]);
    expect(phoneReturned).toBe(false);expect(pushRequests).toHaveLength(2);
   }finally{if(timer!==undefined)clearTimeout(timer);release();await running;}
+ });
+ it('keeps real crying and reminders on parallel delivery under the corrected test-only flag',async()=>{
+  const {parent,listener}=await setup(),configured={...testEnv,PHONE_HEAD_START_TEST_PARENT_ID:parent.deviceId};
+  mockPush(200,2);await upload(listener,alert(listener),configured);
+  vi.spyOn(Date,'now').mockReturnValue(Date.now()+10000);mockPush(200,2);await runReminder(configured,parent.deviceId);
+  expect(pushRequests).toHaveLength(4);
+  const rows=await env.DB.prepare("SELECT details FROM diagnostics WHERE operation='dispatch' AND target='watch'").all<{details:string}>();
+  expect(rows.results.length).toBeGreaterThanOrEqual(2);
+  for(const row of rows.results)expect(JSON.parse(row.details).coordination_mode).toBeUndefined();
  });
  it.each(['phone','watch'] as const)('does not replay an accepted %s target or wait on its retry',async accepted=>{
   const {parent,listener}=await setup(),event={...alert(listener),isTest:true};mockPush(200,2);await call('listener/event',listener,event);

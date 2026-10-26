@@ -12,6 +12,7 @@ const routes = {
  'POST /v1/settings':'settings', 'POST /v1/alert/acknowledge':'acknowledge',
  'POST /v1/pairing/remove':'unpair','POST /v1/device/delete':'delete_device',
  'POST /v1/watch-test/push':'test_push',
+ 'POST /v1/watch-latency-probe/push':'test_push',
  'POST /v1/listener/silent-alarm-test':'test_push',
  'POST /v1/silent-watch-alarms':'settings',
  'GET /v1/watch-test':'test_push','POST /v1/watch-test':'test_push',

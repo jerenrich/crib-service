@@ -7,7 +7,14 @@ export interface PushSchedule {
 }
 // A trial must name one Parent and explicitly opt in. Invalid/absent settings
 // preserve parallel delivery; no device identity is retained in diagnostic rows.
-export function phoneHeadStartFor(env:Env,parentId:string):number {
+export function phoneHeadStartFor(env:Env,parentId:string,isTest=false):number {
+ // The corrected experiment is one-shot only, has matched identities and cannot
+ // overlap another routing trial. Conflicting controls fall back to no delay.
+ if(env.PHONE_HEAD_START_TEST_PARENT_ID===parentId){
+  if(!isTest||[env.WATCH_ONLY_PARENT_ID,env.PHONE_ONLY_TEST_PARENT_ID,
+   env.DISTINCT_APNS_ID_TEST_PARENT_ID,env.SEPARATE_COLLAPSE_ID_TEST_PARENT_ID].includes(parentId))return 0;
+  return 500;
+ }
  if(env.WATCH_PHONE_HEAD_START_PARENT_ID!==parentId)return 0;
  const text=env.WATCH_PHONE_HEAD_START_MS;
  if(!text||!/^\d{1,3}$/.test(text))return 0;

@@ -1,4 +1,5 @@
 import {retiredWatchTest,sendWatchTest,sendSilentAlarmTest} from './watch-test';
+import {sendStandaloneProbe} from './watch-latency-probe';
 import {requestMonitoring,completeMonitoring} from './monitoring';
 import {timeline} from './timeline';
 export {AlertReminders} from './reminders';
@@ -83,6 +84,7 @@ export default {
      case 'POST /v1/device/delete':result=await removeDeviceData(env,device,true);break;
      case 'POST /v1/connection-alerts':result=await connectionPreferences(env,device,await body(request));break;
      case 'POST /v1/watch-test/push':result=await sendWatchTest(env,device,latency,requestId);break;
+     case 'POST /v1/watch-latency-probe/push':result=await sendStandaloneProbe(env,device,latency,requestId);break;
      case 'POST /v1/listener/silent-alarm-test':{
       if(device.role!=='listener')throw new APIError(403,'Only the Listener can send this test.');
       await rateLimit(env,'silent-alarm-test',device.id,6,600);

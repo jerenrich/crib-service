@@ -183,7 +183,7 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
   stage='push';
   let checkpointed=false;
   const status=await deliverToBoth(env,{table:'events',id:eventId,parentId:event.parent_id,attempt:event.attempts,
-   phoneHeadStartMS:phoneHeadStartFor(env,event.parent_id),
+   phoneHeadStartMS:phoneHeadStartFor(env,event.parent_id,alert.isTest===true),
    state:event.delivery_state,phoneToken:parent.phone_token,watchToken:parent.watch_token,requestId,eventRef,
    source:latency.details.dispatch_source,
    accepted:options.accepted?async delivery=>{await latency.measure('outcome_queue_ms',()=>options.accepted!(delivery));checkpointed=true;}:undefined,
