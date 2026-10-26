@@ -184,7 +184,8 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
    source:latency.details.dispatch_source,
    accepted:options.accepted?async delivery=>{await latency.measure('outcome_queue_ms',()=>options.accepted!(delivery));checkpointed=true;}:undefined,
    aggregate:{requestId,started:now,operation:'dispatch',stage:'storage',outcome:'sent',eventRef,attempt,details:latency.progressDetails()},
-   send:(destination,token,timing,schedule)=>sendPush(env,token,alert,destination,timing,parent.silent_watch_alarms===1&&!alert.isTest,schedule)});
+   send:(destination,token,timing,schedule)=>sendPush(env,token,alert,destination,timing,parent.silent_watch_alarms===1&&!alert.isTest,schedule,
+    alert.isTest===true&&env.DISTINCT_APNS_ID_TEST_PARENT_ID===event.parent_id)});
   latency.details.push_outcome=status==='pending'?'retry':status;
   stage='storage';target=undefined;
   // The checkpoint's background persister owns the aggregate and target journals.
@@ -200,7 +201,8 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  const alert=JSON.parse(event.payload) as Alert;
  const silentAlarm=parent.silent_watch_alarms===1&&!alert.isTest&&event.delivery_mode!=='watch_only';
  // The original send and its receipt never depend on the auxiliary phone send.
- const primary=sendPush(env,parent.token,alert,target,latency,silentAlarm);
+ const primary=sendPush(env,parent.token,alert,target,latency,silentAlarm,undefined,
+  alert.isTest===true&&env.DISTINCT_APNS_ID_TEST_PARENT_ID===event.parent_id);
  if(silentAlarm&&target==='watch'&&parent.phone_token){
   auxiliary=(async()=>{
    const started=Date.now(),timing=new Latency();let result:PushResult;

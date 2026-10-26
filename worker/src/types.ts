@@ -14,6 +14,7 @@ export interface Env {
  WATCH_PHONE_HEAD_START_MS?:string;
  WATCH_ONLY_PARENT_ID?:string;
  PHONE_ONLY_TEST_PARENT_ID?:string;
+ DISTINCT_APNS_ID_TEST_PARENT_ID?:string;
  TOKEN_ENCRYPTION_KEY: string;
  PAIRING_PEPPER: string;
 }

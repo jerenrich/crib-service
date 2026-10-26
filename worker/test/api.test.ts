@@ -1634,7 +1634,7 @@ describe('latency path and diagnostic spans',()=>{
   expect(JSON.parse(row!.details).transport).toBe('network');expect(row!.details).not.toContain('private-transport-marker');
  });
  it('rejects unknown detail keys, strings and invalid durations at the journal boundary',async()=>{
-  await recordDiagnostic(testEnv,{requestId:crypto.randomUUID(),started:Date.now(),operation:'dispatch',stage:'push',outcome:'sent',details:{spans:{apns_fetch_ms:12,claim_ms:NaN,private:'private-marker'},apns_reason:'private-marker',apns_unique_id:'private-marker',private:'private-marker',db_calls:-1} as unknown as import('../src/latency').TimingDetails});
+  await recordDiagnostic(testEnv,{requestId:crypto.randomUUID(),started:Date.now(),operation:'dispatch',stage:'push',outcome:'sent',details:{spans:{apns_fetch_ms:12,claim_ms:NaN,private:'private-marker'},apns_reason:'private-marker',apns_unique_id:'private-marker',apns_request_id:'private-marker',apns_id_mode:'private-marker',private:'private-marker',db_calls:-1} as unknown as import('../src/latency').TimingDetails});
   const row=await env.DB.prepare('SELECT details FROM diagnostics').first<{details:string}>();expect(JSON.parse(row!.details)).toEqual({spans:{apns_fetch_ms:12}});
  });
  it('allows scheduling during reminder I/O and preserves the fresh wakeup',async()=>{
@@ -2602,6 +2602,55 @@ describe('phone-only marked-test forwarding control',()=>{
  it('leaves an explicit Watch-only trial in control if flags conflict',async()=>{
   const {parent,listener,configured}=await setup();mockPush();await upload(listener,{...alert(listener),isTest:true},{...configured,WATCH_ONLY_PARENT_ID:parent.deviceId});
   expect(pushRequests).toHaveLength(1);expect(new Headers(pushRequests[0].init?.headers).get('apns-topic')).toBe(testEnv.APNS_BUNDLE_ID+'.watchkitapp');
+ });
+});
+
+describe('distinct APNs request ID marked-test control',()=>{
+ async function setup(){
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
+  return {parent,listener,configured:{...testEnv,DISTINCT_APNS_ID_TEST_PARENT_ID:parent.deviceId}};
+ }
+ const upload=(listener:TestDevice,event:Alert,configured:Env)=>worker.fetch(new Request('https://monitor.test/v1/listener/event',{method:'POST',
+  headers:{'content-type':'application/json',authorization:`Bearer ${listener.deviceId}.${listener.secret}`},body:JSON.stringify(event)}),configured);
+ it('uses different transport UUIDs while matching notification IDs, payloads and event correlation',async()=>{
+  const {listener,configured}=await setup(),event={...alert(listener),isTest:true};mockPush(200,2);
+  expect(await (await upload(listener,event,configured)).json()).toEqual({status:'sent'});
+  const requests=pushRequests.map(r=>({headers:new Headers(r.init?.headers),body:JSON.parse(String(r.init?.body))}));expect(requests).toHaveLength(2);
+  const ids=requests.map(r=>r.headers.get('apns-id'));
+  expect(new Set(ids).size).toBe(2);expect(ids).not.toContain(event.eventId);
+  for(const r of requests){
+   expect(r.headers.get('apns-id')).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
+   expect(r.headers.get('apns-collapse-id')).toBe(event.eventId);
+   expect(r.body).toMatchObject({eventId:event.eventId,episodeId:event.episodeId,isTest:true,
+    aps:{sound:'default',category:'BABY_CRY_ALERT','thread-id':event.episodeId,'interruption-level':'time-sensitive'}});
+  }
+  expect(requests[0].body).toEqual(requests[1].body);
+  const rows=await env.DB.prepare("SELECT target,details FROM diagnostics WHERE operation='dispatch' AND target IS NOT NULL").all<{target:string;details:string}>();
+  expect(rows.results).toHaveLength(2);
+  for(const row of rows.results){
+   const request=requests.find(r=>r.headers.get('apns-topic')===testEnv.APNS_BUNDLE_ID+(row.target==='watch'?'.watchkitapp':''))!;
+   expect(JSON.parse(row.details)).toMatchObject({apns_id_mode:'distinct_request',apns_request_id:request.headers.get('apns-id')});
+  }
+ });
+ it.each(['real','other_parent','disabled'] as const)('preserves existing request IDs for %s alerts',async mode=>{
+  const {listener,configured}=await setup(),event={...alert(listener),...(mode==='real'?{}:{isTest:true})};mockPush(200,2);
+  await upload(listener,event,mode==='disabled'?testEnv:mode==='other_parent'?{...configured,DISTINCT_APNS_ID_TEST_PARENT_ID:crypto.randomUUID()}:configured);
+  expect(pushRequests).toHaveLength(2);
+  for(const r of pushRequests)expect(new Headers(r.init?.headers).get('apns-id')).toBe(event.eventId);
+ });
+ it.each(['retry','uncertain'] as const)('does not replay an accepted sibling after a %s outcome',async mode=>{
+  const {listener,configured}=await setup(),event={...alert(listener),isTest:true};mockPush();
+  if(mode==='retry')mockPush(503);else pushResponses.push(new Error('ambiguous'));
+  await upload(listener,event,configured);
+  const firstIDs=pushRequests.map(r=>new Headers(r.init?.headers).get('apns-id'));
+  await env.DB.prepare('UPDATE events SET next_attempt=0 WHERE event_id=?').bind(event.eventId).run();
+  if(mode==='retry')mockPush();await dispatchEvent(configured,event.eventId);
+  expect(pushRequests).toHaveLength(mode==='retry'?3:2);
+  if(mode==='retry'){
+   const retry=new Headers(pushRequests[2].init?.headers);expect(retry.get('apns-topic')).toBe(testEnv.APNS_BUNDLE_ID+'.watchkitapp');
+   expect(retry.get('apns-collapse-id')).toBe(event.eventId);expect(firstIDs).not.toContain(retry.get('apns-id'));
+  }
  });
 });
 

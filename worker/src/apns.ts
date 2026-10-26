@@ -19,12 +19,16 @@ export function payload(alert:Alert) {
  // Device Silent Mode can mute audio while preserving Watch notification taps.
  return {aps:{alert:{title,body},category:'BABY_CRY_ALERT','thread-id':alert.episodeId,'interruption-level':'time-sensitive',sound:'default'},eventId:alert.eventId,episodeId:alert.episodeId,cryStartedAt:alert.cryStartedAt,createdAt:alert.createdAt,durationSeconds:alert.durationSeconds,...(alert.isTest?{isTest:true}:{})};
 }
-export async function sendPush(env:Env,encryptedToken:string,alert:Alert,target:'phone'|'watch'='phone',latency=new Latency(),silentCryAlarm=false,schedule?:PushSchedule):Promise<PushResult> {
+export async function sendPush(env:Env,encryptedToken:string,alert:Alert,target:'phone'|'watch'='phone',latency=new Latency(),silentCryAlarm=false,schedule?:PushSchedule,distinctRequestID=false):Promise<PushResult> {
  const diagnosticRef=latency.eventRef,deliveryAttempt=latency.deliveryAttempt;
  const correlation=diagnosticRef&&/^[0-9a-f]{64}$/.test(diagnosticRef)&&deliveryAttempt!==undefined&&Number.isSafeInteger(deliveryAttempt)&&deliveryAttempt>0&&deliveryAttempt<=1_000_000?{diagnosticRef,deliveryAttempt}:{};
  const content=payload(alert);
  const {sound:_sound,...silentAPS}=content.aps;
- return sendNotification(env,encryptedToken,alert.eventId,{...content,...correlation,
+ // A transport ID can differ while the collapse ID and logical event stay matched.
+ // This test-only control must not manufacture a second notification identity.
+ const requestID=distinctRequestID?crypto.randomUUID():alert.eventId;
+ if(distinctRequestID){latency.details.apns_id_mode='distinct_request';latency.details.apns_request_id=requestID;}
+ return sendNotification(env,encryptedToken,requestID,{...content,...correlation,
   ...(silentCryAlarm&&target==='phone'&&!alert.isTest?{silentCryAlarm:true,aps:{...silentAPS,'content-available':1}}:{})
  },target,alert.isRepeat?5:3600,alert.isRepeat?alert.episodeId:alert.eventId,latency,schedule);
 }
