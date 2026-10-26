@@ -41,24 +41,49 @@ export async function deliverToBoth(env:Env,options:{
    statements.push(env.DB.prepare(`UPDATE ${table} SET delivery_state=json_set(delivery_state,?,?)
     WHERE ${key}=? AND status='sending' AND attempts=?`).bind(`$.${target}`,state,id,attempt));
   }
-  await timing.db('outcome_storage_ms',()=>env.DB.batch(statements));
+  try{
+   await timing.db('outcome_storage_ms',()=>env.DB.batch(statements));
+  }catch(error){
+   // Keep the known Apple result even if functional persistence fails. This
+   // evidence never authorizes replay of a delivery with ambiguous transport.
+   timing.failure(error);
+   await recordDiagnostic(env,{requestId:options.requestId,started,operation:'dispatch',stage:'storage',
+    outcome:'internal_error',eventRef:options.eventRef,target,attempt,httpStatus:result.httpStatus,details:timing.details});
+   throw error;
+  }
   await recordDiagnostic(env,{requestId:options.requestId,started,operation:'dispatch',stage:'push',
    outcome:result.reason??result.status,eventRef:options.eventRef,target,attempt,httpStatus:result.httpStatus,details:timing.details});
  }));
  const failure=deliveries.find((result):result is PromiseRejectedResult=>result.status==='rejected');
  if(failure)throw failure.reason;
- // Re-read committed results: concurrent JSON updates and replacement-token
- // decisions must be authoritative, rather than either sender's stale snapshot.
- const saved=await env.DB.prepare(`SELECT delivery_state FROM ${table} WHERE ${key}=? AND attempts=?`)
-  .bind(id,attempt).first<{delivery_state:string}>();
- if(!saved)throw new Error('Delivery claim disappeared');
- const values=Object.values(JSON.parse(saved.delivery_state) as Record<Target,State>);
- const status:State=values.every(value=>value==='sent')?'sent':values.includes('pending')?'pending':
-  values.includes('blocked')?'blocked':values.includes('uncertain')?'uncertain':'failed';
- await env.DB.prepare(`UPDATE ${table} SET status=?,next_attempt=?,lease_until=NULL,
-  sent_at=CASE WHEN ?='sent' THEN ? ELSE sent_at END${table==='events'?",last_error=CASE WHEN ?='sent' THEN NULL ELSE ? END":''}
-  WHERE ${key}=? AND status='sending' AND attempts=?`)
-  .bind(status,Date.now()+Math.min(300000,2000*2**Math.min(attempt,8)),status,new Date().toISOString(),
-   ...(table==='events'?[status,status==='uncertain'?'transport_unknown':'partial_delivery']:[]),id,attempt).run();
- return status;
+ // Decide current token eligibility and release the claim in one statement.
+ // Registration before this write sees 'sending'; registration afterward sees
+ // 'blocked'. Both orderings must wake the target, without replaying acceptance.
+ const saved=await env.DB.prepare(`WITH states AS MATERIALIZED (
+  SELECT
+   CASE WHEN json_extract(delivery_state,'$.phone')='blocked' AND EXISTS(SELECT 1 FROM devices d WHERE d.id=${table}.parent_id AND d.push_token IS NOT NULL)
+    THEN 'pending' ELSE json_extract(delivery_state,'$.phone') END AS phone,
+   CASE WHEN json_extract(delivery_state,'$.watch')='blocked' AND EXISTS(SELECT 1 FROM devices d WHERE d.id=${table}.parent_id AND d.watch_push_token IS NOT NULL)
+    THEN 'pending' ELSE json_extract(delivery_state,'$.watch') END AS watch
+  FROM ${table} WHERE ${key}=? AND status='sending' AND attempts=?
+ ), outcome AS (
+  SELECT phone,watch,CASE WHEN phone='sent' AND watch='sent' THEN 'sent'
+   WHEN phone='pending' OR watch='pending' THEN 'pending'
+   WHEN phone='blocked' OR watch='blocked' THEN 'blocked'
+   WHEN phone='uncertain' OR watch='uncertain' THEN 'uncertain' ELSE 'failed' END AS status FROM states
+ ) UPDATE ${table} SET delivery_state=(SELECT json_object('phone',phone,'watch',watch) FROM outcome),
+  status=(SELECT status FROM outcome),next_attempt=?,lease_until=NULL,
+  sent_at=CASE WHEN (SELECT status FROM outcome)='sent' THEN ? ELSE sent_at END
+  ${table==='events'?",last_error=CASE (SELECT status FROM outcome) WHEN 'sent' THEN NULL WHEN 'uncertain' THEN 'transport_unknown' ELSE 'partial_delivery' END":''}
+  WHERE ${key}=? AND status='sending' AND attempts=? RETURNING status`)
+  .bind(id,attempt,Date.now()+Math.min(300000,2000*2**Math.min(attempt,8)),new Date().toISOString(),id,attempt).first<{status:State}>();
+ if(!saved){
+  // Cron can recover an expired lease while target journals are still awaiting
+  // D1. Observe that decision without overwriting it or reporting false failure.
+  const recovered=await env.DB.prepare(`SELECT status FROM ${table} WHERE ${key}=? AND attempts=?`)
+   .bind(id,attempt).first<{status:State}>();
+  if(recovered&&['sent','uncertain'].includes(recovered.status))return recovered.status;
+  throw new Error('Delivery claim disappeared');
+ }
+ return saved.status;
 }

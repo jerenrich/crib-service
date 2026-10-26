@@ -5,6 +5,7 @@ import worker from '../src/index';
 import {defaultConfiguration,type Env,type Alert} from '../src/types';
 import {payload,apnsToken} from '../src/apns';
 import {ProviderTokenCache,providerTokens} from '../src/provider-token';
+import {deliverToBoth} from '../src/dual-delivery';
 import {encryptToken,decryptToken,sha256} from '../src/security';
 import {flushPending,dispatchEvent} from '../src/alerts';
 import {eventReference,recordDiagnostic} from '../src/diagnostics';
@@ -71,6 +72,54 @@ describe('APNs readiness diagnostics',()=>{
 describe('connection alerts, readiness and replacement',()=>{
  const beat=(listener:TestDevice,monitoring=true,appliedConfiguration=defaultConfiguration)=>({listenerId:listener.deviceId,timestamp:new Date().toISOString(),monitoring,powerConnected:true,state:'quiet',episodes:[],appliedConfiguration});
  async function stale(){await env.DB.prepare('UPDATE heartbeats SET received_at=?').bind(new Date(Date.now()-240000).toISOString()).run();}
+ it('does not let a stale concurrent candidate bypass a newer retry backoff',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  await call('listener/heartbeat',listener,beat(listener));await stale();
+  let entered!:()=>void,release!:()=>void;
+  const ready=new Promise<void>(r=>{entered=r;}),gate=new Promise<void>(r=>{release=r;});
+  const db=interceptDB(async(sql,_args,method,execute)=>{
+   const result=await execute();
+   if(sql.startsWith('SELECT n.id FROM connection_notices')&&method==='all'){entered();await gate;}
+   return result;
+  });
+  vi.mocked(fetch).mockImplementation(async(input,init)=>{pushRequests.push({url:String(input),init});return new Response(JSON.stringify({reason:'ServiceUnavailable'}),{status:503});});
+  const first=flushConnections({...testEnv,DB:db});await ready;
+  try{await flushConnections(testEnv);}finally{release();await first;}
+  expect(pushRequests).toHaveLength(1);
+  expect(await env.DB.prepare('SELECT attempts,status FROM connection_notices').first()).toMatchObject({attempts:1,status:'pending'});
+ });
+ it('gives later notices fresh leases after an earlier send takes time',async()=>{
+  for(const token of ['ab','cd']){
+   const {parent,listener}=await paired();await call('device/push-token',parent,{token:token.repeat(32)});
+   await call('listener/heartbeat',listener,beat(listener));
+  }
+  await stale();const start=Date.now();vi.spyOn(Date,'now').mockReturnValue(start);
+  vi.mocked(fetch).mockImplementation(async(input,init)=>{
+   pushRequests.push({url:String(input),init});
+   if(pushRequests.length===1)vi.mocked(Date.now).mockReturnValue(start+31000);
+   else{
+    const id=new Headers(init?.headers).get('apns-id');
+    const claim=await env.DB.prepare('SELECT lease_until FROM connection_notices WHERE id=?').bind(id).first<{lease_until:number}>();
+    expect(claim!.lease_until).toBeGreaterThan(Date.now());
+   }
+   return new Response(null,{status:200});
+  });
+  await flushConnections(testEnv);expect(pushRequests).toHaveLength(2);
+  expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM connection_notices WHERE status='sent'").first()).toEqual({n:2});
+ });
+ it('does not send a connection warning after a claim reply arrives past its lease',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  await call('listener/heartbeat',listener,beat(listener));await stale();
+  const start=Date.now();vi.spyOn(Date,'now').mockReturnValue(start);
+  const db=interceptDB(async(sql,_args,method,execute)=>{
+   const result=await execute();
+   if(sql.startsWith("UPDATE connection_notices SET status='sending'")&&method==='all')vi.mocked(Date.now).mockReturnValue(start+31000);
+   return result;
+  });
+  vi.mocked(fetch).mockImplementation(async(input,init)=>{pushRequests.push({url:String(input),init});return new Response(null,{status:200});});
+  await flushConnections({...testEnv,DB:db});expect(pushRequests).toHaveLength(0);
+  expect(await env.DB.prepare('SELECT status,lease_until FROM connection_notices').first()).toEqual({status:'pending',lease_until:null});
+ });
  it('defaults connection alerts on, respects opt-out and emits one notice per outage with quiet recovery',async()=>{
   const {parent,listener}=await paired();
   await call('device/push-token',parent,{token:'ab'.repeat(32)});
@@ -527,6 +576,81 @@ describe('direct Apple Watch alerts',()=>{
   expect(pushRequests).toHaveLength(0);
  });
 });
+describe('dual delivery race and persistence failures',()=>{
+ it('honors an already recovered acceptance when finalization resumes late',async()=>{
+  const {parent,listener}=await paired(),event={...alert(listener),isTest:true};await call('listener/event',listener,event);
+  const state=JSON.stringify({phone:'pending',watch:'pending'});
+  await env.DB.prepare("UPDATE events SET status='sending',attempts=1,lease_until=?,delivery_state=? WHERE event_id=?").bind(Date.now()+30000,state,event.eventId).run();
+  let recovered=false;
+  const db=interceptDB(async(sql,_args,method,execute)=>{
+   const result=await execute();
+   if(!recovered&&sql.startsWith('UPDATE events SET delivery_state=json_set')&&method==='batch'){
+    const saved=await env.DB.prepare('SELECT delivery_state FROM events WHERE event_id=?').bind(event.eventId).first<{delivery_state:string}>();
+    if(Object.values(JSON.parse(saved!.delivery_state)).every(s=>s==='sent')){
+     recovered=true;await env.DB.prepare('UPDATE events SET lease_until=0 WHERE event_id=?').bind(event.eventId).run();await flushPending(testEnv);
+    }
+   }
+   return result;
+  });
+  const send=vi.fn(async()=>({status:'sent' as const,httpStatus:200}));
+  expect(await deliverToBoth({...testEnv,DB:db},{table:'events',id:event.eventId,parentId:parent.deviceId,attempt:1,state,phoneToken:'phone',watchToken:'watch',requestId:crypto.randomUUID(),send})).toBe('sent');
+  expect(recovered).toBe(true);expect(send).toHaveBeenCalledTimes(2);
+ });
+ it.each([
+  ['events','missing'],['events','invalid'],['connection_notices','missing'],['connection_notices','invalid']
+ ] as const)('preserves a token upload before the %s claim is released (%s token)',async(table,kind)=>{
+  const {parent,listener}=await paired(),event={...alert(listener),isTest:true};
+  await call('listener/event',listener,event);await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  if(kind==='invalid')await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
+  const key=table==='events'?'event_id':'id',state=JSON.stringify({phone:'sent',watch:'pending'});
+  if(table==='events')await env.DB.prepare("UPDATE events SET status='sending',attempts=1,lease_until=?,delivery_state=? WHERE event_id=?").bind(Date.now()+30000,state,event.eventId).run();
+  else await env.DB.prepare("INSERT INTO connection_notices(id,parent_id,listener_id,state,observed_at,created_at,status,attempts,lease_until,delivery_state) VALUES(?,?,?,'offline',?,?,'sending',1,?,?)").bind(event.eventId,parent.deviceId,listener.deviceId,new Date().toISOString(),Date.now(),Date.now()+30000,state).run();
+  let registered=false;
+  const db=interceptDB(async(sql,_args,method,execute)=>{
+   const result=await execute();
+   if(!registered&&(sql.startsWith(`UPDATE ${table} SET delivery_state=json_set`)||sql.startsWith('UPDATE devices SET watch_push_token=NULL'))&&method==='batch'){
+    registered=true;await call('device/watch-push-token',parent,{token:'ef'.repeat(32)});
+   }
+   return result;
+  });
+  const tokenBefore=await env.DB.prepare('SELECT watch_push_token FROM devices WHERE id=?').bind(parent.deviceId).first<{watch_push_token:string|null}>();
+  const send=vi.fn(async(_target:'phone'|'watch',_token:string,_timing:import('../src/latency').Latency):Promise<import('../src/apns').PushResult>=>({status:'blocked',reason:'invalid_device_token',httpStatus:410}));
+  const options={table,id:event.eventId,parentId:parent.deviceId,attempt:1,state,phoneToken:'unused-accepted-phone',watchToken:tokenBefore!.watch_push_token,requestId:crypto.randomUUID(),send};
+  expect(await deliverToBoth({...testEnv,DB:db},options)).toBe('pending');expect(registered).toBe(true);expect(send).toHaveBeenCalledTimes(kind==='missing'?0:1);
+  const saved=await env.DB.prepare(`SELECT delivery_state FROM ${table} WHERE ${key}=?`).bind(event.eventId).first<{delivery_state:string}>();
+  expect(JSON.parse(saved!.delivery_state)).toEqual({phone:'sent',watch:'pending'});
+  const token=await env.DB.prepare('SELECT watch_push_token FROM devices WHERE id=?').bind(parent.deviceId).first<{watch_push_token:string}>();
+  await env.DB.prepare(`UPDATE ${table} SET status='sending',attempts=2 WHERE ${key}=?`).bind(event.eventId).run();
+  send.mockClear();send.mockResolvedValue({status:'sent',httpStatus:200});
+  expect(await deliverToBoth(testEnv,{...options,attempt:2,state:saved!.delivery_state,watchToken:token!.watch_push_token})).toBe('sent');
+  expect(send).toHaveBeenCalledTimes(1);expect(send.mock.calls[0][0]).toBe('watch');
+ });
+ it.each(['device/push-token','device/watch-push-token'])('wakes blocked connection notices when a token arrives afterward via %s',async(route)=>{
+  const {parent,listener}=await paired(),id=crypto.randomUUID();
+  await env.DB.prepare("INSERT INTO connection_notices(id,parent_id,listener_id,state,observed_at,created_at,status,next_attempt) VALUES(?,?,?,'offline',?,?,'blocked',?)")
+   .bind(id,parent.deviceId,listener.deviceId,new Date().toISOString(),Date.now(),Date.now()+300000).run();
+  await call(route,parent,{token:'ef'.repeat(32)});
+  expect(await env.DB.prepare('SELECT status,next_attempt FROM connection_notices WHERE id=?').bind(id).first()).toEqual({status:'pending',next_attempt:0});
+ });
+ it('retains known Apple acceptance when a target outcome write fails',async()=>{
+  const {parent,listener}=await paired(),event={...alert(listener),isTest:true};await call('listener/event',listener,event);
+  const state=JSON.stringify({phone:'pending',watch:'pending'});
+  await env.DB.prepare("UPDATE events SET status='sending',attempts=1,lease_until=?,delivery_state=? WHERE event_id=?").bind(Date.now()+30000,state,event.eventId).run();
+  const db=interceptDB(async(sql,args,method,execute)=>{
+   if(sql.startsWith('UPDATE events SET delivery_state=json_set')&&method==='batch'&&args[0]==='$.watch')throw new Error('D1 outcome unavailable');
+   return execute();
+  });
+  const send=vi.fn(async(_target:unknown,_token:unknown,timing:import('../src/latency').Latency)=>{timing.details.spans!.apns_fetch_ms=12;return {status:'sent' as const,httpStatus:200};});
+  await expect(deliverToBoth({...testEnv,DB:db},{table:'events',id:event.eventId,parentId:parent.deviceId,attempt:1,state,phoneToken:'phone',watchToken:'watch',requestId:crypto.randomUUID(),send})).rejects.toThrow('D1 outcome unavailable');
+  const row=await env.DB.prepare("SELECT outcome,stage,http_status,details FROM diagnostics WHERE operation='dispatch' AND target='watch'").first<{outcome:string;stage:string;http_status:number;details:string}>();
+  expect(row).toMatchObject({outcome:'internal_error',stage:'storage',http_status:200});
+  expect(JSON.parse(row!.details)).toMatchObject({push_outcome:'sent',failed_span:'outcome_storage_ms',spans:{apns_fetch_ms:12}});
+  await env.DB.prepare('UPDATE events SET lease_until=0 WHERE event_id=?').bind(event.eventId).run();await flushPending(testEnv);
+  expect(send).toHaveBeenCalledTimes(2);
+  expect(await env.DB.prepare('SELECT status FROM events WHERE event_id=?').bind(event.eventId).first()).toEqual({status:'uncertain'});
+ });
+});
+
 describe('APNs and durable idempotent alerts',()=>{
  it('sends a clearly marked real test push to the paired parent once per event',async()=>{
   const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});

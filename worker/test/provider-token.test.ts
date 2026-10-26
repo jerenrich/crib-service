@@ -113,6 +113,20 @@ describe('persistent APNs provider tokens',()=>{
   const token=await client.get(a.testEnv);a.restart();
   expect(await new ProviderTokenCache().get(a.testEnv)).toBe(token);expect(a.put).toHaveBeenCalledTimes(2);
  });
+ it('clears an aborted shared lookup so later requests can recover through the authority',async()=>{
+  const a=authority(),client=new ProviderTokenCache(),controller=new AbortController();
+  const timeout=vi.spyOn(AbortSignal,'timeout').mockReturnValue(controller.signal);
+  let entered!:()=>void;const ready=new Promise<void>(r=>{entered=r;});
+  a.fetch.mockImplementationOnce(async(_input,init)=>new Promise<Response>((_resolve,reject)=>{
+   init.signal!.addEventListener('abort',()=>reject(new Error('authority request aborted')),{once:true});entered();
+  }));
+  const first=client.get(a.testEnv);await ready;const second=client.get(a.testEnv);
+  const outcomes=Promise.allSettled([first,second]);controller.abort();
+  expect((await outcomes).map(x=>x.status)).toEqual(['rejected','rejected']);
+  expect(a.put).not.toHaveBeenCalled();timeout.mockRestore();
+  const token=await client.get(a.testEnv);
+  expect(await new ProviderTokenCache().get(a.testEnv)).toBe(token);expect(a.put).toHaveBeenCalledTimes(1);
+ });
  it('rejects a mismatched signing configuration instead of returning an old credential token',async()=>{
   const a=authority();
   await expect(new ProviderTokenCache().get({...a.testEnv,APNS_KEY_ID:'ROTATEDKEY'})).rejects.toThrow('authority unavailable');

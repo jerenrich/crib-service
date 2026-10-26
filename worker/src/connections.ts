@@ -58,17 +58,26 @@ export async function flushConnections(env:Env,requestId=crypto.randomUUID()) {
   try{eventRef=await eventReference(env,id);}catch{/* Best effort. */}
   const record=(outcome:Outcome,operation:'dispatch'|'dispatch_skip'='dispatch')=>recordDiagnostic(env,{requestId,started,operation,stage,outcome,eventRef,target,httpStatus:result?.httpStatus,attempt,details:latency.details});
   try {
-  const notice=await latency.read<{id:string;parent_id:string;listener_id:string;state:string;created_at:number;attempts:number;delivery_state:string|null}>('claim_ms',env.DB.prepare(`UPDATE connection_notices SET status='sending',lease_until=?,attempts=attempts+1,delivery_state=COALESCE(delivery_state,CASE WHEN EXISTS(SELECT 1 FROM devices WHERE id=connection_notices.parent_id AND push_token IS NOT NULL AND watch_push_token IS NOT NULL) THEN '{"phone":"pending","watch":"pending"}' ELSE NULL END) WHERE id=? AND status IN ('pending','blocked') RETURNING *`)
-   .bind(now+30000,id));
+  const claimNow=Date.now();
+  const notice=await latency.read<{id:string;parent_id:string;listener_id:string;state:string;created_at:number;attempts:number;lease_until:number;delivery_state:string|null}>('claim_ms',env.DB.prepare(`UPDATE connection_notices SET status='sending',lease_until=?,attempts=attempts+1,delivery_state=COALESCE(delivery_state,CASE WHEN EXISTS(SELECT 1 FROM devices WHERE id=connection_notices.parent_id AND push_token IS NOT NULL AND watch_push_token IS NOT NULL) THEN '{"phone":"pending","watch":"pending"}' ELSE NULL END) WHERE id=? AND status IN ('pending','blocked') AND next_attempt<=? RETURNING *`)
+   .bind(claimNow+30000,id,claimNow));
   if(!notice){latency.details.exit_reason='not_pending';await record('claim_skipped','dispatch_skip');continue;}
   attempt=notice.attempts;stage='storage';
   const context=await latency.read<{push_token:string|null;watch_push_token:string|null;connection_alerts:number;received_at:string;metadata:string}>('destination_ms',env.DB.prepare(`SELECT d.push_token,d.watch_push_token,d.connection_alerts,h.received_at,h.metadata
    FROM pairs p JOIN devices d ON d.id=p.parent_id JOIN heartbeats h ON h.listener_id=p.listener_id
    WHERE p.parent_id=? AND p.listener_id=?`).bind(notice.parent_id,notice.listener_id)
    );
-  const current=context?(JSON.parse(context.metadata).monitoring===true?(now-Date.parse(context.received_at)>180000?'offline':'online'):'stopped'):null;
-  if((notice.state!=='offline'&&notice.state!=='stopped')||!context?.connection_alerts||current!==notice.state||now-notice.created_at>600000){
-   await latency.db('outcome_storage_ms',()=>env.DB.prepare("UPDATE connection_notices SET status='cancelled',lease_until=NULL WHERE id=?").bind(id).run());
+  const dispatchNow=Date.now();
+  if(notice.lease_until<=dispatchNow){
+   // No APNs call has started. Release only this still-owned attempt so a
+   // delayed database reply does not discard a known-unsent warning.
+   await latency.db('outcome_storage_ms',()=>env.DB.prepare("UPDATE connection_notices SET status='pending',lease_until=NULL,next_attempt=? WHERE id=? AND status='sending' AND attempts=? AND lease_until<=?")
+    .bind(dispatchNow+4000,id,notice.attempts,dispatchNow).run());
+   latency.details.exit_reason='not_pending';await record('claim_skipped','dispatch_skip');continue;
+  }
+  const current=context?(JSON.parse(context.metadata).monitoring===true?(dispatchNow-Date.parse(context.received_at)>180000?'offline':'online'):'stopped'):null;
+  if((notice.state!=='offline'&&notice.state!=='stopped')||!context?.connection_alerts||current!==notice.state||dispatchNow-notice.created_at>600000){
+   await latency.db('outcome_storage_ms',()=>env.DB.prepare("UPDATE connection_notices SET status='cancelled',lease_until=NULL WHERE id=? AND status='sending' AND attempts=?").bind(id,notice.attempts).run());
    await record('notice_cancelled','dispatch_skip');continue;
   }
   if(notice.delivery_state){
@@ -88,12 +97,12 @@ export async function flushConnections(env:Env,requestId=crypto.randomUUID()) {
    const column=target==='watch'?'watch_push_token':'push_token';
    await latency.db('outcome_storage_ms',()=>env.DB.batch([
     env.DB.prepare(`UPDATE devices SET ${column}=NULL WHERE id=? AND ${column}=?`).bind(notice.parent_id,token),
-    env.DB.prepare("UPDATE connection_notices SET status='pending',next_attempt=?,lease_until=NULL WHERE id=?").bind(now+2000,id)
+    env.DB.prepare("UPDATE connection_notices SET status='pending',next_attempt=?,lease_until=NULL WHERE id=? AND status='sending' AND attempts=?").bind(Date.now()+2000,id,notice.attempts)
    ]));
   } else {
    // Unknown acceptance is terminal; never replay it to another destination.
-   await latency.db('outcome_storage_ms',()=>env.DB.prepare("UPDATE connection_notices SET status=?,next_attempt=?,lease_until=NULL,sent_at=CASE WHEN ?='sent' THEN ? ELSE sent_at END WHERE id=?")
-    .bind(push.status==='retry'?'pending':push.status,now+Math.min(300000,2000*2**Math.min(notice.attempts,8)),push.status,new Date().toISOString(),id).run());
+   await latency.db('outcome_storage_ms',()=>env.DB.prepare("UPDATE connection_notices SET status=?,next_attempt=?,lease_until=NULL,sent_at=CASE WHEN ?='sent' THEN ? ELSE sent_at END WHERE id=? AND status='sending' AND attempts=?")
+    .bind(push.status==='retry'?'pending':push.status,Date.now()+Math.min(300000,2000*2**Math.min(notice.attempts,8)),push.status,new Date().toISOString(),id,notice.attempts).run());
   }
   await record(result.reason??result.status);
   }catch(error){latency.failure(error);await record('internal_error');throw error;}
