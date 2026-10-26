@@ -160,3 +160,36 @@ Two marked tests were generated at **12:39:49.238** and **12:40:05.743 UTC**. Bo
 Allowlisted diagnostics add `notification_route=phone_only_test` and `watch_suppressed` for an active scoped phone test. This describes server dispatch, not Apple forwarding or physical haptics. After flag rollback, the pinned phone target remains authoritative even without the active-trial label. Test with J17 locked and face down, the unlocked Watch worn at its face, one test at a time, and previous notifications dismissed before the next trial. The Watch should be selected by Apple's documented system-forwarding rules under those conditions; verify the trace and wearer observation before declaring improvement. Production crying-alert policy has not been changed by this control.
 
 Validation: source/test TypeScript checks and all **277 backend tests** pass, including marked-test versus real-alert separation, unrelated Parents, retry after rollback, existing dual-target retry preservation, missing-token and definitive-invalid-token fallback, uncertain transport, and conflicting Watch-only flags. Both coordination logging profiles remain installed at the user's request.
+
+
+## Phone-forwarded marked-test result (26 October, 12:50 UTC)
+
+Source `6618d25` was merged to main and deployed as Worker `52680eba-9a31-447f-9fdd-57f84ca22348` at **12:48:00.190 UTC**. Runtime `PHONE_ONLY_TEST_PARENT_ID` names the existing trial Parent. The token-free live smoke suite passed all **80 checks**, and its temporary registrations were deleted. No phone/Watch app installation, database migration or repeat-setting change was needed.
+
+The preceding two-target control's system trace helps explain its mixed result. For the fast 12:39:49 test, the Watch received the phone-forwarded bulletin at 12:39:50.990807 and allowed it at 12:39:51.046774. The OS requested vibration playback at 12:39:52.331439 using that forwarded bulletin's `TLAlertConfiguration` pointer. Meanwhile, the separate direct Watch bulletin still waited from 12:39:51.372856 until 12:40:04.626203. For the slow 12:40:05 test, the direct bulletin waited from 12:40:06.734438 until 12:40:21.434276 despite a positive companion message at 12:40:06.787572; playback used the direct bulletin's configuration at 12:40:21.777381. The configuration-pointer correlation distinguishes the two paths within the Watch's own trace; a fast first observation did not mean the direct path's wait had been repaired. These OS playback requests are evidence of the system asking to play a vibration, not measurements of physical motor actuation.
+
+The user then generated four marked tests. All four database rows are sent on attempt 1, pinned to `push_target='phone'` with null dual-delivery state. Each dispatch records `notification_route=phone_only_test`, `watch_suppressed=true` and a single phone APNs request. No direct Watch request was sent for these events.
+
+| Generated (UTC) | Generation → APNs request start | APNs request duration | Generation → Watch controller entry | Generation → Watch view |
+| --- | ---: | ---: | ---: | ---: |
+| 12:50:00.767 | 181 ms | 473 ms | No callback captured | No view captured |
+| 12:50:11.865 | 745 ms | 208 ms | ~1.624 s | ~1.747 s |
+| 12:50:22.232 | 552 ms | 152 ms | ~1.257 s | ~1.280 s |
+| 12:50:26.493 | 230 ms | 152 ms | ~0.931 s | ~0.953 s |
+
+The first test reached the iPhone app's foreground delegate (`application_state=0`, default sound present, presentation options 26). Do not count it as a successful Watch test. The subsequent three have matching durable callback-journal and main-log entries; the callback process is the same as the preceding fast/slow control. The Watch's notification-date-to-controller intervals were **732, 616 and 614 ms**, and controller-to-view intervals were **123, 23 and 22 ms**. The wearer reported **“it felt quicker”** for the batch without distinguishing each event.
+
+`delivered_at_ms` comes from `UNNotification.date`. On a forwarded notification this is notification delivery metadata, not an independently instrumented moment of Watch radio receipt. Do not label these intervals physical receipt-to-haptic latency. Generation-to-Watch totals compare device wall clocks: the available Watch bridge estimate was +48 ms with 287 ms uncertainty and was about ten minutes old, so the table retains approximate raw values. The within-device callback/view timing and wearer observation support a large improvement over the previous 13–15 second delay; three forwarded observations do not establish reliability in every device state.
+
+Local receipts, journals and analysis are under `.local/phone-only-test-trial-2026-10-26/`. Both coordination profiles remain installed at the user's request. The scoped marked-test flag remains active for further comparisons; ordinary crying alerts, reminders, connection notices and other Parents continue dual parallel delivery with no intentional delay. Apple's [forwarding rules](https://developer.apple.com/documentation/watchos-apps/taking-advantage-of-notification-forwarding) select an unlocked phone with its screen on before a worn unlocked Watch. A future real-alert forwarding trial must explicitly account for that behavior and the loss of a separate direct Watch push when the phone cannot provide forwarding.
+
+
+The Watch sysdiagnose retry completed successfully (168,489,558-byte local archive, capture initiated at 12:57:32). Its system log covers all four test events. The first phone-forwarded bulletin explicitly arrived with `shouldPlayLightsAndSirens: NO` and received `alert: NO`; that confirms the missing Watch callback was a routing decision, not a measured long Watch delay. Each of the subsequent three arrived from the companion with `shouldPlayLightsAndSirens: YES` and was approved with `alert: YES` in **36.474, 36.759 and 37.865 ms**, respectively. No 13-second wait is observed for these forwarded bulletins in the captured trial window.
+
+| Generated (UTC) | Watch receives companion bulletin | Watch alert allowed | OS vibration playback request | Generation → playback request |
+| --- | --- | --- | --- | ---: |
+| 12:50:11.865 | 12:50:13.231699 | 12:50:13.268173 | 12:50:13.812116 | ~1.947 s |
+| 12:50:22.232 | 12:50:23.295559 | 12:50:23.332318 | 12:50:23.624653 | ~1.393 s |
+| 12:50:26.493 | 12:50:27.225887 | 12:50:27.263752 | 12:50:27.528404 | ~1.035 s |
+
+The playback requests use the forwarded bulletins' alert configuration and include a non-nil vibration pattern. From the Watch's logged companion-bulletin arrival to playback request, the three intervals are **580.417, 329.094 and 302.517 ms**. Those intervals are measured within one Watch system trace; generation-to-playback remains an approximate comparison of device clocks. The traces support bypassing the competing direct-push path as a practical workaround in this trial, rather than claiming that the direct path's coordination bug is fixed. The next recommended comparison is a controlled real crying-alert episode with phone forwarding, explicitly weighing phone-dependent routing against the separate direct Watch path. That broader route is not enabled by this marked-test experiment.
