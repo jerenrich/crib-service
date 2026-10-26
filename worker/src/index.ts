@@ -1,3 +1,4 @@
+import {confirmAlarmScheduled} from './alarm-scheduling';
 import {retiredWatchTest,sendWatchTest,sendSilentAlarmTest} from './watch-test';
 import {sendStandaloneProbe} from './watch-latency-probe';
 import {requestMonitoring,completeMonitoring} from './monitoring';
@@ -79,6 +80,7 @@ export default {
       await latency.measure('provider_sign_ms',()=>providerTokens.get(env,latency,true));
       result={ready:true,tokenRef:latency.details.provider_token_ref,ageSeconds:latency.details.provider_token_age_s,source:latency.details.provider_token_source};break;
      }
+     case 'POST /v1/alarm/scheduled':result=await confirmAlarmScheduled(env,device,await body(request),latency);break;
      case 'POST /v1/silent-watch-alarms':result=await saveSilentWatchAlarms(env,device,await body(request));break;
      case 'POST /v1/pairing/remove':result=await removeDeviceData(env,device);break;
      case 'POST /v1/device/delete':result=await removeDeviceData(env,device,true);break;

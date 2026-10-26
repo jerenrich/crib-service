@@ -92,7 +92,7 @@ import Observation
     func network(operation: String, outcome: String, status: Int? = nil, requestID: UUID? = nil,
                  elapsedMS: Int, storageUnavailable: Bool = false, error: (any Error)? = nil, eventID: UUID? = nil, benchmarkAttempt: UUID? = nil, serverDiagnosticMS: Int? = nil, diagnosticState: String? = nil,
                  metrics: DiagnosticNetworkTiming? = nil, clock: DiagnosticClockSample? = nil, monotonic: Bool = false, clientRequestID: UUID? = nil) {
-        let operations: Set<String> = ["register", "pairing_create", "pairing_claim", "push_token", "watch_token", "heartbeat", "alert", "status", "timeline", "monitoring", "monitoring_complete", "settings", "acknowledge", "test_push", "connection_preferences", "unpair", "delete_device", "resume_alerts"]
+        let operations: Set<String> = ["alarm_scheduled", "register", "pairing_create", "pairing_claim", "push_token", "watch_token", "heartbeat", "alert", "status", "timeline", "monitoring", "monitoring_complete", "settings", "acknowledge", "test_push", "connection_preferences", "unpair", "delete_device", "resume_alerts"]
         guard operations.contains(operation), ["ok", "http_error", "transport_error", "decode_error", "encode_error", "cancelled", "invalid_response"].contains(outcome) else { return }
         if operation == "status" {
             benchmark.requestFinished(benchmarkAttempt, outcome: outcome, requestID: requestID, status: status, elapsedMS: elapsedMS)
@@ -211,6 +211,10 @@ import Observation
         } else { entry += " background_remaining_ms=unknown" }
         if let error { entry += " " + Self.errorDetails(error) }
         append(entry)
+    }
+    func silentCryAlarmReceipt(phase: String, episodeID: UUID, eventID: UUID, cycleID: UUID) {
+        guard ["queued", "confirmed", "deferred", "discarded"].contains(phase) else { return }
+        append("silent_cry_alarm_receipt phase=\(phase) scope=schedule_acceptance episode_id=\(episodeID.uuidString.lowercased()) event_id=\(eventID.uuidString.lowercased()) cycle_id=\(cycleID.uuidString.lowercased())")
     }
     func silentCryAlarmReadiness(source: SilentCryAlarmRequest.ObservationSource, enabled: Bool,
                                  authorization: SilentCryAlarmRequest.Authorization, assetAvailable: Bool,

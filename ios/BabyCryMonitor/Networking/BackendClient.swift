@@ -98,10 +98,12 @@ protocol BackendServing: AlertSending {
     func sendWatchTest() async throws
     func sendSilentAlarmTest() async throws -> UUID
     func silentWatchAlarms(_ enabled: Bool) async throws
+    func confirmAlarmScheduled(episodeID: UUID, eventID: UUID, cycleID: UUID) async throws
     func unpair() async throws
     func deleteDevice() async throws
 }
 extension BackendServing {
+    func confirmAlarmScheduled(episodeID: UUID, eventID: UUID, cycleID: UUID) async throws { throw BackendError.message("Alarm scheduling receipts require an updated connection service.") }
     func silentWatchAlarms(_ enabled: Bool) async throws { throw BackendError.message("Silent Watch alarms require an updated connection service.") }
     func sendSilentAlarmTest() async throws -> UUID { throw BackendError.message("Silent alarm testing requires an updated connection service.") }
     func sendWatchTest() async throws { throw BackendError.message("Watch test mode requires an updated connection service.") }
@@ -143,7 +145,16 @@ struct BackendClient: BackendServing {
     func resumeAlerts(until: Date) async throws {
         let _: EmptyResponse = try await request("/v1/alert/resume", body: ["expectedUntil": Int64((until.timeIntervalSince1970 * 1000).rounded())])
     }
-    func pushToken(_ token: String) async throws { let _: EmptyResponse = try await request("/v1/device/push-token", body: ["token": token]) }
+    func pushToken(_ token: String) async throws {
+        struct Request: Encodable { let token: String; let alarmReceiptsVersion: Int? }
+        let version: Int? = if #available(iOS 26.0, *) { 1 } else { nil }
+        let _: EmptyResponse = try await request("/v1/device/push-token", body: Request(token: token, alarmReceiptsVersion: version))
+    }
+    func confirmAlarmScheduled(episodeID: UUID, eventID: UUID, cycleID: UUID) async throws {
+        // Receipts must not consume an unbounded background execution budget.
+        var bounded = self; bounded.requestTimeout = min(requestTimeout, 2)
+        let _: EmptyResponse = try await bounded.request("/v1/alarm/scheduled", body: ["episodeId": episodeID.uuidString, "eventId": eventID.uuidString, "cycleId": cycleID.uuidString])
+    }
     func connectionAlerts(_ enabled: Bool) async throws { let _: EmptyResponse = try await request("/v1/connection-alerts", body: ["enabled": enabled]) }
     func requestTestPush() async throws { let _: AlertReceipt = try await request("/v1/test-push", body: [String:String]()) }
     func sendWatchTest() async throws {
@@ -177,7 +188,7 @@ struct BackendClient: BackendServing {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(credential.deviceId.uuidString.lowercased()).\(credential.secret)", forHTTPHeaderField: "Authorization")
         let operation = ["/v1/device/register": "register", "/v1/pairing/create": "pairing_create", "/v1/pairing/claim": "pairing_claim",
-                         "/v1/device/push-token": "push_token", "/v1/device/watch-push-token": "watch_token",
+                         "/v1/alarm/scheduled": "alarm_scheduled", "/v1/device/push-token": "push_token", "/v1/device/watch-push-token": "watch_token",
                          "/v1/listener/heartbeat": "heartbeat", "/v1/listener/event": "alert", "/v1/listener/status": "status",
                          "/v1/timeline": "timeline", "/v1/monitoring": "monitoring", "/v1/monitoring/complete": "monitoring_complete", "/v1/settings": "settings", "/v1/alert/acknowledge": "acknowledge", "/v1/test-push": "test_push", "/v1/watch-test": "test_push", "/v1/watch-test/push": "test_push", "/v1/listener/silent-alarm-test": "test_push", "/v1/alert/resume": "resume_alerts",
                          "/v1/connection-alerts": "connection_preferences", "/v1/pairing/remove": "unpair", "/v1/device/delete": "delete_device"][path] ?? "unknown"

@@ -20,7 +20,8 @@ export function payload(alert:Alert) {
  // Device Silent Mode can mute audio while preserving Watch notification taps.
  return {aps:{alert:{title,body},category:'BABY_CRY_ALERT','interruption-level':'time-sensitive',sound:'default'},eventId:alert.eventId,episodeId:alert.episodeId,cryStartedAt:alert.cryStartedAt,createdAt:alert.createdAt,durationSeconds:alert.durationSeconds,...(alert.isTest?{isTest:true}:{})};
 }
-export async function sendPush(env:Env,encryptedToken:string,alert:Alert,target:'phone'|'watch'='phone',latency=new Latency(),silentCryAlarm=false,schedule?:PushSchedule,identity:PushIdentityOptions={}):Promise<PushResult> {
+export async function sendPush(env:Env,encryptedToken:string,alert:Alert,target:'phone'|'watch'='phone',latency=new Latency(),silentCryAlarm=false,schedule?:PushSchedule,identity:PushIdentityOptions={},alarmCycle?:string):Promise<PushResult> {
+ latency.details.alarm_wake_requested=silentCryAlarm&&target==='phone'&&!alert.isTest;
  const diagnosticRef=latency.eventRef,deliveryAttempt=latency.deliveryAttempt;
  const correlation=diagnosticRef&&/^[0-9a-f]{64}$/.test(diagnosticRef)&&deliveryAttempt!==undefined&&Number.isSafeInteger(deliveryAttempt)&&deliveryAttempt>0&&deliveryAttempt<=1_000_000?{diagnosticRef,deliveryAttempt}:{};
  const content=payload(alert);
@@ -36,13 +37,14 @@ export async function sendPush(env:Env,encryptedToken:string,alert:Alert,target:
  return sendNotification(env,encryptedToken,requestID,{...content,...correlation,
   // AlarmKit is additive: retain the phone's normal sound/haptic request so
   // Apple can forward an alert while the separate direct Watch copy also alerts.
-  ...(silentCryAlarm&&target==='phone'&&!alert.isTest?{silentCryAlarm:true,aps:{...content.aps,'content-available':1}}:{})
+  ...(silentCryAlarm&&target==='phone'&&!alert.isTest?{silentCryAlarm:true,...(alarmCycle?{alarmCycleId:alarmCycle}:{}),aps:{...content.aps,'content-available':1}}:{})
  },target,alert.isRepeat?5:3600,collapseID,latency,schedule);
 }
-export async function sendSilentCryAlarmPush(env:Env,encryptedToken:string,alert:Alert,latency=new Latency()):Promise<PushResult> {
+export async function sendSilentCryAlarmPush(env:Env,encryptedToken:string,alert:Alert,latency=new Latency(),alarmCycle?:string):Promise<PushResult> {
+ latency.details.alarm_wake_requested=true;
  const content=payload(alert);
  // Separate APNs request ID, preserving event/episode identity for acknowledgement.
- return sendNotification(env,encryptedToken,crypto.randomUUID(),{...content,silentCryAlarm:true,
+ return sendNotification(env,encryptedToken,crypto.randomUUID(),{...content,silentCryAlarm:true,...(alarmCycle?{alarmCycleId:alarmCycle}:{}),
   aps:{...content.aps,'content-available':1}},'phone',60,alert.episodeId,latency);
 }
 export async function sendConnectionPush(env:Env,encryptedToken:string,id:string,state:'offline'|'stopped',target:'phone'|'watch',latency=new Latency()):Promise<PushResult> {

@@ -47,6 +47,10 @@ try {
     const code = await request('pairing/create', parent);
     check(code.status === 200 && /^\d{6}$/.test(code.body.code), 'pairing code created');
     check((await request('pairing/claim', listener, {code: code.body.code})).status === 200, 'secure pairing claim');
+    const alarmReceipt = {eventId: randomUUID(), episodeId: randomUUID(), cycleId: randomUUID()};
+    check((await request('alarm/scheduled', null, alarmReceipt)).status === 401, 'alarm scheduling receipt requires authentication');
+    check((await request('alarm/scheduled', listener, alarmReceipt)).status === 403, 'Listener cannot confirm Parent alarm scheduling');
+    check((await request('alarm/scheduled', parent, alarmReceipt)).status === 409, 'unknown alarm scheduling cycle rejected');
     const defaults = await request('listener/status', parent, null, 'GET');
     check(defaults.body.configuration?.alertDuration === 5 && defaults.body.configuration?.snoozeDuration === 60, 'new-device five-second threshold and one-minute snooze');
     const config = {alertDuration: 5, quietResetDuration: 20, repeatInterval: 5, absoluteThreshold: -45, snoozeDuration: 120};

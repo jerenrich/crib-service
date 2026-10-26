@@ -1,5 +1,17 @@
 # Readiness release checks
 
+## Confirmed AlarmKit scheduling and bounded recovery — 26 October 2026
+
+Updated Parents advertise `alarmReceiptsVersion: 1` with their existing phone push registration. They retain all ordinary phone/Watch alerts and reminders, including `sound: default` and the separate destination collapse IDs. Only the initial eligible request and up to two recoveries carry `silentCryAlarm`/`content-available`. Recoveries are eligible no sooner than 30 and 60 seconds after the initial request, with at least 30 seconds between actual attempts; a late reminder delays recovery rather than bunching requests. After the third request there are no further AlarmKit wake requests in that cycle. The alarm itself retains its three-second scheduling lead.
+
+The existing delivery-claim transaction atomically reserves requests in `silent_alarm_cycles` (migration `0012`); it adds one statement, no separate D1 round trip or timer. A confirmed cycle omits the AlarmKit/background marker from later ordinary reminders. Old Parents that do not advertise receipt support retain their existing behavior. Snooze expiry/early resume changes the cycle, and disabling/re-enabling or replacing the pairing permits a fresh cycle. Ordinary notification receipt/Apple acceptance is never treated as confirmation of AlarmKit scheduling.
+
+After successful AlarmKit scheduling, or finding the episode alarm already present, the Parent persists and posts an idempotent `/v1/alarm/scheduled` receipt. The backend verifies the authenticated Parent, exact cycle, current pairing/snooze, a requested real event, and absence of acknowledgement/resolution. Old-cycle receipts cannot suppress a newer alarm. Failed receipt uploads remain bounded locally and retry only during existing app execution, no sooner than 30 seconds after a failed attempt, with a two-second request timeout. Disabling/stopping clears pending scheduling receipts. Confirmation means schedule acceptance, not observed alarm firing or wrist haptics.
+
+Diagnostics add a bounded `alarm_wake_requested` flag per push and event-correlated `alarm_scheduled` API outcomes. Parent receipt logs distinguish queued, confirmed, deferred and discarded, with `scope=schedule_acceptance`. Existing notification routing, the three-second alarm lead and phone vibration settings are preserved. These changes reduce unnecessary requests; they do not establish that coalescing caused the earlier 27.78-second delay or guarantee iOS background execution.
+
+Validation: both backend TypeScript checks, all 308 backend tests, the Worker bundle dry run, five Swift model tests, and 34 iOS simulator networking/diagnostics/request tests passed. The signed Parent device build succeeded. Physical delivery improvement still needs a fresh episode after installation.
+
 ## Distinct reminders and dismissal cleanup — 26 October 2026
 
 Crying and standard test pushes no longer set an episode `thread-id`. Each reminder uses its own event UUID for its collapse ID, with the existing phone/Watch prefixes retained where applicable. Retries of the same event retain their identity. Reminder cadence, the separate forwarded/direct paths, and the additive AlarmKit behavior remain intact. This prevents episode-wide notification replacement; increased physical vibration frequency is not established by automated checks.

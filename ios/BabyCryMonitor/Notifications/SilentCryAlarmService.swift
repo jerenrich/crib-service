@@ -14,6 +14,14 @@ import UIKit
     private let recordsKey = "silentCryAlarmRecords"
     private let pendingKey = "silentCryAlarmPendingAcknowledgements"
     private var receiving = false
+    private var flushingReceipts = false
+    private var receiptRetry: (cycleID: UUID, afterUptime: Double)?
+    private let receiptsKey = "silentCryAlarmSchedulingReceipts"
+    private struct SchedulingReceipt: Codable { let episodeID: UUID; let eventID: UUID; let cycleID: UUID }
+    private var pendingReceipts: [SchedulingReceipt] {
+        get { defaults.data(forKey: receiptsKey).flatMap { try? JSONDecoder().decode([SchedulingReceipt].self, from: $0) } ?? [] }
+        set { defaults.set(try? JSONEncoder().encode(newValue), forKey: receiptsKey) }
+    }
     private var flushing = false
     private var revision = 0
     private var lastReadinessUptime: Double?
@@ -78,6 +86,7 @@ import UIKit
 
     func synchronize(using client: any BackendServing, status server: ParentStatus, checkedAt: Date) async {
         await flushAcknowledgements(using: client)
+        await flushSchedulingReceipts(using: client)
         if defaults.bool(forKey: "silentWatchAlarmsSettingDirty") {
             do { try await client.silentWatchAlarms(enabled); defaults.set(false, forKey: "silentWatchAlarmsSettingDirty") }
             catch { trace("failed") }
@@ -169,7 +178,9 @@ import UIKit
             let existing = try AlarmManager.shared.alarms
             // One alarm per episode. Reminder notifications never restart an active alarm.
             if existing.contains(where: { $0.id == request.episodeID }) {
-                trace("duplicate", request.eventID); record("duplicate"); return false
+                trace("duplicate", request.eventID); record("duplicate")
+                await confirmScheduling(request, using: backend)
+                return false
             }
             let attributes = AlarmAttributes<Metadata>(presentation: AlarmPresentation(alert: .init(
                 title: "Check on baby",
@@ -198,6 +209,7 @@ import UIKit
             }
             status = "Silent crying alarm scheduled. Existing notifications continue."
             trace("scheduled", request.eventID); record("scheduled")
+            await confirmScheduling(request, using: backend)
             return true
         } catch {
             status = "Silent alarm unavailable; existing notifications continue."
@@ -270,11 +282,46 @@ import UIKit
     }
 
     private func cancelAll() {
+        pendingReceipts = []
         guard !records.isEmpty else { return }
         do {
             let ids = Set(records.map(\.episodeID))
             for alarm in try AlarmManager.shared.alarms where ids.contains(alarm.id) { try AlarmManager.shared.cancel(id: alarm.id) }
         } catch { trace("failed") }
+    }
+
+    private func confirmScheduling(_ request: SilentCryAlarmRequest, using backend: any BackendServing) async {
+        guard let cycleID = request.cycleID else { return } // Legacy requests remain compatible.
+        var pending = pendingReceipts
+        if !pending.contains(where: { $0.cycleID == cycleID }) {
+            let receipt = SchedulingReceipt(episodeID: request.episodeID, eventID: request.eventID, cycleID: cycleID)
+            pending.append(receipt); pendingReceipts = Array(pending.suffix(64))
+            receiptTrace("queued", receipt)
+        }
+        await flushSchedulingReceipts(using: backend)
+    }
+
+    // Retry at most one persisted receipt when the app already has execution.
+    // A failed upload never cancels or delays an already scheduled alarm.
+    private func flushSchedulingReceipts(using backend: any BackendServing) async {
+        guard enabled, !flushingReceipts, let receipt = pendingReceipts.first else { return }
+        if let retry = receiptRetry, retry.cycleID == receipt.cycleID, BackgroundBenchmark.continuousUptime < retry.afterUptime { return }
+        flushingReceipts = true; defer { flushingReceipts = false }
+        do {
+            try await backend.confirmAlarmScheduled(episodeID: receipt.episodeID, eventID: receipt.eventID, cycleID: receipt.cycleID)
+            pendingReceipts = pendingReceipts.filter { $0.cycleID != receipt.cycleID }
+            receiptRetry = nil; receiptTrace("confirmed", receipt)
+        } catch BackendError.response(409, _) {
+            pendingReceipts = pendingReceipts.filter { $0.cycleID != receipt.cycleID }
+            receiptRetry = nil; receiptTrace("discarded", receipt)
+        } catch {
+            receiptRetry = (receipt.cycleID, BackgroundBenchmark.continuousUptime + 30)
+            receiptTrace("deferred", receipt)
+        }
+    }
+
+    private func receiptTrace(_ phase: String, _ receipt: SchedulingReceipt) {
+        (log ?? DiagnosticLog()).silentCryAlarmReceipt(phase: phase, episodeID: receipt.episodeID, eventID: receipt.eventID, cycleID: receipt.cycleID)
     }
 
     private func trace(_ phase: String, _ eventID: UUID? = nil) {

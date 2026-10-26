@@ -41,6 +41,21 @@ private final class DiagnosticsURLProtocol: URLProtocol, @unchecked Sendable {
 }
 
 final class DiagnosticsTests: XCTestCase {
+    @MainActor func testSchedulingReceiptsLogAcceptanceScopeAndNetworkOutcome() async throws {
+        let config = URLSessionConfiguration.ephemeral; config.protocolClasses = [DiagnosticsURLProtocol.self]
+        let session = URLSession(configuration: config); defer { session.invalidateAndCancel() }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let log = DiagnosticLog(directory: directory), episode = UUID(), event = UUID(), cycle = UUID()
+        log.silentCryAlarmReceipt(phase: "confirmed", episodeID: episode, eventID: event, cycleID: cycle)
+        log.silentCryAlarmReceipt(phase: "private-payload", episodeID: episode, eventID: event, cycleID: cycle)
+        let client = BackendClient(baseURL: URL(string: "https://private-host")!,
+            credential: DeviceCredential(deviceId: UUID(), secret: "private-credential", role: .parent, registered: true), log: log, session: session)
+        try await client.confirmAlarmScheduled(episodeID: episode, eventID: event, cycleID: cycle)
+        XCTAssertTrue(log.lines.contains { $0.contains("scope=schedule_acceptance") && $0.contains(cycle.uuidString.lowercased()) })
+        XCTAssertTrue(log.lines.contains { $0.contains("network operation=alarm_scheduled outcome=ok") })
+        XCTAssertFalse(log.lines.joined().contains("private-payload")); XCTAssertFalse(log.lines.joined().contains("private-credential"))
+    }
     @MainActor func testAlarmAttemptDiagnosticsRetainFailureStageAndRejectPrivateErrorDetails() {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

@@ -16,6 +16,7 @@ const routes = {
  'POST /v1/listener/silent-alarm-test':'test_push',
  'POST /v1/silent-watch-alarms':'settings',
  'GET /v1/watch-test':'test_push','POST /v1/watch-test':'test_push',
+ 'POST /v1/alarm/scheduled':'alarm_scheduled',
  'POST /v1/connection-alerts':'connection_preferences','POST /v1/test-push':'test_push',
  'GET /v1/live-sound':'live_sound'
 } as const;

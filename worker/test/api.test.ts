@@ -1822,7 +1822,7 @@ describe('diagnostic gap regressions',()=>{
   expect(pushRequests).toHaveLength(2);const ref=await eventReference(testEnv,eventID);
   expect((await env.DB.prepare("SELECT * FROM diagnostics WHERE operation='dispatch_skip' AND event_ref=?").bind(ref).all()).results).toHaveLength(0);
   const sent=await env.DB.prepare("SELECT details FROM diagnostics WHERE operation='dispatch' AND event_ref=?").bind(ref).first<{details:string}>();const details=JSON.parse(sent!.details);
-  expect(details.dispatch_source).toBe('reminder');expect(details.spans.claim_ms).toBe(3073);expect(details.db_stages.claim_ms.statements).toBe(5);
+  expect(details.dispatch_source).toBe('reminder');expect(details.spans.claim_ms).toBe(3073);expect(details.db_stages.claim_ms.statements).toBe(6);
  });
  it('retains the failing preparation query and sanitizes its exception',async()=>{
   const {parent}=await paired();const db=interceptDB(async(sql,_args,_method,execute)=>{if(sql.startsWith('SELECT p.listener_id'))throw new Error('D1_ERROR: timed out private-query-marker');return execute();});
@@ -2104,6 +2104,80 @@ describe('optional overnight silent Watch alarms',()=>{
    return new Response(status===200?'':JSON.stringify({reason:'ServiceUnavailable'}),{status});
   }));
  }
+ async function receiptSetup(){
+  const pair=await setup();
+  expect((await call('device/push-token',pair.parent,{token:'ab'.repeat(32),alarmReceiptsVersion:1})).status).toBe(200);
+  await call('silent-watch-alarms',pair.parent,{enabled:true});fanout();
+  return pair;
+ }
+ const phoneBodies=()=>pushRequests.filter(r=>!new Headers(r.init?.headers).get('apns-topic')!.endsWith('.watchkitapp')).map(r=>JSON.parse(String(r.init?.body)));
+ it('keeps every ordinary reminder and permits only initial, 30s and 60s AlarmKit requests without confirmation',async()=>{
+  const {parent,listener}=await receiptSetup(),base=Date.now(),clock=vi.spyOn(Date,'now').mockReturnValue(base);
+  await call('listener/event',listener,alert(listener));
+  const markedAt=[0];
+  for(const seconds of [5,25,30,35,55,60,65,90]){
+   clock.mockReturnValue(base+seconds*1000);const before=phoneBodies().length;
+   await runReminder(testEnv,parent.deviceId);
+   expect(phoneBodies()).toHaveLength(before+1);
+   if(phoneBodies().at(-1).silentCryAlarm)markedAt.push(seconds);
+  }
+  expect(markedAt).toEqual([0,30,60]);expect(pushRequests).toHaveLength(18);
+  for(const body of phoneBodies())expect(body.aps.sound).toBe('default');
+  expect(new Set(phoneBodies().filter(b=>b.silentCryAlarm).map(b=>b.alarmCycleId)).size).toBe(1);
+  expect((await env.DB.prepare('SELECT request_count,confirmed_at FROM silent_alarm_cycles WHERE parent_id=?').bind(parent.deviceId).first())).toEqual({request_count:3,confirmed_at:null});
+ });
+ it('stops wake requests after idempotent scheduling confirmation without stopping either notification destination',async()=>{
+  const {parent,listener}=await receiptSetup(),base=Date.now(),clock=vi.spyOn(Date,'now').mockReturnValue(base);
+  const initial=alert(listener);await call('listener/event',listener,initial);const first=phoneBodies()[0];
+  const receipt={eventId:initial.eventId,episodeId:initial.episodeId,cycleId:first.alarmCycleId};
+  expect((await call('alarm/scheduled',listener,receipt)).status).toBe(403);
+  expect((await call('alarm/scheduled',parent,{...receipt,cycleId:'invalid'})).status).toBe(400);
+  expect((await call('alarm/scheduled',parent,receipt)).status).toBe(200);
+  expect((await call('alarm/scheduled',parent,receipt)).status).toBe(200);
+  clock.mockReturnValue(base+30000);await runReminder(testEnv,parent.deviceId);
+  expect(pushRequests).toHaveLength(4);expect(phoneBodies()[1].silentCryAlarm).toBeUndefined();
+  expect(phoneBodies()[1].aps['content-available']).toBeUndefined();expect(phoneBodies()[1].aps.sound).toBe('default');
+ });
+ it('does not compress late recovery attempts together and accepts confirmation of the earlier request',async()=>{
+  const {parent,listener}=await receiptSetup(),base=Date.now(),clock=vi.spyOn(Date,'now').mockReturnValue(base);
+  const initial=alert(listener);await call('listener/event',listener,initial);const cycle=phoneBodies()[0].alarmCycleId;
+  clock.mockReturnValue(base+45000);await runReminder(testEnv,parent.deviceId);expect(phoneBodies().at(-1).silentCryAlarm).toBe(true);
+  clock.mockReturnValue(base+60000);await runReminder(testEnv,parent.deviceId);expect(phoneBodies().at(-1).silentCryAlarm).toBeUndefined();
+  clock.mockReturnValue(base+75000);await runReminder(testEnv,parent.deviceId);expect(phoneBodies().at(-1).silentCryAlarm).toBe(true);
+  expect((await call('alarm/scheduled',parent,{eventId:initial.eventId,episodeId:initial.episodeId,cycleId:cycle})).status).toBe(200);
+ });
+ it('starts a fresh cycle after a snooze deadline changes and rejects stale or foreign confirmations',async()=>{
+  const {parent,listener}=await receiptSetup(),base=Date.now(),clock=vi.spyOn(Date,'now').mockReturnValue(base);
+  const initial=alert(listener);await call('listener/event',listener,initial);const old=phoneBodies()[0].alarmCycleId;
+  const other=device('parent');await register(other);
+  const receipt={eventId:initial.eventId,episodeId:initial.episodeId,cycleId:old};
+  expect((await call('alarm/scheduled',other,receipt)).status).toBe(409);
+  expect((await call('alarm/scheduled',parent,receipt)).status).toBe(200);
+  expect((await call('alert/acknowledge',parent,{eventId:initial.eventId})).status).toBe(200);
+  clock.mockReturnValue(base+61000);
+  // A fresh Listener heartbeat confirms that crying persisted through Snooze.
+  await env.DB.prepare('INSERT INTO heartbeats(listener_id,received_at,metadata) VALUES(?,?,?)')
+   .bind(listener.deviceId,new Date(Date.now()).toISOString(),JSON.stringify({monitoring:true,state:'crying',currentEpisode:{id:initial.episodeId,startedAt:initial.cryStartedAt},episodes:[]})).run();
+  await runReminder(testEnv,parent.deviceId);
+  const fresh=phoneBodies().at(-1);expect(fresh.silentCryAlarm).toBe(true);expect(fresh.alarmCycleId).not.toBe(old);
+  expect((await call('alarm/scheduled',parent,receipt)).status).toBe(409);
+  expect((await call('alarm/scheduled',parent,{eventId:fresh.eventId,episodeId:fresh.episodeId,cycleId:fresh.alarmCycleId})).status).toBe(200);
+  await call('alert/acknowledge',parent,{eventId:fresh.eventId});
+  expect((await call('alarm/scheduled',parent,{eventId:fresh.eventId,episodeId:fresh.episodeId,cycleId:fresh.alarmCycleId})).status).toBe(409);
+ });
+ it('reserves only one recovery across concurrent event claims and resets on disable/re-enable',async()=>{
+  const {parent,listener}=await receiptSetup(),base=Date.now(),clock=vi.spyOn(Date,'now').mockReturnValue(base);
+  const initial=alert(listener);await call('listener/event',listener,initial);
+  clock.mockReturnValue(base+30000);
+  const repeats=[0,1].map(()=>({...initial,eventId:crypto.randomUUID(),isRepeat:true,createdAt:new Date(Date.now()).toISOString()}));
+  for(const e of repeats)await env.DB.prepare('INSERT INTO events(event_id,episode_id,listener_id,parent_id,is_repeat,payload,created_at) VALUES(?,?,?,?,?,?,?)')
+   .bind(e.eventId,e.episodeId,listener.deviceId,parent.deviceId,1,JSON.stringify(e),Date.now()).run();
+  await Promise.all(repeats.map(e=>dispatchEvent(testEnv,e.eventId)));
+  expect(pushRequests).toHaveLength(6);expect(phoneBodies().filter(b=>b.silentCryAlarm)).toHaveLength(2);
+  await call('silent-watch-alarms',parent,{enabled:false});await call('silent-watch-alarms',parent,{enabled:true});
+  clock.mockReturnValue(base+35000);await runReminder(testEnv,parent.deviceId);
+  expect(phoneBodies().at(-1).silentCryAlarm).toBe(true);
+ });
  it('defaults off and only a paired Parent can enable it with a boolean',async()=>{
   const {parent,listener}=await setup();
   expect((await (await call('listener/status',parent,undefined,'GET')).json() as {silentWatchAlarmsEnabled:boolean}).silentWatchAlarmsEnabled).toBe(false);

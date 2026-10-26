@@ -1,3 +1,4 @@
+import {reserveAlarmRequest} from './alarm-scheduling';
 import {phoneHeadStartFor} from './notification-coordination';
 import {deliverToBoth} from './dual-delivery';
 import {acceptedDelivery,queueAcceptedDelivery,type AcceptedDelivery} from './accepted-delivery';
@@ -94,7 +95,7 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  // An existing Watch-only opt-in wins if both settings name the same Parent.
  const phoneOnlyParent=env.PHONE_ONLY_TEST_PARENT_ID===env.WATCH_ONLY_PARENT_ID?'':env.PHONE_ONLY_TEST_PARENT_ID??'';
  const phoneOnlySQL="parent_id=? AND push_target IS NULL AND delivery_state IS NULL AND COALESCE(json_extract(payload,'$.isTest'),0)=1 AND EXISTS(SELECT 1 FROM devices WHERE id=events.parent_id AND push_token IS NOT NULL)";
- type Destination={token:string|null;phone_token:string|null;watch_token:string|null;silent_watch_alarms:number};
+ type Destination={token:string|null;phone_token:string|null;watch_token:string|null;silent_watch_alarms:number;alarm_receipts_version?:number;alarm_cycle_id?:string|null;alarm_request_claim_id?:string|null};
  type Receipt=StoredEvent & Destination & {pair_current:number};
  const claim=await latency.confirmedClaim<StoredEvent|Destination,Receipt>(()=>env.DB.batch<StoredEvent|Destination>([...(options.insert?[options.insert]:[]),env.DB.prepare(`UPDATE events SET resolved_at=COALESCE(resolved_at,(SELECT r.resolved_at FROM resolved_episodes r
   JOIN pairs p ON p.parent_id=r.parent_id AND p.listener_id=r.listener_id AND p.created_at=r.pair_created_at
@@ -123,11 +124,12 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
   WHERE event_id=? AND status='pending' AND acknowledged_at IS NULL AND resolved_at IS NULL AND next_attempt<=? RETURNING *`).bind(now+30000,claimId,env.WATCH_ONLY_PARENT_ID??'',env.WATCH_ONLY_PARENT_ID??'',phoneOnlyParent,phoneOnlyParent,eventId,now),
  // Read the selected token in the claim transaction, avoiding another remote
  // round trip. A losing claimant must still return before using this result.
- env.DB.prepare(`SELECT CASE e.push_target WHEN 'watch' THEN d.watch_push_token ELSE d.push_token END AS token,d.push_token AS phone_token,d.watch_push_token AS watch_token,d.silent_watch_alarms
-  FROM events e JOIN devices d ON d.id=e.parent_id WHERE e.event_id=? AND e.status='sending'`).bind(eventId)]),
- ()=>env.DB.prepare(`SELECT e.*,CASE e.push_target WHEN 'watch' THEN d.watch_push_token ELSE d.push_token END AS token,d.push_token AS phone_token,d.watch_push_token AS watch_token,d.silent_watch_alarms,
+ reserveAlarmRequest(env,eventId,claimId,now),
+ env.DB.prepare(`SELECT CASE e.push_target WHEN 'watch' THEN d.watch_push_token ELSE d.push_token END AS token,d.push_token AS phone_token,d.watch_push_token AS watch_token,d.silent_watch_alarms,d.alarm_receipts_version,a.cycle_id AS alarm_cycle_id,a.request_claim_id AS alarm_request_claim_id
+  FROM events e JOIN devices d ON d.id=e.parent_id LEFT JOIN silent_alarm_cycles a ON a.parent_id=e.parent_id AND a.episode_id=e.episode_id WHERE e.event_id=? AND e.status='sending'`).bind(eventId)]),
+ ()=>env.DB.prepare(`SELECT e.*,CASE e.push_target WHEN 'watch' THEN d.watch_push_token ELSE d.push_token END AS token,d.push_token AS phone_token,d.watch_push_token AS watch_token,d.silent_watch_alarms,d.alarm_receipts_version,a.cycle_id AS alarm_cycle_id,a.request_claim_id AS alarm_request_claim_id,
  EXISTS(SELECT 1 FROM pairs p WHERE p.parent_id=e.parent_id AND p.listener_id=e.listener_id) AS pair_current
- FROM events e JOIN devices d ON d.id=e.parent_id WHERE e.event_id=? AND e.claim_id=?`).bind(eventId,claimId).all<Receipt>());
+ FROM events e JOIN devices d ON d.id=e.parent_id LEFT JOIN silent_alarm_cycles a ON a.parent_id=e.parent_id AND a.episode_id=e.episode_id WHERE e.event_id=? AND e.claim_id=?`).bind(eventId,claimId).all<Receipt>());
  const claims=claim.source==='reply'?claim.results:undefined;
  const offset=options.insert?1:0;
  if(options.insert&&claims&&!claims[0].meta.changes){
@@ -177,10 +179,12 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
   latency.details.phone_suppressed=target==='watch';latency.details.phone_fallback=target==='phone';
  }
  const column=target==='watch'?'watch_push_token':'push_token';
- const parent=claim.source==='receipt'?claim.receipt:claims![offset+3].results[0] as Destination|undefined;
+ const parent=claim.source==='receipt'?claim.receipt:claims![offset+4].results[0] as Destination|undefined;
  if(!event.delivery_state&&target==='phone'&&event.parent_id===phoneOnlyParent&&alert.isTest){
   latency.details.notification_route='phone_only_test';latency.details.watch_suppressed=!!parent?.watch_token;
  }
+ const alarmCycle=parent?.alarm_receipts_version===1?(parent.alarm_request_claim_id===claimId?parent.alarm_cycle_id??undefined:undefined):undefined;
+ const requestAlarm=parent?.silent_watch_alarms===1&&!alert.isTest&&(parent.alarm_receipts_version!==1||!!alarmCycle);
  if(event.delivery_state&&parent){
   stage='push';
   let checkpointed=false;
@@ -190,7 +194,7 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
    source:latency.details.dispatch_source,
    accepted:options.accepted?async delivery=>{await latency.measure('outcome_queue_ms',()=>options.accepted!(delivery));checkpointed=true;}:undefined,
    aggregate:{requestId,started:now,operation:'dispatch',stage:'storage',outcome:'sent',eventRef,attempt,details:latency.progressDetails()},
-   send:(destination,token,timing,schedule)=>sendPush(env,token,alert,destination,timing,parent.silent_watch_alarms===1&&!alert.isTest,schedule,identity)});
+   send:(destination,token,timing,schedule)=>sendPush(env,token,alert,destination,timing,requestAlarm,schedule,identity,alarmCycle)});
   latency.details.push_outcome=status==='pending'?'retry':status;
   stage='storage';target=undefined;
   // The checkpoint's background persister owns the aggregate and target journals.
@@ -203,13 +207,13 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
   await latency.db('outcome_storage_ms',()=>env.DB.prepare("UPDATE events SET status=CASE WHEN EXISTS(SELECT 1 FROM devices WHERE id=parent_id AND (push_token IS NOT NULL OR watch_push_token IS NOT NULL)) THEN 'pending' ELSE 'blocked' END,last_error='no_push_token',lease_until=NULL,push_target=NULL WHERE event_id=? AND status='sending'").bind(eventId).run());await record('no_push_token');return;
  }
  stage='push';
- const silentAlarm=parent.silent_watch_alarms===1&&!alert.isTest&&event.delivery_mode!=='watch_only';
+ const silentAlarm=requestAlarm&&event.delivery_mode!=='watch_only';
  // The original send and its receipt never depend on the auxiliary phone send.
- const primary=sendPush(env,parent.token,alert,target,latency,silentAlarm,undefined,identity);
+ const primary=sendPush(env,parent.token,alert,target,latency,silentAlarm,undefined,identity,alarmCycle);
  if(silentAlarm&&target==='watch'&&parent.phone_token){
   auxiliary=(async()=>{
    const started=Date.now(),timing=new Latency();let result:PushResult;
-   try{result=await sendSilentCryAlarmPush(env,parent.phone_token!,alert,timing);}
+   try{result=await sendSilentCryAlarmPush(env,parent.phone_token!,alert,timing,alarmCycle);}
    catch(error){result={status:'failed',reason:error instanceof PushPreparationError?error.code:'apns_configuration'};}
    await recordDiagnostic(env,{requestId,started,operation:'silent_cry_alarm_dispatch',stage:'push',outcome:result.reason??result.status,eventRef,target:'phone',attempt,httpStatus:result.httpStatus,details:timing.details});
   })().catch(()=>{});
@@ -340,6 +344,7 @@ export async function flushPending(env:Env,requestId=crypto.randomUUID(),latency
  // enough time to recover a lost claim response. Status metadata retains max 100 episodes.
  await latency.measure('maintenance_cleanup_ms',()=>env.DB.batch([
   env.DB.prepare('DELETE FROM monitoring_commands WHERE created_at<? AND sequence NOT IN (SELECT MAX(sequence) FROM monitoring_commands GROUP BY parent_id,listener_id,pair_created_at)').bind(Date.now()-30*86400000),
+  env.DB.prepare('DELETE FROM silent_alarm_cycles WHERE last_requested_at<?').bind(Date.now()-30*86400000),
   env.DB.prepare('DELETE FROM alert_snoozes WHERE until_at<?').bind(Date.now()-86400000),
   env.DB.prepare(`DELETE FROM timeline_events WHERE occurred_at<? AND id NOT IN (SELECT id FROM timeline_events t2 WHERE t2.parent_id=timeline_events.parent_id AND t2.listener_id=timeline_events.listener_id AND t2.pair_created_at=timeline_events.pair_created_at AND t2.kind IN ('coverage_active','coverage_stopped') ORDER BY occurred_at DESC LIMIT 1)`).bind(Date.now()-24*3600000),
   env.DB.prepare('DELETE FROM resolved_episodes WHERE resolved_at<?').bind(new Date(Date.now()-30*86400000).toISOString()),

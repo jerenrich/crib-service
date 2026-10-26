@@ -13,6 +13,14 @@ final class SilentCryAlarmRequestTests: XCTestCase {
         ["silentCryAlarm": true, "eventId": UUID().uuidString, "episodeId": episode.uuidString,
          "createdAt": ISO8601DateFormatter().string(from: now.addingTimeInterval(-age))]
     }
+    func testSchedulingCycleIsTypedAndLegacyRequestsRemainAccepted() throws {
+        XCTAssertNil(try XCTUnwrap(SilentCryAlarmRequest(payload: payload(), now: now)).cycleID)
+        let cycle = UUID(); var marked = payload(); marked["alarmCycleId"] = cycle.uuidString
+        XCTAssertEqual(try XCTUnwrap(SilentCryAlarmRequest(payload: marked, now: now)).cycleID, cycle)
+        marked["alarmCycleId"] = "invalid"
+        XCTAssertNil(SilentCryAlarmRequest(payload: marked, now: now))
+        XCTAssertEqual(SilentCryAlarmRequest.payloadRejection(marked, now: now), .malformed)
+    }
     func testOnlyFreshRealCryPayloadsAreAccepted() throws {
         XCTAssertNotNil(SilentCryAlarmRequest(payload: payload(), now: now))
         XCTAssertNil(SilentCryAlarmRequest(payload: payload(age: 61), now: now))

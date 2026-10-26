@@ -32,10 +32,12 @@ struct SilentCryAlarmRequest: Sendable {
     let eventID: UUID
     let episodeID: UUID
     let createdAt: Date
+    let cycleID: UUID?
 
     init?(payload: [AnyHashable: Any], now: Date = Date()) {
         guard case .success(let fields) = Self.parse(payload, now: now) else { return nil }
         eventID = fields.0; episodeID = fields.1; createdAt = fields.2
+        cycleID = (payload["alarmCycleId"] as? String).flatMap(UUID.init(uuidString:))
     }
 
     /// Explains rejected marked payloads without retaining payload text or arbitrary identifiers.
@@ -47,6 +49,7 @@ struct SilentCryAlarmRequest: Sendable {
     private static func parse(_ payload: [AnyHashable: Any], now: Date) -> Result<(UUID, UUID, Date), Rejection> {
         guard payload["silentCryAlarm"] as? Bool == true else { return .failure(.notRequested) }
         guard payload["isTest"] as? Bool != true else { return .failure(.test) }
+        if let cycle = payload["alarmCycleId"], (cycle as? String).flatMap(UUID.init(uuidString:)) == nil { return .failure(.malformed) }
         guard let event = payload["eventId"] as? String, let eventID = UUID(uuidString: event),
               let episode = payload["episodeId"] as? String, let episodeID = UUID(uuidString: episode),
               let text = payload["createdAt"] as? String else { return .failure(.malformed) }

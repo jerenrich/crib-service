@@ -72,9 +72,10 @@ export async function admitAlert(env:Env,request:Request,latency:Latency):Promis
 }
 export async function savePushToken(env:Env,device:Device,value:Record<string,unknown>) {
  requireRole(device,'parent');
+ if(value.alarmReceiptsVersion!==undefined&&value.alarmReceiptsVersion!==1)throw new APIError(400,'Unsupported alarm receipt version.');
  if(typeof value.token!=='string'||!/^[0-9a-f]{64,200}$/i.test(value.token))throw new APIError(400,'Invalid APNs token.');
  await env.DB.batch([
-  env.DB.prepare('UPDATE devices SET push_token=? WHERE id=?').bind(await encryptToken(env,value.token),device.id),
+  env.DB.prepare('UPDATE devices SET push_token=?,alarm_receipts_version=? WHERE id=?').bind(await encryptToken(env,value.token),value.alarmReceiptsVersion===1?1:0,device.id),
   env.DB.prepare("UPDATE events SET status='pending',next_attempt=0 WHERE parent_id=? AND status='blocked' AND acknowledged_at IS NULL AND resolved_at IS NULL").bind(device.id),
   env.DB.prepare("UPDATE connection_notices SET status='pending',next_attempt=0 WHERE parent_id=? AND status='blocked'").bind(device.id)
  ]);
@@ -97,6 +98,7 @@ export async function removeDeviceData(env:Env,device:Device,deleteDevice=false)
   env.DB.prepare('DELETE FROM timeline_events WHERE listener_id=? OR parent_id=?').bind(listener,parent),
   env.DB.prepare('DELETE FROM connection_notices WHERE listener_id=? OR parent_id=?').bind(listener,parent),
   env.DB.prepare('DELETE FROM connection_states WHERE listener_id=?').bind(listener),
+  env.DB.prepare('DELETE FROM silent_alarm_cycles WHERE listener_id=? OR parent_id=?').bind(listener,parent),
   env.DB.prepare('DELETE FROM events WHERE listener_id=? OR parent_id=?').bind(listener,parent),
   env.DB.prepare('DELETE FROM heartbeats WHERE listener_id=?').bind(listener),
   env.DB.prepare('DELETE FROM pairing_codes WHERE parent_id=? OR claimed_by=?').bind(parent,listener),
@@ -127,6 +129,7 @@ export async function saveSilentWatchAlarms(env:Env,device:Device,value:Record<s
  if(typeof value.enabled!=='boolean')throw new APIError(400,'Choose whether silent Watch alarms are enabled.');
  if(value.enabled&&!await pairFor(env,device))throw new APIError(409,'Pair a Listener first.');
  if(value.enabled&&!device.push_token)throw new APIError(409,'Enable notifications on the Parent iPhone first.');
- await env.DB.prepare('UPDATE devices SET silent_watch_alarms=? WHERE id=?').bind(Number(value.enabled),device.id).run();
+ await env.DB.batch([env.DB.prepare('DELETE FROM silent_alarm_cycles WHERE parent_id=? AND EXISTS(SELECT 1 FROM devices WHERE id=? AND silent_watch_alarms!=?)').bind(device.id,device.id,Number(value.enabled)),
+  env.DB.prepare('UPDATE devices SET silent_watch_alarms=? WHERE id=?').bind(Number(value.enabled),device.id)]);
  return {ok:true};
 }
