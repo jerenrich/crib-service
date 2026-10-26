@@ -26,6 +26,7 @@ export interface TimingDetails {
  provider_token_source?:'memory'|'in_flight'|'coordinator_reused'|'coordinator_created';provider_token_ref?:string;
  apns_started_at_ms?:number; apns_response_at_ms?:number; apns_unique_id?:string; colo?:string;
  apns_id_mode?:'distinct_request';apns_request_id?:string;
+ apns_collapse_mode?:'target_scoped';apns_collapse_basis?:'event'|'episode';
  error_kind?:'d1_overloaded'|'d1_timeout'|'d1_error'|'other';
  failed_span?:Span;
  claim_result_source?:'reply'|'receipt';claim_receipt_outcome?:'matched'|'missing'|'error';
@@ -272,6 +273,8 @@ export function safeTimingDetails(value:TimingDetails|undefined):string|null {
  if(['timeout','network'].includes(value.transport!))safe.transport=value.transport;
  if(typeof value.apns_unique_id==='string'&&/^(?:[0-9a-f]{32,64}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$/i.test(value.apns_unique_id))safe.apns_unique_id=value.apns_unique_id.toLowerCase();
  if(value.apns_id_mode==='distinct_request')safe.apns_id_mode=value.apns_id_mode;
+ if(value.apns_collapse_mode==='target_scoped')safe.apns_collapse_mode=value.apns_collapse_mode;
+ if(['event','episode'].includes(value.apns_collapse_basis!))safe.apns_collapse_basis=value.apns_collapse_basis;
  if(typeof value.apns_request_id==='string'&&/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value.apns_request_id))safe.apns_request_id=value.apns_request_id.toLowerCase();
  if(typeof value.colo==='string'&&/^[A-Z]{3}$/.test(value.colo))safe.colo=value.colo;
  if(['d1_overloaded','d1_timeout','d1_error','other'].includes(value.error_kind!))safe.error_kind=value.error_kind;

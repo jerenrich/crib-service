@@ -6,6 +6,7 @@ import {Latency,appleReasons,type AppleReason} from './latency';
 import {providerTokens} from './provider-token';
 
 export type PushResult = {status:'sent'|'retry'|'blocked'|'uncertain'|'failed';reason?:Outcome;httpStatus?:number};
+export interface PushIdentityOptions {distinctRequestID?:boolean;separateCollapseIDs?:boolean}
 export async function apnsToken(env:Env,latency?:Latency):Promise<string> {
  return providerTokens.get(env,latency);
 }
@@ -19,18 +20,21 @@ export function payload(alert:Alert) {
  // Device Silent Mode can mute audio while preserving Watch notification taps.
  return {aps:{alert:{title,body},category:'BABY_CRY_ALERT','thread-id':alert.episodeId,'interruption-level':'time-sensitive',sound:'default'},eventId:alert.eventId,episodeId:alert.episodeId,cryStartedAt:alert.cryStartedAt,createdAt:alert.createdAt,durationSeconds:alert.durationSeconds,...(alert.isTest?{isTest:true}:{})};
 }
-export async function sendPush(env:Env,encryptedToken:string,alert:Alert,target:'phone'|'watch'='phone',latency=new Latency(),silentCryAlarm=false,schedule?:PushSchedule,distinctRequestID=false):Promise<PushResult> {
+export async function sendPush(env:Env,encryptedToken:string,alert:Alert,target:'phone'|'watch'='phone',latency=new Latency(),silentCryAlarm=false,schedule?:PushSchedule,identity:PushIdentityOptions={}):Promise<PushResult> {
  const diagnosticRef=latency.eventRef,deliveryAttempt=latency.deliveryAttempt;
  const correlation=diagnosticRef&&/^[0-9a-f]{64}$/.test(diagnosticRef)&&deliveryAttempt!==undefined&&Number.isSafeInteger(deliveryAttempt)&&deliveryAttempt>0&&deliveryAttempt<=1_000_000?{diagnosticRef,deliveryAttempt}:{};
  const content=payload(alert);
  const {sound:_sound,...silentAPS}=content.aps;
- // A transport ID can differ while the collapse ID and logical event stay matched.
- // This test-only control must not manufacture a second notification identity.
- const requestID=distinctRequestID?crypto.randomUUID():alert.eventId;
- if(distinctRequestID){latency.details.apns_id_mode='distinct_request';latency.details.apns_request_id=requestID;}
+ // Transport and notification identities are separate controls. The logical
+ // payload identity remains shared so acknowledging either copy handles one event.
+ const requestID=identity.distinctRequestID?crypto.randomUUID():alert.eventId;
+ if(identity.distinctRequestID){latency.details.apns_id_mode='distinct_request';latency.details.apns_request_id=requestID;}
+ const collapseBase=alert.isRepeat?alert.episodeId:alert.eventId;
+ const collapseID=identity.separateCollapseIDs?`${target}:${collapseBase}`:collapseBase;
+ if(identity.separateCollapseIDs){latency.details.apns_collapse_mode='target_scoped';latency.details.apns_collapse_basis=alert.isRepeat?'episode':'event';}
  return sendNotification(env,encryptedToken,requestID,{...content,...correlation,
   ...(silentCryAlarm&&target==='phone'&&!alert.isTest?{silentCryAlarm:true,aps:{...silentAPS,'content-available':1}}:{})
- },target,alert.isRepeat?5:3600,alert.isRepeat?alert.episodeId:alert.eventId,latency,schedule);
+ },target,alert.isRepeat?5:3600,collapseID,latency,schedule);
 }
 export async function sendSilentCryAlarmPush(env:Env,encryptedToken:string,alert:Alert,latency=new Latency()):Promise<PushResult> {
  const content=payload(alert);

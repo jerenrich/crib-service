@@ -160,9 +160,12 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  }
  latency.details.spans!.generated_to_dispatch_ms=Math.max(0,now-event.created_at);
  stage='storage';
+ const alert=JSON.parse(event.payload) as Alert;
+ const identity={distinctRequestID:alert.isTest===true&&env.DISTINCT_APNS_ID_TEST_PARENT_ID===event.parent_id,
+  separateCollapseIDs:alert.isTest===true&&env.SEPARATE_COLLAPSE_ID_TEST_PARENT_ID===event.parent_id};
  // No replay after uncertain transport or a worker death during APNs dispatch. APNs does
  // not offer an exactly-once receipt transaction with D1. Surface uncertainty explicitly.
- if(now-Date.parse((JSON.parse(event.payload) as Alert).createdAt)>86400000){
+ if(now-Date.parse(alert.createdAt)>86400000){
   await latency.db('outcome_storage_ms',()=>env.DB.prepare("UPDATE events SET status='failed',last_error='expired_event',lease_until=NULL WHERE event_id=?").bind(eventId).run());await record('expired_event');return;
  }
  if(event.delivery_mode==='watch_only'){
@@ -171,12 +174,11 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  }
  const column=target==='watch'?'watch_push_token':'push_token';
  const parent=claim.source==='receipt'?claim.receipt:claims![offset+3].results[0] as Destination|undefined;
- if(!event.delivery_state&&target==='phone'&&event.parent_id===phoneOnlyParent&&(JSON.parse(event.payload) as Alert).isTest){
+ if(!event.delivery_state&&target==='phone'&&event.parent_id===phoneOnlyParent&&alert.isTest){
   latency.details.notification_route='phone_only_test';latency.details.watch_suppressed=!!parent?.watch_token;
  }
  if(event.delivery_state&&parent){
   stage='push';
-  const alert=JSON.parse(event.payload) as Alert;
   let checkpointed=false;
   const status=await deliverToBoth(env,{table:'events',id:eventId,parentId:event.parent_id,attempt:event.attempts,
    phoneHeadStartMS:phoneHeadStartFor(env,event.parent_id),
@@ -184,8 +186,7 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
    source:latency.details.dispatch_source,
    accepted:options.accepted?async delivery=>{await latency.measure('outcome_queue_ms',()=>options.accepted!(delivery));checkpointed=true;}:undefined,
    aggregate:{requestId,started:now,operation:'dispatch',stage:'storage',outcome:'sent',eventRef,attempt,details:latency.progressDetails()},
-   send:(destination,token,timing,schedule)=>sendPush(env,token,alert,destination,timing,parent.silent_watch_alarms===1&&!alert.isTest,schedule,
-    alert.isTest===true&&env.DISTINCT_APNS_ID_TEST_PARENT_ID===event.parent_id)});
+   send:(destination,token,timing,schedule)=>sendPush(env,token,alert,destination,timing,parent.silent_watch_alarms===1&&!alert.isTest,schedule,identity)});
   latency.details.push_outcome=status==='pending'?'retry':status;
   stage='storage';target=undefined;
   // The checkpoint's background persister owns the aggregate and target journals.
@@ -198,11 +199,9 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
   await latency.db('outcome_storage_ms',()=>env.DB.prepare("UPDATE events SET status=CASE WHEN EXISTS(SELECT 1 FROM devices WHERE id=parent_id AND (push_token IS NOT NULL OR watch_push_token IS NOT NULL)) THEN 'pending' ELSE 'blocked' END,last_error='no_push_token',lease_until=NULL,push_target=NULL WHERE event_id=? AND status='sending'").bind(eventId).run());await record('no_push_token');return;
  }
  stage='push';
- const alert=JSON.parse(event.payload) as Alert;
  const silentAlarm=parent.silent_watch_alarms===1&&!alert.isTest&&event.delivery_mode!=='watch_only';
  // The original send and its receipt never depend on the auxiliary phone send.
- const primary=sendPush(env,parent.token,alert,target,latency,silentAlarm,undefined,
-  alert.isTest===true&&env.DISTINCT_APNS_ID_TEST_PARENT_ID===event.parent_id);
+ const primary=sendPush(env,parent.token,alert,target,latency,silentAlarm,undefined,identity);
  if(silentAlarm&&target==='watch'&&parent.phone_token){
   auxiliary=(async()=>{
    const started=Date.now(),timing=new Latency();let result:PushResult;
