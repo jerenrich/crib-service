@@ -9,24 +9,26 @@ export type PushResult = {status:'sent'|'retry'|'blocked'|'uncertain'|'failed';r
 export async function apnsToken(env:Env,latency?:Latency):Promise<string> {
  return providerTokens.get(env,latency);
 }
-export function payload(alert:Alert,target:'phone'|'watch'='phone') {
+export function payload(alert:Alert) {
  const minutes=Math.floor(alert.durationSeconds/60);const seconds=Math.floor(alert.durationSeconds%60);
  const unit=(value:number,name:string)=>`${value} ${name}${value===1?'':'s'}`;
  const duration=minutes>0?`${unit(minutes,'minute')}${seconds?` ${unit(seconds,'second')}`:''}`:unit(seconds,'second');
  const title=alert.isTest?'Test · Crib Service':alert.isRepeat?'Reminder · Check on baby':'Baby is crying';
  const body=alert.isRepeat&&!alert.isTest?'Crying was detected. Acknowledge this alert to snooze crying alerts for the duration chosen in Settings.':alert.isTest&&alert.isRepeat?'Repeating Watch alert test. Use Stop Watch test in iPhone Settings to end the test.':alert.isTest?`Test notification from your Listener. Simulated the ${duration} alert threshold.`:`Crying-like sound has continued for ${duration}. Started at ${new Date(alert.cryStartedAt).toISOString().slice(11,16)} UTC. Acknowledge to snooze crying alerts for the duration chosen in Settings.`;
- return {aps:{alert:{title,body},category:'BABY_CRY_ALERT','thread-id':alert.episodeId,'interruption-level':'time-sensitive',...(target==='watch'?{sound:'default'}:{})},eventId:alert.eventId,episodeId:alert.episodeId,cryStartedAt:alert.cryStartedAt,createdAt:alert.createdAt,durationSeconds:alert.durationSeconds,...(alert.isTest?{isTest:true}:{})};
+ // Keep presentation metadata identical across the companion devices. Omitting
+ // sound on both tests the observed companion lights-and-sirens mismatch.
+ return {aps:{alert:{title,body},category:'BABY_CRY_ALERT','thread-id':alert.episodeId,'interruption-level':'time-sensitive'},eventId:alert.eventId,episodeId:alert.episodeId,cryStartedAt:alert.cryStartedAt,createdAt:alert.createdAt,durationSeconds:alert.durationSeconds,...(alert.isTest?{isTest:true}:{})};
 }
 export async function sendPush(env:Env,encryptedToken:string,alert:Alert,target:'phone'|'watch'='phone',latency=new Latency(),silentCryAlarm=false,schedule?:PushSchedule):Promise<PushResult> {
  const diagnosticRef=latency.eventRef,deliveryAttempt=latency.deliveryAttempt;
  const correlation=diagnosticRef&&/^[0-9a-f]{64}$/.test(diagnosticRef)&&deliveryAttempt!==undefined&&Number.isSafeInteger(deliveryAttempt)&&deliveryAttempt>0&&deliveryAttempt<=1_000_000?{diagnosticRef,deliveryAttempt}:{};
- const content=payload(alert,target);
+ const content=payload(alert);
  return sendNotification(env,encryptedToken,alert.eventId,{...content,...correlation,
   ...(silentCryAlarm&&target==='phone'&&!alert.isTest?{silentCryAlarm:true,aps:{...content.aps,'content-available':1}}:{})
  },target,alert.isRepeat?5:3600,alert.isRepeat?alert.episodeId:alert.eventId,latency,schedule);
 }
 export async function sendSilentCryAlarmPush(env:Env,encryptedToken:string,alert:Alert,latency=new Latency()):Promise<PushResult> {
- const content=payload(alert,'phone');
+ const content=payload(alert);
  // Separate APNs request ID, preserving event/episode identity for acknowledgement.
  return sendNotification(env,encryptedToken,crypto.randomUUID(),{...content,silentCryAlarm:true,
   aps:{...content.aps,'content-available':1}},'phone',60,alert.episodeId,latency);
@@ -34,12 +36,12 @@ export async function sendSilentCryAlarmPush(env:Env,encryptedToken:string,alert
 export async function sendConnectionPush(env:Env,encryptedToken:string,id:string,state:'offline'|'stopped',target:'phone'|'watch',latency=new Latency()):Promise<PushResult> {
  const title=state==='stopped'?'Listener monitoring stopped':'Listener connection lost';
  const body=state==='stopped'?'The Listener reports that monitoring has stopped. Check the nursery phone.':'No Listener update for at least 3 minutes. Check power, internet, and monitoring.';
- return sendNotification(env,encryptedToken,id,{aps:{alert:{title,body},'thread-id':'listener-connection','interruption-level':'time-sensitive',...(target==='watch'?{sound:'default'}:{})},connectionState:state},target,180,id,latency);
+ return sendNotification(env,encryptedToken,id,{aps:{alert:{title,body},'thread-id':'listener-connection','interruption-level':'time-sensitive'},connectionState:state},target,180,id,latency);
 }
 // A user-visible, soundless notification also requests background execution.
 // It is deliberately separate from ordinary crying and Watch notification routing.
 export async function sendSilentAlarmTestPush(env:Env,encryptedToken:string,alert:Alert,latency=new Latency()):Promise<PushResult> {
- const content={...payload(alert,'phone'),silentAlarmTest:true,aps:{
+ const content={...payload(alert),silentAlarmTest:true,aps:{
   alert:{title:'Test · Silent alarm delivery',body:'Listener test received. If the Parent experiment is armed, it will try to start a silent alarm on your paired Watch.'},
   'content-available':1,category:'SILENT_ALARM_TEST','thread-id':alert.episodeId,'interruption-level':'time-sensitive'
  }};
