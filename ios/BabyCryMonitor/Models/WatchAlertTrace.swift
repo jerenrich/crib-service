@@ -20,6 +20,7 @@ struct WatchAlertTrace: Sendable {
     }
     enum CollapseScope: String, Sendable { case event, episode, other }
     enum HistorySource: String, Sendable { case foreground, cleanup }
+    let presentationProfile: WatchNotificationPresentation?
     let callbackID: UUID?
     let collapseScope: CollapseScope?
     let historySource: HistorySource?
@@ -31,9 +32,12 @@ struct WatchAlertTrace: Sendable {
     let deliveredAt: Date?
     let observedAt: Date
 
-    init(alert: WatchCryAlert, phase: Phase, deliveredAt: Date? = nil, observedAt: Date = Date(), applicationState: ApplicationState? = nil, timing: CallbackTiming? = nil, interruptionLevel: Int? = nil, callbackID: UUID? = nil, collapseScope: CollapseScope? = nil, historySource: HistorySource? = nil) {
+    init(alert: WatchCryAlert, phase: Phase, deliveredAt: Date? = nil, observedAt: Date = Date(), applicationState: ApplicationState? = nil, timing: CallbackTiming? = nil, interruptionLevel: Int? = nil, callbackID: UUID? = nil, collapseScope: CollapseScope? = nil, historySource: HistorySource? = nil, presentationProfile: WatchNotificationPresentation? = nil) {
         self.alert = alert; self.phase = phase; self.deliveredAt = deliveredAt; self.observedAt = observedAt
         self.applicationState = applicationState; self.timing = timing; self.interruptionLevel = interruptionLevel
+        // History can belong to a previously installed build; never label it
+        // using the collecting process's presentation profile.
+        self.presentationProfile = presentationProfile ?? (phase == .retained || phase == .snapshotReceived ? nil : .current)
         self.callbackID = callbackID; self.collapseScope = collapseScope; self.historySource = historySource
     }
 
@@ -70,6 +74,7 @@ struct WatchAlertTrace: Sendable {
         case .hapticRequested: result += " callback_scope=app_haptic_request"
         case .presented: break
         }
+        if let presentationProfile { result += " presentation_profile=\(presentationProfile.rawValue)" }
         if let callbackID { result += " callback_id=\(callbackID.uuidString.lowercased())" }
         if let collapseScope { result += " collapse_scope=\(collapseScope.rawValue)" }
         if let historySource { result += " history_source=\(historySource.rawValue)" }

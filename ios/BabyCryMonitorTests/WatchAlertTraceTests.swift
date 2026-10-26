@@ -81,6 +81,21 @@ final class WatchAlertTraceTests: XCTestCase {
         XCTAssertTrue(history.contains("collapse_scope=episode"));XCTAssertTrue(history.contains("history_source=cleanup"))
         XCTAssertTrue(history.contains("interruption_level=2"))
     }
+    func testPresentationProfilesDistinguishRealCallbacksWithoutRelabellingHistory() throws {
+        let value = alert()
+        for profile in WatchNotificationPresentation.allCases {
+            let trace = WatchAlertTrace(alert: value, phase: .controllerReceived, callbackID: UUID(), presentationProfile: profile)
+            let entry = try XCTUnwrap(trace.entry)
+            XCTAssertTrue(entry.contains("presentation_profile=\(profile.rawValue)"))
+            XCTAssertEqual(WatchAlertTrace.key(in: "timestamp " + entry), trace.key)
+        }
+        for phase in [WatchAlertTrace.Phase.retained, .snapshotReceived] {
+            let trace = WatchAlertTrace(alert: value, phase: phase)
+            XCTAssertFalse(try XCTUnwrap(trace.entry).contains("presentation_profile="), "Old retained notifications can predate the current experiment")
+        }
+        XCTAssertTrue(try XCTUnwrap(WatchAlertTrace(alert: value, phase: .foreground).entry)
+            .contains("presentation_profile=\(WatchNotificationPresentation.current.rawValue)"))
+    }
     func testMalformedDatesAndUntrustedDeduplicationKeysAreRejected() {
         XCTAssertNil(WatchAlertTrace(alert: alert(), phase: .foreground, deliveredAt: Date(timeIntervalSince1970: .nan)).entry)
         XCTAssertNil(WatchAlertTrace(alert: alert(), phase: .foreground, observedAt: Date(timeIntervalSince1970: .infinity)).entry)

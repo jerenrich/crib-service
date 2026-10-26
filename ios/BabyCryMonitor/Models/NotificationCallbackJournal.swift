@@ -35,6 +35,9 @@ final class NotificationCallbackJournal: @unchecked Sendable {
         guard trace.callbackID != nil, let entry = trace.entry else { return 0 }
         return append(at: trace.observedAt, entry.replacingOccurrences(of: "watch_alert ", with: "watch_callback ", options: .anchored))
     }
+    func presentationProfile(_ profile: WatchNotificationPresentation = .current, at now: Date = Date()) {
+        _ = append(at: now, "watch_notification_presentation profile=\(profile.rawValue)")
+    }
     func lifecycle(_ phase: Lifecycle, at now: Date = Date()) {
         _ = append(at: now, "watch_callback_lifecycle phase=\(phase.rawValue)")
     }

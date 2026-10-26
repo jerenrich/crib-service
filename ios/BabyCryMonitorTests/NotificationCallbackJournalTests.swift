@@ -28,6 +28,16 @@ final class NotificationCallbackJournalTests: XCTestCase {
         XCTAssertTrue(try String(contentsOf: file, encoding: .utf8).hasPrefix(saved))
         XCTAssertEqual(try String(contentsOf: file, encoding: .utf8).split(separator: "\n").count, 2)
     }
+    func testPresentationProfileIsPersistedIndependentlyOfTheMainActorLogger() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let journal = NotificationCallbackJournal(directory: dir)
+        journal.presentationProfile(.system)
+        let entry = try String(contentsOf: dir.appendingPathComponent("watch-callbacks.log"), encoding: .utf8)
+        XCTAssertTrue(entry.contains("watch_notification_presentation profile=system"))
+        XCTAssertTrue(entry.contains("callback_process_id="))
+        XCTAssertFalse(entry.contains("callback_id="), "A process profile marker must not look like a notification callback")
+    }
     func testHistoryCannotCreateCallbackEntriesAndRepeatedInstancesAreRetained() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: dir) }

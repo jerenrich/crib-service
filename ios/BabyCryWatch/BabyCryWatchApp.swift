@@ -4,24 +4,33 @@ import UserNotifications
 
 @main struct BabyCryWatchApp: App {
     @WKApplicationDelegateAdaptor(WatchAppDelegate.self) private var delegate
-    @State private var model = WatchModel.shared
 
     var body: some Scene {
-        WindowGroup { WatchHomeView().environment(model) }
+        WindowGroup { WatchHomeView().environment(WatchModel.shared) }
+        #if WATCH_SYSTEM_NOTIFICATIONS
+        // No scene for this category: watchOS renders its native long look and
+        // the same registered Snooze action. No custom rendering callback exists.
+        #elseif WATCH_MINIMAL_NOTIFICATIONS
+        WKNotificationScene(controller: MinimalCryNotificationController.self, category: WatchNotification.category)
+        #else
         WKNotificationScene(controller: CryNotificationController.self, category: WatchNotification.category)
+        #endif
     }
 }
 
 @MainActor final class WatchAppDelegate: NSObject, WKApplicationDelegate, UNUserNotificationCenterDelegate {
     func applicationDidFinishLaunching() {
         NotificationCallbackJournal.shared.lifecycle(.launch)
+        NotificationCallbackJournal.shared.presentationProfile()
         NotificationCallbackJournal.shared.checkpoint()
         UNUserNotificationCenter.current().delegate = self
         let action = UNNotificationAction(identifier: WatchNotification.acknowledge, title: "Snooze", options: [.foreground])
         UNUserNotificationCenter.current().setNotificationCategories([
             UNNotificationCategory(identifier: WatchNotification.category, actions: [action], intentIdentifiers: [], options: [])
         ])
+        #if !WATCH_MINIMAL_NOTIFICATIONS
         _ = WatchModel.shared
+        #endif
     }
     func didRegisterForRemoteNotifications(withDeviceToken deviceToken: Data) {
         WatchModel.shared.registered(deviceToken)
@@ -222,5 +231,48 @@ extension UNNotification {
         if id == alert.eventId { return .event }
         if id == alert.episodeId { return .episode }
         return .other
+    }
+}
+
+/// Experiment: payload-only, noninteractive content plus the system's category
+/// actions. Entry/view traces use the independent journal; neither callback
+/// initializes WatchModel, starts connectivity, or waits for a model logger.
+final class MinimalCryNotificationController: WKUserNotificationHostingController<MinimalCryNotificationView> {
+    private var title = "Crib Service"
+    private var text = "Check on baby."
+    private var alert: WatchCryAlert?
+    private var deliveredAt: Date?
+    override var body: MinimalCryNotificationView {
+        MinimalCryNotificationView(title: title, text: text, alert: alert, deliveredAt: deliveredAt)
+    }
+    override func didReceive(_ notification: UNNotification) {
+        let observedAt = Date(), started = ContinuousClock.now
+        title = notification.request.content.title
+        text = notification.request.content.body
+        alert = WatchCryAlert.notification(notification.request.content)
+        deliveredAt = notification.date
+        guard let alert else { return }
+        NotificationCallbackJournal.shared.record(WatchAlertTrace(alert: alert, phase: .controllerReceived,
+            deliveredAt: notification.date, observedAt: observedAt,
+            timing: .init(handlingMS: DiagnosticTiming.elapsedMS(since: started)),
+            interruptionLevel: Int(exactly: notification.request.content.interruptionLevel.rawValue),
+            callbackID: UUID(), collapseScope: notification.diagnosticCollapseScope(alert)))
+    }
+}
+
+struct MinimalCryNotificationView: View {
+    let title: String
+    let text: String
+    let alert: WatchCryAlert?
+    let deliveredAt: Date?
+    var body: some View {
+        VStack(alignment: .leading) {
+            Text(title).font(.headline)
+            Text(text).font(.footnote)
+        }.onAppear {
+            guard let alert else { return }
+            NotificationCallbackJournal.shared.record(WatchAlertTrace(alert: alert, phase: .viewAppeared,
+                deliveredAt: deliveredAt, callbackID: UUID()))
+        }
     }
 }
