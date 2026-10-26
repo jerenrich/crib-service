@@ -34,7 +34,7 @@ The independent callback journal writes `watch_notification_presentation profile
 4. After the observation, collect server and device diagnostics. If the native interface did not wake the app, opening the Watch app afterward can recover OS notification history; that collection-time launch is not initial presentation. Record its time. Collapsed notifications can leave gaps in individual receipts.
 5. Compare the human observation and OS receipt distributions. A native view having no custom callbacks is expected, and must never be reported as zero callback latency. Only test the minimal profile after the system-profile episode and observation have been captured.
 
-On 26 October 2026, all 156 shared Swift tests and all 302 iOS unit/integration tests passed. All three Watch profiles built and signed successfully. The system build installed and independently confirmed `profile=system` at 09:59:22 GMT. The wearer was asked to generate a fresh episode. The minimal and custom restoration builds are prepared, but have not been installed as part of this comparison. No latency improvement is claimed before the physical trial result. Local build logs and trial evidence are under `.local/long-look-experiments-2026-10-26/`.
+On 26 October 2026, all 156 shared Swift tests and all 302 iOS unit/integration tests passed. All three Watch profiles built and signed successfully. The system build installed and independently confirmed `profile=system` at 09:59:22 GMT. The native and minimal profiles were subsequently tested on wrist, and the original interactive profile was restored. Both trials were reported as about the same for first-tap delay; neither demonstrated a perceived latency improvement. Local build logs and trial evidence are under `.local/long-look-experiments-2026-10-26/`.
 
 
 ## Native-view result
@@ -43,4 +43,15 @@ At 10:01:11.529 GMT, a fresh real episode generated one initial alert and four r
 
 The independent journal confirms there was no custom long-look controller in that build. It records a foreground-delegate entry for the initial alert 405 ms after its OS receipt, then two more foreground-delegate entries for the **same event and attempt** 14.286 and 14.776 seconds after the same receipt. The backend sent each destination once, so these later callbacks are not evidence of an APNs retry. Native presentation still having these late entries, with no perceived improvement, points investigation toward system presentation/routing rather than custom SwiftUI rendering alone. It does not identify which internal watchOS behavior caused the repeated entries or establish the exact tap time.
 
-The minimal profile was subsequently installed and verified at 10:06:03 GMT; a second real-episode comparison was requested. The prepared custom profile remains available for restoration.
+The minimal profile was subsequently installed and verified at 10:06:03 GMT for the second comparison.
+
+
+## Minimal-view result and restoration
+
+At 10:07:11.563 GMT, one initial alert and three reminders were generated. All eight phone/Watch sends were accepted on attempt 1. Recorded Watch receipt differences were 825, 453, 404 and 119 ms. The initial custom-controller entry was **14.166 seconds after the OS receipt**, despite only **6 ms** of callback handling and **24 ms** between entry and view appearance. The wearer again reported the first tap felt **about the same**. These tests provide no reason to remove the interactive Snooze view as a latency fix. The original `custom` presentation was reinstalled and launched after the trials. The backend and five-second reminder setting were not changed.
+
+## Research: a matching system coordination timeout
+
+An [Apple DTS engineer explains a 13-second coordination timeout](https://developer.apple.com/forums/thread/765669): the Watch may wait to reconcile a companion iPhone notification before alerting. The engineer recommends matching request identifiers and simultaneous delivery. A [later watch-first coordination report](https://developer.apple.com/forums/thread/801596) describes the wait persisting despite matching identifiers; Apple acknowledges timing/race problems and recommends following up through Feedback Assistant.
+
+Our current dual path already sends in parallel and uses matching collapse identifiers. This is a strong fit for the observations, not proof that this particular system race caused every delayed tap. Notification dates are metadata and do not measure the physical haptic. A next controlled comparison should test phone-first ordering or iPhone-only forwarding. Watch-only delivery is useful as a diagnostic control but can itself encounter the documented timeout, so it should not be presented as an established latency fix. Such routing comparisons have not yet been applied to real alerts in this work.
