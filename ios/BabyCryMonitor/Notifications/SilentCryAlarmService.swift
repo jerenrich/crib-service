@@ -16,6 +16,7 @@ import UIKit
     private var receiving = false
     private var flushing = false
     private var revision = 0
+    private var lastReadinessUptime: Double?
     private struct Metadata: AlarmMetadata {}
     private struct Record: Codable { let episodeID: UUID; let eventID: UUID; let snoozeDuration: Double; let scheduledAt: Date }
     private var records: [Record] {
@@ -39,7 +40,7 @@ import UIKit
 
     func setEnabled(_ value: Bool, using client: any BackendServing) async {
         guard !busy else { return }
-        busy = true; defer { busy = false }
+        busy = true; defer { busy = false; observeReadiness(source: .settingChange, force: true) }
         let generation = revision
         do {
             if value {
@@ -89,30 +90,87 @@ import UIKit
         reconcile(server, checkedAt: checkedAt)
     }
 
-    func receive(_ request: SilentCryAlarmRequest) async -> Bool {
+    /// Called only when execution is already available; never requests permission,
+    /// schedules a probe alarm or contacts the backend.
+    func observeReadiness(source: SilentCryAlarmRequest.ObservationSource, force: Bool = false) {
+        guard defaults.string(forKey: "role") == "parent", enabled || force else { return }
+        let uptime = BackgroundBenchmark.continuousUptime
+        guard force || lastReadinessUptime.map({ uptime - $0 >= 60 }) ?? true else { return }
+        lastReadinessUptime = uptime
+        let authorization: SilentCryAlarmRequest.Authorization = switch AlarmManager.shared.authorizationState {
+        case .authorized: .authorized
+        case .denied: .denied
+        case .notDetermined: .notDetermined
+        @unknown default: .unknown
+        }
+        var credentialsAvailable = false, alarmCount: Int?, failure: (any Error)?
+        do { _ = try client(); credentialsAvailable = true } catch { failure = error }
+        do { alarmCount = try AlarmManager.shared.alarms.count } catch { failure = error }
+        (log ?? DiagnosticLog()).silentCryAlarmReadiness(source: source, enabled: enabled,
+            authorization: authorization, assetAvailable: Bundle.main.url(forResource: "AlarmTestSilence", withExtension: "caf") != nil,
+            credentialsAvailable: credentialsAvailable, acknowledgementPending: !(defaults.stringArray(forKey: pendingKey) ?? []).isEmpty,
+            locallyMuted: (defaults.object(forKey: "silentCryAlarmMutedUntil") as? Date ?? .distantPast) > Date(),
+            alarmCount: alarmCount, appActive: UIApplication.shared.applicationState == .active,
+            protectedDataAvailable: UIApplication.shared.isProtectedDataAvailable, error: failure)
+    }
+
+    func receive(_ callback: SilentCryAlarmRequest.Callback, source: SilentCryAlarmRequest.Source) async -> Bool {
+        let attemptID = UUID(), start = callback.start
+        let eventID = callback.eventID, episodeID = callback.episodeID
+        attempt("entered", stage: .callback, source: source, attemptID: attemptID,
+            eventID: eventID, episodeID: episodeID, start: start, callbackAt: callback.receivedAt)
+        guard let request = callback.request else {
+            attempt("rejected", stage: .callback, source: source, attemptID: attemptID,
+                eventID: eventID, episodeID: episodeID, start: start,
+                reason: callback.rejection ?? .malformed)
+            return false
+        }
+        return await receive(request, source: source, attemptID: attemptID, start: start)
+    }
+
+    private func receive(_ request: SilentCryAlarmRequest, source: SilentCryAlarmRequest.Source,
+                         attemptID: UUID, start: ContinuousClock.Instant) async -> Bool {
+        var stage = SilentCryAlarmRequest.Stage.preflight
+        func record(_ phase: String, reason: SilentCryAlarmRequest.Rejection? = nil, error: (any Error)? = nil) {
+            attempt(phase, stage: stage, source: source, attemptID: attemptID, eventID: request.eventID,
+                episodeID: request.episodeID, start: start, reason: reason,
+                requestAgeMS: Int(Date().timeIntervalSince(request.createdAt) * 1000), error: error)
+        }
         trace("received", request.eventID)
-        guard enabled, !receiving else { return false }
+        guard enabled else { record("rejected", reason: .disabled); return false }
+        guard !receiving else { record("rejected", reason: .busy); return false }
         receiving = true; defer { receiving = false }
         let generation = revision
         do {
             let backend = try client()
+            stage = .acknowledgements
+            if !(defaults.stringArray(forKey: pendingKey) ?? []).isEmpty { record("started") }
             await flushAcknowledgements(using: backend)
-            guard (defaults.stringArray(forKey: pendingKey) ?? []).isEmpty else { trace("ack_pending", request.eventID); return false }
-            let checkedAt = Date()
-            let server = try await backend.status()
-            reconcile(server, checkedAt: checkedAt)
-            guard generation == revision,
-                  request.isEligible(enabled: enabled, serverEnabled: server.silentWatchAlarmsEnabled == true,
-                    paired: server.paired, relevance: server.notificationRelevance,
-                    mutedUntil: server.alertsMutedUntil, localMutedUntil: defaults.object(forKey: "silentCryAlarmMutedUntil") as? Date,
-                    stoppedBefore: defaults.object(forKey: "silentCryAlarmStoppedBefore") as? Date, now: Date()),
-                  AlarmManager.shared.authorizationState == .authorized,
-                  Bundle.main.url(forResource: "AlarmTestSilence", withExtension: "caf") != nil else {
-                trace("ignored", request.eventID); return false
+            guard (defaults.stringArray(forKey: pendingKey) ?? []).isEmpty else {
+                trace("ack_pending", request.eventID); record("rejected", reason: .acknowledgementPending); return false
             }
+            let checkedAt = Date()
+            stage = .status; record("started")
+            let server = try await backend.status()
+            record("completed")
+            reconcile(server, checkedAt: checkedAt)
+            stage = .eligibility
+            let reason: SilentCryAlarmRequest.Rejection?
+            if generation != revision { reason = .settingChanged }
+            else if let rejection = request.ineligibilityReason(enabled: enabled, serverEnabled: server.silentWatchAlarmsEnabled == true,
+                paired: server.paired, relevance: server.notificationRelevance,
+                mutedUntil: server.alertsMutedUntil, localMutedUntil: defaults.object(forKey: "silentCryAlarmMutedUntil") as? Date,
+                stoppedBefore: defaults.object(forKey: "silentCryAlarmStoppedBefore") as? Date, now: Date()) { reason = rejection }
+            else if AlarmManager.shared.authorizationState != .authorized { reason = .unauthorized }
+            else if Bundle.main.url(forResource: "AlarmTestSilence", withExtension: "caf") == nil { reason = .missingAsset }
+            else { reason = nil }
+            if let reason { trace("ignored", request.eventID); record("rejected", reason: reason); return false }
+            stage = .alarmLookup
             let existing = try AlarmManager.shared.alarms
             // One alarm per episode. Reminder notifications never restart an active alarm.
-            if existing.contains(where: { $0.id == request.episodeID }) { trace("duplicate", request.eventID); return false }
+            if existing.contains(where: { $0.id == request.episodeID }) {
+                trace("duplicate", request.eventID); record("duplicate"); return false
+            }
             let attributes = AlarmAttributes<Metadata>(presentation: AlarmPresentation(alert: .init(
                 title: "Check on baby",
                 stopButton: AlarmButton(text: "Stop", textColor: .white, systemImageName: "stop.circle")
@@ -126,13 +184,38 @@ import UIKit
                 schedule: .fixed(Date().addingTimeInterval(3)), attributes: attributes,
                 stopIntent: SnoozeSilentCryAlarmIntent(episodeID: request.episodeID.uuidString),
                 sound: .named("AlarmTestSilence.caf"))
+            stage = .schedule; record("started")
             _ = try await AlarmManager.shared.schedule(id: request.episodeID, configuration: configuration)
+            record("completed")
             // A user can disable/snooze while the system scheduling call is suspended.
-            if generation != revision || !enabled { try? AlarmManager.shared.cancel(id: request.episodeID); return false }
+            if generation != revision || !enabled {
+                stage = .cancel; record("started", reason: .settingChanged)
+                do {
+                    try AlarmManager.shared.cancel(id: request.episodeID)
+                    record("cancelled", reason: .settingChanged)
+                } catch { record("failed", reason: .settingChanged, error: error) }
+                return false
+            }
             status = "Silent crying alarm scheduled. Existing notifications continue."
-            trace("scheduled", request.eventID)
+            trace("scheduled", request.eventID); record("scheduled")
             return true
-        } catch { status = "Silent alarm unavailable; existing notifications continue."; trace("failed", request.eventID); return false }
+        } catch {
+            status = "Silent alarm unavailable; existing notifications continue."
+            trace("failed", request.eventID); record("failed", error: error); return false
+        }
+    }
+
+    private func attempt(_ phase: String, stage: SilentCryAlarmRequest.Stage, source: SilentCryAlarmRequest.Source,
+                         attemptID: UUID, eventID: UUID?, episodeID: UUID?, start: ContinuousClock.Instant,
+                         reason: SilentCryAlarmRequest.Rejection? = nil, requestAgeMS: Int? = nil,
+                         callbackAt: Date? = nil, error: (any Error)? = nil) {
+        let duration = start.duration(to: .now).components
+        let elapsedMS = Int(duration.seconds * 1000 + duration.attoseconds / 1_000_000_000_000_000)
+        (log ?? DiagnosticLog()).silentCryAlarmAttempt(phase: phase, stage: stage, source: source,
+            attemptID: attemptID, eventID: eventID, episodeID: episodeID, reason: reason, elapsedMS: elapsedMS,
+            appActive: UIApplication.shared.applicationState == .active, protectedDataAvailable: UIApplication.shared.isProtectedDataAvailable,
+            backgroundTimeRemaining: UIApplication.shared.backgroundTimeRemaining, requestAgeMS: requestAgeMS,
+            callbackAt: callbackAt, error: error)
     }
 
     func snooze(episodeID: UUID) async {

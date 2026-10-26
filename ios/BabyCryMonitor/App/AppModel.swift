@@ -906,6 +906,9 @@ import UIKit
         if !active { stopWatchTest() }
         synchronizeLiveSound()
         observeBackgroundBenchmark()
+        if active, role == .parent, defaults === UserDefaults.standard, #available(iOS 26.0, *) {
+            SilentCryAlarmService.shared.observeReadiness(source: .foreground, force: true)
+        }
     }
     func startBackgroundBenchmark() {
         guard role == .parent else { return }
@@ -916,6 +919,9 @@ import UIKit
         let active = UIApplication.shared.applicationState == .active
         refreshExperiment?.maintain(parent: role == .parent, foreground: active)
         guard role == .parent else { log.benchmark.stop(); return }
+        if defaults === UserDefaults.standard, #available(iOS 26.0, *) {
+            SilentCryAlarmService.shared.observeReadiness(source: .appLoop)
+        }
         let device = UIDevice.current
         log.benchmark.observe(.init(active: active,
             powered: device.batteryState == .unknown ? nil : device.batteryState == .charging || device.batteryState == .full,

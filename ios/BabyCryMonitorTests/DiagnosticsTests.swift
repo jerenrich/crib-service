@@ -41,6 +41,46 @@ private final class DiagnosticsURLProtocol: URLProtocol, @unchecked Sendable {
 }
 
 final class DiagnosticsTests: XCTestCase {
+    @MainActor func testAlarmAttemptDiagnosticsRetainFailureStageAndRejectPrivateErrorDetails() {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let log = DiagnosticLog(directory: directory), attempt = UUID(), event = UUID()
+        log.silentCryAlarmAttempt(phase: "failed", stage: .status, source: .remoteNotification,
+            attemptID: attempt, eventID: event, reason: .stale, elapsedMS: 8100,
+            appActive: false, protectedDataAvailable: false, backgroundTimeRemaining: .greatestFiniteMagnitude,
+            requestAgeMS: 61000, error: URLError(.timedOut, userInfo: [NSLocalizedDescriptionKey: "private-url-token"]))
+        let row = log.lines.last!
+        XCTAssertTrue(row.contains("phase=failed stage=status source=remote_notification"))
+        XCTAssertTrue(row.contains("attempt_id=\(attempt.uuidString.lowercased())"))
+        XCTAssertTrue(row.contains("event_id=\(event.uuidString.lowercased())"))
+        XCTAssertTrue(row.contains("reason=stale")); XCTAssertTrue(row.contains("request_age_ms=61000"))
+        XCTAssertTrue(row.contains("background_remaining_ms=unknown")); XCTAssertTrue(row.contains("code=-1001"))
+        XCTAssertFalse(log.export.contains("private-url-token"))
+        log.silentCryAlarmAttempt(phase: "private-phase", stage: .callback, source: .foregroundNotification,
+            attemptID: attempt, eventID: nil, elapsedMS: 0, appActive: true,
+            protectedDataAvailable: true, backgroundTimeRemaining: .nan)
+        XCTAssertEqual(log.lines.count, 1)
+    }
+    @MainActor func testLocalAlarmChecksDoNotClaimPushExecutionOrSchedulingWasVerified() {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let log = DiagnosticLog(directory: directory)
+        func observe(authorization: SilentCryAlarmRequest.Authorization = .authorized, count: Int? = 0, muted: Bool = false) {
+            log.silentCryAlarmReadiness(source: .backgroundRefresh, enabled: true, authorization: authorization,
+                assetAvailable: true, credentialsAvailable: true, acknowledgementPending: false, locallyMuted: muted,
+                alarmCount: count, appActive: false, protectedDataAvailable: false)
+        }
+        observe()
+        XCTAssertTrue(log.lines.last!.contains("local_checks_passed=true"))
+        XCTAssertTrue(log.lines.last!.contains("push_execution=unverified scheduling=untested"))
+        observe(authorization: .denied)
+        XCTAssertTrue(log.lines.last!.contains("local_checks_passed=false"))
+        observe(count: nil)
+        XCTAssertTrue(log.lines.last!.contains("local_checks_passed=false"))
+        XCTAssertTrue(log.lines.last!.contains("alarm_count=unknown"))
+        observe(muted: true)
+        XCTAssertTrue(log.lines.last!.contains("local_checks_passed=false"))
+    }
     @MainActor func testPhoneReceiptRetainsOSDateAndPriorityWithoutInventingDeliveryOrRepeatingHistory() {
         let log = DiagnosticLog(directory: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
         let event = UUID(), episode = UUID(), delivered = Date(timeIntervalSince1970: 1_700_000_000)
