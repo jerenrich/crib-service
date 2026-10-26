@@ -10,7 +10,9 @@ After successful AlarmKit scheduling, or finding the episode alarm already prese
 
 Diagnostics add a bounded `alarm_wake_requested` flag per push and event-correlated `alarm_scheduled` API outcomes. Parent receipt logs distinguish queued, confirmed, deferred and discarded, with `scope=schedule_acceptance`. Existing notification routing, the three-second alarm lead and phone vibration settings are preserved. These changes reduce unnecessary requests; they do not establish that coalescing caused the earlier 27.78-second delay or guarantee iOS background execution.
 
-Validation: both backend TypeScript checks, all 308 backend tests, the Worker bundle dry run, five Swift model tests, and 34 iOS simulator networking/diagnostics/request tests passed. The signed Parent device build succeeded. Physical delivery improvement still needs a fresh episode after installation.
+Validation after integration with main’s distinct-reminder/dismissal release: both backend TypeScript checks, all 309 backend tests, the Worker bundle dry run, all 308 iPhone unit tests and deep signature verification passed. Five Swift model tests and 34 targeted iPhone networking/diagnostics/request tests also passed during development. Physical delivery improvement still needs a fresh episode after installation.
+
+Source `fe35d2f` was merged and pushed to main. Migration `0012` applied successfully, and Worker `f12771d1-58f9-4564-bcf4-8afa974478e6` deployed with existing bindings, five secret bindings, development APNs environment, standalone probe variable and minute cron preserved. All 83 live smoke checks passed; their temporary devices and metadata were deleted through the authenticated API without push registrations or notifications. The signed Parent app was installed in place and launched on J17. Backend readback confirms receipt version 1, AlarmKit enabled and both phone/Watch push registrations retained. J14 was not updated or restarted; no separate Watch installation is required for this policy. Local verification is retained under `.local/alarm-scheduling-policy-2026-10-26/`.
 
 ## Distinct reminders and dismissal cleanup — 26 October 2026
 
