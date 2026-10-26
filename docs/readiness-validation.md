@@ -10,6 +10,8 @@ This is a backend change; no app installation or database migration is needed. A
 
 Validation passed both TypeScript checks, all 303 backend tests and the Worker bundle dry run. Regression coverage checks initial alerts and reminders with AlarmKit enabled, separate phone/Watch notification identities, legacy auxiliary delivery, single-phone fallback, independent destination failures, acknowledgement suppression and test-only routing overrides.
 
+Source `d5f10b0` was merged and pushed to main, then deployed as Worker `a3994583-630a-4948-b2a7-d2f877eda696`. Release readback confirms the existing bindings, secrets and experiment settings were preserved. All 80 live backend smoke checks passed; the temporary registrations and shared data were deleted through the authenticated API, with no push tokens registered or notifications sent. J17 readback confirms AlarmKit remains enabled and both phone and Watch push registrations remain present. No apps were reinstalled, monitoring was not restarted, and physical delivery of the three paths remains to be observed after this fix. Local verification is retained under `.local/additive-cry-alarms-2026-10-26/`.
+
 ## Main integration and redeployment — 25 October 2026
 
 Merged the overnight silent alarm feature with main's current monitoring presentation, single alert timer and delivery-claim recovery fixes at `590deb2`, then fast-forwarded and pushed main. Both the normal claim reply and recovered ownership receipt retain the optional phone token and alarm flag. Recovery fan-out keeps main's two-request bound and retains independent auxiliary background work. A regression test verifies that a recovered claim still sends both the original Watch notification and the optional silent phone alarm request.
