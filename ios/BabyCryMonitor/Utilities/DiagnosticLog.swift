@@ -194,13 +194,17 @@ import Observation
                                attemptID: UUID, eventID: UUID?, episodeID: UUID? = nil,
                                reason: SilentCryAlarmRequest.Rejection? = nil, elapsedMS: Int,
                                appActive: Bool, protectedDataAvailable: Bool, backgroundTimeRemaining: Double,
-                               requestAgeMS: Int? = nil, callbackAt: Date? = nil, error: (any Error)? = nil) {
-        guard ["entered", "started", "completed", "rejected", "duplicate", "scheduled", "failed", "cancelled"].contains(phase) else { return }
+                               requestAgeMS: Int? = nil, callbackAt: Date? = nil,
+                               executionBudgetRemainingMS: Int? = nil, error: (any Error)? = nil) {
+        guard ["entered", "started", "completed", "rejected", "duplicate", "scheduled", "failed", "cancelled", "fallback"].contains(phase) else { return }
         var entry = "silent_cry_alarm_attempt phase=\(phase) stage=\(stage.rawValue) source=\(source.rawValue) attempt_id=\(attemptID.uuidString.lowercased()) elapsed_ms=\(max(0, elapsedMS)) app_active=\(appActive) protected_data_available=\(protectedDataAvailable)"
         if let eventID { entry += " event_id=\(eventID.uuidString.lowercased())" }
         if let episodeID { entry += " episode_id=\(episodeID.uuidString.lowercased())" }
         if let reason { entry += " reason=\(reason.rawValue)" }
         if let requestAgeMS { entry += " request_age_ms=\(requestAgeMS)" }
+        if let executionBudgetRemainingMS {
+            entry += " execution_budget_remaining_ms=\(min(5_000, max(0, executionBudgetRemainingMS)))"
+        }
         if let callbackAt {
             let value = callbackAt.timeIntervalSince1970 * 1000
             if value.isFinite, abs(value) < 9e15 { entry += " callback_at_ms=\(Int64(value.rounded()))" }

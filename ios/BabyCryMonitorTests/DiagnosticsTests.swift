@@ -41,6 +41,23 @@ private final class DiagnosticsURLProtocol: URLProtocol, @unchecked Sendable {
 }
 
 final class DiagnosticsTests: XCTestCase {
+    @MainActor func testAlarmFallbackLogsAppBudgetSeparatelyFromReportedSystemTime() {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let log = DiagnosticLog(directory: directory)
+        log.silentCryAlarmAttempt(phase: "fallback", stage: .status, source: .remoteNotification,
+            attemptID: UUID(), eventID: UUID(), elapsedMS: 2_000, appActive: false,
+            protectedDataAvailable: false, backgroundTimeRemaining: .infinity,
+            executionBudgetRemainingMS: 3_000, error: URLError(.timedOut))
+        let row = log.lines.last ?? ""
+        XCTAssertTrue(row.contains("phase=fallback stage=status"))
+        XCTAssertTrue(row.contains("execution_budget_remaining_ms=3000"))
+        XCTAssertTrue(row.contains("background_remaining_ms=unknown"))
+        XCTAssertTrue(row.contains("code=-1001"))
+        XCTAssertFalse(SilentCryAlarmRequest.allowsStatusFallback(for: BackendError.response(403, "private-response")))
+        XCTAssertFalse(SilentCryAlarmRequest.allowsStatusFallback(for: BackendError.response(503, "private-response")))
+    }
+
     @MainActor func testSchedulingReceiptsLogAcceptanceScopeAndNetworkOutcome() async throws {
         let config = URLSessionConfiguration.ephemeral; config.protocolClasses = [DiagnosticsURLProtocol.self]
         let session = URLSession(configuration: config); defer { session.invalidateAndCancel() }

@@ -176,90 +176,157 @@ final class SilentCryAlarmRequestTests: XCTestCase {
 final class SilentCryAlarmStatusSnapshotTests: XCTestCase {
     private let now = Date(timeIntervalSince1970: 1_800_000_000)
 
-    @MainActor func testSuspendedResponseIsReplacedBeforeCheckingResolvedEpisodeOrSnooze() async throws {
-        let episode = UUID()
-        let request = try XCTUnwrap(SilentCryAlarmRequest(payload: [
-            "silentCryAlarm": true, "eventId": UUID().uuidString, "episodeId": episode.uuidString,
-            "createdAt": ISO8601DateFormatter().string(from: now)
-        ], now: now))
-        // The first response says active, but the episode resolves or is snoozed
-        // during the observed 26-second execution gap. Keep wall time fixed to
-        // prove freshness uses the clock that includes sleep, not Date changes.
-        for snoozed in [false, true] {
-            var clock = ContinuousClock.now, reads = 0
-            let snapshot = try await SilentCryAlarmStatusSnapshot.load(clock: { clock }, date: { self.now }) {
-                reads += 1
-                clock = clock.advanced(by: reads == 1 ? .seconds(26) : .milliseconds(300))
-                let relevance = NotificationRelevance(cryEpisodeIDs: reads == 1 || snoozed ? [episode] : [])
-                return (relevance, reads == 2 && snoozed ? self.now.addingTimeInterval(60) : nil)
-            }
-            XCTAssertEqual(reads, 2)
-            XCTAssertTrue(snapshot.isFresh(at: clock))
-            XCTAssertEqual(request.ineligibilityReason(enabled: true, serverEnabled: true, paired: true,
-                relevance: snapshot.value.0, mutedUntil: snapshot.value.1, localMutedUntil: nil,
-                stoppedBefore: nil, now: now.addingTimeInterval(26.3)), snoozed ? .serverMuted : .irrelevant)
-        }
-    }
-
-    @MainActor func testRecoveryStillAllowsAnActiveEpisodeAndKeepsTheNewRequestStart() async throws {
-        var clock = ContinuousClock.now, date = now, reads = 0
-        let episode = UUID()
-        let snapshot = try await SilentCryAlarmStatusSnapshot.load(clock: { clock }, date: { date }) {
-            reads += 1
-            let delay: Duration = reads == 1 ? .seconds(26) : .milliseconds(300)
-            clock = clock.advanced(by: delay)
-            date = date.addingTimeInterval(reads == 1 ? 26 : 0.3)
-            return NotificationRelevance(cryEpisodeIDs: [episode])
-        }
-        XCTAssertEqual(reads, 2)
-        XCTAssertEqual(snapshot.value.cryEpisodeIDs, [episode])
-        XCTAssertEqual(snapshot.checkedAt, now.addingTimeInterval(26))
-        XCTAssertTrue(snapshot.isFresh(at: clock))
-    }
-
-    @MainActor func testTwoDelayedResponsesFailWithoutAnUnboundedRecoveryLoop() async {
-        var clock = ContinuousClock.now, reads = 0
-        do {
-            _ = try await SilentCryAlarmStatusSnapshot.load(clock: { clock }) {
-                reads += 1
-                clock = clock.advanced(by: .seconds(26))
-                return NotificationRelevance(cryEpisodeIDs: [UUID()])
-            }
-            XCTFail("An old response must never authorize an alarm")
-        } catch {
-            XCTAssertEqual(error as? SilentCryAlarmRequest.Rejection, .staleStatus)
-        }
-        XCTAssertEqual(reads, 2)
-    }
-
-    @MainActor func testPromptResponseNeedsNoRecoveryButExpiresBeforeScheduling() async throws {
+    @MainActor func testSuspendedResponseExpiresWithoutARecoveryRequest() async {
         let started = ContinuousClock.now
         var clock = started, reads = 0
-        let snapshot = try await SilentCryAlarmStatusSnapshot.load(clock: { clock }, date: { self.now }) {
-            reads += 1
-            clock = clock.advanced(by: .milliseconds(300))
-            return NotificationRelevance()
-        }
-        XCTAssertEqual(reads, 1)
-        XCTAssertEqual(snapshot.checkedAt, now)
-        XCTAssertTrue(snapshot.isFresh(at: started.advanced(by: .seconds(5))))
-        XCTAssertFalse(snapshot.isFresh(at: started.advanced(by: .milliseconds(5_001))))
-        XCTAssertFalse(snapshot.isFresh(at: started.advanced(by: .seconds(-1))))
-    }
-
-    @MainActor func testFailedFreshReadCannotFallBackToTheOldActiveResponse() async {
-        var clock = ContinuousClock.now, reads = 0
         do {
-            _ = try await SilentCryAlarmStatusSnapshot.load(clock: { clock }) {
+            _ = try await SilentCryAlarmStatusSnapshot.load(
+                budget: .init(startedAt: started), clock: { clock }, date: { self.now }) {
                 reads += 1
-                if reads == 2 { throw URLError(.notConnectedToInternet) }
                 clock = clock.advanced(by: .seconds(26))
                 return NotificationRelevance(cryEpisodeIDs: [UUID()])
             }
-            XCTFail("A failed recovery must not reuse the stale response")
+            XCTFail("A resumed old response must not authorize an alarm or another read")
         } catch {
-            XCTAssertEqual((error as? URLError)?.code, .notConnectedToInternet)
+            XCTAssertEqual(error as? SilentCryAlarmRequest.Rejection, .budgetExpired)
         }
-        XCTAssertEqual(reads, 2)
+        XCTAssertEqual(reads, 1)
+    }
+
+    @MainActor func testExpiredCallbackDoesNotEvenStartTheStatusRequest() async {
+        let started = ContinuousClock.now
+        var reads = 0
+        do {
+            _ = try await SilentCryAlarmStatusSnapshot.load(
+                budget: .init(startedAt: started), clock: { started.advanced(by: .seconds(26)) }) {
+                reads += 1
+                return NotificationRelevance()
+            }
+            XCTFail("An expired callback should finish without network work")
+        } catch {
+            XCTAssertEqual(error as? SilentCryAlarmRequest.Rejection, .budgetExpired)
+        }
+        XCTAssertEqual(reads, 0)
+    }
+
+    @MainActor func testPromptResponsePreservesCurrentStatusAndOriginalCheckTime() async throws {
+        let started = ContinuousClock.now
+        var clock = started, reads = 0
+        let episode = UUID()
+        let snapshot = try await SilentCryAlarmStatusSnapshot.load(
+            budget: .init(startedAt: started), clock: { clock }, date: { self.now }) {
+            reads += 1
+            clock = clock.advanced(by: .milliseconds(300))
+            return NotificationRelevance(cryEpisodeIDs: [episode])
+        }
+        XCTAssertEqual(reads, 1)
+        XCTAssertEqual(snapshot.value.cryEpisodeIDs, [episode])
+        XCTAssertEqual(snapshot.checkedAt, now)
+        XCTAssertTrue(snapshot.isFresh(at: clock))
+        XCTAssertFalse(snapshot.isFresh(at: started.advanced(by: .seconds(26))))
+    }
+
+    @MainActor func testNetworkFailureIsReturnedWithoutAnotherRequest() async {
+        let started = ContinuousClock.now
+        var clock = started, reads = 0
+        do {
+            let _: SilentCryAlarmStatusSnapshot<NotificationRelevance> = try await .load(
+                budget: .init(startedAt: started), clock: { clock }) {
+                reads += 1
+                clock = clock.advanced(by: .seconds(2))
+                throw URLError(.timedOut)
+            }
+            XCTFail("The caller must explicitly decide whether fallback is eligible")
+        } catch {
+            XCTAssertEqual((error as? URLError)?.code, .timedOut)
+            XCTAssertNoThrow(try SilentCryAlarmExecutionBudget(startedAt: started).requireTime(at: clock))
+        }
+        XCTAssertEqual(reads, 1)
+    }
+
+    func testSchedulingReserveAndRemainingBudgetIncludeElapsedSleep() {
+        let started = ContinuousClock.now
+        let budget = SilentCryAlarmExecutionBudget(startedAt: started)
+        XCTAssertNoThrow(try budget.requireTime(at: started.advanced(by: .milliseconds(3_999))))
+        XCTAssertThrowsError(try budget.requireTime(at: started.advanced(by: .seconds(4))))
+        XCTAssertThrowsError(try budget.requireTime(at: started.advanced(by: .seconds(26))))
+        XCTAssertEqual(budget.remainingMilliseconds(at: started), 5_000)
+        XCTAssertEqual(budget.remainingMilliseconds(at: started.advanced(by: .seconds(2))), 3_000)
+        XCTAssertEqual(budget.remainingMilliseconds(at: started.advanced(by: .seconds(26))), 0)
+    }
+}
+
+final class SilentCryAlarmFallbackTests: XCTestCase {
+    private let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+    private func request(age: TimeInterval = 0) throws -> SilentCryAlarmRequest {
+        try XCTUnwrap(SilentCryAlarmRequest(payload: [
+            "silentCryAlarm": true, "eventId": UUID().uuidString, "episodeId": UUID().uuidString,
+            "createdAt": ISO8601DateFormatter().string(from: now.addingTimeInterval(-age))
+        ], now: now))
+    }
+
+    func testRecentPushCanSurviveTimeoutButNeverOverridesLocalSnoozeOrDisabledSetting() throws {
+        let request = try request(age: 2)
+        func reason(enabled: Bool = true, pending: Bool = false, muted: Date? = nil, stopped: Date? = nil) -> SilentCryAlarmRequest.Rejection? {
+            request.fallbackIneligibilityReason(enabled: enabled, acknowledgementPending: pending,
+                localMutedUntil: muted, stoppedBefore: stopped, evidence: nil, now: now)
+        }
+        XCTAssertNil(reason())
+        XCTAssertEqual(reason(enabled: false), .disabled)
+        XCTAssertEqual(reason(pending: true), .acknowledgementPending)
+        XCTAssertEqual(reason(muted: now.addingTimeInterval(60)), .locallyMuted)
+        XCTAssertEqual(reason(stopped: now), .stopped)
+    }
+
+    func testFallbackRejectsOlderPushesEvenThoughNormalStatusValidationCanStillAcceptThem() throws {
+        for age in [10.0, 11.0, 42.0] {
+            let request = try request(age: age)
+            let rejection = request.fallbackIneligibilityReason(enabled: true, acknowledgementPending: false,
+                localMutedUntil: nil, stoppedBefore: nil, evidence: nil, now: now)
+            XCTAssertEqual(rejection, age <= 10 ? nil : .stale)
+        }
+    }
+
+    func testKnownResolutionUnpairDisableOrServerSnoozeBlocksFallbackAfterRelaunch() throws {
+        let request = try request(age: 2)
+        let relevant = NotificationRelevance(cryEpisodeIDs: [request.episodeID])
+        let cases: [(Bool, Bool, NotificationRelevance, Date?, SilentCryAlarmRequest.Rejection)] = [
+            (true, true, NotificationRelevance(), nil, .irrelevant),
+            (false, true, relevant, nil, .unpaired),
+            (true, false, relevant, nil, .serverDisabled),
+            (true, true, relevant, now.addingTimeInterval(60), .serverMuted)
+        ]
+        for (paired, enabled, relevance, muted, reason) in cases {
+            let evidence = SilentCryAlarmRequest.ServerEvidence(observedAt: now,
+                paired: paired, enabled: enabled, relevance: relevance, mutedUntil: muted)
+            // The same serialized evidence the service restores after relaunch.
+            let restored = try JSONDecoder().decode(SilentCryAlarmRequest.ServerEvidence.self,
+                from: JSONEncoder().encode(evidence))
+            XCTAssertEqual(request.fallbackIneligibilityReason(enabled: true, acknowledgementPending: false,
+                localMutedUntil: nil, stoppedBefore: nil, evidence: restored, now: now), reason)
+        }
+    }
+
+    func testOldQuietSnapshotDoesNotOverrideANewerCryPush() throws {
+        let request = try request()
+        let old = SilentCryAlarmRequest.ServerEvidence(observedAt: now.addingTimeInterval(-30),
+            paired: true, enabled: true, relevance: NotificationRelevance(), mutedUntil: nil)
+        XCTAssertNil(request.fallbackIneligibilityReason(enabled: true, acknowledgementPending: false,
+            localMutedUntil: nil, stoppedBefore: nil, evidence: old, now: now))
+    }
+
+    func testOnlyUnavailableNetworkErrorsPermitFallback() {
+        for code: URLError.Code in [.timedOut, .notConnectedToInternet, .networkConnectionLost,
+                                   .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed] {
+            XCTAssertTrue(SilentCryAlarmRequest.allowsStatusFallback(for: URLError(code)))
+        }
+        for code: URLError.Code in [.cancelled, .secureConnectionFailed, .serverCertificateUntrusted,
+                                   .userAuthenticationRequired, .badServerResponse] {
+            XCTAssertFalse(SilentCryAlarmRequest.allowsStatusFallback(for: URLError(code)))
+        }
+        XCTAssertFalse(SilentCryAlarmRequest.allowsStatusFallback(for: CancellationError()))
+        XCTAssertFalse(SilentCryAlarmRequest.allowsStatusFallback(for: SilentCryAlarmRequest.Rejection.staleStatus))
+        XCTAssertFalse(SilentCryAlarmRequest.allowsStatusFallback(for: SilentCryAlarmRequest.Rejection.budgetExpired))
     }
 }

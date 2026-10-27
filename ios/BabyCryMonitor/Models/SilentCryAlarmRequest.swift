@@ -36,6 +36,7 @@ struct SilentCryAlarmRequest: Sendable {
         case settingChanged = "setting_changed", serverDisabled = "server_disabled", unpaired
         case relevanceUnknown = "relevance_unknown", irrelevant, serverMuted = "server_muted"
         case staleStatus = "stale_status"
+        case budgetExpired = "budget_expired"
         case locallyMuted = "locally_muted", stopped, unauthorized, missingAsset = "missing_asset"
     }
     enum Source: String { case foregroundNotification = "foreground_notification", remoteNotification = "remote_notification" }
@@ -111,6 +112,67 @@ struct SilentCryAlarmRequest: Sendable {
         if !(createdAt > (stoppedBefore ?? .distantPast)) { return .stopped }
         return nil
     }
+
+    /// A recent authenticated push is positive evidence from the service at send
+    /// time. Never use it to override a local Snooze or a newer negative status.
+    func fallbackIneligibilityReason(enabled: Bool, acknowledgementPending: Bool,
+        localMutedUntil: Date?, stoppedBefore: Date?, evidence: ServerEvidence?, now: Date) -> Rejection? {
+        if !enabled { return .disabled }
+        if acknowledgementPending { return .acknowledgementPending }
+        if !(-5...10).contains(now.timeIntervalSince(createdAt)) { return .stale }
+        if (localMutedUntil ?? .distantPast) > now { return .locallyMuted }
+        if createdAt <= (stoppedBefore ?? .distantPast) { return .stopped }
+        if let evidence, evidence.observedAt >= createdAt {
+            if !evidence.paired { return .unpaired }
+            if evidence.enabled == false { return .serverDisabled }
+            if let relevance = evidence.relevance, !relevance.cryEpisodeIDs.contains(episodeID) { return .irrelevant }
+            if (evidence.mutedUntil ?? .distantPast) > now { return .serverMuted }
+        }
+        return nil
+    }
+
+    struct ServerEvidence: Codable, Sendable {
+        let observedAt: Date
+        let paired: Bool
+        let enabled: Bool?
+        let relevance: NotificationRelevance?
+        let mutedUntil: Date?
+
+        func hasSameState(as other: Self) -> Bool {
+            paired == other.paired && enabled == other.enabled && relevance == other.relevance && mutedUntil == other.mutedUntil
+        }
+    }
+
+    static func allowsStatusFallback(for error: any Error) -> Bool {
+        guard let error = error as? URLError else { return false }
+        switch error.code {
+        case .timedOut, .notConnectedToInternet, .networkConnectionLost,
+             .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed: return true
+        default: return false // Cancellation, TLS failures and server rejections stay authoritative.
+        }
+    }
+}
+
+/// An app policy, not an estimate of the runtime iOS has granted. Includes sleep
+/// and actor/executor delays from the original notification callback entry.
+struct SilentCryAlarmExecutionBudget: Sendable {
+    static let maximumDuration: Duration = .seconds(5)
+    static let schedulingReserve: Duration = .seconds(1)
+    static let requestTimeout: TimeInterval = 2
+    let startedAt: ContinuousClock.Instant
+
+    func requireTime(at now: ContinuousClock.Instant = .now) throws {
+        let elapsed = startedAt.duration(to: now)
+        guard elapsed >= .zero, elapsed < Self.maximumDuration - Self.schedulingReserve else {
+            throw SilentCryAlarmRequest.Rejection.budgetExpired
+        }
+        try Task.checkCancellation()
+    }
+
+    func remainingMilliseconds(at now: ContinuousClock.Instant = .now) -> Int {
+        let remaining = now.duration(to: startedAt.advanced(by: Self.maximumDuration)).components
+        return Int(max(0, min(5_000, remaining.seconds * 1_000 + remaining.attoseconds / 1_000_000_000_000_000)))
+    }
 }
 
 /// Measure from before the request, including time suspended before its result is
@@ -125,21 +187,20 @@ struct SilentCryAlarmStatusSnapshot<Value: Sendable>: Sendable {
         (.zero...Self.maximumAge).contains(startedAt.duration(to: now))
     }
 
-    /// One recovery read is enough to replace a delayed response. Never loop
-    /// indefinitely within the phone's limited background execution window.
+    /// One short read per callback. A later server wake can make a fresh attempt;
+    /// a resumed old response must not start another round trip here.
     @MainActor static func load(
+        budget: SilentCryAlarmExecutionBudget,
         clock: () -> ContinuousClock.Instant = { .now },
         date: () -> Date = { Date() },
         fetch: () async throws -> Value
     ) async throws -> Self {
-        for _ in 0..<2 {
-            try Task.checkCancellation()
-            let checkedAt = date(), startedAt = clock()
-            let value = try await fetch()
-            try Task.checkCancellation()
-            let snapshot = Self(value: value, checkedAt: checkedAt, startedAt: startedAt)
-            if snapshot.isFresh(at: clock()) { return snapshot }
-        }
-        throw SilentCryAlarmRequest.Rejection.staleStatus
+        try budget.requireTime(at: clock())
+        let checkedAt = date(), startedAt = clock()
+        let value = try await fetch()
+        try budget.requireTime(at: clock())
+        let snapshot = Self(value: value, checkedAt: checkedAt, startedAt: startedAt)
+        guard snapshot.isFresh(at: clock()) else { throw SilentCryAlarmRequest.Rejection.staleStatus }
+        return snapshot
     }
 }

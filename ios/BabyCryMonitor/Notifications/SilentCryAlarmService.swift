@@ -11,6 +11,18 @@ import UIKit
     private(set) var status = "Off. Existing notifications remain enabled."
     weak var log: DiagnosticLog?
     private let defaults: UserDefaults
+    private static let alertSession: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.waitsForConnectivity = false
+        configuration.urlCache = nil
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.timeoutIntervalForRequest = SilentCryAlarmExecutionBudget.requestTimeout
+        configuration.timeoutIntervalForResource = SilentCryAlarmExecutionBudget.requestTimeout
+        return URLSession(configuration: configuration)
+    }()
+    private let evidenceKey = "silentCryAlarmServerEvidence"
+    private var serverEvidence: SilentCryAlarmRequest.ServerEvidence?
+    private var snoozeDuration: TimeInterval
     private let recordsKey = "silentCryAlarmRecords"
     private let pendingKey = "silentCryAlarmPendingAcknowledgements"
     private var receiving = false
@@ -34,6 +46,10 @@ import UIKit
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         enabled = defaults.bool(forKey: "silentWatchAlarmsEnabled")
+        serverEvidence = defaults.data(forKey: evidenceKey).flatMap {
+            try? JSONDecoder().decode(SilentCryAlarmRequest.ServerEvidence.self, from: $0)
+        }
+        snoozeDuration = (try? MetadataStore().load().configuration.snoozeDuration) ?? MonitoringConfiguration().snoozeDuration
         if enabled { status = "Enabled. Lock this iPhone for Watch delivery; existing notifications continue." }
     }
 
@@ -87,6 +103,7 @@ import UIKit
     func settingUnavailable() { status = enabled ? "Setting could not sync. Check the connection." : "Off on this iPhone. Server setting will sync when connected." }
 
     func synchronize(using client: any BackendServing, status server: ParentStatus, checkedAt: Date) async {
+        remember(server, checkedAt: checkedAt)
         // This status was fetched before these uploads. An acknowledgement sent
         // here may start a snooze that the fetched status does not yet contain.
         let hadPendingAcknowledgements = !(defaults.stringArray(forKey: pendingKey) ?? []).isEmpty
@@ -102,6 +119,20 @@ import UIKit
             if enabled { disableLocally() }
         }
         reconcile(server, checkedAt: checkedAt, canResumeLocalSnooze: !hadPendingAcknowledgements)
+    }
+
+    private func remember(_ server: ParentStatus, checkedAt: Date) {
+        let observedAt = server.serverTime ?? checkedAt
+        guard serverEvidence.map({ $0.observedAt <= observedAt }) ?? true else { return }
+        let evidence = SilentCryAlarmRequest.ServerEvidence(observedAt: observedAt, paired: server.paired,
+            enabled: server.silentWatchAlarmsEnabled, relevance: server.notificationRelevance,
+            mutedUntil: server.alertsMutedUntil)
+        let changed = serverEvidence.map { !$0.hasSameState(as: evidence) } ?? true
+        serverEvidence = evidence
+        // Normal status polling advances the in-memory timestamp. Persist only
+        // state changes so this safeguard adds no write on every poll.
+        if changed { defaults.set(try? JSONEncoder().encode(evidence), forKey: evidenceKey) }
+        snoozeDuration = server.configuration.snoozeDuration
     }
 
     /// Called only when execution is already available; never requests permission,
@@ -155,39 +186,67 @@ import UIKit
         guard !receiving else { record("rejected", reason: .busy); return false }
         receiving = true; defer { receiving = false }
         let generation = revision
+        let budget = SilentCryAlarmExecutionBudget(startedAt: start)
+        func fallbackRejection() -> SilentCryAlarmRequest.Rejection? {
+            request.fallbackIneligibilityReason(enabled: enabled,
+                acknowledgementPending: !(defaults.stringArray(forKey: pendingKey) ?? []).isEmpty,
+                localMutedUntil: defaults.object(forKey: "silentCryAlarmMutedUntil") as? Date,
+                stoppedBefore: defaults.object(forKey: "silentCryAlarmStoppedBefore") as? Date,
+                evidence: serverEvidence, now: Date())
+        }
         do {
-            let backend = try client()
+            try budget.requireTime()
+            guard AlarmManager.shared.authorizationState == .authorized else {
+                record("rejected", reason: .unauthorized); return false
+            }
+            guard Bundle.main.url(forResource: "AlarmTestSilence", withExtension: "caf") != nil else {
+                record("rejected", reason: .missingAsset); return false
+            }
+            var backend = try client()
+            backend.session = Self.alertSession
+            backend.requestTimeout = SilentCryAlarmExecutionBudget.requestTimeout
             stage = .acknowledgements
-            if !(defaults.stringArray(forKey: pendingKey) ?? []).isEmpty { record("started") }
-            await flushAcknowledgements(using: backend)
+            // A pending Snooze remains authoritative. Its existing intent/status
+            // sync uploads it; don't drain that queue before creating an alarm.
             guard (defaults.stringArray(forKey: pendingKey) ?? []).isEmpty else {
                 trace("ack_pending", request.eventID); record("rejected", reason: .acknowledgementPending); return false
             }
-            let snapshot = try await SilentCryAlarmStatusSnapshot<ParentStatus>.load {
-                stage = .status; record("started")
-                let server = try await backend.status()
-                record("completed")
-                return server
+            let snapshot: SilentCryAlarmStatusSnapshot<ParentStatus>?
+            do {
+                snapshot = try await SilentCryAlarmStatusSnapshot<ParentStatus>.load(budget: budget) {
+                    stage = .status; record("started")
+                    let server = try await backend.status()
+                    record("completed")
+                    return server
+                }
+            } catch {
+                // A timeout is only a fallback opportunity while this callback
+                // still has our own execution budget and the push is very recent.
+                try budget.requireTime()
+                guard SilentCryAlarmRequest.allowsStatusFallback(for: error) else { throw error }
+                if let reason = fallbackRejection() { record("rejected", reason: reason); return false }
+                record("fallback", error: error)
+                snapshot = nil
             }
-            let server = snapshot.value
-            reconcile(server, checkedAt: snapshot.checkedAt)
+            if let snapshot {
+                remember(snapshot.value, checkedAt: snapshot.checkedAt)
+                reconcile(snapshot.value, checkedAt: snapshot.checkedAt)
+            }
             stage = .eligibility
             let reason: SilentCryAlarmRequest.Rejection?
             if generation != revision { reason = .settingChanged }
-            else if let rejection = request.ineligibilityReason(enabled: enabled, serverEnabled: server.silentWatchAlarmsEnabled == true,
-                paired: server.paired, relevance: server.notificationRelevance,
-                mutedUntil: server.alertsMutedUntil, localMutedUntil: defaults.object(forKey: "silentCryAlarmMutedUntil") as? Date,
-                stoppedBefore: defaults.object(forKey: "silentCryAlarmStoppedBefore") as? Date, now: Date()) { reason = rejection }
-            else if AlarmManager.shared.authorizationState != .authorized { reason = .unauthorized }
-            else if Bundle.main.url(forResource: "AlarmTestSilence", withExtension: "caf") == nil { reason = .missingAsset }
-            else { reason = nil }
+            else if let snapshot { reason = request.ineligibilityReason(enabled: enabled, serverEnabled: snapshot.value.silentWatchAlarmsEnabled == true,
+                paired: snapshot.value.paired, relevance: snapshot.value.notificationRelevance,
+                mutedUntil: snapshot.value.alertsMutedUntil, localMutedUntil: defaults.object(forKey: "silentCryAlarmMutedUntil") as? Date,
+                stoppedBefore: defaults.object(forKey: "silentCryAlarmStoppedBefore") as? Date, now: Date()) }
+            else { reason = fallbackRejection() }
             if let reason { trace("ignored", request.eventID); record("rejected", reason: reason); return false }
             stage = .alarmLookup
             let existing = try AlarmManager.shared.alarms
             // One alarm per episode. Reminder notifications never restart an active alarm.
             if existing.contains(where: { $0.id == request.episodeID }) {
                 trace("duplicate", request.eventID); record("duplicate")
-                await confirmScheduling(request, using: backend)
+                queueSchedulingReceipt(request)
                 return false
             }
             let attributes = AlarmAttributes<Metadata>(presentation: AlarmPresentation(alert: .init(
@@ -197,7 +256,7 @@ import UIKit
             // Persist acknowledgement metadata before scheduling so an immediate Stop
             // can resolve the event even when the app has to relaunch for the intent.
             var saved = records.filter { $0.episodeID != request.episodeID }
-            saved.append(Record(episodeID: request.episodeID, eventID: request.eventID, snoozeDuration: server.configuration.snoozeDuration, scheduledAt: Date()))
+            saved.append(Record(episodeID: request.episodeID, eventID: request.eventID, snoozeDuration: snoozeDuration, scheduledAt: Date()))
             records = Array(saved.suffix(64))
             let configuration = AlarmManager.AlarmConfiguration<Metadata>.alarm(
                 schedule: .fixed(Date().addingTimeInterval(3)), attributes: attributes,
@@ -206,8 +265,12 @@ import UIKit
             stage = .schedule; record("started")
             // Local reconciliation, alarm lookup or persistence can also stall.
             // Recheck immediately before handing a new alarm to the system.
-            guard snapshot.isFresh() else {
+            try budget.requireTime()
+            if let snapshot, !snapshot.isFresh() {
                 throw SilentCryAlarmRequest.Rejection.staleStatus
+            }
+            if snapshot == nil, let reason = fallbackRejection() {
+                record("rejected", reason: reason); return false
             }
             _ = try await AlarmManager.shared.schedule(id: request.episodeID, configuration: configuration)
             record("completed")
@@ -222,8 +285,11 @@ import UIKit
             }
             status = "Silent alert alarm scheduled. Existing notifications continue."
             trace("scheduled", request.eventID); record("scheduled")
-            await confirmScheduling(request, using: backend)
+            queueSchedulingReceipt(request)
             return true
+        } catch SilentCryAlarmRequest.Rejection.budgetExpired {
+            status = "Alarm attempt expired; existing notifications continue."
+            trace("ignored", request.eventID); record("rejected", reason: .budgetExpired); return false
         } catch SilentCryAlarmRequest.Rejection.staleStatus {
             status = "Current alert status unavailable; existing notifications continue."
             trace("ignored", request.eventID); record("rejected", reason: .staleStatus); return false
@@ -243,7 +309,7 @@ import UIKit
             attemptID: attemptID, eventID: eventID, episodeID: episodeID, reason: reason, elapsedMS: elapsedMS,
             appActive: UIApplication.shared.applicationState == .active, protectedDataAvailable: UIApplication.shared.isProtectedDataAvailable,
             backgroundTimeRemaining: UIApplication.shared.backgroundTimeRemaining, requestAgeMS: requestAgeMS,
-            callbackAt: callbackAt, error: error)
+            callbackAt: callbackAt, executionBudgetRemainingMS: SilentCryAlarmExecutionBudget(startedAt: start).remainingMilliseconds(), error: error)
     }
 
     func snooze(episodeID: UUID) async {
@@ -316,7 +382,7 @@ import UIKit
         } catch { trace("failed") }
     }
 
-    private func confirmScheduling(_ request: SilentCryAlarmRequest, using backend: any BackendServing) async {
+    private func queueSchedulingReceipt(_ request: SilentCryAlarmRequest) {
         guard let cycleID = request.cycleID else { return } // Legacy requests remain compatible.
         var pending = pendingReceipts
         if !pending.contains(where: { $0.cycleID == cycleID }) {
@@ -324,7 +390,6 @@ import UIKit
             pending.append(receipt); pendingReceipts = Array(pending.suffix(64))
             receiptTrace("queued", receipt)
         }
-        await flushSchedulingReceipts(using: backend)
     }
 
     // Retry at most one persisted receipt when the app already has execution.
