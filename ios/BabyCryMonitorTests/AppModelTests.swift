@@ -96,6 +96,31 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(fixture.notifications.cleanupCalls.count, 1)
     }
 
+    @MainActor func testConfirmingATestClearsEveryOutstandingTestAndOldTestsDoNotTakeOver() async throws {
+        let fixture = try Fixture()
+        fixture.model.role = .parent; fixture.model.paired = true
+        let now = fixture.time.now; fixture.model.now = now
+        func test(_ age: TimeInterval) -> RemoteAlert {
+            RemoteAlert(eventId: UUID(), episodeId: UUID(), cryStartedAt: now.addingTimeInterval(-age), durationSeconds: 5,
+                        createdAt: now.addingTimeInterval(-age), status: "sent", acknowledgedAt: nil, isTest: true)
+        }
+        let stale = test(AppModel.testConfirmationWindow + 60)
+        fixture.model.parentStatus = ParentStatus(paired: true, alerts: [stale], configuration: MonitoringConfiguration())
+        XCTAssertNil(fixture.model.activeAlert, "An old unconfirmed test must not take over Monitor")
+        let recent = [test(2), test(4)]
+        let status = ParentStatus(paired: true, alerts: recent + [stale], configuration: MonitoringConfiguration())
+        fixture.model.parentStatus = status
+        XCTAssertEqual(fixture.model.activeAlert?.eventId, recent[0].eventId)
+        var cleared = status; cleared.alerts = []
+        await fixture.backend.setStatus(cleared)
+        let confirmed = await fixture.model.acknowledgeTests()
+        XCTAssertTrue(confirmed)
+        let acknowledged = await fixture.backend.acknowledgements
+        XCTAssertEqual(Set(acknowledged), Set((recent + [stale]).map(\.eventId)))
+        XCTAssertEqual(Set(fixture.notifications.dismissals.compactMap { $0 }), Set(acknowledged))
+        XCTAssertNil(fixture.model.activeAlert)
+    }
+
     @MainActor func testSnoozeClearsRealNotificationsAndTestAcknowledgementOnlyClearsItsTest() async throws {
         let fixture = try Fixture()
         fixture.model.role = .parent; fixture.model.paired = true
@@ -139,17 +164,6 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(fixture.model.parentStatus?.alertsMutedUntil, until)
         XCTAssertTrue(fixture.model.error?.contains("Could not confirm") == true)
         XCTAssertFalse(fixture.model.resumingAlerts)
-    }
-
-    @MainActor func testBedtimeSetupCompletionBelongsToPairing() throws {
-        let fixture = try Fixture()
-        fixture.model.role = .parent; fixture.model.paired = true
-        fixture.model.parentStatus = ParentStatus(paired: true, pairingID: "first", configuration: MonitoringConfiguration())
-        XCTAssertFalse(fixture.model.hasCompletedBedtimeSetup)
-        fixture.model.completeBedtimeSetup()
-        XCTAssertTrue(fixture.model.hasCompletedBedtimeSetup)
-        fixture.model.parentStatus?.pairingID = "replacement"
-        XCTAssertFalse(fixture.model.hasCompletedBedtimeSetup)
     }
 
     @MainActor final class Audio: AudioLevelProviding {
@@ -324,7 +338,8 @@ final class AppModelTests: XCTestCase {
             if resumeFails { throw URLError(.notConnectedToInternet) }
             statusValue?.alertsMutedUntil = Date().addingTimeInterval(-1)
         }
-        func acknowledge(_ id: UUID) async throws {}
+        private(set) var acknowledgements: [UUID] = []
+        func acknowledge(_ id: UUID) async throws { acknowledgements.append(id) }
         func pushToken(_ token: String) async throws {}
         func watchPushToken(_ token: String?) async throws {}
     }

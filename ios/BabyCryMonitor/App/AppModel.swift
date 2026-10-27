@@ -320,7 +320,7 @@ import UIKit
             }
             if ProcessInfo.processInfo.arguments.contains("--uitesting-snoozed") { parentStatus?.alertsMutedUntil = now.addingTimeInterval(60) }
             if ProcessInfo.processInfo.arguments.contains("--uitesting-chart-paused") { remoteSound.disconnected() }
-            if ProcessInfo.processInfo.arguments.contains("--uitesting-setup-complete") { completeBedtimeSetup() }
+            if ProcessInfo.processInfo.arguments.contains("--uitesting-keep-awake") { keepScreenAwake = true }
         }
         #endif
         // Restore a warning only after explicit opt-in; clear legacy deadlines on
@@ -385,9 +385,6 @@ import UIKit
             $0.isTest == true && $0.acknowledgedAt != nil && (-5...1800).contains(now.timeIntervalSince($0.createdAt))
         }
     }
-    private var bedtimeSetupKey: String { "bedtimeSetup|\(backendURL)|\(parentStatus?.pairingID ?? "unpaired")" }
-    var hasCompletedBedtimeSetup: Bool { paired && parentStatus?.pairingID != nil && defaults.bool(forKey: bedtimeSetupKey) }
-    func completeBedtimeSetup() { defaults.set(true, forKey: bedtimeSetupKey) }
 
     func retryConnection() async {
         guard role == .parent, !retryingConnection else { return }
@@ -424,9 +421,15 @@ import UIKit
 
     @ObservationIgnored private var notificationsCheckedAt: Date?
 
+    /// Unacknowledged tests never expire on the server, so only a recent one asks for confirmation.
     var activeAlert: RemoteAlert? {
         let alerts = parentStatus?.alerts?.filter { $0.acknowledgedAt == nil && $0.resolvedAt == nil }
-        return alerts?.first { $0.isTest != true } ?? alerts?.first
+        return alerts?.first { $0.isTest != true }
+            ?? alerts?.first { $0.isTest == true && now.timeIntervalSince($0.createdAt) <= Self.testConfirmationWindow }
+    }
+    static let testConfirmationWindow: TimeInterval = 1800
+    var outstandingTestAlerts: [RemoteAlert] {
+        parentStatus?.alerts?.filter { $0.isTest == true && $0.acknowledgedAt == nil && $0.resolvedAt == nil } ?? []
     }
     func acceptSafety() { safetyAccepted = true; defaults.set(true, forKey: "safetyAccepted") }
     func selectRole(_ value: DeviceRole) {
@@ -1425,6 +1428,31 @@ import UIKit
         ], truncated: false)
     }
     #endif
+    /// The server acknowledges tests one at a time, so confirming receipt clears every
+    /// outstanding test. Otherwise repeated tests would replace each other on Monitor.
+    @discardableResult func acknowledgeTests() async -> Bool {
+        let ids = outstandingTestAlerts.map(\.eventId)
+        guard !acknowledgingAlert, !ids.isEmpty else { return false }
+        acknowledgingAlert = true; defer { acknowledgingAlert = false }
+        for id in ids { await notifications.dismissCryingAlerts(testEventID: id) }
+        let revision = environmentRevision
+        do {
+            let client = try await registeredClient()
+            for id in ids {
+                guard revision == environmentRevision else { return false }
+                try await client.acknowledge(id)
+            }
+            guard revision == environmentRevision else { return false }
+            await refreshParent()
+            return true
+        } catch {
+            guard revision == environmentRevision else { return false }
+            self.error = error.localizedDescription; log.record("acknowledgement_failed", error: error)
+            await refreshParent()
+            return false
+        }
+    }
+
     @discardableResult func acknowledge(_ id: UUID) async -> Bool {
         guard !acknowledgingAlert else { return false }
         acknowledgingAlert = true; defer { acknowledgingAlert = false }

@@ -108,9 +108,9 @@ Integrated validation passed 169 Worker tests plus TypeScript checks, all 129 sh
 
 The first supervised locked-phone end-to-end test passed on 25 October 2026 at approximately 21:09 UTC (21:09 UK time). Before dispatch, Apple's device service reported `passcodeRequired: true` for Parent J17. The paired Listener J14 app initiated exactly one test at `21:09:01.355Z`; Apple acceptance was recorded at `21:09:02.026Z` for event `9778acd1-cf1d-4621-b93b-bfd10cb6b8f9`. Parent J17 recorded receipt for that event at `21:09:02.125Z` and successful AlarmKit scheduling at `21:09:02.144Z`, with `app_active=false` and `protected_data_available=false` for both records. The configured alarm fire date was three seconds after scheduling. The user independently confirmed **Repeating wrist taps; both devices silent**. This establishes one successful Listener-originated, locked-Parent trial with silent repeating Watch haptics; it does not establish overnight reliability, a measured first-tap timestamp, a particular repetition duration, or acknowledgement propagation into real crying episodes. No real crying episode was created or automatically routed into AlarmKit.
 
-This test is available in Parent Settings on iOS 26+. Physical iPhone/Watch checks remain pending; simulator builds cannot establish wrist delivery or haptic strength.
+This test is available in Parent Settings → Diagnostics & simulation on iOS 26+. Physical iPhone/Watch checks remain pending; simulator builds cannot establish wrist delivery or haptic strength.
 
-The silent-tone experiment supersedes the audible test UI: **Parent Settings → Silent alarm experiment → Test silent alarm in 5 seconds**. The parent reported wrist haptics from the original audible AlarmKit test after locking the iPhone. This establishes a useful comparison condition, not silent-tone delivery. The experiment names the complete `AlarmTestSilence.caf` filename and bundles the same silent asset into both apps. The source CAF was decoded and verified to contain exactly 44,100 zero-valued mono 16-bit samples (one second at 44.1 kHz). The app refuses to schedule when its silent tone is absent. Actual phone silence, Watch silence, vibration persistence and acknowledgement still require physical observation.
+The silent-tone experiment supersedes the audible test UI: **Parent Settings → Diagnostics & simulation → Silent alarm experiment → Test silent alarm in 5 seconds**. The parent reported wrist haptics from the original audible AlarmKit test after locking the iPhone. This establishes a useful comparison condition, not silent-tone delivery. The experiment names the complete `AlarmTestSilence.caf` filename and bundles the same silent asset into both apps. The source CAF was decoded and verified to contain exactly 44,100 zero-valued mono 16-bit samples (one second at 44.1 kHz). The app refuses to schedule when its silent tone is absent. Actual phone silence, Watch silence, vibration persistence and acknowledgement still require physical observation.
 
 Silent-tone acceptance: wear the unlocked Watch in Silent Mode with Prominent haptics, tap Test on the Parent, then immediately lock the phone. Record time to first wrist tap, whether taps persist for 30 seconds without interaction, sound from each device, and whether Stop on the Watch ends the alarm. Repeat with Sleep Focus and with the phone left unlocked to document routing differences. A successful schedule or `.alerting` state on the phone does not establish Watch receipt or silence. Test first while the partner is awake because an OS-level sound fallback remains possible.
 
@@ -126,7 +126,7 @@ Installation completed on 25 October 2026: simulator and signed combined device 
 | Tap Test repeatedly | Only one test alarm is scheduled |
 | Cancel before five seconds | No test alarm fires |
 | Let alarm fire; stop from Settings or the system alert | Alarm stops; the test can be run again |
-| Close Settings, lock phone, or relaunch while test exists | System retains the alarm; reopening Parent Settings recovers its cancel/stop control |
+| Close Settings, lock phone, or relaunch while test exists | System retains the alarm; reopening Parent Diagnostics recovers its cancel/stop control |
 | Wear paired, unlocked Watch; repeat with phone open/locked and Silent Mode/Focus on/off | Record phone sound, Watch sound, wrist haptics and actual latency for each case; do not assume Watch-only delivery |
 | Test without server pairing or internet | The local system test can be scheduled without server or push registration |
 | iOS 17–25 | Settings shows the iOS 26 requirement; existing notification tests remain available |
@@ -184,15 +184,15 @@ Coverage added here includes outage opt-in/deduplication/recovery, stopped monit
 - Live smoke checks passed for authentication, temporary registration/pairing, five-second settings and bounds, applied-configuration acknowledgement, diagnostic request references, connection preference default/role/opt-in/out, marked tokenless test events, unpair/replacement, old-history removal and device deletion/revoked credentials. Temporary devices and metadata were deleted through the API. No real push token was submitted and no push was sent.
 - Three consecutive successful maintenance records from the new Worker version confirmed that scheduled work runs after deployment.
 - Signed Debug app and companion built for the configured Apple team with development APNs and the live backend URL. Installed in place and launched successfully on J14 (iPhone 14 Pro), J17 (iPhone 17 Pro) and Jordan’s Apple Watch. No app-data reset or unpairing was performed on these devices.
-- Monitoring must be restarted on the Listener after installation. Parent → Ready for tonight? provides the live checklist and real test request. Connection alerts remain opt-in. Presentation, wrist haptics, room calibration and overnight behavior require the physical checks below.
+- Monitoring must be restarted on the Listener after installation. Parent Monitor shows device health and offers a real test request; Devices → Guided overnight setup provides the wrist-test checklist. Connection alerts remain opt-in. Presentation, wrist haptics, room calibration and overnight behavior require the physical checks below.
 
 ## Physical validation
 
 | Check | Procedure | Expected observation | Hardware result |
 | --- | --- | --- | --- |
-| Setup | Pair, start Listener, connect power and open Parent's Tonight's check | Pairing, active microphone report, power, registration and settings checks pass as fresh data arrives | Not run |
+| Setup | Pair, start Listener, connect power and open Parent Monitor | Ring shows Quiet; Nursery, Watch and Alerts chips show plugged in, registered and the applied delay as fresh data arrives | Not run |
 | Full push path | Send a test from Listener with Parent locked and Watch app closed; repeat with intended Sleep Focus | Marked real test is visible/felt on selected receiver; confirm receipt in Parent | Not run |
-| Parent test | Send real test from Tonight's check and lock phone | Marked test arrives; receipt remains unconfirmed until acknowledged | Not run |
+| Parent test | Send real test from Parent Monitor → Test alert and lock phone | Marked test arrives; receipt remains unconfirmed until acknowledged | Not run |
 | Settings | Change alert duration on Parent while Listener is online | Saving → waiting → applied; actual Listener duration changes | Not run |
 | Offline settings | Disconnect Listener, change duration, reconnect | Parent does not claim applied until Listener reports the new configuration | Not run |
 | Connection loss | Opt in, start Listener, then disconnect only Listener internet for at least four minutes | One connection-loss notice; Parent shows lost connection when opened | Not run |

@@ -4,7 +4,6 @@ import UIKit
 struct RootView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.scenePhase) private var phase
-    @State private var settings = false
     @State private var tab = HomeTab.monitor
     private enum HomeTab { case monitor, activity, devices }
 
@@ -27,7 +26,6 @@ struct RootView: View {
             }
         }
         .foregroundStyle(.white).tint(Palette.lavender).preferredColorScheme(.dark)
-        .sheet(isPresented: $settings) { SettingsView() }
         .alert("Attention needed", isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
             Button("OK") { model.error = nil }
         } message: { Text(model.error ?? "") }
@@ -47,24 +45,10 @@ struct RootView: View {
     private var monitorHome: some View {
         ZStack {
             Palette.background.ignoresSafeArea()
-            VStack(spacing: 0) {
-                HStack {
-                    Label {
-                        Text("Crib Service")
-                    } icon: {
-                        Image(systemName: "moon.stars").foregroundStyle(Palette.lavender)
-                    }.font(.title3.weight(.medium))
-                    Spacer()
-                    Button { settings = true } label: {
-                        Image(systemName: "slider.horizontal.3").font(.body)
-                            .frame(width: 44, height: 44).background(Palette.panel, in: Circle())
-                    }.accessibilityLabel("Settings")
-                }
-                .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
-                .padding(.horizontal, 20)
-                .padding(.top, 8)
-                .padding(.bottom, 4)
-                if model.role == .listener { ListenerView() } else { ParentView() }
+            if model.role == .listener {
+                ListenerView(showDevices: { tab = .devices }, showActivity: { tab = .activity })
+            } else {
+                ParentView(showDevices: { tab = .devices }, showActivity: { tab = .activity })
             }
         }.navigationTitle("Crib Service").toolbar(.hidden, for: .navigationBar)
     }
