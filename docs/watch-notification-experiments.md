@@ -285,3 +285,19 @@ Validation: both TypeScript checks and all **294 backend tests** pass. Coverage 
 Release integration: a separate chat deployed the standalone Wrist Probe endpoint and a corrected marked-test-only phone-first control as Worker `4c64ba7f-d638-45cf-a18f-08c00940718e` while this change was being merged. The combined release preserves that deployed backend source and its two live experiment settings. Real crying alerts and reminders use separate collapse IDs and remain parallel under the corrected phone-first test flag. The combined source passes both TypeScript checks, all **301 backend tests** and a deployment dry run. No pending D1 migrations were found.
 
 Deployment receipt: the crying-alert change (`3bd6a4a`) and preserved live backend experiments (`0f47bde`) were merged and pushed to `main`. Source `0f47bde` was deployed at **2026-10-26T14:49:10.249830Z** as Worker **`52aef452-5760-4a8a-b974-dd200cfb0fb0`**, serving 100% of traffic. Readback confirms all existing bindings, five secret bindings, development APNs settings and both experiment variables are preserved; the minute cron remains configured. The backend health check verified authentication rejection and successful D1 diagnostic storage. All **80 live smoke checks** passed; temporary devices and shared metadata were deleted through the authenticated API, with no push tokens registered or notifications sent. Existing phone/Watch apps were not reinstalled. Local release evidence is retained under `.local/crying-collapse-rollout-2026-10-26/` in this worktree.
+## Standalone Watch and corrected phone-first controls (26 October, afternoon)
+
+See [the standalone probe runbook](watch-latency-probe.md) for the new isolated
+Watch-only app, scoped remote transport, corrected marked-test-only phone-first
+control, signing workaround and developer connection findings. The earlier
+separate-collapse-ID marked-test flag was removed for this comparison. Normal
+crying and reminders retain parallel delivery with matching sound and identities.
+The standalone remote test requested OS vibration approximately **2.262 seconds**
+after backend creation and **522 ms** after the Watch receipt log; its coordination
+wait was **158 ms**. The corrected phone-first tests still waited **13.458 and
+13.539 seconds** for coordination. The first requested OS vibration about
+**32.114 seconds** after creation, including substantial time before Watch
+notification processing. The second has no matched OS playback in the inspected
+window. J17 was unlocked with Crib Service foreground; its delegate retained
+sound (presentation options 26). The unsuccessful phone-first flag is now off.
+See the linked runbook for exact timestamps, scope and measurement limitations.

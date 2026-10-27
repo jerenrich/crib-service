@@ -75,6 +75,28 @@ watchEmbedPhase = obj('embedWatch', fields(isa='PBXCopyFilesBuildPhase', buildAc
 phoneTarget = objects[uid('targetBabyCryMonitor')]
 phonePhases = array([uid('sourcesBabyCryMonitor'), uid('frameworksBabyCryMonitor'), uid('resourcesBabyCryMonitor')])
 objects[uid('targetBabyCryMonitor')] = phoneTarget.replace('buildPhases = '+phonePhases, 'buildPhases = '+array([uid('sourcesBabyCryMonitor'), uid('frameworksBabyCryMonitor'), uid('resourcesBabyCryMonitor'), watchEmbedPhase])).replace('dependencies = ()', 'dependencies = '+array([watchDependency]))
+# Isolated watch-only latency probe. Never embed it in the iOS application or
+# declare an iOS companion: removing that relationship is the experimental variable.
+probeName = 'WatchLatencyProbe'
+probeFiles = sorted((ios/probeName).glob('*.swift')) + [ios/probeName/'Info.plist', ios/probeName/'WatchLatencyProbe.entitlements', ios/'BabyCryWatch/Assets.xcassets', ios/'BabyCryMonitor/PrivacyInfo.xcprivacy']
+probeRefs = []; probeSources = []; probeResources = []
+for path in probeFiles:
+    rel = path.relative_to(ios).as_posix()
+    filetype = {'swift':'sourcecode.swift', 'xcassets':'folder.assetcatalog', 'xcprivacy':'text.xml', 'plist':'text.plist.xml', 'entitlements':'text.plist.entitlements'}[path.suffix[1:]]
+    ref = obj('file'+rel, fields(isa='PBXFileReference', lastKnownFileType=filetype, path=q(rel), sourceTree=q('<group>')))
+    if rel.startswith(probeName+'/'): probeRefs.append(ref)
+    if path.suffix == '.swift': probeSources.append(obj('probebuild'+rel, fields(isa='PBXBuildFile', fileRef=ref)))
+    elif path.suffix in ['.xcassets', '.xcprivacy']: probeResources.append(obj('probebuild'+rel, fields(isa='PBXBuildFile', fileRef=ref)))
+refs.append(obj('group'+probeName, fields(isa='PBXGroup', name=probeName, children=array(probeRefs), sourceTree=q('<group>'))))
+probeProduct = obj('product'+probeName, fields(isa='PBXFileReference', explicitFileType='wrapper.application', includeInIndex='0', path=q(probeName+'.app'), sourceTree='BUILT_PRODUCTS_DIR'))
+products.append(probeProduct)
+probePhases = [obj('sources'+probeName, fields(isa='PBXSourcesBuildPhase', buildActionMask='2147483647', files=array(probeSources), runOnlyForDeploymentPostprocessing='0')), obj('frameworks'+probeName, fields(isa='PBXFrameworksBuildPhase', buildActionMask='2147483647', files='()', runOnlyForDeploymentPostprocessing='0')), obj('resources'+probeName, fields(isa='PBXResourcesBuildPhase', buildActionMask='2147483647', files=array(probeResources), runOnlyForDeploymentPostprocessing='0'))]
+probeConfigs = []
+for mode in ['Debug', 'Release']:
+    settings = dict(PRODUCT_NAME=q('$(TARGET_NAME)'), PRODUCT_BUNDLE_IDENTIFIER=q('com.jordanerenrich.cribservice.latencyprobe'), SWIFT_VERSION='6.0', SWIFT_STRICT_CONCURRENCY='complete', SDKROOT='watchos', SUPPORTED_PLATFORMS=q('watchos watchsimulator'), WATCHOS_DEPLOYMENT_TARGET='10.0', TARGETED_DEVICE_FAMILY='4', CODE_SIGN_STYLE='Automatic', GENERATE_INFOPLIST_FILE='NO', INFOPLIST_FILE=q('WatchLatencyProbe/Info.plist'), CODE_SIGN_ENTITLEMENTS=q('WatchLatencyProbe/WatchLatencyProbe.entitlements'), CURRENT_PROJECT_VERSION='1', MARKETING_VERSION='1.0', SKIP_INSTALL='NO', ASSETCATALOG_COMPILER_APPICON_NAME='AppIcon', SWIFT_OPTIMIZATION_LEVEL=q('-Onone' if mode=='Debug' else '-O'), SWIFT_ACTIVE_COMPILATION_CONDITIONS=q('DEBUG $(inherited)' if mode=='Debug' else '$(inherited)'), LD_RUNPATH_SEARCH_PATHS=q('$(inherited) @executable_path/Frameworks'))
+    probeConfigs.append(obj('targetconfig'+probeName+mode, fields(isa='XCBuildConfiguration', baseConfigurationReference=configRefs[mode], buildSettings=fields(**settings), name=mode)))
+probeConfigList = obj('targetconfigs'+probeName, fields(isa='XCConfigurationList', buildConfigurations=array(probeConfigs), defaultConfigurationIsVisible='0', defaultConfigurationName='Release'))
+targets.append(obj('target'+probeName, fields(isa='PBXNativeTarget', buildConfigurationList=probeConfigList, buildPhases=array(probePhases), buildRules='()', dependencies='()', name=probeName, productName=probeName, productReference=probeProduct, productType=q('com.apple.product-type.application'))))
 prodGroup = obj('products', fields(isa='PBXGroup', name='Products', children=array(products), sourceTree=q('<group>')))
 mainGroup = obj('main', fields(isa='PBXGroup', children=array(refs+[prodGroup]), sourceTree=q('<group>')))
 configs=[]
@@ -86,7 +108,9 @@ obj('project', fields(isa='PBXProject', attributes='{ LastUpgradeCheck = 2700; T
 project=ios/'BabyCryMonitor.xcodeproj'; project.mkdir(exist_ok=True)
 (project/'project.pbxproj').write_text('// !$*UTF8*$!\n{ archiveVersion = 1; classes = {}; objectVersion = 56; objects = {\n'+'\n'.join(k+' = '+v+';' for k,v in objects.items())+'\n}; rootObject = '+uid('project')+'; }\n')
 scheme=project/'xcshareddata'/'xcschemes'; scheme.mkdir(parents=True, exist_ok=True)
-def reference(name): return '<BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="'+uid('target'+name)+'" BuildableName="'+name+('.app' if name in ['BabyCryMonitor', 'BabyCryWatch'] else '.xctest')+'" BlueprintName="'+name+'" ReferencedContainer="container:BabyCryMonitor.xcodeproj"/>'
+def reference(name): return '<BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="'+uid('target'+name)+'" BuildableName="'+name+('.app' if name in ['BabyCryMonitor', 'BabyCryWatch', 'WatchLatencyProbe'] else '.xctest')+'" BlueprintName="'+name+'" ReferencedContainer="container:BabyCryMonitor.xcodeproj"/>'
 (scheme/'BabyCryMonitor.xcscheme').write_text('<?xml version="1.0" encoding="UTF-8"?><Scheme LastUpgradeVersion="2700" version="1.3"><BuildAction parallelizeBuildables="YES" buildImplicitDependencies="YES"><BuildActionEntries><BuildActionEntry buildForTesting="YES" buildForRunning="YES" buildForProfiling="YES" buildForArchiving="YES" buildForAnalyzing="YES">'+reference('BabyCryMonitor')+'</BuildActionEntry></BuildActionEntries></BuildAction><TestAction buildConfiguration="Debug" shouldUseLaunchSchemeArgsEnv="YES"><Testables>'+''.join('<TestableReference skipped="NO">'+reference(n)+'</TestableReference>' for n in ['BabyCryMonitorTests','BabyCryMonitorUITests'])+'</Testables></TestAction><LaunchAction buildConfiguration="Debug" useCustomWorkingDirectory="NO" launchStyle="0"><BuildableProductRunnable runnableDebuggingMode="0">'+reference('BabyCryMonitor')+'</BuildableProductRunnable></LaunchAction><ProfileAction buildConfiguration="Release"><BuildableProductRunnable runnableDebuggingMode="0">'+reference('BabyCryMonitor')+'</BuildableProductRunnable></ProfileAction><AnalyzeAction buildConfiguration="Debug"/><ArchiveAction buildConfiguration="Release" revealArchiveInOrganizer="YES"/></Scheme>')
 (scheme/'BabyCryWatch.xcscheme').write_text('<?xml version="1.0" encoding="UTF-8"?><Scheme LastUpgradeVersion="2700" version="1.3"><BuildAction parallelizeBuildables="YES" buildImplicitDependencies="YES"><BuildActionEntries><BuildActionEntry buildForTesting="YES" buildForRunning="YES" buildForProfiling="YES" buildForArchiving="YES" buildForAnalyzing="YES">'+reference('BabyCryWatch')+'</BuildActionEntry></BuildActionEntries></BuildAction><LaunchAction buildConfiguration="Debug" launchStyle="0"><BuildableProductRunnable runnableDebuggingMode="0">'+reference('BabyCryWatch')+'</BuildableProductRunnable></LaunchAction><ProfileAction buildConfiguration="Release"><BuildableProductRunnable runnableDebuggingMode="0">'+reference('BabyCryWatch')+'</BuildableProductRunnable></ProfileAction><AnalyzeAction buildConfiguration="Debug"/><ArchiveAction buildConfiguration="Release" revealArchiveInOrganizer="YES"/></Scheme>')
 print(project)
+probeScheme = (scheme/'BabyCryWatch.xcscheme').read_text().replace(reference('BabyCryWatch'), reference(probeName))
+(scheme/'WatchLatencyProbe.xcscheme').write_text(probeScheme)
