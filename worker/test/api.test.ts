@@ -3175,6 +3175,27 @@ describe('configurable delayed alert tests',()=>{
   else expect(first.headers.get('apns-collapse-id')).not.toBe(second.headers.get('apns-collapse-id'));
   expect(await (await call('alert-test',listener,undefined,'GET')).json()).toMatchObject({session:{state:'completed',completedCount:2}});
  });
+ it('allows interactive testing beyond the old six-start budget',async()=>{
+  const {parent}=await setup(),id=crypto.randomUUID();
+  const key=await sha256(`${testEnv.PAIRING_PEPPER}|alert-test|${parent.deviceId}`);
+  await env.DB.prepare('INSERT OR REPLACE INTO rate_limits(key,window,attempts) VALUES(?,?,6)')
+   .bind(key,Math.floor(Date.now()/1000/600)).run();
+  expect((await call('alert-test',parent,{id,configuration:options()})).status).toBe(200);
+  expect((await call('alert-test/stop',parent,{id})).status).toBe(200);
+  expect(pushRequests).toHaveLength(0);
+ });
+ it('gives a specific cooldown while leaving status and Stop available at the new limit',async()=>{
+  const {parent,stub}=await setup(),id=crypto.randomUUID();
+  expect((await call('alert-test',parent,{id,configuration:options()})).status).toBe(200);
+  const key=await sha256(`${testEnv.PAIRING_PEPPER}|alert-test|${parent.deviceId}`);
+  await env.DB.prepare('UPDATE rate_limits SET attempts=60 WHERE key=?').bind(key).run();
+  const response=await call('alert-test',parent,{id:crypto.randomUUID(),configuration:options()});
+  expect(response.status).toBe(429);
+  expect((await response.json() as {error:string}).error).toMatch(/60 starts per 10 minutes.*Try again in \d+ seconds.*No new test was scheduled/);
+  expect(await (await call('alert-test',parent,undefined,'GET')).json()).toMatchObject({session:{id,state:'scheduled'}});
+  expect(await (await call('alert-test/stop',parent,{id})).json()).toMatchObject({session:{state:'stopped'}});
+  await runDurableObjectAlarm(stub);expect(pushRequests).toHaveLength(0);
+ });
  it('stops before the first tick from either phone and ignores stale stop IDs',async()=>{
   const {parent,listener,stub}=await setup(),id=crypto.randomUUID();
   await call('alert-test',parent,{id,configuration:options({count:5})});

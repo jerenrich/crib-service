@@ -89,7 +89,16 @@ export default {
      case 'POST /v1/connection-alerts':result=await connectionPreferences(env,device,await body(request));break;
      case 'GET /v1/alert-test':result=await configureAlertTest(env,device,'status');break;
      case 'POST /v1/alert-test':
-      await rateLimit(env,'alert-test',device.id,6,600);
+      // Interactive comparisons need more starts than the older one-shot tests.
+      // Keep a bounded budget in addition to each session's round/time limits.
+      try{await rateLimit(env,'alert-test',device.id,60,600);}
+      catch(error){
+       if(error instanceof APIError&&error.status===429){
+        const wait=Math.ceil(600-Date.now()/1000%600);
+        throw new APIError(429,`Test limit reached (60 starts per 10 minutes). Try again in ${wait} seconds. No new test was scheduled.`);
+       }
+       throw error;
+      }
       result=await configureAlertTest(env,device,'start',await body(request));break;
      case 'POST /v1/alert-test/stop':result=await configureAlertTest(env,device,'stop',await body(request));break;
      case 'POST /v1/watch-test/push':result=await sendWatchTest(env,device,latency,requestId);break;
