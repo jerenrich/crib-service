@@ -163,11 +163,14 @@ import UIKit
             guard (defaults.stringArray(forKey: pendingKey) ?? []).isEmpty else {
                 trace("ack_pending", request.eventID); record("rejected", reason: .acknowledgementPending); return false
             }
-            let checkedAt = Date()
-            stage = .status; record("started")
-            let server = try await backend.status()
-            record("completed")
-            reconcile(server, checkedAt: checkedAt)
+            let snapshot = try await SilentCryAlarmStatusSnapshot<ParentStatus>.load {
+                stage = .status; record("started")
+                let server = try await backend.status()
+                record("completed")
+                return server
+            }
+            let server = snapshot.value
+            reconcile(server, checkedAt: snapshot.checkedAt)
             stage = .eligibility
             let reason: SilentCryAlarmRequest.Rejection?
             if generation != revision { reason = .settingChanged }
@@ -201,6 +204,11 @@ import UIKit
                 stopIntent: SnoozeSilentCryAlarmIntent(episodeID: request.episodeID.uuidString),
                 sound: .named("AlarmTestSilence.caf"))
             stage = .schedule; record("started")
+            // Local reconciliation, alarm lookup or persistence can also stall.
+            // Recheck immediately before handing a new alarm to the system.
+            guard snapshot.isFresh() else {
+                throw SilentCryAlarmRequest.Rejection.staleStatus
+            }
             _ = try await AlarmManager.shared.schedule(id: request.episodeID, configuration: configuration)
             record("completed")
             // A user can disable/snooze while the system scheduling call is suspended.
@@ -216,6 +224,9 @@ import UIKit
             trace("scheduled", request.eventID); record("scheduled")
             await confirmScheduling(request, using: backend)
             return true
+        } catch SilentCryAlarmRequest.Rejection.staleStatus {
+            status = "Current alert status unavailable; existing notifications continue."
+            trace("ignored", request.eventID); record("rejected", reason: .staleStatus); return false
         } catch {
             status = "Silent alarm unavailable; existing notifications continue."
             trace("failed", request.eventID); record("failed", error: error); return false

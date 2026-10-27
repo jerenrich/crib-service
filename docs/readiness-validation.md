@@ -1,5 +1,13 @@
 # Readiness release checks
 
+## AlarmKit status freshness — 27 October 2026 (not installed)
+
+An observed background execution gap allowed the Parent to schedule an alarm using a status response from 26 seconds earlier, after the Listener had already reported quiet. Real crying and Listener-loss alarms now require a status snapshot no more than five seconds old, measured from request start with a continuous clock that includes device sleep. A stale response is discarded before reconciliation or eligibility checks, and the Parent makes at most one recovery read. If that read is also stale or fails, no new alarm is scheduled from the old response. Freshness is checked again immediately before calling AlarmKit so delays in local processing cannot reuse an expired snapshot. Existing notification delivery and the three-second alarm lead are retained. Exhausted or locally expired checks log `reason=stale_status`.
+
+Regression tests simulate the 26-second gap followed by resolution or snooze, recovery while an episode remains active, repeated stale replies, failed recovery, and a snapshot expiring before scheduling. This source change requires an updated Parent app; it does not change the backend or guarantee timely iOS execution or physical Watch delivery.
+
+Validation passed all 173 shared Swift tests, all 16 targeted iOS simulator alarm request/snooze/freshness tests, and the combined iPhone/Watch simulator test build. The fix has not been installed on J17 or tested for physical wrist delivery.
+
 ## Persistent Listener-loss alerts — 27 October 2026
 
 Listener-loss episodes now use the crying-alert pipeline: the server detects missing active-monitoring heartbeats after 3–4 minutes, then the existing per-Parent Durable Object sends reminders at the configured 2/5-second frequency. No Listener execution is required. The phone and Watch display **Listener connection lost** with the same Snooze action; optional Silent Watch alarms use the same permission, scheduling and receipt policy. Snooze pauses both crying and connection-loss alerts. If the outage persists, alerts resume after snooze or early Resume; a fresh heartbeat clears the outage atomically. Opt-out and unpairing end it. Explicitly stopped-monitoring notices and optional local overdue-check warnings retain their separate behavior.

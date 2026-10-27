@@ -172,3 +172,94 @@ final class SilentCryAlarmRequestTests: XCTestCase {
         XCTAssertNil(reason(relevance: relevant, muted: now, localMuted: now))
     }
 }
+
+final class SilentCryAlarmStatusSnapshotTests: XCTestCase {
+    private let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+    @MainActor func testSuspendedResponseIsReplacedBeforeCheckingResolvedEpisodeOrSnooze() async throws {
+        let episode = UUID()
+        let request = try XCTUnwrap(SilentCryAlarmRequest(payload: [
+            "silentCryAlarm": true, "eventId": UUID().uuidString, "episodeId": episode.uuidString,
+            "createdAt": ISO8601DateFormatter().string(from: now)
+        ], now: now))
+        // The first response says active, but the episode resolves or is snoozed
+        // during the observed 26-second execution gap. Keep wall time fixed to
+        // prove freshness uses the clock that includes sleep, not Date changes.
+        for snoozed in [false, true] {
+            var clock = ContinuousClock.now, reads = 0
+            let snapshot = try await SilentCryAlarmStatusSnapshot.load(clock: { clock }, date: { self.now }) {
+                reads += 1
+                clock = clock.advanced(by: reads == 1 ? .seconds(26) : .milliseconds(300))
+                let relevance = NotificationRelevance(cryEpisodeIDs: reads == 1 || snoozed ? [episode] : [])
+                return (relevance, reads == 2 && snoozed ? self.now.addingTimeInterval(60) : nil)
+            }
+            XCTAssertEqual(reads, 2)
+            XCTAssertTrue(snapshot.isFresh(at: clock))
+            XCTAssertEqual(request.ineligibilityReason(enabled: true, serverEnabled: true, paired: true,
+                relevance: snapshot.value.0, mutedUntil: snapshot.value.1, localMutedUntil: nil,
+                stoppedBefore: nil, now: now.addingTimeInterval(26.3)), snoozed ? .serverMuted : .irrelevant)
+        }
+    }
+
+    @MainActor func testRecoveryStillAllowsAnActiveEpisodeAndKeepsTheNewRequestStart() async throws {
+        var clock = ContinuousClock.now, date = now, reads = 0
+        let episode = UUID()
+        let snapshot = try await SilentCryAlarmStatusSnapshot.load(clock: { clock }, date: { date }) {
+            reads += 1
+            let delay: Duration = reads == 1 ? .seconds(26) : .milliseconds(300)
+            clock = clock.advanced(by: delay)
+            date = date.addingTimeInterval(reads == 1 ? 26 : 0.3)
+            return NotificationRelevance(cryEpisodeIDs: [episode])
+        }
+        XCTAssertEqual(reads, 2)
+        XCTAssertEqual(snapshot.value.cryEpisodeIDs, [episode])
+        XCTAssertEqual(snapshot.checkedAt, now.addingTimeInterval(26))
+        XCTAssertTrue(snapshot.isFresh(at: clock))
+    }
+
+    @MainActor func testTwoDelayedResponsesFailWithoutAnUnboundedRecoveryLoop() async {
+        var clock = ContinuousClock.now, reads = 0
+        do {
+            _ = try await SilentCryAlarmStatusSnapshot.load(clock: { clock }) {
+                reads += 1
+                clock = clock.advanced(by: .seconds(26))
+                return NotificationRelevance(cryEpisodeIDs: [UUID()])
+            }
+            XCTFail("An old response must never authorize an alarm")
+        } catch {
+            XCTAssertEqual(error as? SilentCryAlarmRequest.Rejection, .staleStatus)
+        }
+        XCTAssertEqual(reads, 2)
+    }
+
+    @MainActor func testPromptResponseNeedsNoRecoveryButExpiresBeforeScheduling() async throws {
+        let started = ContinuousClock.now
+        var clock = started, reads = 0
+        let snapshot = try await SilentCryAlarmStatusSnapshot.load(clock: { clock }, date: { self.now }) {
+            reads += 1
+            clock = clock.advanced(by: .milliseconds(300))
+            return NotificationRelevance()
+        }
+        XCTAssertEqual(reads, 1)
+        XCTAssertEqual(snapshot.checkedAt, now)
+        XCTAssertTrue(snapshot.isFresh(at: started.advanced(by: .seconds(5))))
+        XCTAssertFalse(snapshot.isFresh(at: started.advanced(by: .milliseconds(5_001))))
+        XCTAssertFalse(snapshot.isFresh(at: started.advanced(by: .seconds(-1))))
+    }
+
+    @MainActor func testFailedFreshReadCannotFallBackToTheOldActiveResponse() async {
+        var clock = ContinuousClock.now, reads = 0
+        do {
+            _ = try await SilentCryAlarmStatusSnapshot.load(clock: { clock }) {
+                reads += 1
+                if reads == 2 { throw URLError(.notConnectedToInternet) }
+                clock = clock.advanced(by: .seconds(26))
+                return NotificationRelevance(cryEpisodeIDs: [UUID()])
+            }
+            XCTFail("A failed recovery must not reuse the stale response")
+        } catch {
+            XCTAssertEqual((error as? URLError)?.code, .notConnectedToInternet)
+        }
+        XCTAssertEqual(reads, 2)
+    }
+}

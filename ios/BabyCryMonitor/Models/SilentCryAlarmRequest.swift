@@ -35,6 +35,7 @@ struct SilentCryAlarmRequest: Sendable {
         case disabled, busy, acknowledgementPending = "acknowledgement_pending"
         case settingChanged = "setting_changed", serverDisabled = "server_disabled", unpaired
         case relevanceUnknown = "relevance_unknown", irrelevant, serverMuted = "server_muted"
+        case staleStatus = "stale_status"
         case locallyMuted = "locally_muted", stopped, unauthorized, missingAsset = "missing_asset"
     }
     enum Source: String { case foregroundNotification = "foreground_notification", remoteNotification = "remote_notification" }
@@ -109,5 +110,36 @@ struct SilentCryAlarmRequest: Sendable {
         if !((localMutedUntil ?? .distantPast) <= now) { return .locallyMuted }
         if !(createdAt > (stoppedBefore ?? .distantPast)) { return .stopped }
         return nil
+    }
+}
+
+/// Measure from before the request, including time suspended before its result is
+/// processed. A newly resumed URLSession completion can contain an old snapshot.
+struct SilentCryAlarmStatusSnapshot<Value: Sendable>: Sendable {
+    static var maximumAge: Duration { .seconds(5) }
+    let value: Value
+    let checkedAt: Date
+    private let startedAt: ContinuousClock.Instant
+
+    func isFresh(at now: ContinuousClock.Instant = .now) -> Bool {
+        (.zero...Self.maximumAge).contains(startedAt.duration(to: now))
+    }
+
+    /// One recovery read is enough to replace a delayed response. Never loop
+    /// indefinitely within the phone's limited background execution window.
+    @MainActor static func load(
+        clock: () -> ContinuousClock.Instant = { .now },
+        date: () -> Date = { Date() },
+        fetch: () async throws -> Value
+    ) async throws -> Self {
+        for _ in 0..<2 {
+            try Task.checkCancellation()
+            let checkedAt = date(), startedAt = clock()
+            let value = try await fetch()
+            try Task.checkCancellation()
+            let snapshot = Self(value: value, checkedAt: checkedAt, startedAt: startedAt)
+            if snapshot.isFresh(at: clock()) { return snapshot }
+        }
+        throw SilentCryAlarmRequest.Rejection.staleStatus
     }
 }
