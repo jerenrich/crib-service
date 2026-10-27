@@ -97,15 +97,21 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  const phoneOnlySQL="parent_id=? AND push_target IS NULL AND delivery_state IS NULL AND COALESCE(json_extract(payload,'$.isTest'),0)=1 AND EXISTS(SELECT 1 FROM devices WHERE id=events.parent_id AND push_token IS NOT NULL)";
  type Destination={token:string|null;phone_token:string|null;watch_token:string|null;silent_watch_alarms:number;alarm_receipts_version?:number;alarm_cycle_id?:string|null;alarm_request_claim_id?:string|null};
  type Receipt=StoredEvent & Destination & {pair_current:number};
- const claim=await latency.confirmedClaim<StoredEvent|Destination,Receipt>(()=>env.DB.batch<StoredEvent|Destination>([...(options.insert?[options.insert]:[]),env.DB.prepare(`UPDATE events SET resolved_at=COALESCE(resolved_at,(SELECT r.resolved_at FROM resolved_episodes r
+ const claim=await latency.confirmedClaim<StoredEvent|Destination,Receipt>(()=>env.DB.batch<StoredEvent|Destination>([...(options.insert?[options.insert]:[]),env.DB.prepare(`UPDATE events SET resolved_at=COALESCE(resolved_at,
+  CASE WHEN json_extract(payload,'$.type')='listener_disconnected' AND NOT EXISTS(
+   SELECT 1 FROM pairs p JOIN devices d ON d.id=p.parent_id JOIN heartbeats h ON h.listener_id=p.listener_id
+   WHERE p.parent_id=events.parent_id AND p.listener_id=events.listener_id AND d.connection_alerts=1
+    AND json_extract(h.metadata,'$.monitoring')=1 AND h.received_at=json_extract(events.payload,'$.cryStartedAt')
+    AND h.received_at<?) THEN ? END,
+  (SELECT r.resolved_at FROM resolved_episodes r
   JOIN pairs p ON p.parent_id=r.parent_id AND p.listener_id=r.listener_id AND p.created_at=r.pair_created_at
   WHERE r.parent_id=events.parent_id AND r.listener_id=events.listener_id AND r.episode_id=events.episode_id))
-  WHERE event_id=? AND COALESCE(json_extract(payload,'$.isTest'),0)=0`).bind(eventId),
+  WHERE event_id=? AND COALESCE(json_extract(payload,'$.isTest'),0)=0`).bind(new Date(now-180000).toISOString(),new Date(now).toISOString(),eventId),
  // Suppress uploads during a mute, including delayed offline outbox entries.
  env.DB.prepare(`UPDATE events SET acknowledged_at=COALESCE(acknowledged_at,?) WHERE event_id=?
  AND COALESCE(json_extract(payload,'$.isTest'),0)=0 AND (
  EXISTS(SELECT 1 FROM devices d WHERE d.id=events.parent_id AND d.alerts_muted_until>0
- AND (d.alerts_muted_until>? OR CAST((julianday(json_extract(events.payload,'$.createdAt'))-2440587.5)*86400000 AS INTEGER) BETWEEN d.alerts_muted_at AND d.alerts_muted_until))
+ AND (d.alerts_muted_until>? OR CAST(ROUND((julianday(json_extract(events.payload,'$.createdAt'))-2440587.5)*86400000) AS INTEGER) BETWEEN d.alerts_muted_at AND d.alerts_muted_until))
  OR EXISTS(SELECT 1 FROM alert_snoozes s JOIN pairs p ON p.parent_id=s.parent_id AND p.listener_id=s.listener_id AND p.created_at=s.pair_created_at
  WHERE s.parent_id=events.parent_id AND s.listener_id=events.listener_id
  AND CAST(ROUND((julianday(json_extract(events.payload,'$.createdAt'))-2440587.5)*86400000) AS INTEGER) BETWEEN s.started_at AND s.until_at)
@@ -335,7 +341,8 @@ export async function flushPending(env:Env,requestId=crypto.randomUUID(),latency
  // Repair scheduling after a failed background request or worker reset. Bound
  // fan-out; existing alarms are never postponed by these idempotent refreshes.
  await latency.measure('maintenance_schedule_ms',async()=>{
- const parents=await env.DB.prepare(`SELECT DISTINCT parent_id FROM events WHERE acknowledged_at IS NULL AND resolved_at IS NULL
+ const parents=await env.DB.prepare(`SELECT DISTINCT parent_id FROM events WHERE resolved_at IS NULL
+  AND (acknowledged_at IS NULL OR json_extract(payload,'$.type')='listener_disconnected')
   AND status IN ('pending','blocked','sent','uncertain') AND COALESCE(last_error,'')!='expired_event'
   AND COALESCE(json_extract(payload,'$.isTest'),0)=0 ORDER BY parent_id LIMIT 25`).all<{parent_id:string}>();
  for(let index=0;index<parents.results.length;index+=5)await Promise.all(parents.results.slice(index,index+5).map(p=>scheduleRemindersSafely(env,p.parent_id,requestId)));

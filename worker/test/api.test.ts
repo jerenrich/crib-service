@@ -106,7 +106,7 @@ describe('connection alerts, readiness and replacement',()=>{
  async function stale(){await env.DB.prepare('UPDATE heartbeats SET received_at=?').bind(new Date(Date.now()-240000).toISOString()).run();}
  it('does not let a stale concurrent candidate bypass a newer retry backoff',async()=>{
   const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
-  await call('listener/heartbeat',listener,beat(listener));await stale();
+  await call('listener/heartbeat',listener,beat(listener));await call('listener/heartbeat',listener,beat(listener,false));
   let entered!:()=>void,release!:()=>void;
   const ready=new Promise<void>(r=>{entered=r;}),gate=new Promise<void>(r=>{release=r;});
   const db=interceptDB(async(sql,_args,method,execute)=>{
@@ -124,8 +124,9 @@ describe('connection alerts, readiness and replacement',()=>{
   for(const token of ['ab','cd']){
    const {parent,listener}=await paired();await call('device/push-token',parent,{token:token.repeat(32)});
    await call('listener/heartbeat',listener,beat(listener));
+   await call('listener/heartbeat',listener,beat(listener,false));
   }
-  await stale();const start=Date.now();vi.spyOn(Date,'now').mockReturnValue(start);
+  const start=Date.now();vi.spyOn(Date,'now').mockReturnValue(start);
   vi.mocked(fetch).mockImplementation(async(input,init)=>{
    pushRequests.push({url:String(input),init});
    if(pushRequests.length===1)vi.mocked(Date.now).mockReturnValue(start+31000);
@@ -141,7 +142,7 @@ describe('connection alerts, readiness and replacement',()=>{
  });
  it('does not send a connection warning after a claim reply arrives past its lease',async()=>{
   const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
-  await call('listener/heartbeat',listener,beat(listener));await stale();
+  await call('listener/heartbeat',listener,beat(listener));await call('listener/heartbeat',listener,beat(listener,false));
   const start=Date.now();vi.spyOn(Date,'now').mockReturnValue(start);
   const db=interceptDB(async(sql,_args,method,execute)=>{
    const result=await execute();
@@ -166,7 +167,7 @@ describe('connection alerts, readiness and replacement',()=>{
   await call('connection-alerts',parent,{enabled:true});
   await stale();mockPush();await flushConnections(testEnv);await flushConnections(testEnv);
   expect(pushRequests).toHaveLength(1);
-  const content=JSON.parse(String(pushRequests[0].init?.body));expect(content.connectionState).toBe('offline');expect(content.eventId).toBeUndefined();
+  const content=JSON.parse(String(pushRequests[0].init?.body));expect(content.connectionState).toBe('offline');expect(content.eventId).toEqual(expect.any(String));expect(content.type).toBe('listener_disconnected');expect(content.aps.category).toBe('BABY_CRY_ALERT');
   expect(content.aps['interruption-level']).toBe('time-sensitive');expect(content.aps.sound).toBe('default');
   await call('listener/heartbeat',listener,beat(listener));await flushConnections(testEnv);await flushConnections(testEnv);
   expect(pushRequests).toHaveLength(1);
@@ -182,7 +183,7 @@ describe('connection alerts, readiness and replacement',()=>{
   await call('listener/heartbeat',listener,beat(listener,false));mockPush();await flushConnections(testEnv);await flushConnections(testEnv);
   expect(pushRequests).toHaveLength(1);expect(JSON.parse(String(pushRequests[0].init?.body)).connectionState).toBe('stopped');
  });
- it('uses scheduled checks to warn the Watch after three minutes without a heartbeat, even during snooze',async()=>{
+ it('uses scheduled checks to warn both devices after three minutes and shares the crying snooze',async()=>{
   const {parent,listener}=await paired();
   await call('device/push-token',parent,{token:'ab'.repeat(32)});
   await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
@@ -192,7 +193,9 @@ describe('connection alerts, readiness and replacement',()=>{
   await env.DB.prepare('UPDATE heartbeats SET received_at=?').bind(new Date(Date.now()-179000).toISOString()).run();
   await check();expect(pushRequests).toHaveLength(0);
   await env.DB.prepare('UPDATE heartbeats SET received_at=?').bind(new Date(Date.now()-181000).toISOString()).run();
-  mockPush(200,2);await check();await check();
+  await check();await check();expect(pushRequests).toHaveLength(0);
+  const clock=vi.spyOn(Date,'now').mockReturnValue(Date.now()+61000);
+  mockPush(200,2);await runReminder(testEnv,parent.deviceId);clock.mockRestore();
   expect(pushRequests).toHaveLength(2);
   const content=JSON.parse(String(pushRequests.find(r=>r.url.includes('cd'.repeat(32)))!.init?.body));
   expect(JSON.parse(String(pushRequests.find(r=>r.url.includes('ab'.repeat(32)))!.init?.body)).aps['interruption-level']).toBe('time-sensitive');
@@ -201,14 +204,14 @@ describe('connection alerts, readiness and replacement',()=>{
   expect(content.aps.alert.title).toBe('Listener connection lost');
   expect(content.aps.sound).toBe('default');
   expect(content.aps['interruption-level']).toBe('time-sensitive');
-  expect((await env.DB.prepare('SELECT status FROM connection_notices').first<{status:string}>())?.status).toBe('sent');
+  expect((await env.DB.prepare("SELECT status FROM events ORDER BY created_at DESC LIMIT 1").first<{status:string}>())?.status).toBe('sent');
  });
  it('does not replay ambiguous health delivery and cancels obsolete outages',async()=>{
   const {parent,listener}=await paired();await call('connection-alerts',parent,{enabled:true});
   await call('device/push-token',parent,{token:'ab'.repeat(32)});await call('listener/heartbeat',listener,beat(listener));await stale();
   pushResponses.push(new Error('transport unknown'));await flushConnections(testEnv);await flushConnections(testEnv);
   expect(pushRequests).toHaveLength(1);
-  const notice=await env.DB.prepare('SELECT status FROM connection_notices').first<{status:string}>();expect(notice?.status).toBe('uncertain');
+  const notice=await env.DB.prepare('SELECT status FROM events').first<{status:string}>();expect(notice?.status).toBe('uncertain');
   await call('connection-alerts',parent,{enabled:false});await call('listener/heartbeat',listener,beat(listener));await flushConnections(testEnv);
   expect(pushRequests).toHaveLength(1);
  });
@@ -243,8 +246,8 @@ describe('connection alerts, readiness and replacement',()=>{
  it('retries explicit rejection once without duplicating concurrent dispatch',async()=>{
   const {parent,listener}=await paired();await call('connection-alerts',parent,{enabled:true});await call('device/push-token',parent,{token:'ab'.repeat(32)});
   await call('listener/heartbeat',listener,beat(listener));await stale();mockPush(503);
-  await flushConnections(testEnv);await env.DB.prepare('UPDATE connection_notices SET next_attempt=0').run();mockPush();
-  await Promise.all([flushConnections(testEnv),flushConnections(testEnv)]);expect(pushRequests).toHaveLength(2);
+  await flushConnections(testEnv);await env.DB.prepare('UPDATE events SET next_attempt=0').run();mockPush();
+  await Promise.all([flushPending(testEnv),flushPending(testEnv)]);expect(pushRequests).toHaveLength(2);
   expect(pushRequests[0].init?.headers).toEqual(pushRequests[1].init?.headers);
  });
  it('invalidates only the rejected connection destination and never replays the accepted phone warning',async()=>{
@@ -256,11 +259,108 @@ describe('connection alerts, readiness and replacement',()=>{
    return String(input).includes('cd'.repeat(32))?new Response(JSON.stringify({reason:'BadDeviceToken'}),{status:400}):new Response(null,{status:200});
   });
   await flushConnections(testEnv);
-  await env.DB.prepare('UPDATE connection_notices SET next_attempt=0').run();await flushConnections(testEnv);
+  await env.DB.prepare('UPDATE events SET next_attempt=0').run();await flushPending(testEnv);
   expect(pushRequests).toHaveLength(2);
   expect(await env.DB.prepare('SELECT watch_push_token FROM devices WHERE id=?').bind(parent.deviceId).first()).toMatchObject({watch_push_token:null});
-  const saved=await env.DB.prepare('SELECT delivery_state FROM connection_notices').first<{delivery_state:string}>();
+  const saved=await env.DB.prepare('SELECT delivery_state FROM events').first<{delivery_state:string}>();
   expect(JSON.parse(saved!.delivery_state)).toEqual({phone:'sent',watch:'blocked'});
+ });
+ it('repeats a lost Listener without app execution, snoozes idempotently, resumes and resolves on recovery',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  await call('listener/heartbeat',listener,beat(listener));await stale();
+  const start=Date.now(),clock=vi.spyOn(Date,'now').mockReturnValue(start);
+  mockPush();await Promise.all([flushConnections(testEnv),flushConnections(testEnv)]);
+  expect(pushRequests).toHaveLength(1);
+  const first=JSON.parse(String(pushRequests[0].init?.body)) as Alert;
+  clock.mockReturnValue(start+5_000);mockPush();expect(await runReminder(testEnv,parent.deviceId)).toBe(true);
+  clock.mockReturnValue(start+20*60_000);mockPush();expect(await runReminder(testEnv,parent.deviceId)).toBe(true);
+  const latest=JSON.parse(String(pushRequests.at(-1)?.init?.body)) as Alert;
+  expect(latest.type).toBe('listener_disconnected');expect(latest.eventId).not.toBe(first.eventId);
+  expect(latest.episodeId).toBe(first.episodeId);
+  const status=await (await call('listener/status',parent,undefined,'GET')).json() as {notificationRelevance:{cryEpisodeIDs:string[]};alerts:Alert[]};
+  expect(status.notificationRelevance.cryEpisodeIDs).toContain(first.episodeId);
+  expect(status.alerts[0].type).toBe('listener_disconnected');
+  const timeline=await (await call('timeline',parent,undefined,'GET')).json() as {events:{kind:string;count?:number;status?:string}[]};
+  expect(timeline.events.filter(e=>e.kind==='connection_alert')).toEqual([expect.objectContaining({count:3,status:'sent'})]);
+  expect(timeline.events.filter(e=>e.kind==='alert')).toHaveLength(0);
+  expect((await call('alert/acknowledge',parent,{eventId:latest.eventId})).status).toBe(200);
+  const deadline=await env.DB.prepare('SELECT alerts_muted_until FROM devices WHERE id=?').bind(parent.deviceId).first<{alerts_muted_until:number}>();
+  clock.mockReturnValue(start+20*60_000+30_000);
+  await call('alert/acknowledge',parent,{eventId:latest.eventId});
+  expect(await env.DB.prepare('SELECT alerts_muted_until FROM devices WHERE id=?').bind(parent.deviceId).first()).toEqual(deadline);
+  expect(await runReminder(testEnv,parent.deviceId)).toBe(true);expect(pushRequests).toHaveLength(3);
+  clock.mockReturnValue(deadline!.alerts_muted_until+1);mockPush();expect(await runReminder(testEnv,parent.deviceId)).toBe(true);
+  expect(pushRequests).toHaveLength(4);
+  await call('listener/heartbeat',listener,beat(listener));
+  expect(await runReminder(testEnv,parent.deviceId)).toBe(false);
+  const recovered=await (await call('listener/status',parent,undefined,'GET')).json() as typeof status;
+  expect(recovered.notificationRelevance.cryEpisodeIDs).not.toContain(first.episodeId);
+  expect(pushRequests).toHaveLength(4);
+ });
+ it('repairs a lost snooze timer from server state without a Listener heartbeat',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  await call('listener/heartbeat',listener,beat(listener));await stale();mockPush();await flushConnections(testEnv);
+  const first=JSON.parse(String(pushRequests[0].init?.body));
+  await call('alert/acknowledge',parent,{eventId:first.eventId});
+  const stub=env.ALERT_REMINDERS.getByName(parent.deviceId);
+  await runInDurableObject(stub,async(_instance,state)=>state.storage.deleteAlarm());
+  await flushPending(testEnv);
+  const deadline=await env.DB.prepare('SELECT alerts_muted_until FROM devices WHERE id=?').bind(parent.deviceId).first<{alerts_muted_until:number}>();
+  expect(await runInDurableObject(stub,async(_instance,state)=>state.storage.getAlarm())).toBe(deadline!.alerts_muted_until);
+  expect(pushRequests).toHaveLength(1);
+ });
+ it('uses the configured AlarmKit delivery and scheduling receipt for an outage',async()=>{
+  const {parent,listener}=await paired();
+  await call('device/push-token',parent,{token:'ab'.repeat(32),alarmReceiptsVersion:1});
+  await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
+  expect((await call('silent-watch-alarms',parent,{enabled:true})).status).toBe(200);
+  await call('listener/heartbeat',listener,beat(listener));await stale();mockPush(200,2);await flushConnections(testEnv);
+  const phone=JSON.parse(String(pushRequests.find(r=>r.url.includes('ab'.repeat(32)))!.init?.body));
+  const watch=JSON.parse(String(pushRequests.find(r=>r.url.includes('cd'.repeat(32)))!.init?.body));
+  expect(phone.type).toBe('listener_disconnected');expect(phone.silentCryAlarm).toBe(true);
+  expect(phone.aps['content-available']).toBe(1);expect(watch.silentCryAlarm).toBeUndefined();
+  expect(watch.eventId).toBe(phone.eventId);expect(phone.alarmCycleId).toEqual(expect.any(String));
+  expect((await call('alarm/scheduled',parent,{episodeId:phone.episodeId,eventId:phone.eventId,cycleId:phone.alarmCycleId})).status).toBe(200);
+  await call('connection-alerts',parent,{enabled:false});
+  expect(await runReminder(testEnv,parent.deviceId)).toBe(false);
+  expect((await call('alarm/scheduled',parent,{episodeId:phone.episodeId,eventId:phone.eventId,cycleId:phone.alarmCycleId})).status).toBe(409);
+ });
+ it('suppresses a reminder if recovery overtakes its prepared snapshot',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  await call('listener/heartbeat',listener,beat(listener));await stale();mockPush();await flushConnections(testEnv);
+  vi.spyOn(Date,'now').mockReturnValue(Date.now()+6000);
+  let recovered=false;
+  const db=interceptDB(async(sql,_args,method,execute)=>{
+   const result=await execute();
+   if(!recovered&&sql.startsWith('SELECT p.listener_id')&&method==='batch'){
+    recovered=true;await call('listener/heartbeat',listener,beat(listener));
+   }
+   return result;
+  });
+  await runReminder({...testEnv,DB:db},parent.deviceId);
+  expect(recovered).toBe(true);expect(pushRequests).toHaveLength(1);
+ });
+ it('starts a new episode when connection alerts are enabled during an existing outage',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  await call('connection-alerts',parent,{enabled:false});
+  await call('listener/heartbeat',listener,beat(listener));await stale();await flushConnections(testEnv);
+  await call('connection-alerts',parent,{enabled:true});mockPush();await flushConnections(testEnv);
+  expect(pushRequests).toHaveLength(1);
+  const first=JSON.parse(String(pushRequests[0].init?.body));
+  await call('connection-alerts',parent,{enabled:false});expect(await runReminder(testEnv,parent.deviceId)).toBe(false);
+  await call('connection-alerts',parent,{enabled:true});mockPush();await flushConnections(testEnv);
+  expect(pushRequests).toHaveLength(2);expect(JSON.parse(String(pushRequests[1].init?.body)).episodeId).not.toBe(first.episodeId);
+ });
+ it('upgrades a previously sent one-shot outage into a persistent episode',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  await call('listener/heartbeat',listener,beat(listener));await stale();
+  const last=await env.DB.prepare('SELECT received_at FROM heartbeats WHERE listener_id=?').bind(listener.deviceId).first<{received_at:string}>();
+  const id=crypto.randomUUID();
+  await env.DB.prepare("INSERT INTO connection_notices(id,parent_id,listener_id,state,observed_at,created_at,status) VALUES(?,?,?,'offline',?,?,'sent')")
+   .bind(id,parent.deviceId,listener.deviceId,last!.received_at,Date.now()).run();
+  mockPush();await flushConnections(testEnv);await flushConnections(testEnv);
+  expect(pushRequests).toHaveLength(1);expect(JSON.parse(String(pushRequests[0].init?.body)).episodeId).toBe(id);
+  expect(await env.DB.prepare('SELECT status FROM connection_notices WHERE id=?').bind(id).first()).toEqual({status:'escalated'});
  });
  it('keeps desired settings separate from settings reported by the Listener',async()=>{
   const {parent,listener}=await paired();const desired={...defaultConfiguration,alertDuration:30};
@@ -2454,7 +2554,7 @@ describe('heartbeat binding wait recovery',()=>{
   const d=JSON.parse(row!.details);expect(d.db_calls).toBe(4);
   expect(d.db_stages.heartbeat_admission_ms).toMatchObject({calls:1,statements:3});
   expect(d.db_stages.heartbeat_snapshot_ms).toMatchObject({calls:1,statements:1});
-  expect(d.db_stages.heartbeat_storage_ms).toMatchObject({calls:1,statements:4});
+  expect(d.db_stages.heartbeat_storage_ms).toMatchObject({calls:1,statements:5});
  });
  it('recovers a stalled credential reply with one fresh SELECT and charges quotas once',async()=>{
   const {listener}=await paired();let reads=0,release!:()=>void,entered!:()=>void;

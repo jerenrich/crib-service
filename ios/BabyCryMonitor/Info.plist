@@ -10,7 +10,7 @@
 <key>CFBundleVersion</key><string>$(CURRENT_PROJECT_VERSION)</string>
 <key>LSRequiresIPhoneOS</key><true/>
 <key>NSMicrophoneUsageDescription</key><string>Listen for sustained crying-like sound. Audio is processed on this iPhone, never recorded or transmitted.</string>
-<key>NSAlarmKitUsageDescription</key><string>Create silent-tone alarms for crying when you enable Silent Watch alarms, and run alarm tests you request.</string>
+<key>NSAlarmKitUsageDescription</key><string>Create silent-tone alarms for crying or a lost Listener connection when you enable Silent Watch alarms, and run alarm tests you request.</string>
 <key>UIBackgroundModes</key><array><string>audio</string><string>fetch</string><string>remote-notification</string></array>
 <key>BGTaskSchedulerPermittedIdentifiers</key><array><string>com.jordanerenrich.cribservice.benchmark.refresh</string></array>
 <key>UILaunchScreen</key><dict/>

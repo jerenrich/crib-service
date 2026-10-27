@@ -63,14 +63,14 @@ export async function timeline(env:Env,device:Device) {
    AND kind IN ('monitoring_started','monitoring_stopped','monitoring_paused','audio_interrupted','audio_resumed','monitoring_unverified','monitoring_observed','stopped_observed','standby_observed','heartbeat_missing','connection_restored','coverage_active','coverage_stopped','coverage_standby') ORDER BY occurred_at DESC,id DESC LIMIT 1`)
    .bind(pair.parent_id,pair.listener_id,pair.created_at,cutoff).first<{payload:string}>(),
   env.DB.prepare(`SELECT episode_id,CASE WHEN delivery_state IS NOT NULL THEN 'both' ELSE push_target END AS push_target,status,COALESCE(json_extract(payload,'$.isTest'),0) AS test,
-   COUNT(*) AS count,MIN(COALESCE(sent_at,json_extract(payload,'$.createdAt'))) AS first_at,
+   COALESCE(json_extract(payload,'$.type')='listener_disconnected',0) AS disconnected,COUNT(*) AS count,MIN(COALESCE(sent_at,json_extract(payload,'$.createdAt'))) AS first_at,
    MAX(COALESCE(sent_at,json_extract(payload,'$.createdAt'))) AS last_at
    FROM events WHERE parent_id=? AND listener_id=? AND created_at>=? AND
    COALESCE(sent_at,json_extract(payload,'$.createdAt'))>=? AND COALESCE(sent_at,json_extract(payload,'$.createdAt'))<=?
    AND (acknowledged_at IS NULL OR sent_at IS NOT NULL)
-   GROUP BY episode_id,CASE WHEN delivery_state IS NOT NULL THEN 'both' ELSE push_target END,status,test ORDER BY first_at DESC LIMIT 401`)
+   GROUP BY episode_id,CASE WHEN delivery_state IS NOT NULL THEN 'both' ELSE push_target END,status,test,disconnected ORDER BY first_at DESC LIMIT 401`)
    .bind(pair.parent_id,pair.listener_id,pair.created_at,new Date(cutoff).toISOString(),new Date(now).toISOString())
-   .all<{episode_id:string;push_target:string|null;status:string;test:number;count:number;first_at:string;last_at:string}>(),
+   .all<{episode_id:string;push_target:string|null;status:string;test:number;disconnected:number;count:number;first_at:string;last_at:string}>(),
   env.DB.prepare(`SELECT id,state,status,sent_at,created_at FROM connection_notices WHERE parent_id=? AND listener_id=? AND created_at>=? ORDER BY created_at DESC LIMIT 201`)
    .bind(pair.parent_id,pair.listener_id,Math.max(pair.created_at,cutoff)).all<{id:string;state:string;status:string;sent_at:string|null;created_at:number}>(),
   env.DB.prepare('SELECT received_at,metadata FROM heartbeats WHERE listener_id=?').bind(pair.listener_id).first<{received_at:string;metadata:string}>()
@@ -78,10 +78,10 @@ export async function timeline(env:Env,device:Device) {
  const events:TimelineEvent[]=journal.results.slice(0,1000).map(row=>JSON.parse(row.payload) as TimelineEvent);
  if(boundary)events.push(JSON.parse(boundary.payload) as TimelineEvent);
  for(const group of groups.results.slice(0,400))events.push({id:`alerts:${group.episode_id}:${group.push_target}:${group.status}:${group.test}`,
-  kind:group.test?'test_alert':'alert',occurredAt:group.first_at,endAt:group.last_at,episodeID:group.episode_id,
+  kind:group.test?'test_alert':group.disconnected?'connection_alert':'alert',occurredAt:group.first_at,endAt:group.last_at,episodeID:group.episode_id,
   target:group.push_target??undefined,count:group.count,status:group.status});
  for(const notice of notices.results.slice(0,200)){
-  if(notice.status==='cancelled')continue;
+  if(notice.status==='cancelled'||notice.status==='escalated')continue;
   events.push({id:`notice:${notice.id}`,kind:'connection_alert',occurredAt:notice.sent_at??new Date(notice.created_at).toISOString(),status:notice.status});
  }
  // A delayed cron must not leave the currently missing heartbeat invisible.

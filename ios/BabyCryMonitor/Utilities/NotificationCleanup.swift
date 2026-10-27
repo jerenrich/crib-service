@@ -1,7 +1,8 @@
 import Foundation
 import UserNotifications
 
-/// Delete only our crying/test category; connection warnings and other notices survive.
+/// The shared alert category includes crying, Listener loss and tests.
+/// Local overdue-check warnings and stopped-monitoring notices stay independent.
 enum NotificationCleanup {
     /// Clearing history never acknowledges an episode or removes pending alerts.
     /// Capture the cutoff at dismissal entry so newly arriving alerts survive.

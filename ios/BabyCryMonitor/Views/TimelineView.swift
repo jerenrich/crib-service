@@ -371,9 +371,8 @@ private extension TimelineEvent {
         switch kind {
         case "monitoring_observed", "stopped_observed", "standby_observed": "Backend observation · Exact transition time unknown"
         case "cry_ended": endAt.map { "Episode lasted \(durationText(occurredAt.timeIntervalSince($0)))" } ?? "Quiet period confirmed"
-        case "alert", "test_alert": "\(count ?? 1) \((count ?? 1) == 1 ? "alert" : "alerts, including reminders") · \(destination)"
-        case "connection_alert": "Connection notice · \(status ?? "pending")"
-        case "alert_acknowledged": endAt.map { "Crying alerts snoozed until \($0.formatted(date: .omitted, time: .standard))" } ?? "Confirmed by parent"
+        case "alert", "test_alert", "connection_alert": "\(count ?? 1) \((count ?? 1) == 1 ? "alert" : "alerts, including reminders") · \(destination)"
+        case "alert_acknowledged": endAt.map { "Alerts snoozed until \($0.formatted(date: .omitted, time: .standard))" } ?? "Confirmed by parent"
         case "heartbeat_missing": "Expected heartbeats stopped arriving"
         case "connection_restored": "Listener updates resumed"
         case "network_lost": "Alerts may be delayed · Recorded on Listener"
@@ -388,7 +387,7 @@ private extension TimelineEvent {
         case "alert", "test_alert", "connection_alert":
             if status == "sent" { return "Apple accepted this notification for delivery. Acceptance does not confirm receipt or a wrist tap. Repeated notifications with the same episode, destination and status are grouped. Tests are labelled separately." }
             return "Current delivery status: \(status ?? "pending"). The timestamp is when the alert was created; it is not a confirmed delivery time. A queued, blocked, failed or uncertain notification is not shown as sent."
-        case "alert_acknowledged": return "The backend recorded an explicit parent acknowledgement. Outstanding crying alerts were acknowledged. \(endAt.map { "Crying alerts were snoozed until \($0.formatted(date: .omitted, time: .standard))." } ?? "") Connection-loss alerts remain independent."
+        case "alert_acknowledged": return "The backend recorded an explicit parent acknowledgement. Outstanding crying and connection-loss alerts were acknowledged. \(endAt.map { "Crying and connection-loss alerts were snoozed until \($0.formatted(date: .omitted, time: .standard))." } ?? "") Connection-loss alerts resume after snooze if the Listener is still disconnected."
         case "monitoring_observed", "stopped_observed", "standby_observed": return "The backend received this monitoring state at the displayed time. It does not establish the exact time the Listener started or stopped."
         case "test_acknowledged": return "A parent acknowledged this test notification. It did not snooze real crying alerts."
         case "heartbeat_missing": return "No heartbeat arrived for more than three minutes. \(endAt.map { "Last update: \($0.formatted(date: .omitted, time: .standard))." } ?? "") Monitoring may have continued locally, but its status could not be verified. The overview marks the interval since that last update as Listener updates missing."

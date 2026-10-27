@@ -1,6 +1,8 @@
+import {dispatchEvent} from './alerts';
+import {scheduleReminders} from './reminders';
 import {deliverToBoth} from './dual-delivery';
 import {timelineInsert,missingHeartbeat} from './timeline';
-import {APIError,requireRole,type Device,type Env} from './types';
+import {APIError,requireRole,type Alert,type Device,type Env} from './types';
 import {sendConnectionPush,type PushResult} from './apns';
 import {eventReference,recordDiagnostic,PushPreparationError,type Stage,type Outcome} from './diagnostics';
 import {Latency} from './latency';
@@ -10,7 +12,9 @@ export async function connectionPreferences(env:Env,device:Device,value:Record<s
  if(typeof value.enabled!=='boolean'||Object.keys(value).some(k=>k!=='enabled'))throw new APIError(400,'Choose whether to enable connection alerts.');
  await env.DB.batch([
   env.DB.prepare('UPDATE devices SET connection_alerts=? WHERE id=?').bind(Number(value.enabled),device.id),
-  env.DB.prepare("UPDATE connection_notices SET status='cancelled' WHERE parent_id=? AND status IN ('pending','blocked') AND ?=0").bind(device.id,Number(value.enabled))
+  env.DB.prepare("UPDATE connection_notices SET status='cancelled' WHERE parent_id=? AND status IN ('pending','blocked','escalated') AND ?=0").bind(device.id,Number(value.enabled)),
+  env.DB.prepare("DELETE FROM connection_notices WHERE parent_id=? AND state='offline' AND status='cancelled' AND ?=1").bind(device.id,Number(value.enabled)),
+  env.DB.prepare("UPDATE events SET resolved_at=COALESCE(resolved_at,?) WHERE parent_id=? AND resolved_at IS NULL AND json_extract(payload,'$.type')='listener_disconnected' AND ?=0").bind(new Date().toISOString(),device.id,Number(value.enabled))
  ]);
  return {ok:true};
 }
@@ -31,7 +35,7 @@ export async function flushConnections(env:Env,requestId=crypto.randomUUID()) {
    continue;
   }
   if(state==='offline')await timelineInsert(env,{parent_id:row.parent_id,listener_id:row.listener_id,created_at:row.pair_created_at},missingHeartbeat(row.received_at)).run();
-  if(state===row.state)continue;
+  if(state===row.state&&state!=='offline')continue;
   await env.DB.batch([
    env.DB.prepare(`INSERT INTO connection_notices(id,listener_id,parent_id,state,observed_at,created_at)
     SELECT ?,?,?,?, ?,? FROM devices d JOIN pairs p ON p.parent_id=d.id
@@ -41,17 +45,61 @@ export async function flushConnections(env:Env,requestId=crypto.randomUUID()) {
    env.DB.prepare('UPDATE connection_states SET state=?,changed_at=? WHERE listener_id=? AND state=? AND EXISTS(SELECT 1 FROM heartbeats h WHERE h.listener_id=connection_states.listener_id AND h.received_at=?)').bind(state,row.received_at,row.listener_id,row.state,row.received_at)
   ]);
  }
+ // Promote each outage into the ordinary persistent alert pipeline. The notice
+ // UUID is the episode/idempotency key; cron retries never create a new episode.
+ // Include sent legacy notices so an existing outage gains persistent reminders.
+ const outages=await env.DB.prepare(`SELECT n.* FROM connection_notices n
+  JOIN pairs p ON p.parent_id=n.parent_id AND p.listener_id=n.listener_id
+  JOIN devices d ON d.id=p.parent_id JOIN heartbeats h ON h.listener_id=p.listener_id
+  WHERE n.state='offline' AND n.status<>'cancelled' AND n.created_at>=p.created_at
+   AND (n.status<>'escalated' OR NOT EXISTS(SELECT 1 FROM events e WHERE e.event_id=n.id))
+   AND d.connection_alerts=1 AND json_extract(h.metadata,'$.monitoring')=1
+   AND h.received_at=n.observed_at AND h.received_at<?
+  ORDER BY n.created_at LIMIT 25`).bind(new Date(now-180000).toISOString())
+  .all<{id:string;parent_id:string;listener_id:string;observed_at:string;created_at:number}>();
+ for(const outage of outages.results){
+  // Retain the shared wire shape for older clients: for this type, the start
+  // is the last heartbeat and duration is the detection timeout, not crying.
+  const event:Alert={eventId:outage.id,episodeId:outage.id,listenerId:outage.listener_id,
+   type:'listener_disconnected',cryStartedAt:outage.observed_at,durationSeconds:180,
+   createdAt:new Date(now).toISOString(),isRepeat:false};
+  await env.DB.batch([
+   env.DB.prepare(`INSERT INTO events(event_id,episode_id,listener_id,parent_id,is_repeat,payload,created_at)
+    SELECT ?,?,?,?,0,?,? WHERE EXISTS(SELECT 1 FROM pairs p JOIN devices d ON d.id=p.parent_id
+     JOIN heartbeats h ON h.listener_id=p.listener_id WHERE p.parent_id=? AND p.listener_id=?
+     AND p.created_at<=? AND d.connection_alerts=1 AND h.received_at=? AND json_extract(h.metadata,'$.monitoring')=1)
+    ON CONFLICT DO NOTHING`).bind(event.eventId,event.episodeId,event.listenerId,outage.parent_id,JSON.stringify(event),now,
+     outage.parent_id,outage.listener_id,outage.created_at,outage.observed_at),
+   env.DB.prepare("UPDATE connection_notices SET status='escalated',lease_until=NULL WHERE id=? AND status<>'cancelled'").bind(outage.id)
+  ]);
+  // Always repair the timer, including after a failed first send or a snooze.
+  try {await dispatchEvent(env,outage.id,requestId);}
+  finally {await scheduleReminders(env,outage.parent_id);}
+ }
+ // Retire obsolete outage episodes before pending/recovery work can deliver them.
+ await env.DB.prepare(`UPDATE events SET resolved_at=COALESCE(resolved_at,?)
+  WHERE resolved_at IS NULL AND json_extract(payload,'$.type')='listener_disconnected' AND NOT EXISTS(
+   SELECT 1 FROM pairs p JOIN devices d ON d.id=p.parent_id JOIN heartbeats h ON h.listener_id=p.listener_id
+   WHERE p.parent_id=events.parent_id AND p.listener_id=events.listener_id AND d.connection_alerts=1
+    AND json_extract(h.metadata,'$.monitoring')=1 AND h.received_at=json_extract(events.payload,'$.cryStartedAt')
+    AND h.received_at<?)`).bind(new Date(now).toISOString(),new Date(now-180000).toISOString()).run();
+ await env.DB.prepare(`UPDATE connection_notices SET status='cancelled',lease_until=NULL WHERE state='offline'
+  AND NOT EXISTS(SELECT 1 FROM pairs p JOIN devices d ON d.id=p.parent_id JOIN heartbeats h ON h.listener_id=p.listener_id
+   WHERE p.parent_id=connection_notices.parent_id AND p.listener_id=connection_notices.listener_id
+    AND d.connection_alerts=1 AND json_extract(h.metadata,'$.monitoring')=1
+    AND h.received_at=connection_notices.observed_at AND h.received_at<?)`)
+  .bind(new Date(now-180000).toISOString()).run();
  // Recovery updates status/history quietly, including notices queued by older versions.
  await env.DB.prepare("UPDATE connection_notices SET status='cancelled',lease_until=NULL WHERE state='online' AND status IN ('pending','blocked')").run();
  const bothAccepted="delivery_state IS NOT NULL AND json_extract(delivery_state,'$.phone')='sent' AND json_extract(delivery_state,'$.watch')='sent'";
  const interrupted=await env.DB.prepare(`UPDATE connection_notices SET status=CASE WHEN ${bothAccepted} THEN 'sent' ELSE 'uncertain' END,
   sent_at=CASE WHEN ${bothAccepted} THEN COALESCE(sent_at,?) ELSE sent_at END,lease_until=NULL
-  WHERE status='sending' AND lease_until<? RETURNING id,attempts,status`).bind(new Date(now).toISOString(),now).all<{id:string;attempts:number;status:string}>();
+  WHERE state<>'offline' AND status='sending' AND lease_until<? RETURNING id,attempts,status`).bind(new Date(now).toISOString(),now).all<{id:string;attempts:number;status:string}>();
  for(const notice of interrupted.results){
   let eventRef:string|undefined;try{eventRef=await eventReference(env,notice.id);}catch{/* Best effort. */}
   await recordDiagnostic(env,{requestId,started:now,operation:notice.status==='sent'?'dispatch_outcome':'dispatch',stage:'claim',outcome:notice.status==='sent'?'sent':'dispatch_interrupted',eventRef,attempt:notice.attempts,details:{dispatch_source:'connection'}});
  }
- const pending=await env.DB.prepare(`SELECT n.id FROM connection_notices n WHERE n.status IN ('pending','blocked') AND n.next_attempt<=? ORDER BY n.created_at LIMIT 25`).bind(now).all<{id:string}>();
+ const pending=await env.DB.prepare(`SELECT n.id FROM connection_notices n WHERE n.state<>'offline' AND n.status IN ('pending','blocked') AND n.next_attempt<=? ORDER BY n.created_at LIMIT 25`).bind(now).all<{id:string}>();
  for(const {id} of pending.results){
   const started=Date.now(),latency=new Latency();latency.details.dispatch_source='connection';
   let stage:Stage='claim',eventRef:string|undefined,attempt:number|undefined,target:'phone'|'watch'|undefined,result:PushResult|undefined;
@@ -107,5 +155,5 @@ export async function flushConnections(env:Env,requestId=crypto.randomUUID()) {
   await record(result.reason??result.status);
   }catch(error){latency.failure(error);await record('internal_error');throw error;}
  }
- await env.DB.prepare('DELETE FROM connection_notices WHERE created_at<?').bind(now-7*86400000).run();
+ await env.DB.prepare("DELETE FROM connection_notices WHERE (state<>'offline' OR status='cancelled') AND created_at<?").bind(now-7*86400000).run();
 }

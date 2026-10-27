@@ -17,7 +17,7 @@ struct SilentWatchAlarmSettingsSection: View {
                 if let url = URL(string: UIApplication.openSettingsURLString) { openURL(url) }
             }
         } header: { Text("Overnight wrist alarms") } footer: {
-            Text("Off by default. When enabled, confirmed crying also requests a repeating alarm with a silent tone. Existing notifications always continue. Keep this iPhone locked and connected; wear your unlocked Watch in Silent Mode with Prominent haptics. No need to keep the Watch app open. Stopping the alarm snoozes crying alerts for your chosen duration. The setting stays on until you turn it off. iOS may delay background processing, and routing or fallback sounds can vary; test before sleeping.")
+            Text("Off by default. When enabled, confirmed crying or a lost Listener connection also requests a repeating alarm with a silent tone. Existing notifications always continue. Keep this iPhone locked and connected; wear your unlocked Watch in Silent Mode with Prominent haptics. No need to keep the Watch app open. Stopping the alarm snoozes crying and connection-loss alerts for your chosen duration. The setting stays on until you turn it off. iOS may delay background processing, and routing or fallback sounds can vary; test before sleeping.")
         }
     }
 }

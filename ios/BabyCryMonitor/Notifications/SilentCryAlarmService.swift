@@ -188,7 +188,7 @@ import UIKit
                 return false
             }
             let attributes = AlarmAttributes<Metadata>(presentation: AlarmPresentation(alert: .init(
-                title: "Check on baby",
+                title: request.isDisconnected ? "Listener connection lost" : "Check on baby",
                 stopButton: AlarmButton(text: "Stop", textColor: .white, systemImageName: "stop.circle")
             )), metadata: Metadata(), tintColor: .mint)
             // Persist acknowledgement metadata before scheduling so an immediate Stop
@@ -212,7 +212,7 @@ import UIKit
                 } catch { record("failed", reason: .settingChanged, error: error) }
                 return false
             }
-            status = "Silent crying alarm scheduled. Existing notifications continue."
+            status = "Silent alert alarm scheduled. Existing notifications continue."
             trace("scheduled", request.eventID); record("scheduled")
             await confirmScheduling(request, using: backend)
             return true
@@ -246,7 +246,7 @@ import UIKit
         guard SilentCryAlarmSnooze(defaults: defaults).apply(eventID: eventID, duration: duration, now: Date()) else { return }
         revision += 1
         cancelAll()
-        status = "Crying alarms snoozed. Acknowledgement syncs when connected."
+        status = "Alerts snoozed. Acknowledgement syncs when connected."
         trace("snoozed", eventID)
     }
 
@@ -282,7 +282,7 @@ import UIKit
            stoppedBefore <= checkedAt,
            defaults.object(forKey: "silentCryAlarmMutedUntil") != nil {
             defaults.removeObject(forKey: "silentCryAlarmMutedUntil")
-            if enabled { status = "Crying alarms resumed. Existing notifications continue." }
+            if enabled { status = "Alerts resumed. Existing notifications continue." }
         }
         guard !records.isEmpty else { return }
         let muted = (server.alertsMutedUntil ?? .distantPast) > Date()
@@ -347,7 +347,7 @@ import UIKit
 
 @available(iOS 26.0, *)
 struct SnoozeSilentCryAlarmIntent: LiveActivityIntent {
-    static var title: LocalizedStringResource { "Snooze crying alerts" }
+    static var title: LocalizedStringResource { "Snooze alerts" }
     @Parameter(title: "Episode") var episodeID: String
     init() {}
     init(episodeID: String) { self.episodeID = episodeID }

@@ -63,7 +63,7 @@ final class OnboardingUITests: XCTestCase {
         let details = app.buttons["nightstandDetails"]
         XCTAssertTrue(details.waitForExistence(timeout: 5))
         XCTAssertTrue(details.isHittable)
-        XCTAssertTrue(app.staticTexts["Crying alerts snoozed"].exists)
+        XCTAssertTrue(app.staticTexts["Alerts snoozed"].exists)
         XCTAssertTrue(app.staticTexts["nightstandState"].label == "Live chart paused")
         XCTAssertEqual(app.scrollViews.count, 0)
         details.tap()

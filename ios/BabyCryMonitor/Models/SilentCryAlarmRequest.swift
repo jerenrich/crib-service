@@ -62,10 +62,12 @@ struct SilentCryAlarmRequest: Sendable {
     let episodeID: UUID
     let createdAt: Date
     let cycleID: UUID?
+    let isDisconnected: Bool
 
     init?(payload: [AnyHashable: Any], now: Date = Date()) {
         guard case .success(let fields) = Self.parse(payload, now: now) else { return nil }
         eventID = fields.0; episodeID = fields.1; createdAt = fields.2
+        isDisconnected = payload["type"] as? String == "listener_disconnected"
         cycleID = (payload["alarmCycleId"] as? String).flatMap(UUID.init(uuidString:))
     }
 
