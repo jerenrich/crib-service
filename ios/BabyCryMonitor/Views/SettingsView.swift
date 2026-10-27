@@ -78,30 +78,6 @@ struct SettingsView: View {
                 if model.role == .parent {
                     if #available(iOS 26.0, *) {
                         SilentWatchAlarmSettingsSection()
-                        AlarmTestSection()
-                    } else {
-                        Section("System alarm test") {
-                            Text("Requires iOS 26 or later.").foregroundStyle(.secondary)
-                        }
-                    }
-                    Section {
-                        LabeledContent("Send every", value: "\(Int(model.watchTestInterval)) \(Int(model.watchTestInterval) == 1 ? "second" : "seconds")")
-                        Slider(value: Binding(get: { model.watchTestInterval }, set: { model.setWatchTestInterval($0) }), in: 1...10, step: 1)
-                            .accessibilityLabel("Watch test frequency")
-                            .accessibilityValue("\(Int(model.watchTestInterval)) seconds")
-                            .accessibilityIdentifier("watchTestFrequency")
-                        if model.watchTestRunning {
-                            Button("Stop Watch test", role: .destructive) { model.stopWatchTest() }
-                                .accessibilityIdentifier("stopWatchTest")
-                            Text("Test running · Every \(Int(model.watchTestInterval)) seconds").font(.footnote)
-                        } else {
-                            Button("Start Watch test") { model.startWatchTest(interval: model.watchTestInterval) }
-                                .accessibilityIdentifier("startWatchTest")
-                                .disabled(!model.paired || model.managingDevice)
-                        }
-                        if let error = model.watchTestError { Text(error).foregroundStyle(.orange) }
-                    } header: { Text("Watch alert testing mode") } footer: {
-                        Text("Keep this iPhone app open and unlocked. The iPhone requests one real Watch test push at a time. Stop works immediately, even offline. Locking the phone, leaving the app or closing Settings stops the test; it never resumes automatically. Internet is required to send. watchOS and Focus settings control delivery and wrist taps. A push already sent may arrive after stopping.")
                     }
                     Section {
                         if let enabled = model.parentStatus?.connectionAlertsEnabled {
@@ -147,8 +123,13 @@ struct SettingsView: View {
                     Text("Audio never leaves the Listener iPhone. Numeric sound-level readings are relayed to the paired Parent for the live chart and are not saved by the connection service. No recordings or audio streams are uploaded.")
                     Text("Sound detection only. Cannot detect breathing problems, movement problems, silent distress, medical emergencies, or unsafe sleep conditions. Adult supervision is required; this is not a medical monitor.").font(.footnote).foregroundStyle(.secondary)
                 }
-                Section { NavigationLink("Diagnostics & simulation") { DebugView() } }
+                Section {
+                    NavigationLink("Diagnostics & simulation") { DebugView() }
+                } footer: {
+                    Text(model.role == .parent ? "Includes Watch alert testing and alarm delivery experiments." : "Includes test pushes and local simulation.")
+                }
             }.accessibilityIdentifier("settingsForm").navigationTitle("Settings")
+                // Leaving Settings, including Diagnostics, stops a Watch test.
                 .onDisappear { model.stopWatchTest() }
                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
                 .sheet(isPresented: $pairing) { PairingView() }

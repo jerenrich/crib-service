@@ -45,7 +45,11 @@ struct RootView: View {
     private var monitorHome: some View {
         ZStack {
             Palette.background.ignoresSafeArea()
-            if model.role == .listener { ListenerView { tab = .devices } } else { ParentView { tab = .devices } }
+            if model.role == .listener {
+                ListenerView(showDevices: { tab = .devices }, showActivity: { tab = .activity })
+            } else {
+                ParentView(showDevices: { tab = .devices }, showActivity: { tab = .activity })
+            }
         }.navigationTitle("Crib Service").toolbar(.hidden, for: .navigationBar)
     }
 }

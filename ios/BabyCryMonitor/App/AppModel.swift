@@ -320,6 +320,7 @@ import UIKit
             }
             if ProcessInfo.processInfo.arguments.contains("--uitesting-snoozed") { parentStatus?.alertsMutedUntil = now.addingTimeInterval(60) }
             if ProcessInfo.processInfo.arguments.contains("--uitesting-chart-paused") { remoteSound.disconnected() }
+            if ProcessInfo.processInfo.arguments.contains("--uitesting-keep-awake") { keepScreenAwake = true }
         }
         #endif
         // Restore a warning only after explicit opt-in; clear legacy deadlines on

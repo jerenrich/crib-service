@@ -43,7 +43,7 @@ struct AlertTestView: View {
                             if model.role == .parent {
                                 Text("Starting requests alarm permission and arms the silent alarm experiment for 10 minutes. You can then lock this iPhone.")
                             } else {
-                                Text("On the Parent running iOS 26 or later, first open Settings → Locked-phone delivery experiment and arm the Listener test for 10 minutes.")
+                                Text("On the Parent running iOS 26 or later, first open Settings → Diagnostics & simulation → Locked-phone delivery experiment and arm the Listener test for 10 minutes.")
                             }
                             Text("The service sends a separate silent wake notification. When iOS allows background execution, the Parent schedules the alarm immediately. The OS may delay or omit this step. Test while everyone is awake; a fallback sound is possible.")
                                 .font(.footnote).foregroundStyle(.secondary)
@@ -131,7 +131,10 @@ struct AlertTestView: View {
                 Text(title)
                 Text(detail).font(.caption).foregroundStyle(.secondary)
             }
-        }.toggleStyle(TestCheckboxStyle())
+        }
+        .toggleStyle(TestCheckboxStyle())
+        // The Toggle is the accessibility element, so describe it as a checkbox here.
+        .accessibilityValue(selection.wrappedValue ? "Checked" : "Unchecked")
     }
 
     @ViewBuilder private func sessionStatus(_ session: AlertTestSession) -> some View {

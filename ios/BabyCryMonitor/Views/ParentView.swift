@@ -3,10 +3,11 @@ import SwiftUI
 struct ParentView: View {
     @Environment(AppModel.self) private var model
     var showDevices: () -> Void = {}
+    var showActivity: () -> Void = {}
     @State private var showMonitoringError = false
 
     var body: some View {
-        NightstandView(role: .parent, showDevices: showDevices)
+        NightstandView(role: .parent, showDevices: showDevices, showActivity: showActivity)
             .onAppear {
                 showMonitoringError = model.monitoringControlError != nil
             }

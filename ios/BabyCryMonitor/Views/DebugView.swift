@@ -35,7 +35,7 @@ struct DebugView: View {
                     Button("Send silent alarm test to Parent") { Task { await model.sendSilentAlarmTest() } }
                         .disabled(!model.paired || model.sendingTestPush)
                         .accessibilityIdentifier("sendSilentAlarmTest")
-                    Text("First arm the ten-minute experiment in Parent Settings, then lock the Parent iPhone. Sends one labelled test event; real crying alerts are unaffected.").font(.footnote)
+                    Text("First arm the ten-minute experiment in Parent Settings → Diagnostics & simulation, then lock the Parent iPhone. Sends one labelled test event; real crying alerts are unaffected.").font(.footnote)
                     if let status = model.testPushStatus { Text(status).font(.footnote) }
                 }
                 Section("Real push test") {
@@ -98,6 +98,34 @@ struct DebugView: View {
                     Text("Requests a short task no earlier than 60 seconds later. iOS chooses when or whether it runs. One pending request is preserved; after delivery the next is requested. The task only logs locally, without network requests or alarms. This changes background execution opportunities, so compare these trials separately from the baseline. Stops at 24 hours when the app next executes. Results are included in Prepare benchmark report above; pending requests are reported as not yet observed, rather than proven never delivered.").font(.footnote)
                 }
             }
+            if model.role == .parent {
+                if #available(iOS 26.0, *) {
+                    AlarmTestSection()
+                } else {
+                    Section("System alarm test") {
+                        Text("Requires iOS 26 or later.").foregroundStyle(.secondary)
+                    }
+                }
+                Section {
+                    LabeledContent("Send every", value: "\(Int(model.watchTestInterval)) \(Int(model.watchTestInterval) == 1 ? "second" : "seconds")")
+                    Slider(value: Binding(get: { model.watchTestInterval }, set: { model.setWatchTestInterval($0) }), in: 1...10, step: 1)
+                        .accessibilityLabel("Watch test frequency")
+                        .accessibilityValue("\(Int(model.watchTestInterval)) seconds")
+                        .accessibilityIdentifier("watchTestFrequency")
+                    if model.watchTestRunning {
+                        Button("Stop Watch test", role: .destructive) { model.stopWatchTest() }
+                            .accessibilityIdentifier("stopWatchTest")
+                        Text("Test running · Every \(Int(model.watchTestInterval)) seconds").font(.footnote)
+                    } else {
+                        Button("Start Watch test") { model.startWatchTest(interval: model.watchTestInterval) }
+                            .accessibilityIdentifier("startWatchTest")
+                            .disabled(!model.paired || model.managingDevice)
+                    }
+                    if let error = model.watchTestError { Text(error).foregroundStyle(.orange) }
+                } header: { Text("Watch alert testing mode") } footer: {
+                    Text("Keep this iPhone app open and unlocked. The iPhone requests one real Watch test push at a time. Stop works immediately, even offline. Locking the phone, leaving the app or leaving Diagnostics stops the test; it never resumes automatically. Internet is required to send. watchOS and Focus settings control delivery and wrist taps. A push already sent may arrive after stopping.")
+                }
+            }
             Section("Synthetic simulation · Local only") {
                 Text("Uses an isolated detector. Simulation never sends alerts to the Worker or changes live monitoring.").font(.footnote)
                 Text("\(simulation.engine.detector.state.rawValue) · \(durationText(simulation.engine.snapshot.current?.duration(at: simulation.now) ?? 0))")
@@ -129,5 +157,6 @@ struct DebugView: View {
                 Text(model.log.previewExport).font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
             }
         }.accessibilityIdentifier("diagnosticsForm").navigationTitle("Diagnostics")
+            .onDisappear { model.stopWatchTest() }
     }
 }

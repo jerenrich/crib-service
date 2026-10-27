@@ -5,9 +5,9 @@ struct NightstandView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dynamicTypeSize) private var typeSize
     @Environment(\.scenePhase) private var scenePhase
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let role: DeviceRole
     var showDevices: () -> Void = {}
+    var showActivity: () -> Void = {}
     @State private var pairing = false
     @State private var settingsPresented = false
     @State private var detailsPresented = false
@@ -15,7 +15,7 @@ struct NightstandView: View {
     @State private var testConfigurationPresented = false
     @State private var detailsTestConfigurationPresented = false
     @State private var confirmStopMicrophone = false
-    @State private var nurseryDimmed = false
+    @State private var nightDimmed = false
     @State private var lastInteraction = Date()
     @ScaledMetric(relativeTo: .caption) private var chartHeader: CGFloat = 40
     private let ringSize: CGFloat = 228
@@ -177,61 +177,84 @@ struct NightstandView: View {
         return frame == nil ? "Waiting for live readings" : "Live chart paused · Last readings"
     }
 
-    // MARK: Nursery dimming
+    // MARK: Night dimming
 
-    private var dimDelay: TimeInterval {
+    private var nightDimDelay: TimeInterval {
         #if DEBUG
         if ProcessInfo.processInfo.arguments.contains("--uitesting-fast-dim") { return 2 }
         #endif
-        return 20
+        return 60
     }
 
-    /// The nursery phone dims while healthy so the room stays dark; problems keep it awake.
-    private var nurseryCanDim: Bool {
-        listener && (model.monitoring || standby) && hero.tone != .caution
-            && !pairing && !settingsPresented && !detailsPresented && !timing && !testConfigurationPresented && !confirmStopMicrophone
+    /// With Keep screen awake on, the Parent dims after a minute untouched. Alerts and problems brighten it.
+    private var parentCanDim: Bool {
+        !listener && model.keepScreenAwake && (hero.tone == .calm || hero.tone == .inactive) && model.activeAlert == nil
+            && !pairing && !settingsPresented && !detailsPresented && !timing && !testConfigurationPresented
     }
 
-    private func setNurseryDimmed(_ value: Bool) {
+    private func setNightDimmed(_ value: Bool) {
         lastInteraction = Date()
-        guard nurseryDimmed != value else { return }
+        guard nightDimmed != value else { return }
         var transaction = Transaction(); transaction.disablesAnimations = true
-        withTransaction(transaction) { nurseryDimmed = value }
+        withTransaction(transaction) { nightDimmed = value }
     }
 
-    private var nurseryDimScreen: some View {
-        let hero = hero
-        // Drift slightly each minute so static text does not mark an OLED screen overnight.
-        let minute = Int(model.now.timeIntervalSince1970 / 60)
-        let drift = CGSize(width: CGFloat(minute % 5 - 2) * 8, height: CGFloat(minute / 5 % 5 - 2) * 12)
-        return ZStack {
-            Color.black.ignoresSafeArea()
-            VStack(spacing: 14) {
-                Spacer()
-                Image(systemName: standby ? "pause.circle" : "mic").font(.system(size: 34)).foregroundStyle(Color(white: 0.2))
-                HStack(spacing: 8) {
-                    Circle().fill(hero.tone.color.opacity(0.5)).frame(width: 7, height: 7)
-                        .phaseAnimator(reduceMotion ? [1.0] : [1.0, 0.3]) { dot, opacity in dot.opacity(opacity) } animation: { _ in .easeInOut(duration: 1.6) }
-                    Text(hero.title).font(.callout).foregroundStyle(hero.tone.color.opacity(0.45))
-                }
-                Spacer()
-                Text("Parent \(parentChip.value.lowercased()) · \(powerChip.value == "Unknown" ? "Battery unknown" : powerChip.value)")
-                    .font(.caption).foregroundStyle(Color(white: 0.24))
-                Text("Tap to wake").font(.caption2).foregroundStyle(Color(white: 0.18))
+    private var nightDimOverlay: some View {
+        Color.clear
+            .contentShape(Rectangle())
+            .overlay(alignment: .bottom) {
+                Text("Tap to brighten").font(.caption2).foregroundStyle(Color(white: 0.4)).padding(.bottom, 120)
             }
-            .padding(.bottom, 40)
-            .offset(drift)
+            .ignoresSafeArea()
+            .statusBarHidden()
+            .onTapGesture { setNightDimmed(false) }
+            .presentationBackground(Color.black.opacity(0.82))
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Screen dimmed")
+            .accessibilityHint("Brightens the monitoring screen")
+            .accessibilityAddTraits(.isButton)
+            .accessibilityAction { setNightDimmed(false) }
+            .accessibilityIdentifier("nightDimOverlay")
+    }
+
+    // MARK: Recent activity
+
+    /// Counts from the shared timeline for the same 12-hour window as Activity.
+    private var recentSummary: String? {
+        guard model.paired, listener || model.timeline != nil else { return nil }
+        let end = model.now.addingTimeInterval(model.timelineClockOffset), start = end.addingTimeInterval(-12 * 3600)
+        var byID = Dictionary((model.timeline?.events ?? []).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        if listener { for event in model.snapshot.timelineEvents { byID[event.id] = event } }
+        let events = byID.values.filter { $0.occurredAt >= start && $0.occurredAt <= end }
+        let episodes = Set(events.filter { $0.category == .crying }.compactMap(\.episodeID)).count
+        let alerts = events.filter { $0.kind == "alert" }.count
+        let gaps = events.filter { $0.kind == "heartbeat_missing" }.count
+        func count(_ value: Int, _ noun: String) -> String { "\(value) \(noun)\(value == 1 ? "" : "s")" }
+        var parts = [episodes == 0 ? "No sound episodes" : count(episodes, "sound episode")]
+        if alerts > 0 { parts.append(count(alerts, "alert")) }
+        if gaps > 0 { parts.append(count(gaps, "connection gap")) }
+        return "Last 12 h · " + parts.joined(separator: " · ")
+    }
+
+    private var activitySummary: some View {
+        let summary = recentSummary
+        return Button(action: showActivity) {
+            HStack(spacing: 4) {
+                Text(summary ?? " ")
+                Image(systemName: "chevron.right").font(.caption2)
+            }
+            .font(.footnote).foregroundStyle(Palette.muted)
+            .lineLimit(typeSize.isAccessibilitySize ? nil : 1).minimumScaleFactor(0.8)
+            .frame(maxWidth: .infinity, minHeight: 28, alignment: typeSize.isAccessibilitySize ? .leading : .center)
+            .contentShape(Rectangle())
         }
-        .contentShape(Rectangle())
-        .onTapGesture { setNurseryDimmed(false) }
-        .statusBarHidden()
-        .persistentSystemOverlays(.hidden)
-        .preferredColorScheme(.dark)
-        .accessibilityElement(children: .combine)
-        .accessibilityAddTraits(.isButton)
-        .accessibilityHint("Shows the full monitoring screen")
-        .accessibilityAction { setNurseryDimmed(false) }
-        .accessibilityIdentifier("nurseryDimScreen")
+        .buttonStyle(.plain)
+        // Reserve the line so the layout does not move when history loads.
+        .opacity(summary == nil ? 0 : 1)
+        .disabled(summary == nil)
+        .accessibilityLabel(summary ?? "")
+        .accessibilityHint("Opens Activity")
+        .accessibilityIdentifier("nightstandSummary")
     }
 
     // MARK: Layout
@@ -244,6 +267,7 @@ struct NightstandView: View {
                     VStack(alignment: .leading, spacing: 16) {
                         header
                         heroText
+                        activitySummary
                         chips
                         soundPanel.frame(height: 100 + chartHeader)
                         actions
@@ -255,7 +279,8 @@ struct NightstandView: View {
             } else {
                 VStack(spacing: 14) {
                     header
-                    heroRing.padding(.vertical, 4)
+                    heroRing.padding(.top, 4)
+                    activitySummary.padding(.top, -10)
                     chips
                     soundPanel.frame(minHeight: 60, maxHeight: .infinity)
                     actions
@@ -274,11 +299,19 @@ struct NightstandView: View {
         .animation(.easeInOut(duration: 0.3), value: hero.tone)
         .simultaneousGesture(DragGesture(minimumDistance: 0).onChanged { _ in lastInteraction = Date() })
         .onChange(of: model.now) { _, now in
-            if nurseryCanDim && !nurseryDimmed && now.timeIntervalSince(lastInteraction) >= dimDelay { setNurseryDimmed(true) }
+            if parentCanDim && !nightDimmed && now.timeIntervalSince(lastInteraction) >= nightDimDelay { setNightDimmed(true) }
         }
-        .onChange(of: nurseryCanDim) { _, canDim in if !canDim { setNurseryDimmed(false) } }
+        .onChange(of: parentCanDim) { _, canDim in if !canDim { setNightDimmed(false) } }
         .onChange(of: scenePhase) { _, phase in if phase == .active { lastInteraction = Date() } }
-        .fullScreenCover(isPresented: $nurseryDimmed) { nurseryDimScreen }
+        .fullScreenCover(isPresented: $nightDimmed) { nightDimOverlay }
+        .task {
+            // Activity is otherwise loaded only on its own tab; the Listener uses its local history.
+            guard !listener else { return }
+            while !Task.isCancelled {
+                await model.refreshTimeline()
+                do { try await Task.sleep(for: .seconds(300)) } catch { break }
+            }
+        }
         .alert("Stop microphone?", isPresented: $confirmStopMicrophone) {
             Button("Stop microphone", role: .destructive) { model.stop() }
             Button("Cancel", role: .cancel) { }

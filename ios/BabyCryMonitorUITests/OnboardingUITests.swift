@@ -8,21 +8,22 @@ final class OnboardingUITests: XCTestCase {
         XCTAssertTrue(test.waitForExistence(timeout: 5))
         test.tap()
         XCTAssertTrue(app.navigationBars["Configure test alert"].waitForExistence(timeout: 5))
-        let phone = app.buttons["testSendToPhone"]
-        let watch = app.buttons["testSendToWatch"]
-        XCTAssertTrue(app.buttons["testUseAlarmKit"].exists)
+        // Delivery choices are checkbox-styled toggles, so match them by identifier only.
+        let phone = app.descendants(matching: .any)["testSendToPhone"].firstMatch
+        let watch = app.descendants(matching: .any)["testSendToWatch"].firstMatch
+        XCTAssertTrue(app.descendants(matching: .any)["testUseAlarmKit"].firstMatch.exists)
         XCTAssertEqual(phone.value as? String, "Checked")
         XCTAssertEqual(watch.value as? String, "Checked")
         watch.tap()
         XCTAssertEqual(watch.value as? String, "Unchecked")
         let repeatToggle = app.switches["testRepeat"]
         XCTAssertTrue(repeatToggle.exists)
-        repeatToggle.tap()
+        repeatToggle.coordinate(withNormalizedOffset: CGVector(dx: 0.92, dy: 0.5)).tap()
         let form = app.collectionViews.firstMatch
         let interval = app.buttons["testRepeatInterval"]
         for _ in 0..<4 { if interval.isHittable { break }; form.swipeUp() }
         XCTAssertTrue(app.steppers["testRepeatCount"].exists)
-        let share = app.buttons["testShareNotificationIDs"]
+        let share = app.descendants(matching: .any)["testShareNotificationIDs"].firstMatch
         for _ in 0..<4 { if share.isHittable { break }; form.swipeUp() }
         XCTAssertTrue(share.exists)
         let shot = XCTAttachment(screenshot: app.screenshot())
@@ -283,23 +284,47 @@ final class OnboardingUITests: XCTestCase {
             app.terminate()
         }
     }
-    @MainActor func testNurseryListenerDimsWhenIdleAndWakesOnTap() {
+    @MainActor func testParentDimsOnlyWithKeepAwakeAndBrightensForAlerts() {
         let app = XCUIApplication()
-        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", "--uitesting-listener", "--uitesting-fast-dim"]
+        let base = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", "--uitesting-fast-dim"]
+        let overlay = app.descendants(matching: .any)["nightDimOverlay"].firstMatch
+        app.launchArguments = base + ["--uitesting-keep-awake"]
         app.launch()
-        let dim = app.descendants(matching: .any)["nurseryDimScreen"].firstMatch
-        XCTAssertTrue(dim.waitForExistence(timeout: 10))
-        XCTAssertTrue(dim.label.contains("Quiet"), dim.label)
-        let shot = XCTAttachment(screenshot: app.screenshot()); shot.name = "Dim nursery screen"; shot.lifetime = .keepAlways; add(shot)
-        dim.tap()
+        XCTAssertTrue(overlay.waitForExistence(timeout: 10))
+        let shot = XCTAttachment(screenshot: app.screenshot()); shot.name = "Dimmed Parent"; shot.lifetime = .keepAlways; add(shot)
+        overlay.tap()
         XCTAssertTrue(app.buttons["nightstandMonitoringControl"].waitForExistence(timeout: 5))
-        XCTAssertFalse(dim.exists)
+        XCTAssertFalse(overlay.exists)
         app.terminate()
-        // The Parent stays fully visible; it is the phone meant to be read at night.
-        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", "--uitesting-fast-dim"]
+        // An active alert keeps the screen bright and the Snooze action reachable.
+        app.launchArguments = base + ["--uitesting-keep-awake", "--uitesting-active-alert"]
+        app.launch()
+        XCTAssertTrue(app.buttons["nightstandSnooze"].waitForExistence(timeout: 5))
+        XCTAssertFalse(overlay.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["nightstandSnooze"].isHittable)
+        app.terminate()
+        // Without Keep screen awake the phone locks normally, so it never dims itself.
+        app.launchArguments = base
         app.launch()
         XCTAssertTrue(app.staticTexts["nightstandState"].waitForExistence(timeout: 5))
-        XCTAssertFalse(dim.waitForExistence(timeout: 5))
+        XCTAssertFalse(overlay.waitForExistence(timeout: 5))
+        app.terminate()
+        // The nursery Listener runs locked and never dims itself.
+        app.launchArguments = base + ["--uitesting-keep-awake", "--uitesting-listener"]
+        app.launch()
+        XCTAssertTrue(app.staticTexts["nightstandState"].waitForExistence(timeout: 5))
+        XCTAssertFalse(overlay.waitForExistence(timeout: 5))
+    }
+
+    @MainActor func testRecentActivitySummaryOpensActivity() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-timeline"]
+        app.launch()
+        let summary = app.buttons["nightstandSummary"]
+        XCTAssertTrue(summary.waitForExistence(timeout: 5))
+        XCTAssertEqual(summary.label, "Last 12 h · 1 sound episode · 1 alert · 1 connection gap")
+        summary.tap()
+        XCTAssertTrue(app.navigationBars["Timeline"].waitForExistence(timeout: 5))
     }
 
     @MainActor func testBothModesUseSameLiveSoundChart() {
