@@ -1,5 +1,39 @@
 import XCTest
 final class OnboardingUITests: XCTestCase {
+    @MainActor func testTestAlertOpensConfigurationWithoutSending() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound"]
+        app.launch()
+        let test = app.buttons["nightstandTestAlert"]
+        XCTAssertTrue(test.waitForExistence(timeout: 5))
+        test.tap()
+        XCTAssertTrue(app.navigationBars["Configure test alert"].waitForExistence(timeout: 5))
+        let phone = app.buttons["testSendToPhone"]
+        let watch = app.buttons["testSendToWatch"]
+        XCTAssertTrue(app.buttons["testUseAlarmKit"].exists)
+        XCTAssertEqual(phone.value as? String, "Checked")
+        XCTAssertEqual(watch.value as? String, "Checked")
+        watch.tap()
+        XCTAssertEqual(watch.value as? String, "Unchecked")
+        let repeatToggle = app.switches["testRepeat"]
+        XCTAssertTrue(repeatToggle.exists)
+        repeatToggle.tap()
+        let form = app.collectionViews.firstMatch
+        let interval = app.buttons["testRepeatInterval"]
+        for _ in 0..<4 { if interval.isHittable { break }; form.swipeUp() }
+        XCTAssertTrue(app.steppers["testRepeatCount"].exists)
+        let share = app.buttons["testShareNotificationIDs"]
+        for _ in 0..<4 { if share.isHittable { break }; form.swipeUp() }
+        XCTAssertTrue(share.exists)
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = "Test alert configuration"; shot.lifetime = .keepAlways; add(shot)
+        let start = app.buttons["startConfiguredAlertTest"]
+        for _ in 0..<6 { if start.isHittable { break }; form.swipeUp() }
+        XCTAssertTrue(start.exists)
+        XCTAssertFalse(start.isEnabled) // Offline status must not imply a scheduled test.
+        XCTAssertFalse(app.buttons["stopConfiguredAlertTest"].exists)
+    }
+
     @MainActor func testActiveAlertUsesFixedNoticeAndSnoozeActionIsExplicit() {
         let app = XCUIApplication()
         app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", "--uitesting-active-alert"]

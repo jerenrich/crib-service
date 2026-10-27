@@ -9,6 +9,8 @@ struct NightstandView: View {
     @State private var readiness = false
     @State private var detailsPresented = false
     @State private var timing = false
+    @State private var testConfigurationPresented = false
+    @State private var detailsTestConfigurationPresented = false
     @State private var confirmStopMicrophone = false
     @ScaledMetric(relativeTo: .caption) private var chartChrome: CGFloat = 96
 
@@ -110,6 +112,7 @@ struct NightstandView: View {
         } message: {
             Text("This turns off the nursery microphone. To resume monitoring, you may need to reopen the app on this iPhone. Leave it in Standby to resume from the Parent.")
         }
+        .sheet(isPresented: $testConfigurationPresented) { AlertTestView() }
         .sheet(isPresented: $timing) { AlertTimingView() }
         .sheet(isPresented: $pairing) { PairingView() }
         .sheet(isPresented: $readiness) {
@@ -323,7 +326,8 @@ struct NightstandView: View {
                             .font(.subheadline).foregroundStyle(Palette.amber)
                     }
                     if let message = model.monitoringControlMessage { Text(message).font(.subheadline) }
-                    Button(model.sendingTestPush ? "Sending…" : "Test alert", action: sendTestAlert)
+                    Button("Test alert") { detailsTestConfigurationPresented = true }
+                        .sheet(isPresented: $detailsTestConfigurationPresented) { AlertTestView() }
                         .frame(minHeight: 44)
                         .disabled(!model.paired || model.sendingTestPush || model.managingDevice)
                         .accessibilityLabel(listener ? "Send test push" : "Test alert")
@@ -440,6 +444,7 @@ struct NightstandView: View {
                     }
                     .disabled(!model.paired || model.sendingTestPush || model.managingDevice)
                     .accessibilityLabel(listener ? "Send test push" : "Test alert")
+                    .accessibilityIdentifier("nightstandTestAlert")
                 }
                 Spacer(minLength: 0)
                 Button { readiness = true } label: { Text("Ready for tonight?").frame(minHeight: 44, alignment: .trailing) }
@@ -458,8 +463,7 @@ struct NightstandView: View {
     }
 
     private func sendTestAlert() {
-        detailsPresented = true
-        Task { if listener { await model.sendTestPush() } else { await model.requestParentTest() } }
+        testConfigurationPresented = true
     }
 
     private func toggleMonitoring() {

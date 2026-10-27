@@ -47,6 +47,19 @@ try {
     const code = await request('pairing/create', parent);
     check(code.status === 200 && /^\d{6}$/.test(code.body.code), 'pairing code created');
     check((await request('pairing/claim', listener, {code: code.body.code})).status === 200, 'secure pairing claim');
+    check((await request('alert-test', null, null, 'GET')).status === 401, 'configured test status requires authentication');
+    for (const device of [parent, listener]) {
+        const testStatus = await request('alert-test', device, null, 'GET');
+        check(testStatus.status === 200 && testStatus.body.session === null, `${device.role} can check configured test status`);
+    }
+    const testOptions = {alarmKit: false, phone: true, watch: false, repeatInterval: 5, count: 1,
+        sharedCollapseIDs: false, distinctRequestIDs: false, coalesceRepeats: false,
+        groupNotifications: true, phoneHeadStartMS: 0};
+    check((await request('alert-test', parent, {id: randomUUID(), configuration: {...testOptions, phone: false}})).status === 400, 'configured test rejects empty delivery selection');
+    check((await request('alert-test', parent, {id: randomUUID(), configuration: testOptions})).status === 409, 'configured test requires selected phone registration');
+    check((await request('alert-test', listener, {id: randomUUID(), configuration: {...testOptions, phone: false, watch: true}})).status === 409, 'configured test requires selected Watch registration');
+    const stoppedTest = await request('alert-test/stop', parent, {id: randomUUID()});
+    check(stoppedTest.status === 200 && stoppedTest.body.session === null, 'configured test stop is safe without a session');
     const alarmReceipt = {eventId: randomUUID(), episodeId: randomUUID(), cycleId: randomUUID()};
     check((await request('alarm/scheduled', null, alarmReceipt)).status === 401, 'alarm scheduling receipt requires authentication');
     check((await request('alarm/scheduled', listener, alarmReceipt)).status === 403, 'Listener cannot confirm Parent alarm scheduling');

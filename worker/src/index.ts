@@ -4,6 +4,8 @@ import {sendStandaloneProbe} from './watch-latency-probe';
 import {requestMonitoring,completeMonitoring} from './monitoring';
 import {timeline} from './timeline';
 export {AlertReminders} from './reminders';
+export {AlertTests} from './alert-tests';
+import {configureAlertTest} from './alert-tests';
 export {LiveSound} from './live-sound';
 export {ProviderTokens} from './provider-token';
 import {providerTokens} from './provider-token';
@@ -85,6 +87,11 @@ export default {
      case 'POST /v1/pairing/remove':result=await removeDeviceData(env,device);break;
      case 'POST /v1/device/delete':result=await removeDeviceData(env,device,true);break;
      case 'POST /v1/connection-alerts':result=await connectionPreferences(env,device,await body(request));break;
+     case 'GET /v1/alert-test':result=await configureAlertTest(env,device,'status');break;
+     case 'POST /v1/alert-test':
+      await rateLimit(env,'alert-test',device.id,6,600);
+      result=await configureAlertTest(env,device,'start',await body(request));break;
+     case 'POST /v1/alert-test/stop':result=await configureAlertTest(env,device,'stop',await body(request));break;
      case 'POST /v1/watch-test/push':result=await sendWatchTest(env,device,latency,requestId);break;
      case 'POST /v1/watch-latency-probe/push':result=await sendStandaloneProbe(env,device,latency,requestId);break;
      case 'POST /v1/listener/silent-alarm-test':{

@@ -28,4 +28,11 @@ final class SilentAlarmTestRequestTests: XCTestCase {
         XCTAssertNil(SilentAlarmTestRequest(payload: payload(age: 61), now: now))
         XCTAssertNil(SilentAlarmTestRequest(payload: payload(age: -6), now: now))
     }
+    func testConfiguredRunSchedulesPromptlyAfterTheServerDelay() throws {
+        var configured = payload()
+        configured["configuredAlertTest"] = true
+        XCTAssertEqual(try XCTUnwrap(SilentAlarmTestRequest(payload: configured, now: now)).schedulingDelay, 0.5)
+        XCTAssertEqual(try XCTUnwrap(SilentAlarmTestRequest(payload: payload(), now: now)).schedulingDelay, 3)
+    }
+
 }

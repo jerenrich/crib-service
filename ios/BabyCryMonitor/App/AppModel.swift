@@ -758,6 +758,22 @@ import UIKit
             queueHeartbeat()
         } catch { log.record("monitoring_control_failed", error: error) }
     }
+    func configuredAlertTest(start id: UUID? = nil, configuration: AlertTestConfiguration? = nil,
+                             stop stopID: UUID? = nil) async throws -> AlertTestSession? {
+        guard paired, !managingDevice else { throw BackendError.message("Pair both iPhones before testing.") }
+        let revision = environmentRevision
+        let client = try await registeredClient()
+        guard revision == environmentRevision else { throw CancellationError() }
+        let response: AlertTestResponse
+        if let stopID { response = try await client.stopAlertTest(id: stopID) }
+        else if let id, let configuration {
+            guard configuration.isValid else { throw BackendError.message("Choose at least one delivery and valid repeat options.") }
+            response = try await client.startAlertTest(id: id, configuration: configuration)
+        } else { response = try await client.alertTest() }
+        guard revision == environmentRevision else { throw CancellationError() }
+        return response.session
+    }
+
     func sendSilentAlarmTest() async {
         guard !sendingTestPush, role == .listener, paired, !managingDevice else { return }
         sendingTestPush = true

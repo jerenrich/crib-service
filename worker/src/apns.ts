@@ -6,7 +6,7 @@ import {Latency,appleReasons,type AppleReason} from './latency';
 import {providerTokens} from './provider-token';
 
 export type PushResult = {status:'sent'|'retry'|'blocked'|'uncertain'|'failed';reason?:Outcome;httpStatus?:number};
-export interface PushIdentityOptions {distinctRequestID?:boolean;separateCollapseIDs?:boolean}
+export interface PushIdentityOptions {distinctRequestID?:boolean;separateCollapseIDs?:boolean;collapseID?:string;threadID?:string;configuredTest?:boolean}
 export async function apnsToken(env:Env,latency?:Latency):Promise<string> {
  return providerTokens.get(env,latency);
 }
@@ -32,14 +32,17 @@ export async function sendPush(env:Env,encryptedToken:string,alert:Alert,target:
  if(identity.distinctRequestID){latency.details.apns_id_mode='distinct_request';latency.details.apns_request_id=requestID;}
  // Every repeat is a new notification. Only retries of the same event share an
  // identity; episode-wide replacement could merge distinct reminders.
- const collapseBase=alert.eventId;
+ const collapseBase=identity.collapseID??alert.eventId;
  const collapseID=identity.separateCollapseIDs?`${target}:${collapseBase}`:collapseBase;
- if(identity.separateCollapseIDs){latency.details.apns_collapse_mode='target_scoped';latency.details.apns_collapse_basis='event';}
+ if(identity.separateCollapseIDs){latency.details.apns_collapse_mode='target_scoped';latency.details.apns_collapse_basis=collapseBase===alert.episodeId?'episode':'event';}
  return sendNotification(env,encryptedToken,requestID,{...content,...correlation,
+  ...(identity.configuredTest?{configuredAlertTest:true,aps:{...content.aps,
+   alert:{title:'Test · Crib Service',body:'Configured alert test. Stop further repetitions from Test alert on either iPhone.'},
+   ...(identity.threadID?{'thread-id':identity.threadID}:{})}}:{}),
   // AlarmKit is additive: retain the phone's normal sound/haptic request so
   // Apple can forward an alert while the separate direct Watch copy also alerts.
   ...(silentCryAlarm&&target==='phone'&&!alert.isTest?{silentCryAlarm:true,...(alarmCycle?{alarmCycleId:alarmCycle}:{}),aps:{...content.aps,'content-available':1}}:{})
- },target,alert.isRepeat?15:3600,collapseID,latency,schedule);
+ },target,identity.configuredTest?60:alert.isRepeat?15:3600,collapseID,latency,schedule);
 }
 export async function sendSilentCryAlarmPush(env:Env,encryptedToken:string,alert:Alert,latency=new Latency(),alarmCycle?:string):Promise<PushResult> {
  latency.details.alarm_wake_requested=true;
@@ -55,12 +58,12 @@ export async function sendConnectionPush(env:Env,encryptedToken:string,id:string
 }
 // A user-visible, soundless notification also requests background execution.
 // It is deliberately separate from ordinary crying and Watch notification routing.
-export async function sendSilentAlarmTestPush(env:Env,encryptedToken:string,alert:Alert,latency=new Latency()):Promise<PushResult> {
- const content={...payload(alert),silentAlarmTest:true,aps:{
+export async function sendSilentAlarmTestPush(env:Env,encryptedToken:string,alert:Alert,latency=new Latency(),identity:PushIdentityOptions={}):Promise<PushResult> {
+ const content={...payload(alert),silentAlarmTest:true,...(identity.configuredTest?{configuredAlertTest:true}:{}),aps:{
   alert:{title:'Test · Silent alarm delivery',body:'Listener test received. If the Parent experiment is armed, it will try to start a silent alarm on your paired Watch.'},
   'content-available':1,category:'SILENT_ALARM_TEST','thread-id':alert.episodeId,'interruption-level':'time-sensitive'
  }};
- return sendNotification(env,encryptedToken,alert.eventId,content,'phone',60,alert.eventId,latency);
+ return sendNotification(env,encryptedToken,identity.distinctRequestID?crypto.randomUUID():alert.eventId,content,'phone',60,identity.collapseID??alert.eventId,latency);
 }
 // Fixed, separate topic for the standalone proof of concept. Reuse the existing
 // provider-token authority so the experiment cannot introduce JWT churn.
