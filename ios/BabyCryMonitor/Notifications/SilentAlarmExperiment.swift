@@ -20,21 +20,22 @@ import UIKit
     var armedUntil: Date? { defaults.object(forKey: deadlineKey) as? Date }
     var armed: Bool { armedUntil.map { $0 > Date() } ?? false }
 
-    func arm() async {
-        guard !busy, defaults.string(forKey: "role") == "parent" else { return }
+    @discardableResult func arm() async -> Bool {
+        guard !busy, defaults.string(forKey: "role") == "parent" else { return false }
         busy = true
         defer { busy = false }
         do {
             guard try await AlarmManager.shared.requestAuthorization() == .authorized else {
-                save("Alarm permission required. Experiment not armed."); return
+                save("Alarm permission required. Experiment not armed."); return false
             }
             guard Bundle.main.url(forResource: "AlarmTestSilence", withExtension: "caf") != nil else {
-                save("Silent tone missing. Experiment not armed."); return
+                save("Silent tone missing. Experiment not armed."); return false
             }
             defaults.set(Date().addingTimeInterval(600), forKey: deadlineKey)
             save("Armed for 10 minutes. Lock this iPhone, then send the silent alarm test from the Listener.")
             trace("armed")
-        } catch { save("Could not arm: \(error.localizedDescription)"); trace("failed") }
+            return true
+        } catch { save("Could not arm: \(error.localizedDescription)"); trace("failed"); return false }
     }
 
     func disarm() {
@@ -66,9 +67,14 @@ import UIKit
                 stopButton: AlarmButton(text: "Stop", textColor: .white, systemImageName: "stop.circle")
             )), metadata: Metadata(), tintColor: .mint)
             let configuration = AlarmManager.AlarmConfiguration<Metadata>.alarm(
-                schedule: .fixed(Date().addingTimeInterval(3)), attributes: attributes,
+                schedule: .fixed(Date().addingTimeInterval(request.schedulingDelay)), attributes: attributes,
                 sound: .named("AlarmTestSilence.caf"))
             _ = try await AlarmManager.shared.schedule(id: request.eventID, configuration: configuration)
+            // Stop can disarm while schedule() yields to AlarmKit.
+            guard armed else {
+                try AlarmManager.shared.cancel(id: request.eventID)
+                return false
+            }
             ids.append(request.eventID.uuidString)
             defaults.set(Array(ids.suffix(50)), forKey: idsKey)
             save("Listener test received; silent alarm scheduled. Check wrist taps and both speakers.")

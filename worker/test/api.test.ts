@@ -2993,3 +2993,124 @@ describe('phone head-start trial delivery',()=>{
   expect((send.mock.calls as unknown as unknown[][])[0][3]).toBeUndefined();
  });
 });
+
+describe('configurable delayed alert tests',()=>{
+ const options=(overrides:Record<string,unknown>={})=>({alarmKit:false,phone:true,watch:true,repeatInterval:5,count:1,
+  sharedCollapseIDs:false,distinctRequestIDs:false,coalesceRepeats:false,groupNotifications:true,phoneHeadStartMS:0,...overrides});
+ async function setup(){
+  const pair=await paired();
+  expect((await call('device/push-token',pair.parent,{token:'a'.repeat(64)})).status).toBe(200);
+  expect((await call('device/watch-push-token',pair.parent,{token:'b'.repeat(64)})).status).toBe(200);
+  const record=await env.DB.prepare('SELECT created_at FROM pairs WHERE parent_id=?').bind(pair.parent.deviceId).first<{created_at:number}>();
+  const stub=env.ALERT_TESTS.get(env.ALERT_TESTS.idFromName(`${pair.parent.deviceId}|${pair.listener.deviceId}|${record!.created_at}`));
+  return {...pair,stub};
+ }
+ async function fire(stub:DurableObjectStub){
+  await runInDurableObject(stub,async(_instance,state)=>{
+   const session=await state.storage.get<{nextAt:string}>('session');
+   session!.nextAt=new Date(Date.now()-1).toISOString();
+   await state.storage.put('session',session);await state.storage.setAlarm(Date.now()+60000);
+  });
+  await runDurableObjectAlarm(stub);
+ }
+ const requests=()=>pushRequests.map(({init})=>({headers:new Headers(init!.headers),body:JSON.parse(init!.body as string)}));
+ it('schedules once, recovers from either phone, and sends selected routes after the delay',async()=>{
+  const {parent,listener,stub}=await setup(),id=crypto.randomUUID();
+  const before=Date.now();
+  const response=await call('alert-test',parent,{id,configuration:options()});
+  expect(response.status).toBe(200);
+  const {session}=await response.json() as {session:{startsAt:string;id:string;state:string}};
+  expect(Date.parse(session.startsAt)).toBeGreaterThanOrEqual(before+10000);
+  expect(pushRequests).toHaveLength(0);
+  expect((await call('alert-test',parent,{id,configuration:options()})).status).toBe(200);
+  expect((await call('alert-test',parent,{id:crypto.randomUUID(),configuration:options()})).status).toBe(409);
+  expect(await (await call('alert-test',listener,undefined,'GET')).json()).toMatchObject({session:{id,state:'scheduled'}});
+  mockPush(200,2);await fire(stub);
+  const sent=requests();expect(sent).toHaveLength(2);
+  expect(sent[0].headers.get('apns-collapse-id')).toMatch(/^phone:/);
+  expect(sent[1].headers.get('apns-collapse-id')).toMatch(/^watch:/);
+  expect(sent[0].body.eventId).toBe(sent[1].body.eventId);
+  expect(sent[0].body.aps['thread-id']).toBe(id);
+  expect(sent[0].body.isTest).toBe(true);
+  expect(await (await call('alert-test',parent,undefined,'GET')).json()).toMatchObject({session:{state:'completed',completedCount:1}});
+  const status=await (await call('listener/status',parent,undefined,'GET')).json() as {notificationRelevance:{testEventIDs:string[]}};
+  expect(status.notificationRelevance.testEventIDs).toContain(sent[0].body.eventId);
+  expect((await call('alert/acknowledge',parent,{eventId:sent[0].body.eventId})).status).toBe(200);
+ });
+ it.each([
+  [{phone:true,watch:false,alarmKit:false},1],
+  [{phone:false,watch:true,alarmKit:false},1],
+  [{phone:false,watch:false,alarmKit:true},1],
+  [{phone:true,watch:true,alarmKit:true},3]
+ ] as const)('uses only the selected destinations: %j',async(selection,total)=>{
+  const {parent,stub}=await setup();
+  expect((await call('alert-test',parent,{id:crypto.randomUUID(),configuration:options(selection)})).status).toBe(200);
+  mockPush(200,total);await fire(stub);
+  const sent=requests();expect(sent).toHaveLength(total);
+  expect(sent.filter(r=>r.headers.get('apns-topic')!.endsWith('.watchkitapp'))).toHaveLength(selection.watch?1:0);
+  expect(sent.filter(r=>r.body.silentAlarmTest)).toHaveLength(selection.alarmKit?1:0);
+  if(selection.alarmKit){
+   const wake=sent.find(r=>r.body.silentAlarmTest)!;
+   expect(wake.body.aps.sound).toBeUndefined();expect(wake.body.aps['content-available']).toBe(1);
+   expect(wake.body.configuredAlertTest).toBe(true);
+   expect(wake.headers.get('apns-collapse-id')).toMatch(/^alarm:/);
+  }
+ });
+ it('shares or separates notification IDs independently from transport IDs and thread grouping',async()=>{
+  const {parent,stub}=await setup();
+  expect((await call('alert-test',parent,{id:crypto.randomUUID(),configuration:options({sharedCollapseIDs:true,distinctRequestIDs:true,groupNotifications:false})})).status).toBe(200);
+  mockPush(200,2);await fire(stub);const [phone,watch]=requests();
+  expect(phone.headers.get('apns-collapse-id')).toBe(watch.headers.get('apns-collapse-id'));
+  expect(phone.headers.get('apns-id')).not.toBe(watch.headers.get('apns-id'));
+  expect(phone.body.aps['thread-id']).toBeUndefined();
+ });
+ it.each([true,false])('coalesces repeat notification IDs only when selected: %s',async(coalesceRepeats)=>{
+  const {listener,stub}=await setup(),id=crypto.randomUUID();
+  expect((await call('alert-test',listener,{id,configuration:options({watch:false,count:2,coalesceRepeats})})).status).toBe(200);
+  mockPush(200);await fire(stub);
+  mockPush(200);await fire(stub);
+  const [first,second]=requests();expect(first.body.eventId).not.toBe(second.body.eventId);
+  expect(first.body.episodeId).toBe(second.body.episodeId);
+  if(coalesceRepeats)expect(first.headers.get('apns-collapse-id')).toBe(second.headers.get('apns-collapse-id'));
+  else expect(first.headers.get('apns-collapse-id')).not.toBe(second.headers.get('apns-collapse-id'));
+  expect(await (await call('alert-test',listener,undefined,'GET')).json()).toMatchObject({session:{state:'completed',completedCount:2}});
+ });
+ it('stops before the first tick from either phone and ignores stale stop IDs',async()=>{
+  const {parent,listener,stub}=await setup(),id=crypto.randomUUID();
+  await call('alert-test',parent,{id,configuration:options({count:5})});
+  expect(await (await call('alert-test/stop',listener,{id:crypto.randomUUID()})).json()).toMatchObject({session:{state:'scheduled'}});
+  expect(await (await call('alert-test/stop',listener,{id})).json()).toMatchObject({session:{state:'stopped'}});
+  await runDurableObjectAlarm(stub);expect(pushRequests).toHaveLength(0);
+ });
+ it('stops on uncertain delivery without retrying an accepted sibling or sending later rounds',async()=>{
+  const {parent,stub}=await setup();
+  await call('alert-test',parent,{id:crypto.randomUUID(),configuration:options({count:5})});
+  mockPush(200);pushResponses.push(new Error('Connection lost'));
+  await fire(stub);
+  expect(await (await call('alert-test',parent,undefined,'GET')).json()).toMatchObject({session:{state:'failed',completedCount:1}});
+  await runDurableObjectAlarm(stub);expect(pushRequests).toHaveLength(2);
+ });
+ it('never replays an interrupted reserved round',async()=>{
+  const {parent,stub}=await setup();
+  await call('alert-test',parent,{id:crypto.randomUUID(),configuration:options({count:5})});
+  await runInDurableObject(stub,async(_instance,state)=>{
+   const session=await state.storage.get<Record<string,unknown>>('session');
+   await state.storage.put('session',{...session,dispatching:true,completedCount:1});
+  });
+  await fire(stub);expect(pushRequests).toHaveLength(0);
+  expect(await (await call('alert-test',parent,undefined,'GET')).json()).toMatchObject({session:{state:'failed',completedCount:1}});
+ });
+ it('cancels a session when pairing changes, before sending any push',async()=>{
+  const {parent,stub}=await setup();
+  await call('alert-test',parent,{id:crypto.randomUUID(),configuration:options()});
+  await env.DB.prepare('DELETE FROM pairs WHERE parent_id=?').bind(parent.deviceId).run();
+  await fire(stub);expect(pushRequests).toHaveLength(0);
+ });
+ it.each([
+  {phone:false,watch:false,alarmKit:false},{repeatInterval:0},{repeatInterval:0.5},{count:21},{count:0},
+  {alarmKit:'yes'},{phoneHeadStartMS:999},{phone:false,phoneHeadStartMS:500},{unexpected:true}
+ ])('rejects invalid configuration %j',async invalid=>{
+  const {parent}=await setup();
+  expect((await call('alert-test',parent,{id:crypto.randomUUID(),configuration:options(invalid)})).status).toBe(400);
+ });
+});

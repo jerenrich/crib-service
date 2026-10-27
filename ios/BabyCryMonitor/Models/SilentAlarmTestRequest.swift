@@ -3,6 +3,7 @@ import Foundation
 struct SilentAlarmTestRequest: Sendable {
     let eventID: UUID
     let createdAt: Date
+    let schedulingDelay: TimeInterval
 
     init?(payload: [AnyHashable: Any], now: Date = Date()) {
         guard payload["silentAlarmTest"] as? Bool == true,
@@ -15,5 +16,8 @@ struct SilentAlarmTestRequest: Sendable {
         guard let date, (-5...60).contains(now.timeIntervalSince(date)) else { return nil }
         eventID = id
         createdAt = date
+        // Configured tests already waited ten seconds on the service. Starting
+        // promptly also lets one- and two-second test rounds actually alert.
+        schedulingDelay = payload["configuredAlertTest"] as? Bool == true ? 0.5 : 3
     }
 }

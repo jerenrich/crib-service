@@ -57,3 +57,12 @@ class_name = "ProviderTokens"
 [[migrations]]
 tag = "v5-provider-tokens"
 new_sqlite_classes = ["ProviderTokens"]
+
+# Explicit, bounded test sessions run independently of phone background execution.
+[[durable_objects.bindings]]
+name = "ALERT_TESTS"
+class_name = "AlertTests"
+
+[[migrations]]
+tag = "v6-configurable-alert-tests"
+new_sqlite_classes = ["AlertTests"]

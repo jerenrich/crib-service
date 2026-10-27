@@ -95,6 +95,9 @@ protocol BackendServing: AlertSending {
     func watchPushToken(_ token: String?) async throws
     func connectionAlerts(_ enabled: Bool) async throws
     func requestTestPush() async throws
+    func alertTest() async throws -> AlertTestResponse
+    func startAlertTest(id: UUID, configuration: AlertTestConfiguration) async throws -> AlertTestResponse
+    func stopAlertTest(id: UUID) async throws -> AlertTestResponse
     func sendWatchTest() async throws
     func sendSilentAlarmTest() async throws -> UUID
     func silentWatchAlarms(_ enabled: Bool) async throws
@@ -103,6 +106,9 @@ protocol BackendServing: AlertSending {
     func deleteDevice() async throws
 }
 extension BackendServing {
+    func alertTest() async throws -> AlertTestResponse { throw BackendError.message("Configurable tests require an updated connection service.") }
+    func startAlertTest(id: UUID, configuration: AlertTestConfiguration) async throws -> AlertTestResponse { throw BackendError.message("Configurable tests require an updated connection service.") }
+    func stopAlertTest(id: UUID) async throws -> AlertTestResponse { throw BackendError.message("Configurable tests require an updated connection service.") }
     func confirmAlarmScheduled(episodeID: UUID, eventID: UUID, cycleID: UUID) async throws { throw BackendError.message("Alarm scheduling receipts require an updated connection service.") }
     func silentWatchAlarms(_ enabled: Bool) async throws { throw BackendError.message("Silent Watch alarms require an updated connection service.") }
     func sendSilentAlarmTest() async throws -> UUID { throw BackendError.message("Silent alarm testing requires an updated connection service.") }
@@ -156,6 +162,16 @@ struct BackendClient: BackendServing {
         let _: EmptyResponse = try await bounded.request("/v1/alarm/scheduled", body: ["episodeId": episodeID.uuidString, "eventId": eventID.uuidString, "cycleId": cycleID.uuidString])
     }
     func connectionAlerts(_ enabled: Bool) async throws { let _: EmptyResponse = try await request("/v1/connection-alerts", body: ["enabled": enabled]) }
+    func alertTest() async throws -> AlertTestResponse {
+        try await request("/v1/alert-test", method: "GET", body: Optional<String>.none)
+    }
+    func startAlertTest(id: UUID, configuration: AlertTestConfiguration) async throws -> AlertTestResponse {
+        struct Request: Encodable { let id: UUID; let configuration: AlertTestConfiguration }
+        return try await request("/v1/alert-test", body: Request(id: id, configuration: configuration))
+    }
+    func stopAlertTest(id: UUID) async throws -> AlertTestResponse {
+        try await request("/v1/alert-test/stop", body: ["id": id.uuidString])
+    }
     func requestTestPush() async throws { let _: AlertReceipt = try await request("/v1/test-push", body: [String:String]()) }
     func sendWatchTest() async throws {
         let _: EmptyResponse = try await request("/v1/watch-test/push", body: [String:String]())
@@ -190,7 +206,7 @@ struct BackendClient: BackendServing {
         let operation = ["/v1/device/register": "register", "/v1/pairing/create": "pairing_create", "/v1/pairing/claim": "pairing_claim",
                          "/v1/alarm/scheduled": "alarm_scheduled", "/v1/device/push-token": "push_token", "/v1/device/watch-push-token": "watch_token",
                          "/v1/listener/heartbeat": "heartbeat", "/v1/listener/event": "alert", "/v1/listener/status": "status",
-                         "/v1/timeline": "timeline", "/v1/monitoring": "monitoring", "/v1/monitoring/complete": "monitoring_complete", "/v1/settings": "settings", "/v1/alert/acknowledge": "acknowledge", "/v1/test-push": "test_push", "/v1/watch-test": "test_push", "/v1/watch-test/push": "test_push", "/v1/listener/silent-alarm-test": "test_push", "/v1/alert/resume": "resume_alerts",
+                         "/v1/timeline": "timeline", "/v1/monitoring": "monitoring", "/v1/monitoring/complete": "monitoring_complete", "/v1/settings": "settings", "/v1/alert/acknowledge": "acknowledge", "/v1/test-push": "test_push", "/v1/alert-test": "test_push", "/v1/alert-test/stop": "test_push", "/v1/watch-test": "test_push", "/v1/watch-test/push": "test_push", "/v1/listener/silent-alarm-test": "test_push", "/v1/alert/resume": "resume_alerts",
                          "/v1/connection-alerts": "connection_preferences", "/v1/pairing/remove": "unpair", "/v1/device/delete": "delete_device"][path] ?? "unknown"
         // Generated for each transport attempt, before receiving any response.
         // It is diagnostic correlation only; the event UUID remains idempotency authority.
