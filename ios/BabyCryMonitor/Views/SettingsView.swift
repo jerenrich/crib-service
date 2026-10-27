@@ -69,7 +69,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Repeat alerts")
                 } footer: {
-                    Text("Crying alerts repeat every \(Int(model.configuration.repeatInterval ?? 5)) seconds until you snooze one on your iPhone or Watch, or the Listener confirms the quiet period. Acknowledging snoozes crying alerts for \(alertDurationText(model.configuration.snoozeDuration)). Snooze clears existing crying notifications on that device. Opening the app clears alerts that have settled or been snoozed. Connection-loss alerts stay on. Frequent alerts request more notifications; watchOS controls background wrist taps, so a tap every two seconds is not guaranteed. Notification delivery depends on connectivity and your device settings.")
+                    Text("Crying and Listener connection-loss alerts repeat every \(Int(model.configuration.repeatInterval ?? 5)) seconds until you snooze one on your iPhone or Watch, or the Listener confirms quiet or reconnects. Acknowledging snoozes both kinds of alerts for \(alertDurationText(model.configuration.snoozeDuration)). Snooze clears existing alert notifications on that device. Opening the app clears alerts that have settled or been snoozed. If the Listener is still disconnected when snooze ends, alerts resume. Frequent alerts request more notifications; watchOS controls background wrist taps, so a tap every two seconds is not guaranteed. Notification delivery depends on connectivity and your device settings.")
                 }
                 Section("This iPhone") {
                     Picker("Mode", selection: Binding(get: { model.role ?? .listener }, set: { model.selectRole($0) })) { Text("Listener").tag(DeviceRole.listener); Text("Parent").tag(DeviceRole.parent) }
@@ -114,7 +114,7 @@ struct SettingsView: View {
                             LabeledContent("Server connection alerts", value: model.paired ? "Status unavailable" : "On by default")
                         }
                     } header: { Text("Monitoring connection") } footer: {
-                        Text("On by default for new registrations. The server reports a stopped Listener or missing updates after 3–4 minutes, even while Parent Mode is closed or the phone is locked. Receiving these alerts requires internet and allowed notifications.")
+                        Text("On by default for new registrations. The server reports a stopped Listener or missing updates after 3–4 minutes, even while Parent Mode is closed or the phone is locked. Missing-update alerts repeat at your chosen alert frequency until snoozed or the Listener reconnects, and use Silent Watch alarms when enabled. Snooze pauses crying and connection-loss alerts together. Receiving these alerts requires internet and allowed notifications.")
                     }
                     Section {
                         Toggle("Local overdue-check warning", isOn: Binding(get: { model.localConnectionWarningEnabled }, set: { model.setLocalConnectionWarning($0) }))

@@ -65,6 +65,8 @@ struct WatchCryAlert: Codable, Equatable, Identifiable, Sendable {
     let createdAt: Date
     let duration: Double
     let isTest: Bool
+    var type: String? = nil
+    var isDisconnected: Bool { type == "listener_disconnected" }
     var diagnosticRef: String? = nil
     var deliveryAttempt: Int? = nil
     var id: UUID { eventId }

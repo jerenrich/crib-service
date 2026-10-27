@@ -89,6 +89,20 @@ final class SilentCryAlarmRequestTests: XCTestCase {
         ["silentCryAlarm": true, "eventId": UUID().uuidString, "episodeId": episode.uuidString,
          "createdAt": ISO8601DateFormatter().string(from: now.addingTimeInterval(-age))]
     }
+    func testDisconnectedListenerUsesAlarmEligibilityAndClearsOnRecovery() throws {
+        var value = payload(); value["type"] = "listener_disconnected"
+        let request = try XCTUnwrap(SilentCryAlarmRequest(payload: value, now: now))
+        XCTAssertTrue(request.isDisconnected)
+        XCTAssertTrue(request.isEligible(enabled: true, serverEnabled: true, paired: true,
+            relevance: NotificationRelevance(cryEpisodeIDs: [episode]), mutedUntil: nil,
+            localMutedUntil: nil, stoppedBefore: nil, now: now))
+        XCTAssertEqual(request.ineligibilityReason(enabled: true, serverEnabled: true, paired: true,
+            relevance: NotificationRelevance(), mutedUntil: nil, localMutedUntil: nil,
+            stoppedBefore: nil, now: now), .irrelevant)
+        XCTAssertEqual(request.ineligibilityReason(enabled: true, serverEnabled: true, paired: true,
+            relevance: NotificationRelevance(cryEpisodeIDs: [episode]), mutedUntil: now.addingTimeInterval(60),
+            localMutedUntil: nil, stoppedBefore: nil, now: now), .serverMuted)
+    }
     func testSchedulingCycleIsTypedAndLegacyRequestsRemainAccepted() throws {
         XCTAssertNil(try XCTUnwrap(SilentCryAlarmRequest(payload: payload(), now: now)).cycleID)
         let cycle = UUID(); var marked = payload(); marked["alarmCycleId"] = cycle.uuidString

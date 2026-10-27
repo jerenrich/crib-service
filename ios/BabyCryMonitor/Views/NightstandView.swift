@@ -208,8 +208,8 @@ struct NightstandView: View {
             return Notice(title: "Monitoring not confirmed", summary: "Check the nursery phone. Do not rely on alerts.", icon: "exclamationmark.triangle.fill")
         }
         if !listener, model.activeAlert != nil {
-            return Notice(title: model.activeAlert?.isTest == true ? "Test notification" : "Check on your baby",
-                summary: "Review the alert to confirm receipt or snooze crying alerts.", icon: "bell.badge")
+            return Notice(title: model.activeAlert?.isTest == true ? "Test notification" : model.activeAlert?.isDisconnected == true ? "Listener connection lost" : "Check on your baby",
+                summary: "Review the alert to confirm receipt or snooze alerts.", icon: "bell.badge")
         }
         if listener, listenerAlertFailed {
             return Notice(title: "Alert delivery failed", summary: "Check delivery details. This alert will not retry.", icon: "exclamationmark.triangle.fill")
@@ -224,7 +224,7 @@ struct NightstandView: View {
             return Notice(title: "Connection interrupted", summary: "Check the nursery phone. Do not rely on alerts.", icon: "wifi.slash")
         }
         if !listener, let until = model.parentStatus?.alertsMutedUntil, until > model.now {
-            return Notice(title: "Crying alerts snoozed", summary: "Snoozed until \(until.formatted(date: .omitted, time: .shortened)).", icon: "bell.slash")
+            return Notice(title: "Alerts snoozed", summary: "Snoozed until \(until.formatted(date: .omitted, time: .shortened)).", icon: "bell.slash")
         }
         if !model.paired {
             return Notice(title: "Pair your iPhones", summary: "Connect the nursery and Parent phones to begin.", icon: "link", caution: false)
@@ -319,7 +319,7 @@ struct NightstandView: View {
                         }
                     }
                     if !listener, let until = model.parentStatus?.alertsMutedUntil, until > model.now {
-                        Label("Crying alerts snoozed until \(until.formatted(date: .omitted, time: .shortened))", systemImage: "bell.slash")
+                        Label("Alerts snoozed until \(until.formatted(date: .omitted, time: .shortened))", systemImage: "bell.slash")
                             .font(.subheadline).foregroundStyle(Palette.amber)
                     }
                     if let message = model.monitoringControlMessage { Text(message).font(.subheadline) }
@@ -351,7 +351,7 @@ struct NightstandView: View {
 
     private func snoozePanel(until: Date) -> some View {
         Panel {
-            Label("Crying alerts snoozed", systemImage: "bell.slash").font(.headline)
+            Label("Alerts snoozed", systemImage: "bell.slash").font(.headline)
             HStack {
                 Text("Resume in")
                 Text(timerInterval: model.now...until, countsDown: true).monospacedDigit()
@@ -496,14 +496,14 @@ struct NightstandView: View {
 
     private func alertPanel(_ alert: RemoteAlert) -> some View {
         Panel {
-            Label(alert.isTest == true ? "Test notification" : "Check on baby", systemImage: "bell.badge")
+            Label(alert.isTest == true ? "Test notification" : alert.isDisconnected ? "Listener connection lost" : "Check on baby", systemImage: "bell.badge")
                 .font(.title2.weight(.semibold)).foregroundStyle(Palette.amber)
-            Text(alert.isTest == true ? "Confirm only after you receive this test on your intended device." : "Crying-like sound was detected. Check on baby.")
+            Text(alert.isTest == true ? "Confirm only after you receive this test on your intended device." : alert.isDisconnected ? "No Listener update for at least 3 minutes. Check the nursery phone’s power, internet and monitoring." : "Crying-like sound was detected. Check on baby.")
                 .font(.subheadline)
             Text("Sent \(alert.createdAt.formatted(date: .omitted, time: .shortened)) · Delivery: \(alert.status)")
                 .font(.caption).foregroundStyle(Palette.muted)
             if alert.isTest != true {
-                Text("Snoozing stops repeat crying alerts. Monitoring and connection warnings stay on.")
+                Text("Snoozing pauses crying and Listener connection-loss alerts for your chosen duration. Monitoring stays on.")
                     .font(.footnote).foregroundStyle(Palette.muted)
             }
             PrimaryButton(title: model.acknowledgingAlert ? "Confirming…" : alert.isTest == true ? "I received this test" : "Snooze alerts for \(spokenDuration(model.configuration.snoozeDuration))") {

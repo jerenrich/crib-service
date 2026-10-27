@@ -14,11 +14,12 @@ export function payload(alert:Alert) {
  const minutes=Math.floor(alert.durationSeconds/60);const seconds=Math.floor(alert.durationSeconds%60);
  const unit=(value:number,name:string)=>`${value} ${name}${value===1?'':'s'}`;
  const duration=minutes>0?`${unit(minutes,'minute')}${seconds?` ${unit(seconds,'second')}`:''}`:unit(seconds,'second');
- const title=alert.isTest?'Test · Crib Service':alert.isRepeat?'Repeat alert · Check on baby':'Baby is crying';
- const body=alert.isRepeat&&!alert.isTest?'Crying was detected. Acknowledge this alert to snooze crying alerts for the duration chosen in Settings.':alert.isTest&&alert.isRepeat?'Repeating Watch alert test. Use Stop Watch test in iPhone Settings to end the test.':alert.isTest?`Test notification from your Listener. Simulated the ${duration} alert threshold.`:`Crying-like sound has continued for ${duration}. Started at ${new Date(alert.cryStartedAt).toISOString().slice(11,16)} UTC. Acknowledge to snooze crying alerts for the duration chosen in Settings.`;
+ const disconnected=alert.type==='listener_disconnected';
+ const title=disconnected?'Listener connection lost':alert.isTest?'Test · Crib Service':alert.isRepeat?'Repeat alert · Check on baby':'Baby is crying';
+ const body=disconnected?'No Listener update for at least 3 minutes. Check the nursery phone’s power, internet and monitoring. Snooze to pause alerts for the duration chosen in Settings.':alert.isRepeat&&!alert.isTest?'Crying was detected. Acknowledge this alert to snooze alerts for the duration chosen in Settings.':alert.isTest&&alert.isRepeat?'Repeating Watch alert test. Use Stop Watch test in iPhone Settings to end the test.':alert.isTest?`Test notification from your Listener. Simulated the ${duration} alert threshold.`:`Crying-like sound has continued for ${duration}. Started at ${new Date(alert.cryStartedAt).toISOString().slice(11,16)} UTC. Acknowledge to snooze alerts for the duration chosen in Settings.`;
  // Keep alerting metadata identical so both devices request system sound/haptics.
  // Device Silent Mode can mute audio while preserving Watch notification taps.
- return {aps:{alert:{title,body},category:'BABY_CRY_ALERT','interruption-level':'time-sensitive',sound:'default'},eventId:alert.eventId,episodeId:alert.episodeId,cryStartedAt:alert.cryStartedAt,createdAt:alert.createdAt,durationSeconds:alert.durationSeconds,...(alert.isTest?{isTest:true}:{})};
+ return {aps:{alert:{title,body},category:'BABY_CRY_ALERT','interruption-level':'time-sensitive',sound:'default'},type:alert.type,...(disconnected?{connectionState:'offline'}:{}),eventId:alert.eventId,episodeId:alert.episodeId,cryStartedAt:alert.cryStartedAt,createdAt:alert.createdAt,durationSeconds:alert.durationSeconds,...(alert.isTest?{isTest:true}:{})};
 }
 export async function sendPush(env:Env,encryptedToken:string,alert:Alert,target:'phone'|'watch'='phone',latency=new Latency(),silentCryAlarm=false,schedule?:PushSchedule,identity:PushIdentityOptions={},alarmCycle?:string):Promise<PushResult> {
  latency.details.alarm_wake_requested=silentCryAlarm&&target==='phone'&&!alert.isTest;

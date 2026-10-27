@@ -1649,7 +1649,7 @@ import UIKit
         value.discardedAcknowledgementEventId = defaults.string(forKey: watchDiscardedKey).flatMap(UUID.init(uuidString:))
         if value.parentMode, let alert = activeAlert {
             value.alert = WatchCryAlert(eventId: alert.eventId, episodeId: alert.episodeId, startedAt: alert.cryStartedAt,
-                                        createdAt: alert.createdAt, duration: alert.durationSeconds, isTest: alert.isTest == true)
+                                        createdAt: alert.createdAt, duration: alert.durationSeconds, isTest: alert.isTest == true, type: alert.type)
         }
         value.message = message
         return value
@@ -1664,7 +1664,7 @@ import UIKit
             guard let deadline = command.snoozeDeadline else { return watchSnapshot(message: "Open your iPhone to resume alerts.") }
             await refreshParent()
             let resumed = await resumeAlerts(until: deadline)
-            return watchSnapshot(message: resumed ? "Crying alerts resumed." : "Resume not confirmed. Check the Parent iPhone; a newer snooze may be active.")
+            return watchSnapshot(message: resumed ? "Alerts resumed." : "Resume not confirmed. Check the Parent iPhone; a newer snooze may be active.")
         case .registerToken:
             let latest = defaults.object(forKey: watchRegistrationDateKey) as? Date ?? .distantPast
             if command.issuedAt >= latest {

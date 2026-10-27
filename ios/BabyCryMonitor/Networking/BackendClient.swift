@@ -60,6 +60,8 @@ struct RemoteAlert: Identifiable, Codable, Sendable {
     let isTest: Bool?
     var resolvedAt: Date? = nil
     var deliveryTarget: String? = nil
+    var type: String? = nil
+    var isDisconnected: Bool { type == "listener_disconnected" }
     var id: UUID { eventId }
 }
 struct Heartbeat: Codable, Sendable {

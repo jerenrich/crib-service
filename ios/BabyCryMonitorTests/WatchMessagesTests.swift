@@ -9,6 +9,16 @@ import XCTest
 final class WatchMessagesTests: XCTestCase {
     let now = Date(timeIntervalSince1970: 1_800_000_000)
 
+    func testDisconnectedAlertKindSurvivesWatchSnapshotAndLegacyPayloads() throws {
+        let alert = WatchCryAlert(eventId: UUID(), episodeId: UUID(), startedAt: now.addingTimeInterval(-180),
+            createdAt: now, duration: 180, isTest: false, type: "listener_disconnected")
+        let snapshot = WatchSnapshot(updatedAt: now, alert: alert)
+        let decoded = try JSONDecoder().decode(WatchSnapshot.self, from: JSONEncoder().encode(snapshot))
+        XCTAssertTrue(try XCTUnwrap(decoded.alert).isDisconnected)
+        let legacy = WatchCryAlert(eventId: UUID(), episodeId: UUID(), startedAt: now, createdAt: now, duration: 5, isTest: false)
+        let decodedLegacy = try JSONDecoder().decode(WatchCryAlert.self, from: JSONEncoder().encode(legacy))
+        XCTAssertFalse(decodedLegacy.isDisconnected)
+    }
     func testLivePresentationMatchesParentWithoutChangingRawHeartbeatOrWarningDeadline() throws {
         var snapshot = WatchSnapshot(updatedAt: now, parentMode: true, paired: true,
             lastHeartbeat: now.addingTimeInterval(-180), monitoring: false, state: .quiet)

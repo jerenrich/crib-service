@@ -214,6 +214,17 @@ export async function runReminder(env:Env,parentId:string,latency=new Latency(),
  // than letting it shut down reminders for every other outstanding episode.
  let previous=snapshot[2].results[0] as StoredEvent|undefined;
  if(!previous) {
+  // An outage needs no Listener execution to resume after Snooze. A newer
+  // heartbeat or opt-out resolves it; never manufacture an outage from stale cry data.
+  previous=await read<StoredEvent>('reminder_original_ms',env.DB.prepare(`SELECT e.* FROM events e
+   JOIN pairs p ON p.parent_id=e.parent_id AND p.listener_id=e.listener_id
+   JOIN devices d ON d.id=p.parent_id JOIN heartbeats h ON h.listener_id=p.listener_id
+   WHERE e.parent_id=? AND e.resolved_at IS NULL AND json_extract(e.payload,'$.type')='listener_disconnected'
+    AND d.connection_alerts=1 AND json_extract(h.metadata,'$.monitoring')=1
+    AND h.received_at=json_extract(e.payload,'$.cryStartedAt') AND h.received_at<?
+   ORDER BY e.created_at DESC LIMIT 1`).bind(parentId,new Date(now-180000).toISOString()));
+ }
+ if(!previous) {
   // After a mute, require a fresh Listener update confirming sustained crying.
   if(!pair.alerts_muted_until)return stop('no_pending_alert');
   const last=await read<{received_at:string;metadata:string}>('reminder_heartbeat_ms',env.DB.prepare('SELECT received_at,metadata FROM heartbeats WHERE listener_id=?').bind(pair.listener_id));
@@ -246,7 +257,7 @@ export async function runReminder(env:Env,parentId:string,latency=new Latency(),
  // Keep the original measured duration: a reminder is not evidence of more crying.
  const insert=env.DB.prepare(`INSERT INTO events(event_id,episode_id,listener_id,parent_id,is_repeat,payload,created_at,reminder_of)
  SELECT ?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM pairs p JOIN devices d ON d.id=p.parent_id WHERE p.parent_id=? AND p.listener_id=? AND d.alerts_muted_until<=?)
- AND (SELECT acknowledged_at FROM events WHERE event_id=?) IS ?
+ AND EXISTS(SELECT 1 FROM events WHERE event_id=? AND resolved_at IS NULL AND acknowledged_at IS ?)
  ON CONFLICT DO NOTHING`)
   .bind(event.eventId,event.episodeId,pair.listener_id,parentId,1,JSON.stringify(event),now,previous.event_id,parentId,pair.listener_id,now,previous.event_id,previous.acknowledged_at);
  // Insertion, suppression guards, claim and token read commit together. Cron

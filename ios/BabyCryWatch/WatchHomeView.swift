@@ -19,7 +19,7 @@ struct WatchHomeView: View {
                         }
                         if let until = model.snapshot.alertsMutedUntil, until > context.date {
                             VStack(spacing: 4) {
-                                Text("Crying alerts resume in")
+                                Text("Alerts resume in")
                                 Text(timerInterval: context.date...until, countsDown: true).monospacedDigit()
                                 Button("Resume alerts") { model.resumeAlerts() }.disabled(model.refreshing)
                             }.font(.caption2).foregroundStyle(.secondary)
@@ -106,12 +106,12 @@ struct WatchHomeView: View {
     }
     private func alertCard(_ alert: WatchCryAlert, now: Date) -> some View {
         VStack(spacing: 10) {
-            Image(systemName: alert.isTest ? "bell.badge" : "waveform").font(.system(size: 34)).foregroundStyle(.orange)
-            Text(alert.isTest ? "Test alert" : "Check on baby").font(.system(.title2, design: .rounded).weight(.semibold)).multilineTextAlignment(.center)
-            Text(alert.isTest ? "A test from your Listener." : "Crying-like sound continued for \(duration(alert.duration)).").font(.footnote).multilineTextAlignment(.center)
+            Image(systemName: alert.isTest ? "bell.badge" : alert.isDisconnected ? "wifi.slash" : "waveform").font(.system(size: 34)).foregroundStyle(.orange)
+            Text(alert.isTest ? "Test alert" : alert.isDisconnected ? "Listener connection lost" : "Check on baby").font(.system(.title2, design: .rounded).weight(.semibold)).multilineTextAlignment(.center)
+            Text(alert.isTest ? "A test from your Listener." : alert.isDisconnected ? "No Listener update for at least 3 minutes. Check the nursery phone’s power, internet and monitoring." : "Crying-like sound continued for \(duration(alert.duration)).").font(.footnote).multilineTextAlignment(.center)
             Text("Sent \(alert.createdAt.formatted(date: .omitted, time: .shortened))").font(.caption2).foregroundStyle(.secondary)
             if !alert.isRecent(at: now) { Text("Earlier alert · Check current nursery status.").font(.caption2).foregroundStyle(.orange) }
-            if !alert.isTest { Text("Tap Snooze to pause crying alerts for \(duration(model.snapshot.snoozeDuration ?? 60)).").font(.caption2).foregroundStyle(.secondary) }
+            if !alert.isTest { Text("Tap Snooze to pause crying and connection-loss alerts for \(duration(model.snapshot.snoozeDuration ?? 60)).").font(.caption2).foregroundStyle(.secondary) }
         }.padding(.vertical, 8)
     }
     private func stateTitle(online: Bool, now: Date) -> String {

@@ -84,7 +84,7 @@ final class WatchIntegrationTests: XCTestCase {
         XCTAssertTrue(unchanged.message?.contains("not confirmed") == true)
         let resumed = try await fixture.command(WatchCommand(kind: .resumeAlerts, snoozeDeadline: newer))
         XCTAssertLessThan(try XCTUnwrap(resumed.alertsMutedUntil), Date())
-        XCTAssertEqual(resumed.message, "Crying alerts resumed.")
+        XCTAssertEqual(resumed.message, "Alerts resumed.")
         let sent = await fixture.backend.resumedDeadlines
         XCTAssertEqual(sent, [original, newer])
     }
