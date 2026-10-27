@@ -4,7 +4,6 @@ struct SettingsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     @State private var pairing = false
-    @State private var readiness = false
     @State private var removal = Removal.unpair
     @State private var confirmRemoval = false
     private enum Removal { case unpair, delete }
@@ -105,7 +104,6 @@ struct SettingsView: View {
                         Text("Keep this iPhone app open and unlocked. The iPhone requests one real Watch test push at a time. Stop works immediately, even offline. Locking the phone, leaving the app or closing Settings stops the test; it never resumes automatically. Internet is required to send. watchOS and Focus settings control delivery and wrist taps. A push already sent may arrive after stopping.")
                     }
                     Section {
-                        Button("Ready for tonight?") { readiness = true }
                         if let enabled = model.parentStatus?.connectionAlertsEnabled {
                             Toggle("Server connection alerts", isOn: Binding(get: { model.parentStatus?.connectionAlertsEnabled ?? enabled }, set: { value in Task { await model.setConnectionAlerts(value) } }))
                                 .disabled(model.changingConnectionAlerts || !model.paired)
@@ -154,7 +152,6 @@ struct SettingsView: View {
                 .onDisappear { model.stopWatchTest() }
                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
                 .sheet(isPresented: $pairing) { PairingView() }
-                .sheet(isPresented: $readiness) { ReadinessView() }
                 .alert(removal == .delete ? "Delete device and shared history?" : "Unpair these phones?", isPresented: $confirmRemoval) {
                     Button(removal == .delete ? "Delete device & shared history" : "Unpair and clear shared history", role: .destructive) {
                         let deleteDevice = removal == .delete

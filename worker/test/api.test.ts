@@ -379,6 +379,22 @@ describe('connection alerts, readiness and replacement',()=>{
   expect(status.alerts[0].isTest).toBe(true);expect(JSON.parse(String(pushRequests[0].init?.body)).isTest).toBe(true);
   expect((await call('alert/acknowledge',parent,{eventId:status.alerts[0].eventId})).status).toBe(200);
  });
+ it('confirms earlier unconfirmed tests with one acknowledgement without touching real alerts or later tests',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});mockPush();
+  const tests=[0,1,2].map(()=>({...alert(listener),isTest:true}));const real=alert(listener);const later={...alert(listener),isTest:true};
+  for(const event of [...tests,real,later])await call('listener/event',listener,event);
+  // Order creation explicitly: two earlier tests, a real alert, then two tests after the confirmed one.
+  const created=new Map([[tests[0].eventId,1000],[tests[1].eventId,2000],[real.eventId,1500],[tests[2].eventId,3000],[later.eventId,4000]]);
+  for(const [id,at] of created)await env.DB.prepare('UPDATE events SET created_at=? WHERE event_id=?').bind(at,id).run();
+  expect((await call('alert/acknowledge',parent,{eventId:tests[1].eventId})).status).toBe(200);
+  const acknowledged=async(id:string)=>(await env.DB.prepare('SELECT acknowledged_at FROM events WHERE event_id=?').bind(id).first<{acknowledged_at:string|null}>())?.acknowledged_at!=null;
+  expect(await acknowledged(tests[0].eventId)).toBe(true);expect(await acknowledged(tests[1].eventId)).toBe(true);
+  expect(await acknowledged(tests[2].eventId)).toBe(false);expect(await acknowledged(later.eventId)).toBe(false);
+  expect(await acknowledged(real.eventId)).toBe(false);
+  expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM timeline_events WHERE kind=?').bind('test_acknowledged').first()).toEqual({n:1});
+  const mute=await env.DB.prepare('SELECT alerts_muted_until FROM devices WHERE id=?').bind(parent.deviceId).first<{alerts_muted_until:number}>();
+  expect(mute?.alerts_muted_until).toBe(0);
+ });
  it('unpairs atomically, permits replacement and prevents old history replay',async()=>{
   const {parent,listener}=await paired();const other=await paired();const old=alert(listener);await call('listener/event',listener,old);
   await call('listener/heartbeat',listener,beat(listener));await call('listener/heartbeat',other.listener,beat(other.listener));

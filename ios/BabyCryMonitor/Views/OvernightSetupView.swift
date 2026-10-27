@@ -117,7 +117,7 @@ struct OvernightSetupView: View {
             if model.parentDisplaysMonitoring {
                 Label("Nursery microphone confirmed active", systemImage: "checkmark.circle.fill").foregroundStyle(Palette.mint)
                 Text(model.settingsSyncStatus).font(.footnote)
-                Button("Finish setup") { model.completeBedtimeSetup(); dismiss() }
+                Button("Finish setup") { dismiss() }
                     .accessibilityIdentifier("finishBedtimeSetup")
             } else {
                 if !model.canStartMonitoringRemotely && model.pendingMonitoringCommand == nil && !model.requestingMonitoring {

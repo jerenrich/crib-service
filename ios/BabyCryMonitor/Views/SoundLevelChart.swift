@@ -11,7 +11,7 @@ struct SoundLevelChart: View {
     var notificationPositions: [CGFloat] = []
 
     var body: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 0) {
             GeometryReader { geometry in
                 let triggerHeight = levelHeight(trigger, in: geometry.size.height)
                 ZStack(alignment: .bottom) {
@@ -49,31 +49,9 @@ struct SoundLevelChart: View {
                 .clipped()
             }
             .frame(height: height)
-
-            HStack {
-                Text("30 sec ago")
-                Spacer()
-                Label("Alert", systemImage: "bell.fill").foregroundStyle(Palette.amber)
-                Spacer()
-                Text("now")
-            }
-            .font(.caption2.monospacedDigit())
-            .foregroundStyle(Palette.muted)
-
-            ViewThatFits(in: .horizontal) {
-                HStack {
-                    Text(monitoring ? "Current \(levelText(currentLevel))" : "Inactive")
-                        .font(.caption.monospacedDigit()).foregroundStyle(Palette.muted)
-                    Spacer(minLength: 12)
-                    thresholdLabel("Trigger", value: trigger, color: Palette.amber, dash: [6, 4])
-                }
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(monitoring ? "Current \(levelText(currentLevel))" : "Inactive")
-                        .font(.caption.monospacedDigit()).foregroundStyle(Palette.muted)
-                    thresholdLabel("Trigger", value: trigger, color: Palette.amber, dash: [6, 4])
-                }.frame(maxWidth: .infinity, alignment: .leading)
-            }
         }
+        // Keep the accessibility frame equal to the plot, even when bars are flat.
+        .contentShape(Rectangle())
         .accessibilityElement(children: .ignore)
         .accessibilityIdentifier("soundLevelChart")
         .accessibilityLabel("Live sound level")
@@ -93,21 +71,6 @@ struct SoundLevelChart: View {
             path.addLine(to: CGPoint(x: size.width, y: y))
         }
         .stroke(color.opacity(monitoring ? 0.65 : 0.4), style: StrokeStyle(lineWidth: 1, dash: dash))
-    }
-
-    private func thresholdLabel(_ title: String, value: Double, color: Color, dash: [CGFloat]) -> some View {
-        HStack(spacing: 6) {
-            Path { path in
-                path.move(to: CGPoint(x: 0, y: 1))
-                path.addLine(to: CGPoint(x: 16, y: 1))
-            }
-            .stroke(color.opacity(0.8), style: StrokeStyle(lineWidth: 1, dash: dash))
-            .frame(width: 16, height: 2)
-            Text("\(title) \(levelText(value))")
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(color)
-                .fixedSize()
-        }
     }
 
     private func levelText(_ level: Double) -> String {

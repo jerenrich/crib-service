@@ -272,9 +272,12 @@ export async function acknowledge(env:Env,device:Device,value:Record<string,unkn
   AND EXISTS(SELECT 1 FROM events WHERE event_id=? AND acknowledged_at IS NULL) ON CONFLICT DO NOTHING`)
   .bind(journalEvent.id,pair.parent_id,pair.listener_id,pair.created_at,journalEvent.kind,now,JSON.stringify(journalEvent),pair.parent_id,pair.listener_id,pair.created_at,id);
  if(isTest) {
-  await env.DB.batch([journal,env.DB.prepare(`UPDATE events SET acknowledged_at=COALESCE(acknowledged_at,?) WHERE event_id=? AND parent_id=?
+  // Tests never expire, so confirming one also confirms this pair's earlier unconfirmed tests.
+  // Otherwise repeated tests would each need a separate confirmation. Real alerts are untouched.
+  await env.DB.batch([journal,env.DB.prepare(`UPDATE events SET acknowledged_at=COALESCE(acknowledged_at,?) WHERE parent_id=? AND listener_id=?
+   AND acknowledged_at IS NULL AND COALESCE(json_extract(payload,'$.isTest'),0)=1 AND (event_id=? OR created_at<=?)
    AND EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?)`)
-   .bind(timestamp,id,device.id,pair.parent_id,pair.listener_id,pair.created_at)]);
+   .bind(timestamp,device.id,event.listener_id,id,event.created_at,pair.parent_id,pair.listener_id,pair.created_at)]);
  }else{
   const claim=crypto.randomUUID();
   // A unique request claim gates every side effect in the same D1 transaction.

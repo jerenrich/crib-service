@@ -1,7 +1,8 @@
 import SwiftUI
 
 struct ListenerView: View {
-    var body: some View { NightstandView(role: .listener) }
+    var showDevices: () -> Void = {}
+    var body: some View { NightstandView(role: .listener, showDevices: showDevices) }
 
     static func alertMessage(for episode: CryEpisode, snapshot: SessionSnapshot, now: Date) -> String {
         switch snapshot.alertStatus(for: episode) {

@@ -174,15 +174,15 @@ Coverage added here includes outage opt-in/deduplication/recovery, stopped monit
 - Live smoke checks passed for authentication, temporary registration/pairing, five-second settings and bounds, applied-configuration acknowledgement, diagnostic request references, connection preference default/role/opt-in/out, marked tokenless test events, unpair/replacement, old-history removal and device deletion/revoked credentials. Temporary devices and metadata were deleted through the API. No real push token was submitted and no push was sent.
 - Three consecutive successful maintenance records from the new Worker version confirmed that scheduled work runs after deployment.
 - Signed Debug app and companion built for the configured Apple team with development APNs and the live backend URL. Installed in place and launched successfully on J14 (iPhone 14 Pro), J17 (iPhone 17 Pro) and Jordan’s Apple Watch. No app-data reset or unpairing was performed on these devices.
-- Monitoring must be restarted on the Listener after installation. Parent → Ready for tonight? provides the live checklist and real test request. Connection alerts remain opt-in. Presentation, wrist haptics, room calibration and overnight behavior require the physical checks below.
+- Monitoring must be restarted on the Listener after installation. Parent Monitor shows device health and offers a real test request; Devices → Guided overnight setup provides the wrist-test checklist. Connection alerts remain opt-in. Presentation, wrist haptics, room calibration and overnight behavior require the physical checks below.
 
 ## Physical validation
 
 | Check | Procedure | Expected observation | Hardware result |
 | --- | --- | --- | --- |
-| Setup | Pair, start Listener, connect power and open Parent's Tonight's check | Pairing, active microphone report, power, registration and settings checks pass as fresh data arrives | Not run |
+| Setup | Pair, start Listener, connect power and open Parent Monitor | Ring shows Quiet; Nursery, Watch and Alerts chips show plugged in, registered and the applied delay as fresh data arrives | Not run |
 | Full push path | Send a test from Listener with Parent locked and Watch app closed; repeat with intended Sleep Focus | Marked real test is visible/felt on selected receiver; confirm receipt in Parent | Not run |
-| Parent test | Send real test from Tonight's check and lock phone | Marked test arrives; receipt remains unconfirmed until acknowledged | Not run |
+| Parent test | Send real test from Parent Monitor → Test alert and lock phone | Marked test arrives; receipt remains unconfirmed until acknowledged | Not run |
 | Settings | Change alert duration on Parent while Listener is online | Saving → waiting → applied; actual Listener duration changes | Not run |
 | Offline settings | Disconnect Listener, change duration, reconnect | Parent does not claim applied until Listener reports the new configuration | Not run |
 | Connection loss | Opt in, start Listener, then disconnect only Listener internet for at least four minutes | One connection-loss notice; Parent shows lost connection when opened | Not run |
