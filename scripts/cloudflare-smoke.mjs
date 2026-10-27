@@ -56,7 +56,9 @@ try {
         sharedCollapseIDs: false, distinctRequestIDs: false, coalesceRepeats: false,
         groupNotifications: true, phoneHeadStartMS: 0};
     check((await request('alert-test', parent, {id: randomUUID(), configuration: {...testOptions, phone: false}})).status === 400, 'configured test rejects empty delivery selection');
-    check((await request('alert-test', parent, {id: randomUUID(), configuration: testOptions})).status === 409, 'configured test requires selected phone registration');
+    for (let attempt = 1; attempt <= 7; attempt++) {
+        check((await request('alert-test', parent, {id: randomUUID(), configuration: testOptions})).status === 409, `configured test attempt ${attempt} requires phone registration without hitting the old six-start limit`);
+    }
     check((await request('alert-test', listener, {id: randomUUID(), configuration: {...testOptions, phone: false, watch: true}})).status === 409, 'configured test requires selected Watch registration');
     const stoppedTest = await request('alert-test/stop', parent, {id: randomUUID()});
     check(stoppedTest.status === 200 && stoppedTest.body.session === null, 'configured test stop is safe without a session');
