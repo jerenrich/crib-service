@@ -89,6 +89,102 @@ final class WatchIntegrationTests: XCTestCase {
         XCTAssertEqual(sent, [original, newer])
     }
 
+    @MainActor func testEarlyResumeClearsSilentAlarmSnoozeAndKeepsOldPushCutoff() async throws {
+        guard #available(iOS 26.0, *) else { throw XCTSkip("Silent crying alarms require iOS 26.") }
+        let fixture = try Fixture()
+        fixture.defaults.set(true, forKey: "silentWatchAlarmsEnabled")
+        let service = SilentCryAlarmService(defaults: fixture.defaults)
+        let until = Date().addingTimeInterval(300)
+        await fixture.backend.setMute(until)
+        service.snoozeLocally(eventID: UUID(), duration: 300)
+        let cutoff = try XCTUnwrap(fixture.defaults.object(forKey: "silentCryAlarmStoppedBefore") as? Date)
+        // Sync the original acknowledgement before requesting an early Resume.
+        await service.synchronize(using: fixture.backend, status: try await fixture.backend.status(), checkedAt: Date())
+        await fixture.model.refreshParent()
+        let resumed = await fixture.model.resumeAlerts(until: until)
+        XCTAssertTrue(resumed)
+        let checkedAt = Date(), status = try await fixture.backend.status()
+        await service.synchronize(using: fixture.backend, status: status, checkedAt: checkedAt)
+        XCTAssertNil(fixture.defaults.object(forKey: "silentCryAlarmMutedUntil"))
+        XCTAssertEqual(fixture.defaults.object(forKey: "silentCryAlarmStoppedBefore") as? Date, cutoff)
+
+        let now = max(Date(), cutoff.addingTimeInterval(1)), episode = UUID()
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let request = try XCTUnwrap(SilentCryAlarmRequest(payload: [
+            "silentCryAlarm": true, "eventId": UUID().uuidString, "episodeId": episode.uuidString,
+            "createdAt": formatter.string(from: now)
+        ], now: now))
+        XCTAssertNil(request.ineligibilityReason(enabled: true, serverEnabled: true, paired: true,
+            relevance: NotificationRelevance(cryEpisodeIDs: [episode]), mutedUntil: status.alertsMutedUntil,
+            localMutedUntil: fixture.defaults.object(forKey: "silentCryAlarmMutedUntil") as? Date,
+            stoppedBefore: cutoff, now: now))
+    }
+
+    @MainActor func testSilentAlarmResumePreservesNewerLocalAndServerSnoozes() async throws {
+        guard #available(iOS 26.0, *) else { throw XCTSkip("Silent crying alarms require iOS 26.") }
+        let fixture = try Fixture()
+        fixture.defaults.set(true, forKey: "silentWatchAlarmsEnabled")
+        let service = SilentCryAlarmService(defaults: fixture.defaults)
+        let beforeSnooze = Date().addingTimeInterval(-1), until = Date().addingTimeInterval(300)
+        fixture.defaults.set(Date(), forKey: "silentCryAlarmStoppedBefore")
+        fixture.defaults.set(until, forKey: "silentCryAlarmMutedUntil")
+        let unmuted = ParentStatus(paired: true, configuration: MonitoringConfiguration())
+        await service.synchronize(using: fixture.backend, status: unmuted, checkedAt: beforeSnooze)
+        XCTAssertEqual(fixture.defaults.object(forKey: "silentCryAlarmMutedUntil") as? Date, until)
+        let muted = ParentStatus(paired: true, alertsMutedUntil: until, configuration: MonitoringConfiguration())
+        await service.synchronize(using: fixture.backend, status: muted, checkedAt: Date())
+        XCTAssertEqual(fixture.defaults.object(forKey: "silentCryAlarmMutedUntil") as? Date, until)
+    }
+
+    @MainActor func testSilentAlarmResumeRequiresStatusFetchedAfterAcknowledgementSync() async throws {
+        guard #available(iOS 26.0, *) else { throw XCTSkip("Silent crying alarms require iOS 26.") }
+        let fixture = try Fixture()
+        fixture.defaults.set(true, forKey: "silentWatchAlarmsEnabled")
+        let service = SilentCryAlarmService(defaults: fixture.defaults)
+        service.snoozeLocally(eventID: UUID(), duration: 300)
+        let until = fixture.defaults.object(forKey: "silentCryAlarmMutedUntil") as? Date
+        let checkedAt = Date(), unmuted = ParentStatus(paired: true, configuration: MonitoringConfiguration())
+        await fixture.backend.fail(true)
+        await service.synchronize(using: fixture.backend, status: unmuted, checkedAt: checkedAt)
+        XCTAssertEqual(fixture.defaults.object(forKey: "silentCryAlarmMutedUntil") as? Date, until)
+        await fixture.backend.fail(false)
+        await service.synchronize(using: fixture.backend, status: unmuted, checkedAt: checkedAt)
+        XCTAssertEqual(fixture.defaults.object(forKey: "silentCryAlarmMutedUntil") as? Date, until)
+        XCTAssertTrue((fixture.defaults.stringArray(forKey: "silentCryAlarmPendingAcknowledgements") ?? []).isEmpty)
+        // Reusing that old read must still preserve the mute after the queue drains.
+        await service.synchronize(using: fixture.backend, status: unmuted, checkedAt: checkedAt)
+        XCTAssertEqual(fixture.defaults.object(forKey: "silentCryAlarmMutedUntil") as? Date, until)
+        await service.synchronize(using: fixture.backend, status: unmuted, checkedAt: Date())
+        XCTAssertNil(fixture.defaults.object(forKey: "silentCryAlarmMutedUntil"))
+    }
+
+    @MainActor func testDuplicateWatchSnoozePreservesNewAlarmWorkAcrossRelaunch() async throws {
+        guard #available(iOS 26.0, *) else { throw XCTSkip("Silent crying alarms require iOS 26.") }
+        let fixture = try Fixture()
+        fixture.defaults.set(true, forKey: "silentWatchAlarmsEnabled")
+        let service = SilentCryAlarmService(defaults: fixture.defaults), first = UUID(), newer = UUID()
+        service.snoozeLocally(eventID: first, duration: 60)
+        await service.synchronize(using: fixture.backend,
+            status: ParentStatus(paired: true, configuration: MonitoringConfiguration()), checkedAt: Date())
+        service.snoozeLocally(eventID: newer, duration: 60)
+        let cutoff = fixture.defaults.object(forKey: "silentCryAlarmStoppedBefore") as? Date
+        let deadline = fixture.defaults.object(forKey: "silentCryAlarmMutedUntil") as? Date
+        // cancelAll() clears these receipts even when no system alarm is present.
+        // A late duplicate must never reach that cancellation path.
+        let receipt = try JSONSerialization.data(withJSONObject: [[
+            "episodeID": UUID().uuidString, "eventID": UUID().uuidString, "cycleID": UUID().uuidString
+        ]])
+        fixture.defaults.set(receipt, forKey: "silentCryAlarmSchedulingReceipts")
+        service.snoozeLocally(eventID: first, duration: 900)
+        let relaunched = SilentCryAlarmService(defaults: fixture.defaults)
+        relaunched.snoozeLocally(eventID: first, duration: 900)
+        XCTAssertEqual(fixture.defaults.object(forKey: "silentCryAlarmStoppedBefore") as? Date, cutoff)
+        XCTAssertEqual(fixture.defaults.object(forKey: "silentCryAlarmMutedUntil") as? Date, deadline)
+        XCTAssertEqual(fixture.defaults.stringArray(forKey: "silentCryAlarmPendingAcknowledgements"), [newer.uuidString])
+        XCTAssertEqual(fixture.defaults.data(forKey: "silentCryAlarmSchedulingReceipts"), receipt)
+    }
+
     @MainActor func testOldQueuedTokenCannotUndoNewerRemoval() async throws {
         let fixture = try Fixture()
         let date = Date()

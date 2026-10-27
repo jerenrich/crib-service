@@ -6,11 +6,11 @@ import UIKit
 @available(iOS 26.0, *)
 @MainActor @Observable final class SilentCryAlarmService {
     static let shared = SilentCryAlarmService()
-    private(set) var enabled = UserDefaults.standard.bool(forKey: "silentWatchAlarmsEnabled")
+    private(set) var enabled: Bool
     private(set) var busy = false
     private(set) var status = "Off. Existing notifications remain enabled."
     weak var log: DiagnosticLog?
-    private let defaults = UserDefaults.standard
+    private let defaults: UserDefaults
     private let recordsKey = "silentCryAlarmRecords"
     private let pendingKey = "silentCryAlarmPendingAcknowledgements"
     private var receiving = false
@@ -31,7 +31,9 @@ import UIKit
         get { (defaults.data(forKey: recordsKey)).flatMap { try? JSONDecoder().decode([Record].self, from: $0) } ?? [] }
         set { defaults.set(try? JSONEncoder().encode(newValue), forKey: recordsKey) }
     }
-    private init() {
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        enabled = defaults.bool(forKey: "silentWatchAlarmsEnabled")
         if enabled { status = "Enabled. Lock this iPhone for Watch delivery; existing notifications continue." }
     }
 
@@ -85,6 +87,9 @@ import UIKit
     func settingUnavailable() { status = enabled ? "Setting could not sync. Check the connection." : "Off on this iPhone. Server setting will sync when connected." }
 
     func synchronize(using client: any BackendServing, status server: ParentStatus, checkedAt: Date) async {
+        // This status was fetched before these uploads. An acknowledgement sent
+        // here may start a snooze that the fetched status does not yet contain.
+        let hadPendingAcknowledgements = !(defaults.stringArray(forKey: pendingKey) ?? []).isEmpty
         await flushAcknowledgements(using: client)
         await flushSchedulingReceipts(using: client)
         if defaults.bool(forKey: "silentWatchAlarmsSettingDirty") {
@@ -96,7 +101,7 @@ import UIKit
         if checkedAt >= settingChangedAt, !server.paired || server.silentWatchAlarmsEnabled == false {
             if enabled { disableLocally() }
         }
-        reconcile(server, checkedAt: checkedAt)
+        reconcile(server, checkedAt: checkedAt, canResumeLocalSnooze: !hadPendingAcknowledgements)
     }
 
     /// Called only when execution is already available; never requests permission,
@@ -238,12 +243,8 @@ import UIKit
 
     func snoozeLocally(eventID: UUID, duration: Double) {
         guard enabled || records.contains(where: { $0.eventID == eventID }) else { return }
+        guard SilentCryAlarmSnooze(defaults: defaults).apply(eventID: eventID, duration: duration, now: Date()) else { return }
         revision += 1
-        defaults.set(Date(), forKey: "silentCryAlarmStoppedBefore")
-        defaults.set(Date().addingTimeInterval(duration), forKey: "silentCryAlarmMutedUntil")
-        var pending = defaults.stringArray(forKey: pendingKey) ?? []
-        if !pending.contains(eventID.uuidString) { pending.append(eventID.uuidString) }
-        defaults.set(Array(pending.suffix(100)), forKey: pendingKey)
         cancelAll()
         status = "Crying alarms snoozed. Acknowledgement syncs when connected."
         trace("snoozed", eventID)
@@ -262,13 +263,27 @@ import UIKit
             do { try await client.acknowledge(id) }
             catch BackendError.response(404, _) { /* Old/deleted pairing: discard only this old action. */ }
             catch { trace("ack_pending", id); return }
+            SilentCryAlarmSnooze(defaults: defaults).markHandled(id)
             var pending = defaults.stringArray(forKey: pendingKey) ?? []
             pending.removeAll { $0 == text }; defaults.set(pending, forKey: pendingKey)
+            defaults.set(Date(), forKey: "silentCryAlarmAcknowledgementsSyncedAt")
             trace("acknowledged", id)
         }
     }
 
-    private func reconcile(_ server: ParentStatus, checkedAt: Date) {
+    private func reconcile(_ server: ParentStatus, checkedAt: Date, canResumeLocalSnooze: Bool = true) {
+        // A fresh, unmuted server status confirms early Resume. Keep the cutoff
+        // for old pushes, and never undo a newer or still-unsynced local Snooze.
+        if canResumeLocalSnooze, server.paired,
+           (server.alertsMutedUntil ?? .distantPast) <= Date(),
+           (defaults.stringArray(forKey: pendingKey) ?? []).isEmpty,
+           (defaults.object(forKey: "silentCryAlarmAcknowledgementsSyncedAt") as? Date ?? .distantPast) <= checkedAt,
+           let stoppedBefore = defaults.object(forKey: "silentCryAlarmStoppedBefore") as? Date,
+           stoppedBefore <= checkedAt,
+           defaults.object(forKey: "silentCryAlarmMutedUntil") != nil {
+            defaults.removeObject(forKey: "silentCryAlarmMutedUntil")
+            if enabled { status = "Crying alarms resumed. Existing notifications continue." }
+        }
         guard !records.isEmpty else { return }
         let muted = (server.alertsMutedUntil ?? .distantPast) > Date()
         let obsolete = records.filter { record in

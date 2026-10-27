@@ -52,6 +52,38 @@ beforeEach(async()=>{
 });
 afterEach(()=>{try{expect(pushResponses).toHaveLength(0);}finally{vi.unstubAllGlobals();vi.restoreAllMocks();}});
 
+describe('shared settings pairing changes',()=>{
+ it.each(['unpaired','replacement','same devices'] as const)('rejects an in-flight settings write after %s',async(change)=>{
+  const {parent,listener}=await paired();
+  // Give even a same-device re-pair a distinct relationship version.
+  await env.DB.prepare('UPDATE pairs SET created_at=created_at-1 WHERE parent_id=?').bind(parent.deviceId).run();
+  let entered!:()=>void,release!:()=>void;
+  const ready=new Promise<void>(r=>{entered=r;}),gate=new Promise<void>(r=>{release=r;});
+  const db=interceptDB(async(sql,_args,method,execute)=>{
+   const result=await execute();
+   if(sql==='SELECT * FROM pairs WHERE listener_id=?'&&method==='first'){entered();await gate;}
+   return result;
+  });
+  const request=new Request('https://monitor.test/v1/settings',{method:'POST',headers:{
+   'content-type':'application/json',authorization:`Bearer ${listener.deviceId}.${listener.secret}`
+  },body:JSON.stringify({...defaultConfiguration,alertDuration:3600})});
+  const pending=worker.fetch(request,{...testEnv,DB:db});await ready;
+  try {
+   expect((await call('pairing/remove',parent)).status).toBe(200);
+   if(change!=='unpaired'){
+    const next=change==='same devices'?listener:device('listener');
+    if(change==='replacement')await register(next);
+    const {code}=await (await call('pairing/create',parent)).json() as {code:string};
+    expect((await call('pairing/claim',next,{code})).status).toBe(200);
+    expect((await call('settings',next,{...defaultConfiguration,alertDuration:30})).status).toBe(200);
+   }
+  } finally { release(); }
+  expect((await pending).status).toBe(409);
+  const saved=await env.DB.prepare('SELECT config FROM devices WHERE id=?').bind(parent.deviceId).first<{config:string}>();
+  expect(JSON.parse(saved!.config).alertDuration).toBe(change==='unpaired'?defaultConfiguration.alertDuration:30);
+ });
+});
+
 describe('APNs readiness diagnostics',()=>{
  it('requires a Parent, returns only safe reuse evidence, sends no pushes and enforces its budget',async()=>{
   expect((await call('diagnostics/apns')).status).toBe(401);

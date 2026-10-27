@@ -1424,6 +1424,7 @@ import UIKit
             guard revision == environmentRevision else { return false }
             try await client.acknowledge(id)
             guard revision == environmentRevision else { return false }
+            SilentCryAlarmSnooze(defaults: defaults).markHandled(id)
             await refreshParent()
             return true
         } catch {
@@ -1674,6 +1675,11 @@ import UIKit
             }
         case .acknowledge:
             if let id = command.eventId {
+                // Preserve the last pre-upgrade confirmation too. Its queued
+                // Watch copy must not apply a new local Snooze after relaunch.
+                if defaults.string(forKey: watchConfirmedKey) == id.uuidString || defaults.string(forKey: watchDiscardedKey) == id.uuidString {
+                    SilentCryAlarmSnooze(defaults: defaults).markHandled(id)
+                }
                 if #available(iOS 26.0, *), defaults === UserDefaults.standard {
                     if command.isTest == false { SilentCryAlarmService.shared.snoozeLocally(eventID: id, duration: configuration.snoozeDuration) }
                     else if command.isTest == nil { SilentCryAlarmService.shared.acknowledgeKnownEvent(id) }
@@ -1727,6 +1733,7 @@ import UIKit
                     discarded = true
                 }
                 guard revision == environmentRevision else { return nil }
+                SilentCryAlarmSnooze(defaults: defaults).markHandled(id)
                 log.record(discarded ? "watch_acknowledgement_discarded" : "watch_acknowledged")
                 var remaining = defaults.stringArray(forKey: queueKey) ?? []
                 remaining.removeAll { $0 == rawID }

@@ -82,7 +82,10 @@ export async function listenerStatus(env:Env,device:Device,latency=new Latency()
 export async function saveSettings(env:Env,device:Device,value:Record<string,unknown>) {
  const config=configuration(value);const pair=await pairFor(env,device);
  if(!pair)throw new APIError(409,'Pair before changing shared settings.');
- await env.DB.prepare('UPDATE devices SET config=? WHERE id=?').bind(JSON.stringify(config),pair.parent_id).run();
+ const result=await env.DB.prepare(`UPDATE devices SET config=? WHERE id=?
+  AND EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?)`)
+  .bind(JSON.stringify(config),pair.parent_id,pair.parent_id,pair.listener_id,pair.created_at).run();
+ if(!result.meta.changes)throw new APIError(409,'Pairing changed. Refresh before changing settings.');
  // Apply a faster cadence to an already active reminder timer immediately.
  await scheduleReminders(env,pair.parent_id,true);
  return {ok:true};

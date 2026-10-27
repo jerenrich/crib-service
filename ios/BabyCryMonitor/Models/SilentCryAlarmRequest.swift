@@ -1,5 +1,34 @@
 import Foundation
 
+/// All callers run on the main actor so applying an acknowledgement is a single
+/// local operation. Keep its receipt after upload/Resume: WatchConnectivity may
+/// deliver the queued copy after a newer episode, or after the phone relaunches.
+@MainActor struct SilentCryAlarmSnooze {
+    let defaults: UserDefaults
+
+    func markHandled(_ eventID: UUID) {
+        defaults.set(true, forKey: "silentCryAlarmSnoozed|\(eventID.uuidString)")
+    }
+
+    @discardableResult func apply(eventID: UUID, duration: TimeInterval, now: Date) -> Bool {
+        let id = eventID.uuidString
+        let receiptKey = "silentCryAlarmSnoozed|\(id)"
+        guard !defaults.bool(forKey: receiptKey) else { return false }
+        var pending = defaults.stringArray(forKey: "silentCryAlarmPendingAcknowledgements") ?? []
+        if pending.contains(id) {
+            // A pre-upgrade pending acknowledgement already applied its snooze.
+            markHandled(eventID)
+            return false
+        }
+        defaults.set(now, forKey: "silentCryAlarmStoppedBefore")
+        defaults.set(now.addingTimeInterval(duration), forKey: "silentCryAlarmMutedUntil")
+        pending.append(id)
+        defaults.set(Array(pending.suffix(100)), forKey: "silentCryAlarmPendingAcknowledgements")
+        markHandled(eventID)
+        return true
+    }
+}
+
 struct SilentCryAlarmRequest: Sendable {
     enum Rejection: String, Error {
         case notRequested = "not_requested", test, malformed, stale

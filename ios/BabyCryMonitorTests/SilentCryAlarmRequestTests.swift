@@ -6,6 +6,82 @@ import XCTest
 @testable import BabyCryMonitor
 #endif
 
+final class SilentCryAlarmSnoozeTests: XCTestCase {
+    private let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+    @MainActor private func withDefaults(_ body: (UserDefaults) -> Void) throws {
+        let suite = "SilentCryAlarmSnoozeTests.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        body(defaults)
+    }
+
+    @MainActor func testDuplicateDoesNotExtendSnoozeOrEnqueueAnotherAcknowledgement() throws {
+        try withDefaults { defaults in
+            let snooze = SilentCryAlarmSnooze(defaults: defaults), id = UUID()
+            XCTAssertTrue(snooze.apply(eventID: id, duration: 60, now: now))
+            XCTAssertFalse(snooze.apply(eventID: id, duration: 900, now: now.addingTimeInterval(120)))
+            XCTAssertEqual(defaults.object(forKey: "silentCryAlarmStoppedBefore") as? Date, now)
+            XCTAssertEqual(defaults.object(forKey: "silentCryAlarmMutedUntil") as? Date, now.addingTimeInterval(60))
+            XCTAssertEqual(defaults.stringArray(forKey: "silentCryAlarmPendingAcknowledgements"), [id.uuidString])
+        }
+    }
+
+    @MainActor func testDelayedCopyAfterResumeAndRelaunchDoesNotRestoreSnooze() throws {
+        try withDefaults { defaults in
+            let id = UUID()
+            SilentCryAlarmSnooze(defaults: defaults).apply(eventID: id, duration: 300, now: now)
+            defaults.set([], forKey: "silentCryAlarmPendingAcknowledgements")
+            defaults.removeObject(forKey: "silentCryAlarmMutedUntil")
+            let relaunched = SilentCryAlarmSnooze(defaults: defaults)
+            XCTAssertFalse(relaunched.apply(eventID: id, duration: 300, now: now.addingTimeInterval(30)))
+            XCTAssertNil(defaults.object(forKey: "silentCryAlarmMutedUntil"))
+            XCTAssertEqual(defaults.object(forKey: "silentCryAlarmStoppedBefore") as? Date, now)
+            XCTAssertEqual(defaults.stringArray(forKey: "silentCryAlarmPendingAcknowledgements"), [])
+        }
+    }
+
+    @MainActor func testOlderCopyPreservesNewerSnoozeAndItsPendingAcknowledgement() throws {
+        try withDefaults { defaults in
+            let snooze = SilentCryAlarmSnooze(defaults: defaults), first = UUID(), newer = UUID()
+            snooze.apply(eventID: first, duration: 60, now: now)
+            defaults.set([], forKey: "silentCryAlarmPendingAcknowledgements")
+            let next = now.addingTimeInterval(120)
+            XCTAssertTrue(snooze.apply(eventID: newer, duration: 60, now: next))
+            XCTAssertFalse(snooze.apply(eventID: first, duration: 900, now: next.addingTimeInterval(30)))
+            XCTAssertEqual(defaults.object(forKey: "silentCryAlarmStoppedBefore") as? Date, next)
+            XCTAssertEqual(defaults.object(forKey: "silentCryAlarmMutedUntil") as? Date, next.addingTimeInterval(60))
+            XCTAssertEqual(defaults.stringArray(forKey: "silentCryAlarmPendingAcknowledgements"), [newer.uuidString])
+        }
+    }
+
+    @MainActor func testLegacyPendingCopyRemainsHandledAfterItsQueueDrains() throws {
+        try withDefaults { defaults in
+            let id = UUID(), deadline = now.addingTimeInterval(60)
+            defaults.set([id.uuidString], forKey: "silentCryAlarmPendingAcknowledgements")
+            defaults.set(now, forKey: "silentCryAlarmStoppedBefore")
+            defaults.set(deadline, forKey: "silentCryAlarmMutedUntil")
+            XCTAssertFalse(SilentCryAlarmSnooze(defaults: defaults).apply(eventID: id, duration: 900, now: now.addingTimeInterval(120)))
+            defaults.set([], forKey: "silentCryAlarmPendingAcknowledgements")
+            XCTAssertFalse(SilentCryAlarmSnooze(defaults: defaults).apply(eventID: id, duration: 900, now: now.addingTimeInterval(180)))
+            XCTAssertEqual(defaults.object(forKey: "silentCryAlarmMutedUntil") as? Date, deadline)
+            XCTAssertEqual(defaults.object(forKey: "silentCryAlarmStoppedBefore") as? Date, now)
+        }
+    }
+
+    @MainActor func testAlreadySyncedAcknowledgementCannotStartALocalSnoozeLater() throws {
+        try withDefaults { defaults in
+            let id = UUID()
+            // The phone can confirm/discard an acknowledgement while AlarmKit is off.
+            SilentCryAlarmSnooze(defaults: defaults).markHandled(id)
+            XCTAssertFalse(SilentCryAlarmSnooze(defaults: defaults).apply(eventID: id, duration: 60, now: now))
+            XCTAssertNil(defaults.object(forKey: "silentCryAlarmStoppedBefore"))
+            XCTAssertNil(defaults.object(forKey: "silentCryAlarmMutedUntil"))
+            XCTAssertNil(defaults.stringArray(forKey: "silentCryAlarmPendingAcknowledgements"))
+        }
+    }
+}
+
 final class SilentCryAlarmRequestTests: XCTestCase {
     private let now = Date(timeIntervalSince1970: 1_800_000_000)
     private let episode = UUID()
