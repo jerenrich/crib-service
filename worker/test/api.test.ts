@@ -1025,7 +1025,7 @@ describe('configurable reminders and acknowledgement mute',()=>{
   advance(1);mockPush();await runReminder(testEnv,parent.deviceId);expect(pushRequests).toHaveLength(2);
   const reminder=JSON.parse(String(pushRequests[1].init?.body));
   expect(reminder.eventId).not.toBe(event.eventId);expect(reminder.episodeId).toBe(event.episodeId);
-  expect(reminder.aps.alert.title).toContain('Reminder');expect(reminder.aps.alert.body).toContain('Settings');
+  expect(reminder.aps.alert.title).toBe('Repeat alert · Check on baby');expect(reminder.aps.alert.body).toContain('Settings');
   const headers=pushRequests[1].init?.headers as Record<string,string>;
   expect(Number(headers['apns-expiration'])).toBe(Math.floor(Date.now()/1000)+15);
   expect(headers['apns-collapse-id']).toBe(`phone:${reminder.eventId}`);

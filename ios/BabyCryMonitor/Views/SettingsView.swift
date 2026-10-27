@@ -67,7 +67,7 @@ struct SettingsView: View {
                     }
                     .accessibilityIdentifier("snoozeDurationPicker")
                 } header: {
-                    Text("Reminders")
+                    Text("Repeat alerts")
                 } footer: {
                     Text("Crying alerts repeat every \(Int(model.configuration.repeatInterval ?? 5)) seconds until you snooze one on your iPhone or Watch, or the Listener confirms the quiet period. Acknowledging snoozes crying alerts for \(alertDurationText(model.configuration.snoozeDuration)). Snooze clears existing crying notifications on that device. Opening the app clears alerts that have settled or been snoozed. Connection-loss alerts stay on. Frequent alerts request more notifications; watchOS controls background wrist taps, so a tap every two seconds is not guaranteed. Notification delivery depends on connectivity and your device settings.")
                 }

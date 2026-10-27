@@ -14,7 +14,7 @@ export function payload(alert:Alert) {
  const minutes=Math.floor(alert.durationSeconds/60);const seconds=Math.floor(alert.durationSeconds%60);
  const unit=(value:number,name:string)=>`${value} ${name}${value===1?'':'s'}`;
  const duration=minutes>0?`${unit(minutes,'minute')}${seconds?` ${unit(seconds,'second')}`:''}`:unit(seconds,'second');
- const title=alert.isTest?'Test · Crib Service':alert.isRepeat?'Reminder · Check on baby':'Baby is crying';
+ const title=alert.isTest?'Test · Crib Service':alert.isRepeat?'Repeat alert · Check on baby':'Baby is crying';
  const body=alert.isRepeat&&!alert.isTest?'Crying was detected. Acknowledge this alert to snooze crying alerts for the duration chosen in Settings.':alert.isTest&&alert.isRepeat?'Repeating Watch alert test. Use Stop Watch test in iPhone Settings to end the test.':alert.isTest?`Test notification from your Listener. Simulated the ${duration} alert threshold.`:`Crying-like sound has continued for ${duration}. Started at ${new Date(alert.cryStartedAt).toISOString().slice(11,16)} UTC. Acknowledge to snooze crying alerts for the duration chosen in Settings.`;
  // Keep alerting metadata identical so both devices request system sound/haptics.
  // Device Silent Mode can mute audio while preserving Watch notification taps.
