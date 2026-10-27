@@ -67,7 +67,13 @@ export default {
     stage='rate_limit';
     // Separate budgets: a device's own polling must never delay a crying alert.
     const watchTestPush=route==='POST /v1/watch-test/push';
-    if(!alertUpload&&!heartbeatUpload)await latency.measure('rate_limit_ms',()=>rateLimit(env,watchTestPush?'watch-test-push':'device',device.id,watchTestPush?660:600,600,latency,'device_rate_limit_ms'));
+    const alertTestStart=route==='POST /v1/alert-test';
+    const alertTestControl=route==='GET /v1/alert-test'||route==='POST /v1/alert-test/stop';
+    // Starts have their own budget below. Reserve separate capacity for status
+    // and Stop so testing cannot exhaust ordinary monitoring requests.
+    const scope=alertTestControl?'alert-test-control':watchTestPush?'watch-test-push':'device';
+    const requestLimit=alertTestControl?1200:watchTestPush?660:600;
+    if(!alertUpload&&!heartbeatUpload&&!alertTestStart)await latency.measure('rate_limit_ms',()=>rateLimit(env,scope,device.id,requestLimit,600,latency,'device_rate_limit_ms'));
     stage='handler';
     const special=await latency.measure('handler_ms',async()=>{switch(route){
      case 'POST /v1/pairing/create':result=await createPairing(env,device);break;
@@ -91,11 +97,11 @@ export default {
      case 'POST /v1/alert-test':
       // Interactive comparisons need more starts than the older one-shot tests.
       // Keep a bounded budget in addition to each session's round/time limits.
-      try{await rateLimit(env,'alert-test',device.id,60,600);}
+      try{await rateLimit(env,'alert-test',device.id,600,600);}
       catch(error){
        if(error instanceof APIError&&error.status===429){
         const wait=Math.ceil(600-Date.now()/1000%600);
-        throw new APIError(429,`Test limit reached (60 starts per 10 minutes). Try again in ${wait} seconds. No new test was scheduled.`);
+        throw new APIError(429,`Test limit reached (600 starts per 10 minutes). Try again in ${wait} seconds. No new test was scheduled.`);
        }
        throw error;
       }
