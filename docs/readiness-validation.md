@@ -1,5 +1,15 @@
 # Readiness release checks
 
+## Smooth monitoring timer — 28 October 2026
+
+Source `d01563e` advances the orange progress ring at 30 frames per second while its timer is visible and the app is active. Listener progress uses the episode start time; Parent progress estimates elapsed time between live readings on its own clock. Delayed readings cannot rewind the same live episode, and estimation stops at the existing three-second freshness limit. Quiet, a new episode and reconnection reset the estimate. Snooze progress uses the same animation clock. Detection and alert delivery timing are unchanged.
+
+Validation passed 186 shared Swift tests, eight iOS live-sound unit tests, three UI scenarios covering compact layout, snooze/recovery and accessibility text, 355 Worker tests, both TypeScript checks and the Worker bundle dry run. The signed combined iPhone/Watch build passed deep signature, profile, Time Sensitive entitlement and silent-asset checks.
+
+Installed in place and launched successfully on J14, J17 and the Watch. Both phones retained their roles, pairing, accepted onboarding and saved preferences. J14 retained all 100 history entries, configuration and its empty outbox, and remained stopped. The Watch retained pairing, Parent mode, snooze and acknowledgement state and refreshed its direct push registration. Start monitoring on J14 when ready; physical crying and wrist delivery were not tested.
+
+Redeployed the merged source as Worker `b000193e-23a4-43c6-8725-dcf02a22606d`. Version readback confirms the source SHA, existing bindings, five secrets and development APNs settings; the minute cron remains configured and no migrations were pending. The live authentication/diagnostics health check returned HTTP 401 with diagnostic storage confirmed. Receipts and verification are retained under ignored `.context/timer-rollout/` in the Riga workspace.
+
 ## Wake-up gap fixes: partial delivery, unexpected stops and late Snooze — 28 October 2026
 
 **Partial delivery no longer stops reminders.** If the phone push was accepted but the Watch push was rejected (stale token → `blocked`) or retryable (APNs 429/5xx → `pending` with backoff), the reminder loop kept retrying that event instead of repeating, so the Parent got one phone notification for the whole episode. Reminders now repeat once either destination has accepted; the other destination keeps its own retry, and an event accepted nowhere keeps its ordinary backoff.
