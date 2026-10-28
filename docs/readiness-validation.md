@@ -1,5 +1,13 @@
 # Readiness release checks
 
+## Short real cry: one AlarmKit wake-up, held by iOS while charging — 28 October 2026
+
+A real cry test reached J14's threshold at 21:19:32.8. The server accepted phone and Watch delivery at 21:19:33.5, and that first alert carried the episode's AlarmKit wake request. J17 displayed the notification, and the Watch received the forwarded copy (`playLightsAndSirens: YES`, `watchNearby=YES`). J14 confirmed quiet at 21:19:53.7, which ended the episode. As intended, no AlarmKit recovery was sent: recoveries start 30 seconds after the first request, and only while the episode is still active, because no alarm is needed after crying stops. A short cry that settles first gets exactly one wake attempt.
+
+iOS held that single attempt for 7 minutes 19 seconds. The J17 unified log (21:18–21:50 UTC) shows the push received and its `pushLaunch` activity submitted to `dasd` at 21:19:33.4. J17 was charging (on AC from 21:18:30 until it was unplugged at 21:21:00) and locked, and the app had been suspended normally at 21:19:26.5. Unlike the battery case, `dasd` recorded no refusal: it did not score the activity at all during about 20 evaluation passes. Throughout the first 88 seconds, the `com.apple.dasd.defaultNetwork` activity group, which push launches use, had two system tasks running (`tipsd.update-content` and a `fileproviderd` background download). At 20:23 the same log refused this app's launch with `defaultNetwork.currentAvailableLimit == 0`, so a full network group can hold the launch. The group was empty from 21:21:26, but the activity was not reconsidered until a `com.apple.das.cpm.modeChanged` trigger at 21:26:52. It then ran immediately with a CP decision, and the app correctly rejected the request as stale (older than 60 seconds). The late re-evaluation is an inference from `dasd` logging; no explicit reason was logged.
+
+Conclusion: charging removes the battery refusal but does not guarantee a prompt wake. The AlarmKit alarm remains an additive backup to the notifications, which arrived on time. Longer cries get further attempts at 30 seconds, 60 seconds and then every two minutes, and each new push gives iOS a fresh scheduling request.
+
 ## AlarmKit tests use the real alarm path — 28 October 2026
 
 A configured **Use AlarmKit** test started on J14 at 20:57:59 reached J17, and J17 was woken in the background while charging. It was then dropped (`silent_alarm_test phase=ignored`). Configured tests went through the older armed Listener→Parent experiment, which accepted pushes only within ten minutes of arming on the Parent itself. Starting from the Parent armed it; starting from the Listener never did. Every Listener-started AlarmKit test since 27 October was dropped the same way.
