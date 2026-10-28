@@ -124,7 +124,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(fixture.notifications.cleanupCalls.count, 1)
     }
 
-    @MainActor func testConfirmingATestClearsEveryOutstandingTestAndOldTestsDoNotTakeOver() async throws {
+    @MainActor func testTestAlertsNeverTakeOverMonitorButStillReachWatch() async throws {
         let fixture = try Fixture()
         fixture.model.role = .parent; fixture.model.paired = true
         let now = fixture.time.now; fixture.model.now = now
@@ -132,20 +132,24 @@ final class AppModelTests: XCTestCase {
             RemoteAlert(eventId: UUID(), episodeId: UUID(), cryStartedAt: now.addingTimeInterval(-age), durationSeconds: 5,
                         createdAt: now.addingTimeInterval(-age), status: "sent", acknowledgedAt: nil, isTest: true)
         }
-        let stale = test(AppModel.testConfirmationWindow + 60)
-        fixture.model.parentStatus = ParentStatus(paired: true, alerts: [stale], configuration: MonitoringConfiguration())
-        XCTAssertNil(fixture.model.activeAlert, "An old unconfirmed test must not take over Monitor")
+        let stale = test(1860)
         let recent = [test(2), test(4)]
         let status = ParentStatus(paired: true, alerts: recent + [stale], configuration: MonitoringConfiguration())
-        fixture.model.parentStatus = status
-        XCTAssertEqual(fixture.model.activeAlert?.eventId, recent[0].eventId)
-        var cleared = status; cleared.alerts = []
-        await fixture.backend.setStatus(cleared)
-        let confirmed = await fixture.model.acknowledgeTests()
-        XCTAssertTrue(confirmed)
+        await fixture.backend.setStatus(status)
+        await fixture.model.refreshParent()
+        XCTAssertNil(fixture.model.activeAlert, "Fresh and restored tests must not replace nursery status")
+        let handler = try XCTUnwrap(fixture.model.watch.onCommand)
+        let watch = await handler(WatchCommand(kind: .refresh))
+        XCTAssertEqual(watch.alert?.eventId, recent[0].eventId)
+        XCTAssertEqual(watch.alert?.isTest, true)
         let acknowledged = await fixture.backend.acknowledgements
-        XCTAssertEqual(Set(acknowledged), Set((recent + [stale]).map(\.eventId)))
-        XCTAssertEqual(Set(fixture.notifications.dismissals.compactMap { $0 }), Set(acknowledged))
+        XCTAssertTrue(acknowledged.isEmpty, "Opening Monitor must not report an unobserved receipt")
+        XCTAssertTrue(fixture.notifications.dismissals.isEmpty)
+
+        var oldStatus = status; oldStatus.alerts = [stale]
+        await fixture.backend.setStatus(oldStatus)
+        let oldWatch = await handler(WatchCommand(kind: .refresh))
+        XCTAssertNil(oldWatch.alert, "Old tests must not resurface on Watch either")
         XCTAssertNil(fixture.model.activeAlert)
     }
 
@@ -155,8 +159,9 @@ final class AppModelTests: XCTestCase {
         let now = fixture.time.now
         let real = RemoteAlert(eventId: UUID(), episodeId: UUID(), cryStartedAt: now, durationSeconds: 5, createdAt: now, status: "sent", acknowledgedAt: nil, isTest: false)
         let test = RemoteAlert(eventId: UUID(), episodeId: UUID(), cryStartedAt: now, durationSeconds: 5, createdAt: now, status: "sent", acknowledgedAt: nil, isTest: true)
-        let status = ParentStatus(paired: true, alerts: [real,test], configuration: MonitoringConfiguration())
+        let status = ParentStatus(paired: true, alerts: [test,real], configuration: MonitoringConfiguration())
         await fixture.backend.setStatus(status); fixture.model.parentStatus = status
+        XCTAssertEqual(fixture.model.activeAlert?.id, real.eventId)
         _ = await fixture.model.acknowledge(real.eventId)
         _ = await fixture.model.acknowledge(test.eventId)
         XCTAssertEqual(fixture.notifications.dismissals.count, 2)
@@ -164,7 +169,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(fixture.notifications.dismissals[1], test.eventId)
         var resolved = real; resolved.resolvedAt = now
         fixture.model.parentStatus?.alerts = [resolved,test]
-        XCTAssertEqual(fixture.model.activeAlert?.id, test.eventId)
+        XCTAssertNil(fixture.model.activeAlert)
     }
 
     @MainActor func testResumeAlertsRefreshesConfirmedDeadlineAndKeepsMonitoringActive() async throws {

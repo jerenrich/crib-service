@@ -87,9 +87,6 @@ struct NightstandView: View {
                         tone: .caution, ring: .dashed, icon: "exclamationmark.triangle.fill")
         }
         if let alert = model.activeAlert {
-            if alert.isTest == true {
-                return Hero(title: "Test alert", detail: "Confirm once it reaches your intended device.", tone: .alert, ring: .full, icon: "bell.badge")
-            }
             if alert.isDisconnected {
                 return Hero(title: "Listener connection lost", detail: "No nursery update for 3+ minutes. Check its power and internet.",
                             tone: .alert, ring: .full, icon: "wifi.slash")
@@ -558,9 +555,9 @@ struct NightstandView: View {
                 Button { pairing = true } label: { actionLabel(listener ? "Pair with Parent" : "Pair iPhones", icon: "link", style: .primary) }
                     .disabled(model.managingDevice)
             } else if !listener, let alert = model.activeAlert {
-                Button { Task { if alert.isTest == true { await model.acknowledgeTests() } else { await model.acknowledge(alert.eventId) } } } label: {
-                    actionLabel(model.acknowledgingAlert ? "Confirming…" : alert.isTest == true ? "I received this test" : "Snooze alerts for \(spokenDuration(model.configuration.snoozeDuration))",
-                                icon: alert.isTest == true ? "checkmark" : "bell.slash", style: alert.isTest == true ? .primary : .alert)
+                Button { Task { await model.acknowledge(alert.eventId) } } label: {
+                    actionLabel(model.acknowledgingAlert ? "Confirming…" : "Snooze alerts for \(spokenDuration(model.configuration.snoozeDuration))",
+                                icon: "bell.slash", style: .alert)
                 }
                 .disabled(model.acknowledgingAlert)
                 .accessibilityIdentifier("nightstandSnooze")
@@ -829,18 +826,16 @@ struct NightstandView: View {
 
     private func alertPanel(_ alert: RemoteAlert) -> some View {
         Panel {
-            Label(alert.isTest == true ? "Test notification" : alert.isDisconnected ? "Listener connection lost" : alert.isMonitoringFailure ? "Nursery monitoring stopped" : "Check on baby", systemImage: "bell.badge")
+            Label(alert.isDisconnected ? "Listener connection lost" : alert.isMonitoringFailure ? "Nursery monitoring stopped" : "Check on baby", systemImage: "bell.badge")
                 .font(.title2.weight(.semibold)).foregroundStyle(Palette.amber)
-            Text(alert.isTest == true ? "Confirm only after you receive this test on your intended device." : alert.isDisconnected ? "No Listener update for at least 3 minutes. Check the nursery phone’s power, internet and monitoring." : alert.isMonitoringFailure ? "The nursery iPhone stopped listening unexpectedly. Tap Start on it. Crying is not being detected." : "Crying-like sound was detected. Check on baby.")
+            Text(alert.isDisconnected ? "No Listener update for at least 3 minutes. Check the nursery phone’s power, internet and monitoring." : alert.isMonitoringFailure ? "The nursery iPhone stopped listening unexpectedly. Tap Start on it. Crying is not being detected." : "Crying-like sound was detected. Check on baby.")
                 .font(.subheadline)
             Text("Sent \(alert.createdAt.formatted(date: .omitted, time: .shortened)) · Delivery: \(alert.status)")
                 .font(.caption).foregroundStyle(Palette.muted)
-            if alert.isTest != true {
-                Text("Snoozing pauses crying and Listener connection-loss alerts for your chosen duration. Monitoring stays on.")
-                    .font(.footnote).foregroundStyle(Palette.muted)
-            }
-            PrimaryButton(title: model.acknowledgingAlert ? "Confirming…" : alert.isTest == true ? "I received this test" : "Snooze alerts for \(spokenDuration(model.configuration.snoozeDuration))") {
-                Task { if alert.isTest == true { await model.acknowledgeTests() } else { await model.acknowledge(alert.eventId) } }
+            Text("Snoozing pauses crying and Listener connection-loss alerts for your chosen duration. Monitoring stays on.")
+                .font(.footnote).foregroundStyle(Palette.muted)
+            PrimaryButton(title: model.acknowledgingAlert ? "Confirming…" : "Snooze alerts for \(spokenDuration(model.configuration.snoozeDuration))") {
+                Task { await model.acknowledge(alert.eventId) }
             }.disabled(model.acknowledgingAlert).accessibilityIdentifier("activeAlertAction")
         }
     }

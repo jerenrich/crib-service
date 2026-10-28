@@ -309,9 +309,10 @@ import UIKit
             if role == .parent { parentStatus = status }
             else { listenerPairStatus = status; listenerPairStatusReceivedAt = now }
             seedLiveSoundFrameForUITest()
-            if ProcessInfo.processInfo.arguments.contains("--uitesting-active-alert") {
+            if ProcessInfo.processInfo.arguments.contains("--uitesting-active-alert") || ProcessInfo.processInfo.arguments.contains("--uitesting-test-alert") {
                 parentStatus?.alerts = [RemoteAlert(eventId: UUID(), episodeId: UUID(), cryStartedAt: now.addingTimeInterval(-60),
-                    durationSeconds: 60, createdAt: now, status: "sent", acknowledgedAt: nil, isTest: false)]
+                    durationSeconds: 60, createdAt: now, status: "sent", acknowledgedAt: nil,
+                    isTest: ProcessInfo.processInfo.arguments.contains("--uitesting-test-alert"))]
             }
             if ProcessInfo.processInfo.arguments.contains("--uitesting-snoozed") { parentStatus?.alertsMutedUntil = now.addingTimeInterval(60) }
             if ProcessInfo.processInfo.arguments.contains("--uitesting-chart-paused") { remoteSound.disconnected() }
@@ -416,15 +417,15 @@ import UIKit
 
     @ObservationIgnored private var notificationsCheckedAt: Date?
 
-    /// Unacknowledged tests never expire on the server, so only a recent one asks for confirmation.
+    /// Test delivery must not replace nursery status or monitoring controls.
     var activeAlert: RemoteAlert? {
-        let alerts = parentStatus?.alerts?.filter { $0.acknowledgedAt == nil && $0.resolvedAt == nil }
-        return alerts?.first { $0.isTest != true }
-            ?? alerts?.first { $0.isTest == true && now.timeIntervalSince($0.createdAt) <= Self.testConfirmationWindow }
+        parentStatus?.alerts?.first { $0.isTest != true && $0.acknowledgedAt == nil && $0.resolvedAt == nil }
     }
-    static let testConfirmationWindow: TimeInterval = 1800
-    var outstandingTestAlerts: [RemoteAlert] {
-        parentStatus?.alerts?.filter { $0.isTest == true && $0.acknowledgedAt == nil && $0.resolvedAt == nil } ?? []
+    /// Keep existing Watch test presentation independent of Monitor's real alerts.
+    private var watchAlert: RemoteAlert? {
+        activeAlert ?? parentStatus?.alerts?.first {
+            $0.isTest == true && $0.acknowledgedAt == nil && $0.resolvedAt == nil && now.timeIntervalSince($0.createdAt) <= 1800
+        }
     }
     func acceptSafety() { safetyAccepted = true; defaults.set(true, forKey: "safetyAccepted") }
     func selectRole(_ value: DeviceRole) {
@@ -1455,31 +1456,6 @@ import UIKit
         ], truncated: false)
     }
     #endif
-    /// The server acknowledges tests one at a time, so confirming receipt clears every
-    /// outstanding test. Otherwise repeated tests would replace each other on Monitor.
-    @discardableResult func acknowledgeTests() async -> Bool {
-        let ids = outstandingTestAlerts.map(\.eventId)
-        guard !acknowledgingAlert, !ids.isEmpty else { return false }
-        acknowledgingAlert = true; defer { acknowledgingAlert = false }
-        for id in ids { await notifications.dismissCryingAlerts(testEventID: id) }
-        let revision = environmentRevision
-        do {
-            let client = try await registeredClient()
-            for id in ids {
-                guard revision == environmentRevision else { return false }
-                try await client.acknowledge(id)
-            }
-            guard revision == environmentRevision else { return false }
-            await refreshParent()
-            return true
-        } catch {
-            guard revision == environmentRevision else { return false }
-            self.error = error.localizedDescription; log.record("acknowledgement_failed", error: error)
-            await refreshParent()
-            return false
-        }
-    }
-
     @discardableResult func acknowledge(_ id: UUID) async -> Bool {
         guard !acknowledgingAlert else { return false }
         acknowledgingAlert = true; defer { acknowledgingAlert = false }
@@ -1570,7 +1546,7 @@ import UIKit
             guard revision == environmentRevision else { return false }
             testPushStatus = requiresWatch
                 ? "Test requested. Lock this iPhone and wait for a test notification and wrist tap on your Watch. Confirm only if you feel it."
-                : "Test requested. Lock this iPhone and check your receiving phone or Watch, then confirm receipt below."
+                : "Test requested. Lock this iPhone and check for a test notification on your receiving phone or Watch."
             await refreshParent()
             return revision == environmentRevision && role == .parent && paired
         } catch {
@@ -1719,7 +1695,7 @@ import UIKit
         value.notificationsCheckedAt = value.parentMode ? notificationsCheckedAt : nil
         value.acknowledgedEventId = defaults.string(forKey: watchConfirmedKey).flatMap(UUID.init(uuidString:))
         value.discardedAcknowledgementEventId = defaults.string(forKey: watchDiscardedKey).flatMap(UUID.init(uuidString:))
-        if value.parentMode, let alert = activeAlert {
+        if value.parentMode, let alert = watchAlert {
             value.alert = WatchCryAlert(eventId: alert.eventId, episodeId: alert.episodeId, startedAt: alert.cryStartedAt,
                                         createdAt: alert.createdAt, duration: alert.durationSeconds, isTest: alert.isTest == true, type: alert.type)
         }

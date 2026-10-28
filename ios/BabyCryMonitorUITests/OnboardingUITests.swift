@@ -35,6 +35,22 @@ final class OnboardingUITests: XCTestCase {
         XCTAssertFalse(app.buttons["stopConfiguredAlertTest"].exists)
     }
 
+    @MainActor func testTestAlertLeavesNurseryStatusAndControlsVisible() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", "--uitesting-test-alert"]
+        app.launch()
+        XCTAssertTrue(app.buttons["nightstandTestAlert"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["nightstandTestAlert"].isHittable)
+        XCTAssertTrue(app.buttons["nightstandMonitoringControl"].isHittable)
+        XCTAssertEqual(app.staticTexts["nightstandState"].label, "Quiet")
+        XCTAssertFalse(app.buttons["I received this test"].exists)
+        XCTAssertFalse(app.buttons["nightstandSnooze"].exists)
+        app.buttons["nightstandDetails"].tap()
+        XCTAssertTrue(app.navigationBars["Monitoring details"].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.buttons["activeAlertAction"].exists)
+        XCTAssertFalse(app.staticTexts["Test notification"].exists)
+    }
+
     @MainActor func testActiveAlertOffersOneTapSnoozeOnMonitor() {
         let app = XCUIApplication()
         app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", "--uitesting-active-alert"]

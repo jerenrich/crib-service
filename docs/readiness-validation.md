@@ -253,8 +253,8 @@ Coverage added here includes outage opt-in/deduplication/recovery, stopped monit
 | Check | Procedure | Expected observation | Hardware result |
 | --- | --- | --- | --- |
 | Setup | Pair, start Listener, connect power and open Parent Monitor | Ring shows Quiet; Nursery, Watch and Alerts chips show plugged in, registered and the applied delay as fresh data arrives | Not run |
-| Full push path | Send a test from Listener with Parent locked and Watch app closed; repeat with intended Sleep Focus | Marked real test is visible/felt on selected receiver; confirm receipt in Parent | Not run |
-| Parent test | Send real test from Parent Monitor → Test alert and lock phone | Marked test arrives; receipt remains unconfirmed until acknowledged | Not run |
+| Full push path | Send a test from Listener with Parent locked and Watch app closed; repeat with intended Sleep Focus | Marked real test is visible/felt on selected receiver; Monitor retains nursery status without a receipt prompt | Not run |
+| Parent test | Send real test from Parent Monitor → Test alert and lock phone | Marked test arrives; opening Parent retains nursery status and monitoring controls without a receipt prompt | Not run |
 | Settings | Change alert duration on Parent while Listener is online | Saving → waiting → applied; actual Listener duration changes | Not run |
 | Offline settings | Disconnect Listener, change duration, reconnect | Parent does not claim applied until Listener reports the new configuration | Not run |
 | Connection loss | Opt in, start Listener, then disconnect only Listener internet for at least four minutes | One connection-loss notice; Parent shows lost connection when opened | Not run |
