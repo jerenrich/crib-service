@@ -1,5 +1,13 @@
 # Readiness release checks
 
+## AlarmKit tests use the real alarm path — 28 October 2026
+
+A configured **Use AlarmKit** test started on J14 at 20:57:59 reached J17, and J17 was woken in the background while charging. It was then dropped (`silent_alarm_test phase=ignored`). Configured tests went through the older armed Listener→Parent experiment, which accepted pushes only within ten minutes of arming on the Parent itself. Starting from the Parent armed it; starting from the Listener never did. Every Listener-started AlarmKit test since 27 October was dropped the same way.
+
+Source `81c8c86` removes that separate path. The Worker builds real and test AlarmKit pushes with one function (`sendSilentCryAlarmPush`): the same `silentCryAlarm` marker and `content-available`, with test pushes labelled and soundless. The Parent handles both in `SilentCryAlarmService` with the same permission, asset, setting, pairing, freshness, status and fallback checks, per-episode alarm and three-second schedule. Tests differ only where they must. Relevance is the unacknowledged test event. Real-alert snoozes do not block a test. Stopping or acknowledging a test alarm acknowledges that test without snoozing, and cancels only test alarms. The service now refuses an AlarmKit test while Silent Watch alarms are off, so the starting phone sees the error. `SilentAlarmExperiment`, its arming UI, the Listener's send button and `POST /v1/listener/silent-alarm-test` were removed (the route returns 410). The local five-second alarm test remains.
+
+Validation passed 354 Worker tests, both TypeScript checks, 184 shared Swift tests, all 345 iOS simulator unit tests and the signed combined build with deep signature verification. No migrations were pending. Worker `8a43ad35-e293-4c1c-8329-43a4b64a8aba` was deployed with message `81c8c86` over `d01563e`; the live health check returned 401 with diagnostics recorded. Installed and launched on J17, J14 and the Watch. Both phones retained their roles and pairing, and J17 retained Silent Watch alarms. J14 needs monitoring restarted.
+
 ## Notification-tap crash and battery-gated AlarmKit wakes — 28 October 2026
 
 **Tapping a notification crashed the app.** J17 recorded four identical `SIGABRT` reports (27 October 22:54, 22:58 and 23:00; 28 October 20:23:38), with matching Watch reports at the same times and at 20:27:26. The `nonisolated async` `userNotificationCenter(_:didReceive:)` returned on a cooperative thread. UIKit then ran its snapshot completion there and aborted (`-[UIApplication _performBlockAfterCATransactionCommitSynchronizes:]`). The handler work, including Snooze, had already finished, but the app relaunched. Both apps now use the completion-handler variant and call it from the main actor after handling.
