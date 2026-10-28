@@ -206,9 +206,12 @@ import UIKit
             backend.session = Self.alertSession
             backend.requestTimeout = SilentCryAlarmExecutionBudget.requestTimeout
             stage = .acknowledgements
-            // A pending Snooze remains authoritative. Its existing intent/status
-            // sync uploads it; don't drain that queue before creating an alarm.
-            guard (defaults.stringArray(forKey: pendingKey) ?? []).isEmpty else {
+            // A pending Snooze takes a separate short sync path. Never continue
+            // into status/fallback/scheduling from this same callback.
+            if !(defaults.stringArray(forKey: pendingKey) ?? []).isEmpty {
+                record("started")
+                await flushAcknowledgements(using: backend, limit: 1)
+                try budget.requireTime()
                 trace("ack_pending", request.eventID); record("rejected", reason: .acknowledgementPending); return false
             }
             let snapshot: SilentCryAlarmStatusSnapshot<ParentStatus>?
@@ -332,10 +335,10 @@ import UIKit
         snoozeLocally(eventID: eventID, duration: record.snoozeDuration)
     }
 
-    private func flushAcknowledgements(using client: any BackendServing) async {
+    func flushAcknowledgements(using client: any BackendServing, limit: Int = 2) async {
         guard !flushing else { return }; flushing = true; defer { flushing = false }
         // Keep acknowledgement work bounded within the background execution budget.
-        for text in (defaults.stringArray(forKey: pendingKey) ?? []).prefix(2) {
+        for text in (defaults.stringArray(forKey: pendingKey) ?? []).prefix(max(0, min(2, limit))) {
             guard let id = UUID(uuidString: text) else { continue }
             do { try await client.acknowledge(id) }
             catch BackendError.response(404, _) { /* Old/deleted pairing: discard only this old action. */ }

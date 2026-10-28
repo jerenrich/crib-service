@@ -41,6 +41,23 @@ private final class DiagnosticsURLProtocol: URLProtocol, @unchecked Sendable {
 }
 
 final class DiagnosticsTests: XCTestCase {
+    @MainActor func testAlarmCallbackCanDrainOnePendingSnoozeWithoutDrainingTheQueue() async throws {
+        guard #available(iOS 26.0, *) else { return }
+        let suite = "AlarmAcknowledgementBudgetTests.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let first = UUID(), second = UUID()
+        defaults.set([first.uuidString, second.uuidString], forKey: "silentCryAlarmPendingAcknowledgements")
+        let service = SilentCryAlarmService(defaults: defaults)
+        let backend = AppModelTests.Backend(credential: DeviceCredential(
+            deviceId: UUID(), secret: "test", role: .parent, registered: true))
+        await service.flushAcknowledgements(using: backend, limit: 1)
+        let acknowledged = await backend.acknowledgements
+        XCTAssertEqual(acknowledged, [first])
+        XCTAssertEqual(defaults.stringArray(forKey: "silentCryAlarmPendingAcknowledgements"), [second.uuidString])
+        XCTAssertTrue(defaults.bool(forKey: "silentCryAlarmSnoozed|\(first.uuidString)"))
+    }
+
     @MainActor func testAlarmFallbackLogsAppBudgetSeparatelyFromReportedSystemTime() {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
