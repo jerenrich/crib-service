@@ -120,23 +120,33 @@ extension NotificationProviding {
         // the phone's forwarded bulletin even when APNs metadata matches.
         content.sound == nil ? [.banner, .list] : [.banner, .list, .sound]
     }
-    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping @Sendable () -> Void) {
         let cutoff = Date()
-        if response.actionIdentifier == UNNotificationDismissActionIdentifier {
-            if response.notification.request.content.categoryIdentifier == WatchNotification.category {
-                await clearReceivedCryingAlerts(deliveredBefore: cutoff)
-            }
+        let content = response.notification.request.content
+        let action = response.actionIdentifier, crying = content.categoryIdentifier == WatchNotification.category
+        let receipt = Self.receipt(response.notification)
+        let eventID = (content.userInfo["eventId"] as? String).flatMap(UUID.init(uuidString:))
+        let isTest = content.userInfo["isTest"] as? Bool == true
+        // UIKit asserts that this completion runs on the main thread. The async
+        // variant finished on a background executor and aborted after every tap.
+        Task { @MainActor in
+            await handleResponse(action: action, crying: crying, receipt: receipt, eventID: eventID, isTest: isTest, cutoff: cutoff)
+            completionHandler()
+        }
+    }
+    private func handleResponse(action: String, crying: Bool, receipt: (UUID, UUID, Date, Int)?,
+                                eventID: UUID?, isTest: Bool, cutoff: Date) async {
+        if action == UNNotificationDismissActionIdentifier {
+            if crying { await clearReceivedCryingAlerts(deliveredBefore: cutoff) }
             return
         }
-        await recordReceipt(Self.receipt(response.notification), phase: "opened")
-        if response.actionIdentifier == WatchNotification.acknowledge,
-           let rawID = response.notification.request.content.userInfo["eventId"] as? String,
-           let id = UUID(uuidString: rawID) {
-            let isTest = response.notification.request.content.userInfo["isTest"] as? Bool == true
-            await dismissCryingAlerts(testEventID: isTest ? id : nil)
-            await acknowledge(id)
+        recordReceipt(receipt, phase: "opened")
+        if action == WatchNotification.acknowledge, let eventID {
+            await dismissCryingAlerts(testEventID: isTest ? eventID : nil)
+            await acknowledge(eventID)
         }
-        await refresh()
+        refresh()
     }
     private func acknowledge(_ id: UUID) async { await onAcknowledge?(id) }
     private func clearReceivedCryingAlerts(deliveredBefore: Date) async {

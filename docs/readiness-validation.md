@@ -1,5 +1,13 @@
 # Readiness release checks
 
+## Notification-tap crash and battery-gated AlarmKit wakes — 28 October 2026
+
+**Tapping a notification crashed the app.** J17 recorded four identical `SIGABRT` reports (27 October 22:54, 22:58 and 23:00; 28 October 20:23:38), with matching Watch reports at the same times and at 20:27:26. The `nonisolated async` `userNotificationCenter(_:didReceive:)` returned on a cooperative thread. UIKit then ran its snapshot completion there and aborted (`-[UIApplication _performBlockAfterCATransactionCommitSynchronizes:]`). The handler work, including Snooze, had already finished, but the app relaunched. Both apps now use the completion-handler variant and call it from the main actor after handling.
+
+**iOS refused AlarmKit wakes while J17 was on battery.** A J17 unified log from 18:00 to 20:50 UTC shows `dasd` rejecting every Crib Service push launch with `Low Power Mode Policy … isChallengedForBatteryLife == 1 → MNP`, even though Low Power Mode was off and the battery was at 35–57%. That covers 49 rejections across the 18:05 and 20:22 episodes. The flag is set throughout every unplugged period (18:00–18:54 and 19:32–20:23). It is absent while charging (18:54–19:32 and from 20:23:33), and every launch then is accepted: the 20:26:55 and 20:40 wakes ran within 1–2 seconds. Rejected launches stay queued until the app runs for another reason; only the latest was delivered. The 20:22:59 episode's alarm was scheduled only after the notification was opened, at 47 seconds. The server sent both requested wakes. The Parent iPhone must stay on its charger for AlarmKit backup; notification delivery is unaffected.
+
+Validation passed 186 shared Swift tests, all 347 iOS simulator unit tests and the signed combined iPhone/Watch build with deep signature and Time Sensitive entitlement checks. Installed in place and launched on J17 and the Watch. J17 retained Parent mode, pairing, onboarding and enabled Silent Watch alarms. J14 was running the Listener, so it was not reinstalled; it does not need this fix. No Worker change or migration.
+
 ## Smooth monitoring timer — 28 October 2026
 
 Source `d01563e` advances the orange progress ring at 30 frames per second while its timer is visible and the app is active. Listener progress uses the episode start time; Parent progress estimates elapsed time between live readings on its own clock. Delayed readings cannot rewind the same live episode, and estimation stops at the existing three-second freshness limit. Quiet, a new episode and reconnection reset the estimate. Snooze progress uses the same animation clock. Detection and alert delivery timing are unchanged.

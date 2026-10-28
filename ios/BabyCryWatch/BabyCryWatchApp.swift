@@ -69,11 +69,15 @@ import UserNotifications
             }
         }
     }
-    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping @Sendable () -> Void) {
         let cutoff = Date()
         if response.actionIdentifier == UNNotificationDismissActionIdentifier {
-            if response.notification.request.content.categoryIdentifier == WatchNotification.category {
-                await WatchModel.shared.clearReceivedNotifications(deliveredBefore: cutoff)
+            let crying = response.notification.request.content.categoryIdentifier == WatchNotification.category
+            // WatchKit asserts that this completion runs on the main thread, as on iOS.
+            Task { @MainActor in
+                if crying { await WatchModel.shared.clearReceivedNotifications(deliveredBefore: cutoff) }
+                completionHandler()
             }
             return
         }
@@ -86,13 +90,14 @@ import UserNotifications
                 deliveredAt: deliveredAt, observedAt: observedAt, callbackID: callbackID,
                 collapseScope: collapse))
         }
-        await MainActor.run {
+        Task { @MainActor in
             if let alert {
                 WatchModel.shared.log.watchAlert(WatchAlertTrace(alert: alert, phase: acknowledge ? .acknowledged : .opened,
                                                                deliveredAt: deliveredAt, observedAt: observedAt, callbackID: callbackID,
                                                                collapseScope: collapse))
                 WatchModel.shared.handleNotification(alert, acknowledging: acknowledge)
             } else { WatchModel.shared.log.record("watch_payload_unrecognized", code: 2) }
+            completionHandler()
         }
     }
 }
