@@ -1,4 +1,4 @@
-import {monitoringCommandRepresentation} from './monitoring';
+import {monitoringCommandRepresentation,monitoringResumedSQL} from './monitoring';
 import {Latency} from './latency';
 import {heartbeatTimeline} from './timeline';
 import {scheduleReminders} from './reminders';
@@ -33,6 +33,8 @@ export async function saveHeartbeat(env:Env,device:Device,value:Record<string,un
  type Parent={config:string;alerts_muted_until:number};
  const result=await latency.confirmedWrite<unknown,Parent>('heartbeat',()=>env.DB.batch([heartbeatWrite,...heartbeatTimeline(env,pair,heartbeat,previous,observedAt),...resolutionWrites,...(resolutions.length?[retire]:[]),...(heartbeat.monitoring?[online]:[]),
   env.DB.prepare("UPDATE events SET resolved_at=COALESCE(resolved_at,?) WHERE parent_id=? AND listener_id=? AND resolved_at IS NULL AND json_extract(payload,'$.type')='listener_disconnected' AND EXISTS(SELECT 1 FROM heartbeats h WHERE h.listener_id=events.listener_id AND json_extract(h.metadata,'$.__heartbeatReceipt')=?)").bind(new Date(observedAt).toISOString(),pair.parent_id,pair.listener_id,receiptID),
+  // Monitoring again (from this heartbeat) ends an unexpected-stop episode.
+  ...(heartbeat.monitoring?[env.DB.prepare(`UPDATE events SET resolved_at=COALESCE(resolved_at,?) WHERE parent_id=? AND listener_id=? AND resolved_at IS NULL AND ${monitoringResumedSQL}`).bind(new Date(observedAt).toISOString(),pair.parent_id,pair.listener_id)]:[]),
   env.DB.prepare('SELECT d.config,d.alerts_muted_until FROM devices d JOIN pairs p ON p.parent_id=d.id WHERE p.parent_id=? AND p.listener_id=? AND p.created_at=?').bind(pair.parent_id,pair.listener_id,pair.created_at)
  ]),()=>env.DB.prepare(`SELECT d.config,d.alerts_muted_until FROM heartbeats h
   JOIN pairs p ON p.listener_id=h.listener_id JOIN devices d ON d.id=p.parent_id

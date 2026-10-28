@@ -35,7 +35,7 @@ export interface TimingDetails {
  client_request_id?:string;in_flight_span?:Span;in_flight_ms?:number;
  dispatch_source?:'upload'|'reminder'|'maintenance'|'connection'|'watch_test';
  observed_status?:'pending'|'sending'|'sent'|'blocked'|'uncertain'|'failed';
- exit_reason?:'acknowledged'|'resolved'|'in_flight'|'already_sent'|'backoff'|'not_pending'|'not_found'|'not_created'|'no_pair'|'monitoring_stopped'|'no_pending_alert'|'stale_heartbeat'|'not_crying'|'below_threshold'|'muted'|'not_due'|'superseded';
+ exit_reason?:'acknowledged'|'suppressed'|'resolved'|'in_flight'|'already_sent'|'backoff'|'not_pending'|'not_found'|'not_created'|'no_pair'|'monitoring_stopped'|'no_pending_alert'|'stale_heartbeat'|'not_crying'|'below_threshold'|'muted'|'not_due'|'superseded';
  push_outcome?:'sent'|'retry'|'blocked'|'uncertain'|'failed';
  observed_attempts?:number; next_attempt_at_ms?:number;
  preparation_started_at_ms?:number; preparation_finished_at_ms?:number;
@@ -287,6 +287,6 @@ export function safeTimingDetails(value:TimingDetails|undefined):string|null {
  if(['upload','reminder','maintenance','connection','watch_test'].includes(value.dispatch_source!))safe.dispatch_source=value.dispatch_source;
  if(['pending','sending','sent','blocked','uncertain','failed'].includes(value.observed_status!))safe.observed_status=value.observed_status;
  if(['sent','retry','blocked','uncertain','failed'].includes(value.push_outcome!))safe.push_outcome=value.push_outcome;
- if(['acknowledged','resolved','in_flight','already_sent','backoff','not_pending','not_found','not_created','no_pair','monitoring_stopped','no_pending_alert','stale_heartbeat','not_crying','below_threshold','muted','not_due','superseded'].includes(value.exit_reason!))safe.exit_reason=value.exit_reason;
+ if(['acknowledged','suppressed','resolved','in_flight','already_sent','backoff','not_pending','not_found','not_created','no_pair','monitoring_stopped','no_pending_alert','stale_heartbeat','not_crying','below_threshold','muted','not_due','superseded'].includes(value.exit_reason!))safe.exit_reason=value.exit_reason;
  return Object.keys(safe).length?JSON.stringify(safe):null;
 }

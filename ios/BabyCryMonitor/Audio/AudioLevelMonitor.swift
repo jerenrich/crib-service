@@ -57,13 +57,20 @@ enum AudioCaptureStatus {
         observers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] notification in
             let type = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
             let options = notification.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
-            Task { @MainActor [weak self] in await self?.handle(name: name, type: type, options: options) }
+            let reason = notification.userInfo?[AVAudioSessionInterruptionReasonKey] as? UInt
+                ?? notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
+            Task { @MainActor [weak self] in await self?.handle(name: name, type: type, options: options, reason: reason) }
         })
     }
-    private func handle(name: Notification.Name, type: UInt?, options: UInt) async {
+    private func handle(name: Notification.Name, type: UInt?, options: UInt, reason: UInt?) async {
         guard wantsMonitoring else { return }
-        if name == AVAudioSession.interruptionNotification { log?.record(type == AVAudioSession.InterruptionType.began.rawValue ? "audio_interruption_began" : "audio_interruption_ended") }
-        else if name == AVAudioSession.routeChangeNotification { log?.record("audio_route_changed") }
+        // Codes: began → AVAudioSession.InterruptionReason, ended → InterruptionOptions
+        // (1 = shouldResume; without it one restart is still tried), route → RouteChangeReason.
+        if name == AVAudioSession.interruptionNotification {
+            let began = type == AVAudioSession.InterruptionType.began.rawValue
+            log?.record(began ? "audio_interruption_began" : "audio_interruption_ended", code: began ? reason.map { Int($0) } : Int(options))
+        }
+        else if name == AVAudioSession.routeChangeNotification { log?.record("audio_route_changed", code: reason.map { Int($0) }) }
         else if name == AVAudioSession.mediaServicesWereResetNotification { log?.record("audio_services_reset") }
         else if name == .AVAudioEngineConfigurationChange { log?.record("audio_engine_changed") }
         if name == .AVAudioEngineConfigurationChange, await driver.isRunning { return }
@@ -73,10 +80,11 @@ enum AudioCaptureStatus {
             onStatus?(.recovering("Audio interrupted. Waiting for microphone…"))
             await driver.pause(generation: expected); return
         }
-        if name == AVAudioSession.interruptionNotification,
-           !AVAudioSession.InterruptionOptions(rawValue: options).contains(.shouldResume) {
-            onStatus?(.failed("Audio could not resume. Open the app to restart monitoring.")); return
-        }
+        // Without shouldResume the system makes no promise, but a background
+        // record session can often reactivate anyway. Try once; an activation
+        // error reports the failure, and a silent engine trips the stall check.
+        let unprompted = name == AVAudioSession.interruptionNotification
+            && !AVAudioSession.InterruptionOptions(rawValue: options).contains(.shouldResume)
         generation += 1; let expected = generation
         // End the last observed episode before restarting; no interruption counts as crying.
         onStatus?(.recovering("Audio route changed. Recovering microphone…"))
@@ -86,8 +94,9 @@ enum AudioCaptureStatus {
             onStatus?(.active)
         } catch {
             guard generation == expected, wantsMonitoring else { return }
-            log?.record("audio_interrupted", error: error)
-            onStatus?(.failed("Microphone unavailable. Open the app to restart monitoring."))
+            log?.record("audio_interrupted", code: unprompted ? 1 : 0, error: error)
+            onStatus?(.failed(unprompted ? "Audio could not resume. Open the app to restart monitoring."
+                                         : "Microphone unavailable. Open the app to restart monitoring."))
         }
     }
 }

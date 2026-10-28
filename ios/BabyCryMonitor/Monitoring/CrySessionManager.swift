@@ -23,6 +23,19 @@ public struct CrySessionManager: Sendable {
         snapshot.pending.append(PendingAlert(alert: alert))
         return alert
     }
+    /// Queue one persistent "monitoring stopped" alert for an unexpected stop. Its
+    /// start is the stop time, so the server can tell a later monitoring heartbeat.
+    @discardableResult public mutating func queueMonitoringFailure(listenerId: UUID, at date: Date) -> CryAlert? {
+        guard !snapshot.pending.contains(where: { $0.alert.isMonitoringFailure }) else { return nil }
+        let alert = CryAlert(episodeId: UUID(), listenerId: listenerId, cryStartedAt: date, durationSeconds: 0,
+                             createdAt: date, isRepeat: false, type: CryAlert.monitoringFailedType)
+        snapshot.pending.append(PendingAlert(alert: alert))
+        return alert
+    }
+    /// Monitoring resumed or a person stopped it: an unsent stop alert is obsolete.
+    public mutating func clearMonitoringFailures() {
+        snapshot.pending.removeAll { $0.alert.isMonitoringFailure }
+    }
     @discardableResult public mutating func consume(_ sample: AudioLevelSample, listenerId: UUID) -> [CryAlert] {
         if let last = snapshot.lastObservedAt, sample.timestamp <= last { return [] }
         guard sample.dbFS.isFinite else { return [] }

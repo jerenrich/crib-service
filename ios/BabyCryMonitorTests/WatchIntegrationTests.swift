@@ -32,8 +32,10 @@ final class WatchIntegrationTests: XCTestCase {
         func heartbeat(_ value: Heartbeat) async throws -> MonitoringConfiguration { MonitoringConfiguration() }
         func settings(_ configuration: MonitoringConfiguration) async throws {}
         func send(_ alert: CryAlert) async throws -> AlertReceipt { AlertReceipt(status: "sent") }
-        func acknowledge(_ id: UUID) async throws {
+        private(set) var acknowledgementTimes: [UUID: Date] = [:]
+        func acknowledge(_ id: UUID, actedAt: Date?) async throws {
             acknowledgementAttempts.append(id)
+            acknowledgementTimes[id] = actedAt
             if failing { throw URLError(.notConnectedToInternet) }
             if let status = acknowledgementFailures[id] { throw BackendError.response(status, "Test failure") }
             acknowledgements.append(id)

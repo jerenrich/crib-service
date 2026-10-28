@@ -62,6 +62,7 @@ struct RemoteAlert: Identifiable, Codable, Sendable {
     var deliveryTarget: String? = nil
     var type: String? = nil
     var isDisconnected: Bool { type == "listener_disconnected" }
+    var isMonitoringFailure: Bool { type == CryAlert.monitoringFailedType }
     var id: UUID { eventId }
 }
 struct Heartbeat: Codable, Sendable {
@@ -91,7 +92,8 @@ protocol BackendServing: AlertSending {
     func setMonitoring(_ enabled: Bool, id: UUID) async throws -> MonitoringCommand
     func completeMonitoring(_ id: UUID, succeeded: Bool) async throws
     func settings(_ configuration: MonitoringConfiguration) async throws
-    func acknowledge(_ id: UUID) async throws
+    /// `actedAt` is when the person tapped Snooze, for a queued/late delivery.
+    func acknowledge(_ id: UUID, actedAt: Date?) async throws
     func resumeAlerts(until: Date) async throws
     func pushToken(_ token: String) async throws
     func watchPushToken(_ token: String?) async throws
@@ -108,6 +110,7 @@ protocol BackendServing: AlertSending {
     func deleteDevice() async throws
 }
 extension BackendServing {
+    func acknowledge(_ id: UUID) async throws { try await acknowledge(id, actedAt: nil) }
     func alertTest() async throws -> AlertTestResponse { throw BackendError.message("Configurable tests require an updated connection service.") }
     func startAlertTest(id: UUID, configuration: AlertTestConfiguration) async throws -> AlertTestResponse { throw BackendError.message("Configurable tests require an updated connection service.") }
     func stopAlertTest(id: UUID) async throws -> AlertTestResponse { throw BackendError.message("Configurable tests require an updated connection service.") }
@@ -149,7 +152,11 @@ struct BackendClient: BackendServing {
         let _: EmptyResponse = try await request("/v1/monitoring/complete", body: Request(id: id, succeeded: succeeded))
     }
     func settings(_ configuration: MonitoringConfiguration) async throws { let _: EmptyResponse = try await request("/v1/settings", body: configuration) }
-    func acknowledge(_ id: UUID) async throws { let _: EmptyResponse = try await request("/v1/alert/acknowledge", body: ["eventId": id.uuidString]) }
+    func acknowledge(_ id: UUID, actedAt: Date?) async throws {
+        var body = ["eventId": id.uuidString]
+        if let actedAt { body["actedAt"] = actedAt.formatted(Date.ISO8601FormatStyle(includingFractionalSeconds: true)) }
+        let _: EmptyResponse = try await request("/v1/alert/acknowledge", body: body)
+    }
     func resumeAlerts(until: Date) async throws {
         let _: EmptyResponse = try await request("/v1/alert/resume", body: ["expectedUntil": Int64((until.timeIntervalSince1970 * 1000).rounded())])
     }

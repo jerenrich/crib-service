@@ -101,8 +101,11 @@ extension NotificationProviding {
         await recordReceipt(Self.receipt(notification), phase: "foreground", payloadHasSound: content.sound != nil,
             presentationOptions: options.rawValue)
         if let alarmCallback {
+            // The AlarmKit attempt includes a status request (up to its 5 s budget).
+            // The app is active here, so run it alongside presentation instead of
+            // holding this crying banner/sound until it finishes, as on the Watch.
             if #available(iOS 26.0, *) {
-                _ = await SilentCryAlarmService.shared.receive(alarmCallback, source: .foregroundNotification)
+                Task { _ = await SilentCryAlarmService.shared.receive(alarmCallback, source: .foregroundNotification) }
             }
         }
         if let request = SilentAlarmTestRequest(payload: notification.request.content.userInfo) {

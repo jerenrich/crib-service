@@ -56,8 +56,10 @@ export function heartbeat(value:Record<string,unknown>):Heartbeat {
 export function alert(value:Record<string,unknown>):Alert {
  onlyKeys(value,['eventId','episodeId','listenerId','type','cryStartedAt','durationSeconds','createdAt','isRepeat','isTest']);
  if(value.isTest!==undefined&&typeof value.isTest!=='boolean')throw new APIError(400,'Invalid test flag.');
- if(value.type!=='sustained_cry'||typeof value.isRepeat!=='boolean'||typeof value.durationSeconds!=='number'||!Number.isFinite(value.durationSeconds)||value.durationSeconds<0||value.durationSeconds>604800)throw new APIError(400,'Invalid alert.');
- const result:Alert={eventId:uuid(value.eventId),episodeId:uuid(value.episodeId),listenerId:uuid(value.listenerId),type:'sustained_cry',cryStartedAt:date(value.cryStartedAt),durationSeconds:value.durationSeconds,createdAt:date(value.createdAt),isRepeat:value.isRepeat};
+ // monitoring_failed: the Listener stopped listening without a person's Stop
+ // (microphone failure/stall, termination). Its "start" is the stop time.
+ if(!['sustained_cry','monitoring_failed'].includes(String(value.type))||value.type==='monitoring_failed'&&value.isTest===true||typeof value.isRepeat!=='boolean'||typeof value.durationSeconds!=='number'||!Number.isFinite(value.durationSeconds)||value.durationSeconds<0||value.durationSeconds>604800)throw new APIError(400,'Invalid alert.');
+ const result:Alert={eventId:uuid(value.eventId),episodeId:uuid(value.episodeId),listenerId:uuid(value.listenerId),type:value.type as Alert['type'],cryStartedAt:date(value.cryStartedAt),durationSeconds:value.durationSeconds,createdAt:date(value.createdAt),isRepeat:value.isRepeat};
  if(value.isTest!==undefined)result.isTest=value.isTest;
  if(Math.abs((Date.parse(result.createdAt)-Date.parse(result.cryStartedAt))/1000-result.durationSeconds)>2)throw new APIError(400,'Inconsistent alert duration.');
  return result;

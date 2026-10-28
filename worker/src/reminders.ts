@@ -4,6 +4,7 @@ import {dispatchEvent} from './alerts';
 import {recordDiagnostic,eventReference} from './diagnostics';
 import {Latency,type Span} from './latency';
 import {persistAcceptedDelivery,type AcceptedDelivery} from './accepted-delivery';
+import {monitoringResumedSQL} from './monitoring';
 
 const outcomePrefix='accepted/';
 interface ReminderDelivery {
@@ -184,6 +185,11 @@ export class AlertReminders implements DurableObject {
  }
 }
 
+function partiallyAccepted(event:StoredEvent):boolean {
+ if(!event.delivery_state)return false;
+ try{return Object.values(JSON.parse(event.delivery_state) as Record<string,string>).includes('sent');}catch{return false;}
+}
+
 export async function runReminder(env:Env,parentId:string,latency=new Latency(),observed?:(interval:number,mutedUntil:number)=>void,delivery:ReminderDelivery={}):Promise<boolean> {
  const now=Date.now(),startedMono=performance.now();let handedOff=false,failed=false,stopped=false,eventId:string|undefined;
  latency.details.dispatch_source='reminder';latency.details.preparation_started_at_ms=now;
@@ -225,6 +231,15 @@ export async function runReminder(env:Env,parentId:string,latency=new Latency(),
    ORDER BY e.created_at DESC LIMIT 1`).bind(parentId,new Date(now-180000).toISOString()));
  }
  if(!previous) {
+  // Likewise resume an unexpected monitoring stop after Snooze until the Listener
+  // reports monitoring again, a person stops it (control check above) or unpairs.
+  previous=await read<StoredEvent>('reminder_original_ms',env.DB.prepare(`SELECT events.* FROM events
+   JOIN pairs p ON p.parent_id=events.parent_id AND p.listener_id=events.listener_id
+   WHERE events.parent_id=? AND events.resolved_at IS NULL AND COALESCE(events.last_error,'')!='expired_event'
+    AND json_extract(events.payload,'$.type')='monitoring_failed' AND NOT (${monitoringResumedSQL})
+   ORDER BY events.created_at DESC LIMIT 1`).bind(parentId));
+ }
+ if(!previous) {
   // After a mute, require a fresh Listener update confirming sustained crying.
   if(!pair.alerts_muted_until)return stop('no_pending_alert');
   const last=await read<{received_at:string;metadata:string}>('reminder_heartbeat_ms',env.DB.prepare('SELECT received_at,metadata FROM heartbeats WHERE listener_id=?').bind(pair.listener_id));
@@ -242,11 +257,16 @@ export async function runReminder(env:Env,parentId:string,latency=new Latency(),
  // acknowledgement/resolution or authorize a retry of an uncertain APNs call.
  if(['sending','uncertain'].includes(previous.status)&&delivery.acceptedFor){
   const accepted=await delivery.acceptedFor(previous.event_id);
-  if(accepted?.parentId===parentId&&accepted.attempt===previous.attempts
-   &&(!accepted.dual||Object.values(accepted.dual.states).every(state=>state==='sent')))previous={...previous,status:'sent'};
+  if(accepted?.parentId===parentId&&accepted.attempt===previous.attempts){
+   if(!accepted.dual||Object.values(accepted.dual.states).every(state=>state==='sent'))previous={...previous,status:'sent'};
+   else if(Object.values(accepted.dual.states).includes('sent'))previous={...previous,status:'pending',delivery_state:JSON.stringify(accepted.dual.states)};
+  }
  }
- // Preserve ordinary retry/backoff for an event not yet submitted.
- if(previous.acknowledged_at===null&&['pending','blocked','sending'].includes(previous.status)) {
+ // Preserve ordinary retry/backoff for an event not yet submitted. Once either
+ // destination accepted it, the other destination's retry (cron) or missing token
+ // must not hold back reminders: repeat on schedule, as for a fully sent event.
+ if(previous.acknowledged_at===null&&(previous.status==='sending'
+  ||['pending','blocked'].includes(previous.status)&&!partiallyAccepted(previous))) {
   await send(previous.event_id);
   return true;
  }

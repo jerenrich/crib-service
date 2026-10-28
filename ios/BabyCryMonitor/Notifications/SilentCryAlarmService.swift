@@ -253,7 +253,7 @@ import UIKit
                 return false
             }
             let attributes = AlarmAttributes<Metadata>(presentation: AlarmPresentation(alert: .init(
-                title: request.isDisconnected ? "Listener connection lost" : "Check on baby",
+                title: request.isDisconnected ? "Listener connection lost" : request.isMonitoringFailure ? "Nursery monitoring stopped" : "Check on baby",
                 stopButton: AlarmButton(text: "Stop", textColor: .white, systemImageName: "stop.circle")
             )), metadata: Metadata(), tintColor: .mint)
             // Persist acknowledgement metadata before scheduling so an immediate Stop
@@ -340,10 +340,11 @@ import UIKit
         // Keep acknowledgement work bounded within the background execution budget.
         for text in (defaults.stringArray(forKey: pendingKey) ?? []).prefix(max(0, min(2, limit))) {
             guard let id = UUID(uuidString: text) else { continue }
-            do { try await client.acknowledge(id) }
+            do { try await client.acknowledge(id, actedAt: SilentCryAlarmSnooze(defaults: defaults).actedAt(id)) }
             catch BackendError.response(404, _) { /* Old/deleted pairing: discard only this old action. */ }
             catch { trace("ack_pending", id); return }
             SilentCryAlarmSnooze(defaults: defaults).markHandled(id)
+            defaults.removeObject(forKey: SilentCryAlarmSnooze.actedAtKey(id))
             var pending = defaults.stringArray(forKey: pendingKey) ?? []
             pending.removeAll { $0 == text }; defaults.set(pending, forKey: pendingKey)
             defaults.set(Date(), forKey: "silentCryAlarmAcknowledgementsSyncedAt")

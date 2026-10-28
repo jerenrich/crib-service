@@ -2,11 +2,11 @@ import {reserveAlarmRequest} from './alarm-scheduling';
 import {phoneHeadStartFor} from './notification-coordination';
 import {deliverToBoth} from './dual-delivery';
 import {acceptedDelivery,queueAcceptedDelivery,type AcceptedDelivery} from './accepted-delivery';
-import {stoppedMonitoringSQL} from './monitoring';
+import {stoppedMonitoringSQL,monitoringResumedSQL} from './monitoring';
 import {scheduleReminders} from './reminders';
 import {Latency} from './latency';
 import {APIError,requireRole,type Alert,type Device,type Env,type StoredEvent} from './types';
-import {alert as validateAlert,uuid,configuration} from './security';
+import {alert as validateAlert,uuid,configuration,date} from './security';
 import {pairFor} from './devices';
 import {sendPush,sendSilentCryAlarmPush,type PushResult} from './apns';
 import {eventReference,recordDiagnostic,observeLateWrites,PushPreparationError,type Outcome,type Stage} from './diagnostics';
@@ -102,13 +102,13 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
    SELECT 1 FROM pairs p JOIN devices d ON d.id=p.parent_id JOIN heartbeats h ON h.listener_id=p.listener_id
    WHERE p.parent_id=events.parent_id AND p.listener_id=events.listener_id AND d.connection_alerts=1
     AND json_extract(h.metadata,'$.monitoring')=1 AND h.received_at=json_extract(events.payload,'$.cryStartedAt')
-    AND h.received_at<?) THEN ? END,
+    AND h.received_at<?) THEN ? WHEN ${monitoringResumedSQL} THEN ? END,
   (SELECT r.resolved_at FROM resolved_episodes r
   JOIN pairs p ON p.parent_id=r.parent_id AND p.listener_id=r.listener_id AND p.created_at=r.pair_created_at
   WHERE r.parent_id=events.parent_id AND r.listener_id=events.listener_id AND r.episode_id=events.episode_id))
-  WHERE event_id=? AND COALESCE(json_extract(payload,'$.isTest'),0)=0`).bind(new Date(now-180000).toISOString(),new Date(now).toISOString(),eventId),
+  WHERE event_id=? AND COALESCE(json_extract(payload,'$.isTest'),0)=0`).bind(new Date(now-180000).toISOString(),new Date(now).toISOString(),new Date(now).toISOString(),eventId),
  // Suppress uploads during a mute, including delayed offline outbox entries.
- env.DB.prepare(`UPDATE events SET acknowledged_at=COALESCE(acknowledged_at,?) WHERE event_id=?
+ env.DB.prepare(`UPDATE events SET acknowledged_at=COALESCE(acknowledged_at,?) WHERE event_id=? AND acknowledged_at IS NULL
  AND COALESCE(json_extract(payload,'$.isTest'),0)=0 AND (
  EXISTS(SELECT 1 FROM devices d WHERE d.id=events.parent_id AND d.alerts_muted_until>0
  AND (d.alerts_muted_until>? OR CAST(ROUND((julianday(json_extract(events.payload,'$.createdAt'))-2440587.5)*86400000) AS INTEGER) BETWEEN d.alerts_muted_at AND d.alerts_muted_until))
@@ -159,7 +159,9 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
    latency.details.observed_status=observed?.status as typeof latency.details.observed_status;
    latency.details.observed_attempts=observed?.attempts;
    latency.details.next_attempt_at_ms=observed?.next_attempt;
-   latency.details.exit_reason=!observed?'not_found':observed.acknowledged_at?'acknowledged':observed.resolved_at?'resolved':observed.status==='sent'?'already_sent':observed.status==='sending'?'in_flight':observed.status==='pending'&&observed.next_attempt>Date.now()?'backoff':'not_pending';
+   // Distinguish this claim's own mute/snooze/Stop suppression from a Parent's earlier acknowledgement.
+   const suppressed=!!claims&&claims[offset+1].meta.changes>0;
+   latency.details.exit_reason=!observed?'not_found':observed.acknowledged_at?(suppressed?'suppressed':'acknowledged'):observed.resolved_at?'resolved':observed.status==='sent'?'already_sent':observed.status==='sending'?'in_flight':observed.status==='pending'&&observed.next_attempt>Date.now()?'backoff':'not_pending';
   }catch{/* Optional observation must not turn a skipped send into a failure. */}
   await record('claim_skipped',undefined,'dispatch_skip');return;
  }
@@ -264,13 +266,16 @@ export async function acknowledge(env:Env,device:Device,value:Record<string,unkn
  const now=Date.now(),timestamp=new Date(now).toISOString();
  const pair=await pairFor(env,device);if(!pair||pair.listener_id!==event.listener_id)throw new APIError(409,'Pairing changed.');
  const isTest=(JSON.parse(event.payload) as Alert).isTest===true;
- const until=now+configuration(JSON.parse(device.config)).snoozeDuration*1000;
- const journalEvent={id:`ack:${id}`,kind:isTest?'test_acknowledged':'alert_acknowledged',occurredAt:timestamp,episodeID:event.episode_id,
+ // A queued Snooze (Watch relay, offline AlarmKit Stop) can arrive long after the
+ // tap. Snooze from the tap, so a late delivery cannot silence a newer episode.
+ const actedAt=value.actedAt===undefined?now:Math.min(now,Math.max(now-86400000,Date.parse(date(value.actedAt))));
+ const until=actedAt+configuration(JSON.parse(device.config)).snoozeDuration*1000;
+ const journalEvent={id:`ack:${id}`,kind:isTest?'test_acknowledged':'alert_acknowledged',occurredAt:new Date(actedAt).toISOString(),episodeID:event.episode_id,
   ...(isTest?{}:{endAt:new Date(until).toISOString()})};
  const journal=env.DB.prepare(`INSERT INTO timeline_events(id,parent_id,listener_id,pair_created_at,kind,occurred_at,payload)
   SELECT ?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?)
   AND EXISTS(SELECT 1 FROM events WHERE event_id=? AND acknowledged_at IS NULL) ON CONFLICT DO NOTHING`)
-  .bind(journalEvent.id,pair.parent_id,pair.listener_id,pair.created_at,journalEvent.kind,now,JSON.stringify(journalEvent),pair.parent_id,pair.listener_id,pair.created_at,id);
+  .bind(journalEvent.id,pair.parent_id,pair.listener_id,pair.created_at,journalEvent.kind,actedAt,JSON.stringify(journalEvent),pair.parent_id,pair.listener_id,pair.created_at,id);
  if(isTest) {
   // Tests never expire, so confirming one also confirms this pair's earlier unconfirmed tests.
   // Otherwise repeated tests would each need a separate confirmation. Real alerts are untouched.
@@ -286,13 +291,15 @@ export async function acknowledge(env:Env,device:Device,value:Record<string,unkn
    env.DB.prepare(`INSERT INTO alert_snoozes(event_id,claim_id,parent_id,listener_id,pair_created_at,started_at,until_at)
     SELECT ?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?)
     AND EXISTS(SELECT 1 FROM events WHERE event_id=? AND parent_id=? AND listener_id=? AND acknowledged_at IS NULL)
-    ON CONFLICT DO NOTHING`).bind(id,claim,device.id,pair.listener_id,pair.created_at,now,until,pair.parent_id,pair.listener_id,pair.created_at,id,device.id,pair.listener_id),
-   env.DB.prepare(`UPDATE devices SET alerts_muted_until=?,alerts_muted_at=? WHERE id=?
-    AND EXISTS(SELECT 1 FROM alert_snoozes WHERE event_id=? AND claim_id=?)`).bind(until,now,device.id,id,claim),
+    ON CONFLICT DO NOTHING`).bind(id,claim,device.id,pair.listener_id,pair.created_at,actedAt,until,pair.parent_id,pair.listener_id,pair.created_at,id,device.id,pair.listener_id),
+   // Never shorten a longer snooze that is already running; an expired one mutes nothing.
+   env.DB.prepare(`UPDATE devices SET alerts_muted_until=?,alerts_muted_at=? WHERE id=? AND ?>? AND ?>alerts_muted_until
+    AND EXISTS(SELECT 1 FROM alert_snoozes WHERE event_id=? AND claim_id=?)`).bind(until,actedAt,device.id,until,now,until,id,claim),
    journal,
+   // Alerts created after the snooze window ended stay active.
    env.DB.prepare(`UPDATE events SET acknowledged_at=COALESCE(acknowledged_at,?) WHERE parent_id=? AND listener_id=?
-    AND COALESCE(json_extract(payload,'$.isTest'),0)=0
-    AND EXISTS(SELECT 1 FROM alert_snoozes WHERE event_id=? AND claim_id=?)`).bind(timestamp,device.id,pair.listener_id,id,claim)
+    AND COALESCE(json_extract(payload,'$.isTest'),0)=0 AND (event_id=? OR created_at<=?)
+    AND EXISTS(SELECT 1 FROM alert_snoozes WHERE event_id=? AND claim_id=?)`).bind(timestamp,device.id,pair.listener_id,id,until,id,claim)
   ]);
   await scheduleReminders(env,device.id);
  }
@@ -345,7 +352,7 @@ export async function flushPending(env:Env,requestId=crypto.randomUUID(),latency
  // fan-out; existing alarms are never postponed by these idempotent refreshes.
  await latency.measure('maintenance_schedule_ms',async()=>{
  const parents=await env.DB.prepare(`SELECT DISTINCT parent_id FROM events WHERE resolved_at IS NULL
-  AND (acknowledged_at IS NULL OR json_extract(payload,'$.type')='listener_disconnected')
+  AND (acknowledged_at IS NULL OR json_extract(payload,'$.type') IN ('listener_disconnected','monitoring_failed'))
   AND status IN ('pending','blocked','sent','uncertain') AND COALESCE(last_error,'')!='expired_event'
   AND COALESCE(json_extract(payload,'$.isTest'),0)=0 ORDER BY parent_id LIMIT 25`).all<{parent_id:string}>();
  for(let index=0;index<parents.results.length;index+=5)await Promise.all(parents.results.slice(index,index+5).map(p=>scheduleRemindersSafely(env,p.parent_id,requestId)));

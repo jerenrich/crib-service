@@ -49,6 +49,34 @@ final class AppModelTests: XCTestCase {
         fixture.model.stop()
     }
 
+    @MainActor func testAlertWaitsForUnsentLocalStartSoAnOlderStopCannotSilenceIt() async throws {
+        let fixture = try Fixture()
+        await fixture.backend.setMonitoringFailure(true)
+        await fixture.model.start()
+        let start = fixture.time.now
+        for index in 0...44 {
+            fixture.time.now = start.addingTimeInterval(Double(index) / 4)
+            fixture.audio.emit(AudioLevelSample(timestamp: fixture.time.now, dbFS: -10))
+        }
+        let held = await eventually { fixture.model.log.export.contains("alert_held_for_monitoring_report") }
+        XCTAssertTrue(held)
+        var sent = await fixture.backend.sent
+        XCTAssertTrue(sent.isEmpty, "The server would judge this upload against the earlier Stop and retire it")
+        XCTAssertEqual(fixture.model.snapshot.pending.count, 1)
+        await fixture.backend.setMonitoringFailure(false)
+        fixture.time.now = fixture.time.now.addingTimeInterval(4)
+        await fixture.model.tick()
+        let delivered = await eventually { fixture.model.snapshot.pending.isEmpty }
+        XCTAssertTrue(delivered)
+        sent = await fixture.backend.sent
+        XCTAssertEqual(sent.count, 1)
+        let requests = await fixture.backend.monitoringRequests
+        XCTAssertEqual(requests.last?.0, true)
+        XCTAssertTrue(fixture.model.log.export.contains("alert_outbox phase=receipt event_id=\(sent[0].eventId.uuidString.lowercased())"))
+        XCTAssertTrue(fixture.model.log.export.contains("status=sent"))
+        fixture.model.stop()
+    }
+
     @MainActor func testFailedDurableSavePreventsImmediateAlertUpload() async throws {
         let fixture = try Fixture()
         let gate = RequestGate()
@@ -339,7 +367,7 @@ final class AppModelTests: XCTestCase {
             statusValue?.alertsMutedUntil = Date().addingTimeInterval(-1)
         }
         private(set) var acknowledgements: [UUID] = []
-        func acknowledge(_ id: UUID) async throws { acknowledgements.append(id) }
+        func acknowledge(_ id: UUID, actedAt: Date?) async throws { acknowledgements.append(id) }
         func pushToken(_ token: String) async throws {}
         func watchPushToken(_ token: String?) async throws {}
     }
@@ -1528,6 +1556,56 @@ final class AppModelTests: XCTestCase {
         try await Task.sleep(for: .seconds(2))
         let requests = await fixture.backend.monitoringRequests
         XCTAssertEqual(requests.map(\.0), [true], "Only the person's Start is reported; the stall is not a Stop")
+    }
+    @MainActor func testUnexpectedMicrophoneFailureSendsOnePersistentStopAlertUntilRestart() async throws {
+        let fixture = try Fixture()
+        await fixture.model.start(); await fixture.model.tick()
+        fixture.audio.onStatus?(.recovering("Recovering microphone…"))
+        fixture.audio.onStatus?(.failed("Microphone unavailable. Open the app to restart monitoring."))
+        let sent = await eventually { await fixture.backend.sent.contains { $0.isMonitoringFailure } }
+        XCTAssertTrue(sent)
+        let uploads = await fixture.backend.sent
+        let alert = try XCTUnwrap(uploads.first { $0.isMonitoringFailure })
+        XCTAssertEqual(alert.type, "monitoring_failed"); XCTAssertFalse(alert.isRepeat); XCTAssertNil(alert.isTest)
+        XCTAssertEqual(alert.cryStartedAt, alert.createdAt); XCTAssertEqual(alert.durationSeconds, 0)
+        fixture.audio.onStatus?(.failed("Microphone unavailable. Open the app to restart monitoring."))
+        await fixture.model.tick()
+        var failures = await fixture.backend.sent.filter(\.isMonitoringFailure)
+        XCTAssertEqual(failures.count, 1, "One episode per unexpected stop")
+        XCTAssertTrue(fixture.model.log.export.contains("monitoring_failure_alert_queued"))
+        // Restarting ends the episode (the server resolves it from the monitoring heartbeat).
+        await fixture.model.start()
+        XCTAssertTrue(fixture.model.monitoring)
+        fixture.audio.onStatus?(.failed("Microphone unavailable. Open the app to restart monitoring."))
+        let again = await eventually { await fixture.backend.sent.filter(\.isMonitoringFailure).count == 2 }
+        XCTAssertTrue(again, "A new stop after a restart is a new episode")
+        failures = await fixture.backend.sent.filter(\.isMonitoringFailure)
+        XCTAssertNotEqual(failures[0].episodeId, failures[1].episodeId)
+        fixture.model.stop()
+    }
+    @MainActor func testPersonStopPauseAndStandbyFailureSendNoStopAlert() async throws {
+        let fixture = try Fixture()
+        await fixture.model.start(); await fixture.model.tick()
+        fixture.model.stop(); await fixture.model.tick()
+        await fixture.model.start(); await fixture.model.tick()
+        fixture.model.pauseMonitoring()
+        fixture.audio.onStatus?(.recovering("Audio interrupted"))
+        fixture.audio.onStatus?(.failed("Microphone unavailable"))
+        fixture.time.now = fixture.time.now.addingTimeInterval(4)
+        await fixture.model.tick()
+        try await Task.sleep(for: .milliseconds(300))
+        let failures = await fixture.backend.sent.filter(\.isMonitoringFailure)
+        XCTAssertTrue(failures.isEmpty)
+        fixture.model.stop()
+    }
+    @MainActor func testMicrophoneStallSendsStopAlertWithoutReportingAStop() async throws {
+        let fixture = try Fixture(automaticallyStart: true)
+        await fixture.model.start()
+        fixture.time.now = fixture.time.now.addingTimeInterval(4)
+        let sent = await eventually(timeout: .seconds(5)) { await fixture.backend.sent.contains { $0.isMonitoringFailure } }
+        XCTAssertTrue(sent)
+        let requests = await fixture.backend.monitoringRequests
+        XCTAssertFalse(requests.contains { !$0.0 }, "The stall must not report a Stop that would retire alerts")
     }
     @MainActor func testRelaunchAfterTerminationDoesNotReportAStopButResendsAnUnsentLocalAction() async throws {
         let fixture = try Fixture()

@@ -90,6 +90,10 @@ struct NightstandView: View {
                 return Hero(title: "Listener connection lost", detail: "No nursery update for 3+ minutes. Check its power and internet.",
                             tone: .alert, ring: .full, icon: "wifi.slash")
             }
+            if alert.isMonitoringFailure {
+                return Hero(title: "Nursery monitoring stopped", detail: "The nursery iPhone stopped listening unexpectedly. Tap Start on it.",
+                            tone: .alert, ring: .full, icon: "mic.slash")
+            }
             return Hero(title: "Check on baby",
                         detail: elapsed.map { "Crying-like sound for \(clock($0))" } ?? "Alert sent \(alert.createdAt.formatted(date: .omitted, time: .shortened))",
                         tone: .alert, ring: .full, icon: "bell.fill")
@@ -809,9 +813,9 @@ struct NightstandView: View {
 
     private func alertPanel(_ alert: RemoteAlert) -> some View {
         Panel {
-            Label(alert.isTest == true ? "Test notification" : alert.isDisconnected ? "Listener connection lost" : "Check on baby", systemImage: "bell.badge")
+            Label(alert.isTest == true ? "Test notification" : alert.isDisconnected ? "Listener connection lost" : alert.isMonitoringFailure ? "Nursery monitoring stopped" : "Check on baby", systemImage: "bell.badge")
                 .font(.title2.weight(.semibold)).foregroundStyle(Palette.amber)
-            Text(alert.isTest == true ? "Confirm only after you receive this test on your intended device." : alert.isDisconnected ? "No Listener update for at least 3 minutes. Check the nursery phone’s power, internet and monitoring." : "Crying-like sound was detected. Check on baby.")
+            Text(alert.isTest == true ? "Confirm only after you receive this test on your intended device." : alert.isDisconnected ? "No Listener update for at least 3 minutes. Check the nursery phone’s power, internet and monitoring." : alert.isMonitoringFailure ? "The nursery iPhone stopped listening unexpectedly. Tap Start on it. Crying is not being detected." : "Crying-like sound was detected. Check on baby.")
                 .font(.subheadline)
             Text("Sent \(alert.createdAt.formatted(date: .omitted, time: .shortened)) · Delivery: \(alert.status)")
                 .font(.caption).foregroundStyle(Palette.muted)

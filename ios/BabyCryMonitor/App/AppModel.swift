@@ -74,6 +74,8 @@ import UIKit
     @ObservationIgnored private var localMonitoringReport: (id: UUID, enabled: Bool)?
     @ObservationIgnored private var reportingLocalMonitoring = false
     @ObservationIgnored private var nextLocalReportAt = Date.distantPast
+    @ObservationIgnored private var monitoringFailureQueued = false
+    @ObservationIgnored private var recoveringSince: Date?
     var managingDevice = false
     var changingConnectionAlerts = false
     private(set) var localConnectionWarningEnabled: Bool
@@ -264,6 +266,9 @@ import UIKit
         }
         if needsRestart, role == .listener {
             engine.recordTimeline("monitoring_unverified", at: interruptedMonitoringAt ?? currentTime()); persist()
+            // Relaunched without a person present: this heartbeat ends any server
+            // connection-loss alert, so replace it with a monitoring-stopped alert.
+            if automaticallyStart, UIApplication.shared.applicationState == .background { reportUnexpectedStop() }
         }
         #if DEBUG
         if ProcessInfo.processInfo.arguments.contains("--silent-alarm-e2e-arm"), role == .parent {
@@ -591,6 +596,7 @@ import UIKit
     }
     func stop(remote: Bool = false) {
         if !remote { controlGeneration += 1 }
+        clearMonitoringFailure()
         if !remote, role == .listener, paired { queueLocalMonitoringReport(false) }
         haltMonitoring()
     }
@@ -602,6 +608,7 @@ import UIKit
             controlGeneration += 1
             if paired { queueLocalMonitoringReport(false) }
         }
+        clearMonitoringFailure()
         let wasMonitoring = monitoring
         detectionPaused = microphoneActive || recoveringAudio
         monitoring = false; detectionStartedAt = nil
@@ -613,6 +620,26 @@ import UIKit
         if standby { audioStatus = "Standby · Microphone active" }
         persist(); synchronizeLiveSound(); queueHeartbeat(); recordBatterySample()
         log.record("monitoring_paused")
+    }
+    /// Monitoring stopped without a person's Stop or Pause: the nursery is no longer
+    /// covered. Send one persistent alert through the durable outbox; the server
+    /// repeats it until this Listener reports monitoring again or a person stops it.
+    private func reportUnexpectedStop() {
+        guard role == .listener, paired, let credential, storageHealthy, store != nil, !monitoringFailureQueued else { return }
+        monitoringFailureQueued = true
+        guard let alert = engine.queueMonitoringFailure(listenerId: credential.deviceId, at: currentTime()) else { return }
+        persist()
+        guard storageHealthy else { return }
+        log.alertPersisted(alert, at: currentTime(), elapsedMS: 0)
+        log.record("monitoring_failure_alert_queued")
+        requestImmediateAlertDelivery()
+    }
+    private func clearMonitoringFailure() {
+        let pending = snapshot.pending.contains { $0.alert.isMonitoringFailure }
+        guard monitoringFailureQueued || pending else { return }
+        monitoringFailureQueued = false
+        if pending { engine.clearMonitoringFailures(); persist() }
+        log.record("monitoring_failure_alert_cleared")
     }
     /// Ends capture without reporting a Stop. Only a person's Stop may retire
     /// crying alerts; a stall or lost pairing must leave reminders running.
@@ -839,6 +866,7 @@ import UIKit
         switch status {
         case .active:
             log.record("audio_active")
+            recoveringSince = nil; clearMonitoringFailure()
             meter = Array(repeating: -100, count: SoundLevelFrame.barCount); currentDBFS = -100
             chartNotificationTimes.removeAll(); chartSampledAt = nil
             microphoneActive = true; monitoring = !detectionPaused
@@ -851,6 +879,7 @@ import UIKit
             }
             queueHeartbeat()
         case .stopped:
+            recoveringSince = nil
             detectionPaused = false
             audioStatus = "Stopped"
             if wasActive { engine.recordTimeline("monitoring_stopped", at: currentTime()) }
@@ -860,6 +889,7 @@ import UIKit
             // Route changes and resumable interruptions need no user action.
             // Suspend detection so the missing audio never extends an episode.
             recoveringAudio = true; audioStatus = message; needsRestart = false
+            if !wasRecovering { recoveringSince = currentTime() }
             if wasActive && !wasRecovering { engine.recordTimeline("audio_interrupted", at: currentTime()) }
             engine.suspend(); persist()
             log.record("audio_recovering"); queueHeartbeat()
@@ -867,8 +897,10 @@ import UIKit
             audioStatus = message
             if wasActive { engine.recordTimeline("audio_interrupted", at: currentTime()) }
             engine.suspend(); persist()
-            error = message; needsRestart = true
-            log.record("audio_interrupted"); queueHeartbeat()
+            error = message; needsRestart = true; recoveringSince = nil
+            log.record("audio_interrupted")
+            if wasMonitoring || (wasRecovering && !detectionPaused) { reportUnexpectedStop() }
+            queueHeartbeat()
         }
         synchronizeLiveSound()
     }
@@ -999,7 +1031,14 @@ import UIKit
         }
         powerConnected = powered
         if microphoneActive, let lastSampleAt, now.timeIntervalSince(lastSampleAt) > 3 {
+            let wasMonitoring = monitoring
             haltMonitoring(); error = "Monitoring stopped: microphone samples stopped arriving."; needsRestart = true; log.record("audio_stalled")
+            if wasMonitoring { reportUnexpectedStop() }
+        }
+        // An interruption that never ends (or never reports its end) leaves the
+        // nursery unmonitored. Keep waiting to resume, but tell the Parent.
+        if recoveringAudio, !detectionPaused, let since = recoveringSince, now.timeIntervalSince(since) >= 60 {
+            reportUnexpectedStop()
         }
         synchronizeLiveSound()
         recordBatterySample()
@@ -1137,6 +1176,14 @@ import UIKit
                 self.alertDeliveryRequested = false
                 guard !Task.isCancelled, revision == self.environmentRevision, !self.managingDevice,
                       self.role == .listener, self.paired, self.storageHealthy, self.connectivity.available else { return }
+                // The server acknowledges (and the Listener then drops) an upload judged
+                // against an older applied Stop. Hold the outbox until this Start is
+                // recorded; the one-second tick retries the report and then the alerts.
+                await self.flushLocalMonitoringReport(using: client)
+                guard revision == self.environmentRevision else { return }
+                if self.localMonitoringReport?.enabled == true, !self.snapshot.pending.isEmpty {
+                    self.log.record("alert_held_for_monitoring_report"); return
+                }
                 await self.flushAlerts(using: client, revision: revision)
             }
         }
@@ -1148,11 +1195,16 @@ import UIKit
                                   willSend: { [self] alert, attempt in log.alertUploadStarted(alert, attempt: attempt, at: currentTime()) }) { alert, result in
             guard revision == environmentRevision else { return }
             switch result {
+            case .success(let receipt): log.alertReceipt(alert, status: receipt.status, at: currentTime())
+            case .failure: log.alertReceipt(alert, status: "request_failed", at: currentTime())
+            }
+            switch result {
             case .success(let receipt) where receipt.status == "sent":
                 engine.delivered(alert.eventId, at: Date()); log.record("alert_apns_accepted")
                 deliveryStatus = "Connected · APNs accepted alert"
             case .success(let receipt) where receipt.status == "resolved":
                 engine.acknowledged(alert.eventId)
+                log.record("alert_resolved")
                 deliveryStatus = "Episode settled · alert retired"
             case .success(let receipt) where receipt.status == "acknowledged":
                 engine.acknowledged(alert.eventId)
@@ -1731,6 +1783,10 @@ import UIKit
                 var queue = defaults.stringArray(forKey: watchAcknowledgementsKey) ?? []
                 if !queue.contains(id.uuidString) { queue.append(id.uuidString) }
                 defaults.set(queue, forKey: watchAcknowledgementsKey)
+                // Keep the Watch tap time; the relay to the server may be much later.
+                var tapped = defaults.dictionary(forKey: watchAcknowledgementsKey + "|actedAt") as? [String: Date] ?? [:]
+                if tapped[id.uuidString] == nil { tapped[id.uuidString] = command.issuedAt }
+                defaults.set(tapped.filter { queue.contains($0.key) }, forKey: watchAcknowledgementsKey + "|actedAt")
             }
         }
         let failure = await syncWatchCommands()
@@ -1769,7 +1825,8 @@ import UIKit
                 guard let id = UUID(uuidString: rawID), revision == environmentRevision else { continue }
                 let discarded: Bool
                 do {
-                    try await client.acknowledge(id)
+                    let tapped = (defaults.dictionary(forKey: queueKey + "|actedAt") as? [String: Date])?[rawID]
+                    try await client.acknowledge(id, actedAt: tapped)
                     discarded = false
                 } catch BackendError.response(404, _) {
                     // Deleted/old-pair alerts cannot be acknowledged. Resolve the
@@ -1782,6 +1839,8 @@ import UIKit
                 var remaining = defaults.stringArray(forKey: queueKey) ?? []
                 remaining.removeAll { $0 == rawID }
                 defaults.set(remaining, forKey: queueKey)
+                var tapped = defaults.dictionary(forKey: queueKey + "|actedAt") as? [String: Date] ?? [:]
+                tapped.removeValue(forKey: rawID); defaults.set(tapped, forKey: queueKey + "|actedAt")
                 defaults.set(rawID, forKey: discarded ? discardedKey : confirmedKey)
             }
             return nil

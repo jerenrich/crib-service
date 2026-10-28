@@ -214,7 +214,7 @@ struct CryNotificationView: View {
                     .buttonStyle(.borderedProminent).tint(Color(red: 0.62, green: 0.90, blue: 0.79)).foregroundStyle(.black)
                     .frame(maxWidth: .infinity)
             }
-            Label(alert?.isTest == true ? "Test alert" : alert?.isDisconnected == true ? "Listener connection lost" : "Check on baby", systemImage: "waveform")
+            Label(alert?.isTest == true ? "Test alert" : alert?.isDisconnected == true ? "Listener connection lost" : alert?.isMonitoringFailure == true ? "Nursery monitoring stopped" : "Check on baby", systemImage: "waveform")
                 .font(.headline).foregroundStyle(.orange)
             Text(text).font(.footnote)
             if let alert { Text(alert.createdAt, style: .time).font(.caption).foregroundStyle(.secondary) }

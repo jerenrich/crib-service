@@ -24,6 +24,23 @@ final class WatchAlertStateTests: XCTestCase {
         XCTAssertTrue((fixture.defaults.dictionary(forKey: "pendingAcknowledgementTests") ?? [:]).isEmpty)
     }
 
+    @MainActor func testQueuedSnoozeKeepsItsTapTimeAcrossRetriesAndRelaunch() throws {
+        let fixture = try Fixture()
+        var now = Date(timeIntervalSince1970: 1_800_000_000)
+        var state = fixture.makeState(currentTime: { now })
+        let real = fixture.alert()
+        state.handleNotification(real, acknowledging: true)
+        now = now.addingTimeInterval(3600)
+        state = fixture.makeState(currentTime: { now })
+        fixture.activated = true
+        state.retryPendingAcknowledgement()
+        XCTAssertEqual(fixture.commands.last?.eventId, real.eventId)
+        XCTAssertEqual(fixture.commands.last?.issuedAt, Date(timeIntervalSince1970: 1_800_000_000),
+                       "The server snoozes from the tap, not from this late delivery")
+        state.confirmAcknowledgement(real.eventId)
+        XCTAssertTrue((fixture.defaults.dictionary(forKey: "pendingAcknowledgementTimes") ?? [:]).isEmpty)
+    }
+
     @MainActor func testEarlyResumeAllowsNewRemindersButKeepsOldNotificationsDismissed() throws {
         let fixture = try Fixture()
         var now = Date()
@@ -69,8 +86,8 @@ final class WatchAlertStateTests: XCTestCase {
         init() throws { defaults = try XCTUnwrap(UserDefaults(suiteName: suite)) }
         deinit { UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite) }
 
-        func makeState() -> WatchAlertState {
-            let state = WatchAlertState(defaults: defaults)
+        func makeState(currentTime: @escaping () -> Date = Date.init) -> WatchAlertState {
+            let state = WatchAlertState(defaults: defaults, currentTime: currentTime)
             state.sendAcknowledgement = { [weak self] command in
                 guard let self, self.activated else { return }
                 self.commands.append(command)

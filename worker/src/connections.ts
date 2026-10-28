@@ -40,8 +40,10 @@ export async function flushConnections(env:Env,requestId=crypto.randomUUID()) {
    env.DB.prepare(`INSERT INTO connection_notices(id,listener_id,parent_id,state,observed_at,created_at)
     SELECT ?,?,?,?, ?,? FROM devices d JOIN pairs p ON p.parent_id=d.id
     JOIN connection_states s ON s.listener_id=p.listener_id JOIN heartbeats h ON h.listener_id=p.listener_id
-    WHERE p.listener_id=? AND d.id=? AND d.connection_alerts=1 AND s.state=? AND h.received_at=? AND ?<>'online' ON CONFLICT DO NOTHING`)
-    .bind(crypto.randomUUID(),row.listener_id,row.parent_id,state,row.received_at,now,row.listener_id,row.parent_id,row.state,row.received_at,state),
+    WHERE p.listener_id=? AND d.id=? AND d.connection_alerts=1 AND s.state=? AND h.received_at=? AND ?<>'online'
+    AND (?<>'stopped' OR NOT EXISTS(SELECT 1 FROM events e WHERE e.parent_id=p.parent_id AND e.listener_id=p.listener_id
+     AND e.resolved_at IS NULL AND json_extract(e.payload,'$.type')='monitoring_failed')) ON CONFLICT DO NOTHING`)
+    .bind(crypto.randomUUID(),row.listener_id,row.parent_id,state,row.received_at,now,row.listener_id,row.parent_id,row.state,row.received_at,state,state),
    env.DB.prepare('UPDATE connection_states SET state=?,changed_at=? WHERE listener_id=? AND state=? AND EXISTS(SELECT 1 FROM heartbeats h WHERE h.listener_id=connection_states.listener_id AND h.received_at=?)').bind(state,row.received_at,row.listener_id,row.state,row.received_at)
   ]);
  }

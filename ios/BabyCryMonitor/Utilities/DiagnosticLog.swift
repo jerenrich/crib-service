@@ -34,6 +34,7 @@ import Observation
         "crying_started", "possible_cry", "crying_ended", "crying_resumed", "quiet_gap_started",
         "alert_threshold_reached", "metadata_write_failed", "alert_apns_accepted", "alert_acknowledged",
         "alert_delivery_failed", "alert_uncertain", "alert_blocked", "alert_server_pending", "alert_retry_scheduled",
+        "alert_resolved", "alert_held_for_monitoring_report", "monitoring_failure_alert_queued", "monitoring_failure_alert_cleared",
         "test_push_apns_accepted", "heartbeat_retry_scheduled", "heartbeat_recovered", "settings_synced",
         "settings_sync_failed", "parent_status_failed", "parent_status_recovered", "backend_unavailable",
         "network_available", "network_unavailable", "push_token_received", "push_token_uploaded", "push_received",
@@ -79,7 +80,8 @@ import Observation
                                       "heartbeat_retry_scheduled", "settings_sync_failed", "parent_status_failed",
                                       "backend_unavailable", "watch_sync_failed", "watch_snapshot_failed", "watch_snapshot_received",
                                       "listener_status_failed", "monitoring_start_blocked_storage", "monitoring_start_blocked_safety",
-                                      "parent_connection_warning_armed", "parent_connection_warning_failed", "watch_payload_unrecognized"]
+                                      "parent_connection_warning_armed", "parent_connection_warning_failed", "watch_payload_unrecognized",
+                                      "alert_held_for_monitoring_report"]
         let details = error.map { Self.errorDetails($0) } ?? ""
         let fingerprint = "event_\(event)_\(code ?? 0)_\(details)"
         if repetitive.contains(event), let last = recent[fingerprint], Date().timeIntervalSince(last) < 60 { sampledRecords += 1; return }
@@ -174,6 +176,12 @@ import Observation
     }
     func alertUploadStarted(_ alert: CryAlert, attempt: Int, at now: Date) {
         alertOutbox(alert, phase: "upload_started", at: now, extra: " attempt=\(max(1, attempt))")
+    }
+    /// The server's decision for this event. "acknowledged" includes uploads silenced
+    /// by a snooze or Stop, which then leave the outbox; keep that tied to the event.
+    func alertReceipt(_ alert: CryAlert, status: String, at now: Date) {
+        let known: Set<String> = ["sent", "resolved", "acknowledged", "failed", "uncertain", "blocked", "pending", "sending", "request_failed"]
+        alertOutbox(alert, phase: "receipt", at: now, extra: " status=\(known.contains(status) ? status : "other")")
     }
     private func alertOutbox(_ alert: CryAlert, phase: String, at now: Date, extra: String) {
         let created = alert.createdAt.timeIntervalSince1970 * 1000, observed = now.timeIntervalSince1970 * 1000

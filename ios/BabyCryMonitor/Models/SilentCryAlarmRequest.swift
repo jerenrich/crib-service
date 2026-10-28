@@ -9,6 +9,8 @@ import Foundation
     func markHandled(_ eventID: UUID) {
         defaults.set(true, forKey: "silentCryAlarmSnoozed|\(eventID.uuidString)")
     }
+    static func actedAtKey(_ eventID: UUID) -> String { "silentCryAlarmActedAt|\(eventID.uuidString)" }
+    func actedAt(_ eventID: UUID) -> Date? { defaults.object(forKey: Self.actedAtKey(eventID)) as? Date }
 
     @discardableResult func apply(eventID: UUID, duration: TimeInterval, now: Date) -> Bool {
         let id = eventID.uuidString
@@ -22,6 +24,7 @@ import Foundation
         }
         defaults.set(now, forKey: "silentCryAlarmStoppedBefore")
         defaults.set(now.addingTimeInterval(duration), forKey: "silentCryAlarmMutedUntil")
+        defaults.set(now, forKey: Self.actedAtKey(eventID))
         pending.append(id)
         defaults.set(Array(pending.suffix(100)), forKey: "silentCryAlarmPendingAcknowledgements")
         markHandled(eventID)
@@ -65,11 +68,13 @@ struct SilentCryAlarmRequest: Sendable {
     let createdAt: Date
     let cycleID: UUID?
     let isDisconnected: Bool
+    let isMonitoringFailure: Bool
 
     init?(payload: [AnyHashable: Any], now: Date = Date()) {
         guard case .success(let fields) = Self.parse(payload, now: now) else { return nil }
         eventID = fields.0; episodeID = fields.1; createdAt = fields.2
         isDisconnected = payload["type"] as? String == "listener_disconnected"
+        isMonitoringFailure = payload["type"] as? String == CryAlert.monitoringFailedType
         cycleID = (payload["alarmCycleId"] as? String).flatMap(UUID.init(uuidString:))
     }
 

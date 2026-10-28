@@ -67,9 +67,13 @@ public struct CryAlert: Identifiable, Codable, Equatable, Sendable {
     // second-rounded wire metadata, so an upgrade cannot break UUID deduplication.
     let wireTimestampVersion: Int?
     public var id: UUID { eventId }
-    public init(eventId: UUID = UUID(), episodeId: UUID, listenerId: UUID, cryStartedAt: Date, durationSeconds: Double, createdAt: Date, isRepeat: Bool, isTest: Bool? = nil) {
+    /// The Listener stopped listening without a person's Stop. The server repeats
+    /// it like crying until the Listener reports monitoring again.
+    public static let monitoringFailedType = "monitoring_failed"
+    public var isMonitoringFailure: Bool { type == Self.monitoringFailedType }
+    public init(eventId: UUID = UUID(), episodeId: UUID, listenerId: UUID, cryStartedAt: Date, durationSeconds: Double, createdAt: Date, isRepeat: Bool, isTest: Bool? = nil, type: String = "sustained_cry") {
         self.eventId = eventId; self.episodeId = episodeId; self.listenerId = listenerId
-        self.type = "sustained_cry"; self.cryStartedAt = cryStartedAt; self.durationSeconds = durationSeconds
+        self.type = type; self.cryStartedAt = cryStartedAt; self.durationSeconds = durationSeconds
         self.createdAt = createdAt; self.isRepeat = isRepeat
         self.isTest = isTest
         self.wireTimestampVersion = 1

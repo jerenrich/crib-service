@@ -16,11 +16,14 @@ import Observation
     private var localMutedUntil: Date?
     private var pendingAcknowledgements: [UUID]
     private var pendingTests: [String: Bool]
+    /// Tap time per queued Snooze, so the server snoozes from the tap, not delivery.
+    private var pendingActedAt: [String: Double]
 
     init(defaults: UserDefaults = .standard, currentTime: @escaping () -> Date = Date.init) {
         self.defaults = defaults
         self.currentTime = currentTime
         pendingTests = defaults.dictionary(forKey: "pendingAcknowledgementTests") as? [String: Bool] ?? [:]
+        pendingActedAt = defaults.dictionary(forKey: "pendingAcknowledgementTimes") as? [String: Double] ?? [:]
         snoozeDuration = defaults.object(forKey: "snoozeDuration") as? Double ?? 60
         mutedUntil = defaults.object(forKey: "cryAlertsMutedUntil") as? Date
         localMutedUntil = defaults.object(forKey: "localCryAlertsMutedUntil") as? Date
@@ -64,6 +67,7 @@ import Observation
         acknowledgedEpisodes = Array(acknowledgedEpisodes.suffix(100))
         pendingAcknowledgements.append(value.eventId)
         pendingTests[value.eventId.uuidString] = value.isTest
+        pendingActedAt[value.eventId.uuidString] = currentTime().timeIntervalSince1970
         // A real Snooze applies to all crying episodes, including older alerts.
         // Test acknowledgements affect only that test.
         if !value.isTest {
@@ -104,6 +108,7 @@ import Observation
         guard let eventID, pendingAcknowledgements.contains(eventID) else { return }
         pendingAcknowledgements.removeAll { $0 == eventID }
         pendingTests.removeValue(forKey: eventID.uuidString)
+        pendingActedAt.removeValue(forKey: eventID.uuidString)
         persist()
         retryPendingAcknowledgement()
     }
@@ -112,7 +117,9 @@ import Observation
     /// The transport may be unavailable; retain each event until the Parent confirms it.
     func retryPendingAcknowledgement() {
         guard let eventID = pendingAcknowledgements.first else { return }
-        sendAcknowledgement?(WatchCommand(kind: .acknowledge, eventId: eventID, isTest: pendingTests[eventID.uuidString]))
+        var command = WatchCommand(kind: .acknowledge, eventId: eventID, isTest: pendingTests[eventID.uuidString])
+        if let tapped = pendingActedAt[eventID.uuidString] { command.issuedAt = Date(timeIntervalSince1970: tapped) }
+        sendAcknowledgement?(command)
     }
 
     private func isSuppressed(_ value: WatchCryAlert) -> Bool {
@@ -138,6 +145,8 @@ import Observation
         defaults.set(pendingAcknowledgements.map(\.uuidString), forKey: "pendingAcknowledgements")
         pendingTests = pendingTests.filter { key, _ in pendingAcknowledgements.contains { $0.uuidString == key } }
         defaults.set(pendingTests, forKey: "pendingAcknowledgementTests")
+        pendingActedAt = pendingActedAt.filter { key, _ in pendingAcknowledgements.contains { $0.uuidString == key } }
+        defaults.set(pendingActedAt, forKey: "pendingAcknowledgementTimes")
         defaults.removeObject(forKey: "pendingAcknowledgement")
     }
 }

@@ -49,6 +49,13 @@ export async function completeMonitoring(env:Env,device:Device,value:Record<stri
  return {ok:result.meta.changes>0};
 }
 
+// A monitoring_failed episode ends once the Listener reports monitoring again.
+// Compare Listener timestamps with each other, never with server time, so a
+// skewed clock cannot let the pre-failure heartbeat retire the new alert.
+// Reminders copy cryStartedAt (the stop time) but stamp createdAt on the server.
+export const monitoringResumedSQL=`json_extract(events.payload,'$.type')='monitoring_failed' AND EXISTS(SELECT 1 FROM heartbeats h
+ WHERE h.listener_id=events.listener_id AND json_extract(h.metadata,'$.monitoring')=1
+ AND julianday(json_extract(h.metadata,'$.timestamp'))>julianday(json_extract(events.payload,'$.cryStartedAt')))`;
 // A pending Stop suppresses late uploads; an applied Stop remains in force until
 // either phone starts again. Never claim that this proves the microphone stopped.
 export const stoppedMonitoringSQL=`EXISTS(SELECT 1 FROM monitoring_commands m JOIN pairs p
