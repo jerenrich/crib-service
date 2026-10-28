@@ -48,15 +48,35 @@ public struct LiveSoundRequests: Sendable {
 public struct RemoteSoundState: Sendable {
     public private(set) var frame: SoundLevelFrame?
     public private(set) var receivedAt: Date?
+    private var localEpisodeStartedAt: Date?
     public init() {}
     public mutating func receive(_ value: SoundLevelFrame, at now: Date) {
         guard value.isValid, frame.map({ value.sampledAt > $0.sampledAt }) ?? true else { return }
+        if let duration = value.episodeDuration {
+            let start = now.addingTimeInterval(-duration)
+            // Map the Listener's elapsed time onto this phone's clock. Within a
+            // live episode, slower packets must not make the timer run backwards.
+            if isLive(at: now), frame?.episodeStartedAt == value.episodeStartedAt,
+               let previous = localEpisodeStartedAt {
+                localEpisodeStartedAt = min(previous, start)
+            } else {
+                localEpisodeStartedAt = start
+            }
+        } else {
+            localEpisodeStartedAt = nil
+        }
         frame = value; receivedAt = now
     }
-    public mutating func disconnected() { receivedAt = nil }
+    public mutating func disconnected() { receivedAt = nil; localEpisodeStartedAt = nil }
     public func isLive(at now: Date) -> Bool {
         guard let receivedAt else { return false }
         return (0..<3).contains(now.timeIntervalSince(receivedAt))
+    }
+    /// Presentation only: assume the current episode continues between live
+    /// readings, without comparing the two phones' wall clocks or extending freshness.
+    public func episodeDuration(at now: Date) -> TimeInterval? {
+        guard isLive(at: now), let localEpisodeStartedAt else { return nil }
+        return max(0, now.timeIntervalSince(localEpisodeStartedAt))
     }
 }
 

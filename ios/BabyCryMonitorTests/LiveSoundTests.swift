@@ -55,6 +55,63 @@ final class LiveSoundTests: XCTestCase {
         value.requestID = UUID().uuidString
         XCTAssertFalse(requests.accepts(value, at: now))
     }
+
+    func testEpisodeTimerAdvancesBetweenFramesUsingTheReceivingClock() throws {
+        let now = Date(timeIntervalSince1970: 10_000)
+        var state = RemoteSoundState()
+        state.receive(frame(), at: now)
+        XCTAssertEqual(try XCTUnwrap(state.episodeDuration(at: now)), 5)
+        XCTAssertEqual(try XCTUnwrap(state.episodeDuration(at: now.addingTimeInterval(0.125))), 5.125, accuracy: 0.001)
+        XCTAssertEqual(try XCTUnwrap(state.episodeDuration(at: now.addingTimeInterval(2.9))), 7.9, accuracy: 0.001)
+        XCTAssertEqual(state.frame?.episodeDuration, 5, "Extrapolation must not change the reported sound state")
+    }
+
+    func testLateFramesDoNotRewindTheLiveEpisodeTimer() throws {
+        let now = Date(timeIntervalSince1970: 10_000)
+        var state = RemoteSoundState()
+        state.receive(frame(), at: now)
+        // A quarter-second reading arrives three quarters of a second later.
+        state.receive(frame(at: 100.25), at: now.addingTimeInterval(0.75))
+        XCTAssertEqual(try XCTUnwrap(state.episodeDuration(at: now.addingTimeInterval(0.75))), 5.75, accuracy: 0.001)
+        XCTAssertEqual(try XCTUnwrap(state.episodeDuration(at: now.addingTimeInterval(0.875))), 5.875, accuracy: 0.001)
+        // A faster reading can correct the estimate forwards.
+        state.receive(frame(at: 101), at: now.addingTimeInterval(0.9))
+        XCTAssertEqual(try XCTUnwrap(state.episodeDuration(at: now.addingTimeInterval(0.9))), 6, accuracy: 0.001)
+    }
+
+    func testEpisodeTimerResetsForQuietAndANewEpisode() throws {
+        let now = Date(timeIntervalSince1970: 10_000)
+        var state = RemoteSoundState()
+        state.receive(frame(), at: now)
+        var quiet = frame(at: 101)
+        quiet.state = .quiet; quiet.episodeStartedAt = nil
+        state.receive(quiet, at: now.addingTimeInterval(1))
+        XCTAssertNil(state.episodeDuration(at: now.addingTimeInterval(1)))
+        var next = frame(at: 102)
+        next.episodeStartedAt = 101.5
+        state.receive(next, at: now.addingTimeInterval(2))
+        XCTAssertEqual(try XCTUnwrap(state.episodeDuration(at: now.addingTimeInterval(2))), 0.5)
+        // Even without an intervening quiet frame, a new start replaces the anchor.
+        next.sampledAt = 103; next.episodeStartedAt = 102.75
+        state.receive(next, at: now.addingTimeInterval(3))
+        XCTAssertEqual(try XCTUnwrap(state.episodeDuration(at: now.addingTimeInterval(3))), 0.25)
+    }
+
+    func testEpisodeTimerStopsWithStaleOrDisconnectedDataAndResyncs() throws {
+        let now = Date(timeIntervalSince1970: 10_000)
+        var state = RemoteSoundState()
+        XCTAssertNil(state.episodeDuration(at: now))
+        state.receive(frame(), at: now)
+        XCTAssertNil(state.episodeDuration(at: now.addingTimeInterval(-1)))
+        XCTAssertNil(state.episodeDuration(at: now.addingTimeInterval(3)))
+        // Recovery uses the new reading, not the extrapolation across the gap.
+        state.receive(frame(at: 101), at: now.addingTimeInterval(4))
+        XCTAssertEqual(try XCTUnwrap(state.episodeDuration(at: now.addingTimeInterval(4))), 6)
+        state.disconnected()
+        XCTAssertNil(state.episodeDuration(at: now.addingTimeInterval(4)))
+        state.receive(frame(at: 102), at: now.addingTimeInterval(4.5))
+        XCTAssertEqual(try XCTUnwrap(state.episodeDuration(at: now.addingTimeInterval(4.5))), 7)
+    }
 }
 
 final class ParentMonitoringEvidenceTests: XCTestCase {

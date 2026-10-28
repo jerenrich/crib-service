@@ -32,7 +32,9 @@ struct NightstandView: View {
     private var frameTime: TimeInterval { listener ? (model.chartSampledAt ?? model.now).timeIntervalSince1970 : frame?.sampledAt ?? model.now.timeIntervalSince1970 }
     private var threshold: Double { listener ? model.threshold : frame?.threshold ?? model.parentStatus?.listenerConfiguration?.absoluteThreshold ?? model.threshold }
     private var alertDuration: TimeInterval { listener ? model.configuration.alertDuration : frame.flatMap { soundLive ? $0.alertDuration : nil } ?? model.parentStatus?.listenerConfiguration?.alertDuration ?? model.configuration.alertDuration }
-    private var elapsed: TimeInterval? { listener ? model.snapshot.current.map { $0.duration(at: model.now) } : soundLive ? frame?.episodeDuration : nil }
+    private func elapsed(at date: Date) -> TimeInterval? {
+        listener ? model.snapshot.current.map { $0.duration(at: date) } : soundLive ? model.remoteSound.episodeDuration(at: date) : nil
+    }
     private var confirmedParentState: Bool { ["Monitoring", "Standby", "Stopped"].contains(model.nurseryConnection) }
     private var standby: Bool { listener ? model.standby : model.parentMonitoringDisplayState == .standby }
     private var monitoringActive: Bool { listener ? model.monitoring || model.recoveringAudio : model.parentDisplaysMonitoring }
@@ -75,9 +77,11 @@ struct NightstandView: View {
         var resumesAt: Date?
     }
 
-    private var hero: Hero { listener ? listenerHero : parentHero }
+    private var hero: Hero { hero(at: model.now) }
 
-    private var parentHero: Hero {
+    private func hero(at date: Date) -> Hero { listener ? listenerHero(at: date) : parentHero(at: date) }
+
+    private func parentHero(at date: Date) -> Hero {
         if model.monitoringControlError != nil {
             return Hero(title: "Monitoring not confirmed", detail: "Check the nursery phone. Don't rely on alerts.",
                         tone: .caution, ring: .dashed, icon: "exclamationmark.triangle.fill")
@@ -95,7 +99,7 @@ struct NightstandView: View {
                             tone: .alert, ring: .full, icon: "mic.slash")
             }
             return Hero(title: "Check on baby",
-                        detail: elapsed.map { "Crying-like sound for \(clock($0))" } ?? "Alert sent \(alert.createdAt.formatted(date: .omitted, time: .shortened))",
+                        detail: elapsed(at: date).map { "Crying-like sound for \(clock($0))" } ?? "Alert sent \(alert.createdAt.formatted(date: .omitted, time: .shortened))",
                         tone: .alert, ring: .full, icon: "bell.fill")
         }
         switch model.parentMonitoringDisplayState {
@@ -109,7 +113,7 @@ struct NightstandView: View {
         default: break
         }
         if let until = snoozedUntil {
-            let remaining = until.timeIntervalSince(model.now) / max(1, model.configuration.snoozeDuration)
+            let remaining = max(0, until.timeIntervalSince(date)) / max(1, model.configuration.snoozeDuration)
             return Hero(title: "Alerts snoozed", detail: "Resumes in", tone: .caution, ring: .progress(min(1, remaining)), icon: "bell.slash", resumesAt: until)
         }
         if standby {
@@ -119,7 +123,7 @@ struct NightstandView: View {
             return Hero(title: "Stopped", detail: "Monitoring is off on the nursery iPhone.", tone: .inactive, icon: "stop.circle")
         }
         // A fresh sound frame can be displayed before the next heartbeat.
-        if !soundLive {
+        if !soundLive || !model.remoteSound.isLive(at: date) {
             let last = model.parentStatus?.lastHeartbeat
             if model.parentDisplaysMonitoring {
                 return Hero(title: "Live chart paused", detail: last.map { "Monitoring confirmed \(ago($0))." } ?? "Waiting for live readings.",
@@ -128,10 +132,10 @@ struct NightstandView: View {
             return Hero(title: "Monitoring unconfirmed", detail: last.map { "Last nursery update \(ago($0))." } ?? "Waiting for a confirmed Listener update.",
                         tone: .caution, ring: .dashed, icon: "questionmark.circle")
         }
-        return liveHero(alertSent: false)
+        return liveHero(alertSent: false, at: date)
     }
 
-    private var listenerHero: Hero {
+    private func listenerHero(at date: Date) -> Hero {
         if listenerAlertFailed {
             return Hero(title: "Alert failed", detail: "Check delivery details. This alert will not retry.", tone: .caution, ring: .full, icon: "exclamationmark.triangle.fill")
         }
@@ -155,11 +159,11 @@ struct NightstandView: View {
         if model.paired, model.connectivity.checked, !model.connectivity.available {
             return Hero(title: "Internet unavailable", detail: "Alerts can't be delivered right now.", tone: .caution, ring: .dashed, icon: "wifi.slash")
         }
-        return liveHero(alertSent: model.snapshot.current?.alertSentAt != nil)
+        return liveHero(alertSent: model.snapshot.current?.alertSentAt != nil, at: date)
     }
 
-    private func liveHero(alertSent: Bool) -> Hero {
-        if let elapsed {
+    private func liveHero(alertSent: Bool, at date: Date) -> Hero {
+        if let elapsed = elapsed(at: date) {
             if alertSent || elapsed >= alertDuration {
                 return Hero(title: "Crying-like sound", detail: "For \(clock(elapsed))\(alertSent ? " · Alert sent" : "")", tone: .alert, ring: .full, icon: "bell.fill")
             }
@@ -270,7 +274,7 @@ struct NightstandView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
                         header
-                        heroText
+                        timedHero
                         activitySummary
                         chips
                         soundPanel.frame(height: 100 + chartHeader)
@@ -283,7 +287,7 @@ struct NightstandView: View {
             } else {
                 VStack(spacing: 14) {
                     header
-                    heroRing.padding(.top, 4)
+                    timedHero.padding(.top, 4)
                     activitySummary.padding(.top, -10)
                     chips
                     soundPanel.frame(minHeight: 60, maxHeight: .infinity)
@@ -348,9 +352,22 @@ struct NightstandView: View {
         .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
     }
 
-    private var heroRing: some View {
-        let hero = hero
-        return ZStack {
+    private var timedHero: some View {
+        let animating = scenePhase == .active && (hero.timer != nil || hero.resumesAt != nil)
+        // Redraw only the timer presentation; the chart and model keep their
+        // normal cadence. Absolute dates also catch up immediately after resume.
+        return SwiftUI.TimelineView(.animation(minimumInterval: 1.0 / 30, paused: !animating)) { context in
+            let value = hero(at: animating ? max(context.date, model.now) : model.now)
+            if typeSize.isAccessibilitySize {
+                heroText(value)
+            } else {
+                heroRing(value)
+            }
+        }
+    }
+
+    private func heroRing(_ hero: Hero) -> some View {
+        ZStack {
             StatusRing(fill: hero.ring, color: hero.tone.color, glow: hero.tone == .alert)
             VStack(spacing: 4) {
                 if let icon = hero.icon {
@@ -372,9 +389,8 @@ struct NightstandView: View {
         .frame(maxWidth: .infinity)
     }
 
-    private var heroText: some View {
-        let hero = hero
-        return VStack(alignment: .leading, spacing: 6) {
+    private func heroText(_ hero: Hero) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
             heroTitle(hero).font(.system(.title2, design: .rounded).weight(.semibold))
             if let timer = hero.timer { Text(clock(timer)).font(.title.monospacedDigit()) }
             heroDetail(hero).font(.subheadline).foregroundStyle(Palette.muted)
@@ -871,7 +887,6 @@ private struct StatusRing: View {
                 .rotationEffect(.degrees(-90))
                 .shadow(color: glow ? color.opacity(0.55) : .clear, radius: 14)
                 .opacity(fraction > 0 ? 1 : 0)
-                .animation(.easeInOut(duration: 0.4), value: fraction)
         }
         .padding(lineWidth / 2)
         .accessibilityHidden(true)
