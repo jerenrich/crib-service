@@ -33,6 +33,7 @@ import Foundation
 }
 
 struct SilentCryAlarmRequest: Sendable {
+    static let maximumPushAge: TimeInterval = 60
     enum Rejection: String, Error {
         case notRequested = "not_requested", test, malformed, stale
         case disabled, busy, acknowledgementPending = "acknowledgement_pending"
@@ -94,7 +95,7 @@ struct SilentCryAlarmRequest: Sendable {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         guard let date = formatter.date(from: text) ?? ISO8601DateFormatter().date(from: text) else { return .failure(.malformed) }
-        guard (-5...60).contains(now.timeIntervalSince(date)) else { return .failure(.stale) }
+        guard (-5...maximumPushAge).contains(now.timeIntervalSince(date)) else { return .failure(.stale) }
         return .success((eventID, episodeID, date))
     }
 
@@ -109,7 +110,7 @@ struct SilentCryAlarmRequest: Sendable {
         if !enabled { return .disabled }
         if !serverEnabled { return .serverDisabled }
         if !paired { return .unpaired }
-        if !(-5...60).contains(now.timeIntervalSince(createdAt)) { return .stale }
+        if !(-5...Self.maximumPushAge).contains(now.timeIntervalSince(createdAt)) { return .stale }
         guard let relevance else { return .relevanceUnknown }
         if !relevance.cryEpisodeIDs.contains(episodeID) { return .irrelevant }
         if !((mutedUntil ?? .distantPast) <= now) { return .serverMuted }
@@ -124,7 +125,7 @@ struct SilentCryAlarmRequest: Sendable {
         localMutedUntil: Date?, stoppedBefore: Date?, evidence: ServerEvidence?, now: Date) -> Rejection? {
         if !enabled { return .disabled }
         if acknowledgementPending { return .acknowledgementPending }
-        if !(-5...10).contains(now.timeIntervalSince(createdAt)) { return .stale }
+        if !(-5...Self.maximumPushAge).contains(now.timeIntervalSince(createdAt)) { return .stale }
         if (localMutedUntil ?? .distantPast) > now { return .locallyMuted }
         if createdAt <= (stoppedBefore ?? .distantPast) { return .stopped }
         if let evidence, evidence.observedAt >= createdAt {
@@ -149,6 +150,9 @@ struct SilentCryAlarmRequest: Sendable {
     }
 
     static func allowsStatusFallback(for error: any Error) -> Bool {
+        if let rejection = error as? Rejection {
+            return rejection == .budgetExpired || rejection == .staleStatus
+        }
         guard let error = error as? URLError else { return false }
         switch error.code {
         case .timedOut, .notConnectedToInternet, .networkConnectionLost,
@@ -156,10 +160,15 @@ struct SilentCryAlarmRequest: Sendable {
         default: return false // Cancellation, TLS failures and server rejections stay authoritative.
         }
     }
+
+    static func allowsStatusFallback(forHTTPStatus status: Int) -> Bool {
+        status == 408 || status == 429 || (500...599).contains(status)
+    }
 }
 
-/// An app policy, not an estimate of the runtime iOS has granted. Includes sleep
-/// and actor/executor delays from the original notification callback entry.
+/// A soft budget for status validation, not a scheduling deadline or an estimate
+/// of iOS runtime. Expiry skips further network work and permits guarded fallback.
+/// Includes sleep and actor/executor delays from notification callback entry.
 struct SilentCryAlarmExecutionBudget: Sendable {
     static let maximumDuration: Duration = .seconds(5)
     static let schedulingReserve: Duration = .seconds(1)
@@ -192,8 +201,8 @@ struct SilentCryAlarmStatusSnapshot<Value: Sendable>: Sendable {
         (.zero...Self.maximumAge).contains(startedAt.duration(to: now))
     }
 
-    /// One short read per callback. A later server wake can make a fresh attempt;
-    /// a resumed old response must not start another round trip here.
+    /// One short read per callback. Discard a resumed old response; the caller may
+    /// use the recent push for guarded fallback without another round trip.
     @MainActor static func load(
         budget: SilentCryAlarmExecutionBudget,
         clock: () -> ContinuousClock.Instant = { .now },

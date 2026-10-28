@@ -25,10 +25,12 @@ export function reserveAlarmRequest(env:Env,eventId:string,claimId:string,now:nu
    last_requested_at=excluded.last_requested_at,
    request_count=CASE WHEN ${same} THEN silent_alarm_cycles.request_count+1 ELSE 1 END,
    request_claim_id=excluded.request_claim_id,
-   request_event_ids=CASE WHEN ${same} THEN json_insert(silent_alarm_cycles.request_event_ids,'$[#]',json_extract(excluded.request_event_ids,'$[0]')) ELSE excluded.request_event_ids END,confirmed_at=NULL
-  WHERE NOT (${same}) OR (silent_alarm_cycles.confirmed_at IS NULL AND silent_alarm_cycles.request_count<3
-   AND excluded.last_requested_at>=silent_alarm_cycles.last_requested_at+30000
-   AND excluded.last_requested_at>=silent_alarm_cycles.first_requested_at+silent_alarm_cycles.request_count*30000)`)
+   request_event_ids=CASE WHEN ${same} THEN json_insert(
+    CASE WHEN json_array_length(silent_alarm_cycles.request_event_ids)>=32 THEN json_remove(silent_alarm_cycles.request_event_ids,'$[0]') ELSE silent_alarm_cycles.request_event_ids END,
+    '$[#]',json_extract(excluded.request_event_ids,'$[0]')) ELSE excluded.request_event_ids END,confirmed_at=NULL
+  WHERE NOT (${same}) OR (silent_alarm_cycles.confirmed_at IS NULL
+   AND excluded.last_requested_at>=silent_alarm_cycles.last_requested_at+
+    CASE WHEN silent_alarm_cycles.request_count<3 THEN 30000 ELSE 120000 END)`)
   .bind(crypto.randomUUID(),now,now,claimId,eventId,claimId,now);
 }
 

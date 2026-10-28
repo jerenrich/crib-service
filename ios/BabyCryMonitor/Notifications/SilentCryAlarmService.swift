@@ -195,7 +195,7 @@ import UIKit
                 evidence: serverEvidence, now: Date())
         }
         do {
-            try budget.requireTime()
+            try Task.checkCancellation()
             guard AlarmManager.shared.authorizationState == .authorized else {
                 record("rejected", reason: .unauthorized); return false
             }
@@ -211,28 +211,34 @@ import UIKit
             if !(defaults.stringArray(forKey: pendingKey) ?? []).isEmpty {
                 record("started")
                 await flushAcknowledgements(using: backend, limit: 1)
-                try budget.requireTime()
                 trace("ack_pending", request.eventID); record("rejected", reason: .acknowledgementPending); return false
             }
             let snapshot: SilentCryAlarmStatusSnapshot<ParentStatus>?
             do {
+                let statusCheckedAt = Date()
                 snapshot = try await SilentCryAlarmStatusSnapshot<ParentStatus>.load(budget: budget) {
                     stage = .status; record("started")
                     let server = try await backend.status()
+                    // Even a delayed response can supply a newer negative fact.
+                    // Preserve it before the snapshot loader rejects old timing.
+                    remember(server, checkedAt: statusCheckedAt)
                     record("completed")
                     return server
                 }
             } catch {
-                // A timeout is only a fallback opportunity while this callback
-                // still has our own execution budget and the push is very recent.
-                try budget.requireTime()
-                guard SilentCryAlarmRequest.allowsStatusFallback(for: error) else { throw error }
+                // Our deadline limits network work, never an otherwise eligible
+                // alarm. A resumed callback can still use a recent real push.
+                try Task.checkCancellation()
+                let unavailable: Bool
+                if case BackendError.response(let status, _) = error {
+                    unavailable = SilentCryAlarmRequest.allowsStatusFallback(forHTTPStatus: status)
+                } else { unavailable = SilentCryAlarmRequest.allowsStatusFallback(for: error) }
+                guard unavailable else { throw error }
                 if let reason = fallbackRejection() { record("rejected", reason: reason); return false }
                 record("fallback", error: error)
                 snapshot = nil
             }
             if let snapshot {
-                remember(snapshot.value, checkedAt: snapshot.checkedAt)
                 reconcile(snapshot.value, checkedAt: snapshot.checkedAt)
             }
             stage = .eligibility
@@ -266,14 +272,14 @@ import UIKit
                 stopIntent: SnoozeSilentCryAlarmIntent(episodeID: request.episodeID.uuidString),
                 sound: .named("AlarmTestSilence.caf"))
             stage = .schedule; record("started")
-            // Local reconciliation, alarm lookup or persistence can also stall.
-            // Recheck immediately before handing a new alarm to the system.
-            try budget.requireTime()
-            if let snapshot, !snapshot.isFresh() {
-                throw SilentCryAlarmRequest.Rejection.staleStatus
-            }
-            if snapshot == nil, let reason = fallbackRejection() {
+            // Local processing can also stall. Discard expired validation and
+            // fall back to the push, still honoring all newer negative evidence.
+            try Task.checkCancellation()
+            if let reason = fallbackRejection() {
                 record("rejected", reason: reason); return false
+            }
+            if let snapshot, !snapshot.isFresh() {
+                record("fallback", reason: .staleStatus)
             }
             _ = try await AlarmManager.shared.schedule(id: request.episodeID, configuration: configuration)
             record("completed")
@@ -290,12 +296,6 @@ import UIKit
             trace("scheduled", request.eventID); record("scheduled")
             queueSchedulingReceipt(request)
             return true
-        } catch SilentCryAlarmRequest.Rejection.budgetExpired {
-            status = "Alarm attempt expired; existing notifications continue."
-            trace("ignored", request.eventID); record("rejected", reason: .budgetExpired); return false
-        } catch SilentCryAlarmRequest.Rejection.staleStatus {
-            status = "Current alert status unavailable; existing notifications continue."
-            trace("ignored", request.eventID); record("rejected", reason: .staleStatus); return false
         } catch {
             status = "Silent alarm unavailable; existing notifications continue."
             trace("failed", request.eventID); record("failed", error: error); return false

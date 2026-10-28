@@ -11,6 +11,7 @@ import {flushPending,dispatchEvent} from '../src/alerts';
 import {eventReference,recordDiagnostic} from '../src/diagnostics';
 import {flushConnections} from '../src/connections';
 import {soundFrame} from '../src/live-sound';
+import {reserveAlarmRequest} from '../src/alarm-scheduling';
 
 let testEnv:Env;
 const secret=btoa('0123456789abcdef0123456789abcdef');
@@ -2301,20 +2302,39 @@ describe('optional overnight silent Watch alarms',()=>{
   return pair;
  }
  const phoneBodies=()=>pushRequests.filter(r=>!new Headers(r.init?.headers).get('apns-topic')!.endsWith('.watchkitapp')).map(r=>JSON.parse(String(r.init?.body)));
- it('keeps every ordinary reminder and permits only initial, 30s and 60s AlarmKit requests without confirmation',async()=>{
+ it('keeps ordinary reminders and recovers at 30s, 60s, then every two minutes until confirmed',async()=>{
   const {parent,listener}=await receiptSetup(),base=Date.now(),clock=vi.spyOn(Date,'now').mockReturnValue(base);
   await call('listener/event',listener,alert(listener));
   const markedAt=[0];
-  for(const seconds of [5,25,30,35,55,60,65,90]){
+  for(const seconds of [5,25,30,35,55,60,65,90,175,180,185,295,300]){
    clock.mockReturnValue(base+seconds*1000);const before=phoneBodies().length;
    await runReminder(testEnv,parent.deviceId);
    expect(phoneBodies()).toHaveLength(before+1);
    if(phoneBodies().at(-1).silentCryAlarm)markedAt.push(seconds);
   }
-  expect(markedAt).toEqual([0,30,60]);expect(pushRequests).toHaveLength(18);
+  expect(markedAt).toEqual([0,30,60,180,300]);expect(pushRequests).toHaveLength(28);
   for(const body of phoneBodies())expect(body.aps.sound).toBe('default');
   expect(new Set(phoneBodies().filter(b=>b.silentCryAlarm).map(b=>b.alarmCycleId)).size).toBe(1);
-  expect((await env.DB.prepare('SELECT request_count,confirmed_at FROM silent_alarm_cycles WHERE parent_id=?').bind(parent.deviceId).first())).toEqual({request_count:3,confirmed_at:null});
+  expect((await env.DB.prepare('SELECT request_count,confirmed_at FROM silent_alarm_cycles WHERE parent_id=?').bind(parent.deviceId).first())).toEqual({request_count:5,confirmed_at:null});
+  const last=phoneBodies().at(-1);
+  expect((await call('alarm/scheduled',parent,{eventId:last.eventId,episodeId:last.episodeId,cycleId:last.alarmCycleId})).status).toBe(200);
+  clock.mockReturnValue(base+420000);await runReminder(testEnv,parent.deviceId);
+  expect(phoneBodies().at(-1).silentCryAlarm).toBeUndefined();
+ });
+ it('bounds receipt history during prolonged recovery and accepts recent delayed confirmations',async()=>{
+  const {parent,listener}=await receiptSetup(),base=Date.now(),initial=alert(listener);
+  let lastEvent='';
+  for(let i=0;i<36;i++){
+   const event={...initial,eventId:crypto.randomUUID()},claim=crypto.randomUUID(),at=base+i*120000;
+   await env.DB.prepare("INSERT INTO events(event_id,episode_id,listener_id,parent_id,payload,created_at,status,claim_id,is_repeat) VALUES(?,?,?,?,?,?,'sending',?,1)")
+    .bind(event.eventId,event.episodeId,listener.deviceId,parent.deviceId,JSON.stringify(event),at,claim).run();
+   await reserveAlarmRequest(testEnv,event.eventId,claim,at).run();
+   lastEvent=event.eventId;
+  }
+  const row=await env.DB.prepare('SELECT request_count,request_event_ids,cycle_id FROM silent_alarm_cycles WHERE parent_id=?').bind(parent.deviceId).first<{request_count:number;request_event_ids:string;cycle_id:string}>();
+  expect(row!.request_count).toBe(36);expect(JSON.parse(row!.request_event_ids)).toHaveLength(32);
+  expect(JSON.parse(row!.request_event_ids).at(-1)).toBe(lastEvent);
+  expect((await call('alarm/scheduled',parent,{eventId:JSON.parse(row!.request_event_ids)[0],episodeId:initial.episodeId,cycleId:row!.cycle_id})).status).toBe(200);
  });
  it('stops wake requests after idempotent scheduling confirmation without stopping either notification destination',async()=>{
   const {parent,listener}=await receiptSetup(),base=Date.now(),clock=vi.spyOn(Date,'now').mockReturnValue(base);

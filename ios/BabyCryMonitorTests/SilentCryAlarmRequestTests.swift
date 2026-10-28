@@ -186,7 +186,7 @@ final class SilentCryAlarmStatusSnapshotTests: XCTestCase {
                 clock = clock.advanced(by: .seconds(26))
                 return NotificationRelevance(cryEpisodeIDs: [UUID()])
             }
-            XCTFail("A resumed old response must not authorize an alarm or another read")
+            XCTFail("A resumed old response must not be treated as current validation")
         } catch {
             XCTAssertEqual(error as? SilentCryAlarmRequest.Rejection, .budgetExpired)
         }
@@ -244,7 +244,7 @@ final class SilentCryAlarmStatusSnapshotTests: XCTestCase {
         XCTAssertEqual(reads, 1)
     }
 
-    func testSchedulingReserveAndRemainingBudgetIncludeElapsedSleep() {
+    func testSoftStatusBudgetAndRemainingTimeIncludeElapsedSleep() {
         let started = ContinuousClock.now
         let budget = SilentCryAlarmExecutionBudget(startedAt: started)
         XCTAssertNoThrow(try budget.requireTime(at: started.advanced(by: .milliseconds(3_999))))
@@ -279,12 +279,15 @@ final class SilentCryAlarmFallbackTests: XCTestCase {
         XCTAssertEqual(reason(stopped: now), .stopped)
     }
 
-    func testFallbackRejectsOlderPushesEvenThoughNormalStatusValidationCanStillAcceptThem() throws {
-        for age in [10.0, 11.0, 42.0] {
+    func testFallbackAcceptsDelayedRecentPushButRechecksExpiryImmediatelyBeforeScheduling() throws {
+        for age in [10.0, 11.0, 26.0, 42.0, 60.0] {
             let request = try request(age: age)
             let rejection = request.fallbackIneligibilityReason(enabled: true, acknowledgementPending: false,
                 localMutedUntil: nil, stoppedBefore: nil, evidence: nil, now: now)
-            XCTAssertEqual(rejection, age <= 10 ? nil : .stale)
+            XCTAssertNil(rejection)
+            XCTAssertEqual(request.fallbackIneligibilityReason(enabled: true, acknowledgementPending: false,
+                localMutedUntil: nil, stoppedBefore: nil, evidence: nil,
+                now: now.addingTimeInterval(61 - age)), .stale)
         }
     }
 
@@ -316,7 +319,7 @@ final class SilentCryAlarmFallbackTests: XCTestCase {
             localMutedUntil: nil, stoppedBefore: nil, evidence: old, now: now))
     }
 
-    func testOnlyUnavailableNetworkErrorsPermitFallback() {
+    func testUnavailableNetworkAndSoftDeadlineErrorsPermitFallback() {
         for code: URLError.Code in [.timedOut, .notConnectedToInternet, .networkConnectionLost,
                                    .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed] {
             XCTAssertTrue(SilentCryAlarmRequest.allowsStatusFallback(for: URLError(code)))
@@ -326,7 +329,53 @@ final class SilentCryAlarmFallbackTests: XCTestCase {
             XCTAssertFalse(SilentCryAlarmRequest.allowsStatusFallback(for: URLError(code)))
         }
         XCTAssertFalse(SilentCryAlarmRequest.allowsStatusFallback(for: CancellationError()))
-        XCTAssertFalse(SilentCryAlarmRequest.allowsStatusFallback(for: SilentCryAlarmRequest.Rejection.staleStatus))
-        XCTAssertFalse(SilentCryAlarmRequest.allowsStatusFallback(for: SilentCryAlarmRequest.Rejection.budgetExpired))
+        XCTAssertTrue(SilentCryAlarmRequest.allowsStatusFallback(for: SilentCryAlarmRequest.Rejection.staleStatus))
+        XCTAssertTrue(SilentCryAlarmRequest.allowsStatusFallback(for: SilentCryAlarmRequest.Rejection.budgetExpired))
+        XCTAssertFalse(SilentCryAlarmRequest.allowsStatusFallback(for: SilentCryAlarmRequest.Rejection.serverMuted))
+    }
+
+    func testTemporaryHTTPFailuresPermitFallbackButAuthenticationAndOtherRejectionsDoNot() {
+        for status in [408, 429, 500, 502, 503, 504, 599] {
+            XCTAssertTrue(SilentCryAlarmRequest.allowsStatusFallback(forHTTPStatus: status))
+        }
+        for status in [200, 400, 401, 403, 404, 409, 422] {
+            XCTAssertFalse(SilentCryAlarmRequest.allowsStatusFallback(forHTTPStatus: status))
+        }
+    }
+
+    @MainActor func testExpiredStatusBudgetFallsBackWithoutAnotherNetworkRead() async throws {
+        let started = ContinuousClock.now, request = try request(age: 26)
+        var reads = 0
+        do {
+            let _: SilentCryAlarmStatusSnapshot<NotificationRelevance> = try await .load(
+                budget: .init(startedAt: started), clock: { started.advanced(by: .seconds(26)) }) {
+                reads += 1; return NotificationRelevance()
+            }
+            XCTFail("An expired budget should skip status work")
+        } catch {
+            XCTAssertTrue(SilentCryAlarmRequest.allowsStatusFallback(for: error))
+            XCTAssertNil(request.fallbackIneligibilityReason(enabled: true, acknowledgementPending: false,
+                localMutedUntil: nil, stoppedBefore: nil, evidence: nil, now: now))
+        }
+        XCTAssertEqual(reads, 0)
+    }
+
+    @MainActor func testDelayedNegativeResponseStillBlocksFallbackWhenValidationExpires() async throws {
+        let started = ContinuousClock.now, request = try request(age: 26)
+        var clock = started, evidence: SilentCryAlarmRequest.ServerEvidence?
+        do {
+            let _: SilentCryAlarmStatusSnapshot<NotificationRelevance> = try await .load(
+                budget: .init(startedAt: started), clock: { clock }) {
+                clock = started.advanced(by: .seconds(26))
+                evidence = .init(observedAt: self.now.addingTimeInterval(-25), paired: true,
+                    enabled: true, relevance: NotificationRelevance(), mutedUntil: nil)
+                return NotificationRelevance()
+            }
+            XCTFail("A suspended response must expire")
+        } catch {
+            XCTAssertTrue(SilentCryAlarmRequest.allowsStatusFallback(for: error))
+            XCTAssertEqual(request.fallbackIneligibilityReason(enabled: true, acknowledgementPending: false,
+                localMutedUntil: nil, stoppedBefore: nil, evidence: evidence, now: now), .irrelevant)
+        }
     }
 }
