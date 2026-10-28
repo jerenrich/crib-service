@@ -1,5 +1,5 @@
 import {confirmAlarmScheduled} from './alarm-scheduling';
-import {retiredWatchTest,sendWatchTest,sendSilentAlarmTest} from './watch-test';
+import {retiredWatchTest,sendWatchTest} from './watch-test';
 import {sendStandaloneProbe} from './watch-latency-probe';
 import {requestMonitoring,completeMonitoring} from './monitoring';
 import {timeline} from './timeline';
@@ -109,11 +109,8 @@ export default {
      case 'POST /v1/alert-test/stop':result=await configureAlertTest(env,device,'stop',await body(request));break;
      case 'POST /v1/watch-test/push':result=await sendWatchTest(env,device,latency,requestId);break;
      case 'POST /v1/watch-latency-probe/push':result=await sendStandaloneProbe(env,device,latency,requestId);break;
-     case 'POST /v1/listener/silent-alarm-test':{
-      if(device.role!=='listener')throw new APIError(403,'Only the Listener can send this test.');
-      await rateLimit(env,'silent-alarm-test',device.id,6,600);
-      result=await sendSilentAlarmTest(env,device,latency,requestId);break;
-     }
+     // Replaced by Test alert with AlarmKit, which uses the real alarm path.
+     case 'POST /v1/listener/silent-alarm-test':throw new APIError(410,'Update both iPhones and use Test alert with AlarmKit.');
      case 'GET /v1/watch-test':result=retiredWatchTest(device);break;
      case 'POST /v1/watch-test':result=retiredWatchTest(device,await body(request));break;
      case 'POST /v1/test-push':{

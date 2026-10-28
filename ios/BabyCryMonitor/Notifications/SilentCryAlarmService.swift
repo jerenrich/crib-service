@@ -38,7 +38,10 @@ import UIKit
     private var revision = 0
     private var lastReadinessUptime: Double?
     private struct Metadata: AlarmMetadata {}
-    private struct Record: Codable { let episodeID: UUID; let eventID: UUID; let snoozeDuration: Double; let scheduledAt: Date }
+    private struct Record: Codable {
+        let episodeID: UUID; let eventID: UUID; let snoozeDuration: Double; let scheduledAt: Date
+        var isTest: Bool? = nil // Absent in records saved before tests shared this path.
+    }
     private var records: [Record] {
         get { (defaults.data(forKey: recordsKey)).flatMap { try? JSONDecoder().decode([Record].self, from: $0) } ?? [] }
         set { defaults.set(try? JSONEncoder().encode(newValue), forKey: recordsKey) }
@@ -259,13 +262,14 @@ import UIKit
                 return false
             }
             let attributes = AlarmAttributes<Metadata>(presentation: AlarmPresentation(alert: .init(
-                title: request.isDisconnected ? "Listener connection lost" : request.isMonitoringFailure ? "Nursery monitoring stopped" : "Check on baby",
+                title: request.isTest ? "Test alarm · Crib Service" : request.isDisconnected ? "Listener connection lost" : request.isMonitoringFailure ? "Nursery monitoring stopped" : "Check on baby",
                 stopButton: AlarmButton(text: "Stop", textColor: .white, systemImageName: "stop.circle")
             )), metadata: Metadata(), tintColor: .mint)
             // Persist acknowledgement metadata before scheduling so an immediate Stop
             // can resolve the event even when the app has to relaunch for the intent.
             var saved = records.filter { $0.episodeID != request.episodeID }
-            saved.append(Record(episodeID: request.episodeID, eventID: request.eventID, snoozeDuration: snoozeDuration, scheduledAt: Date()))
+            saved.append(Record(episodeID: request.episodeID, eventID: request.eventID, snoozeDuration: snoozeDuration, scheduledAt: Date(),
+                                isTest: request.isTest ? true : nil))
             records = Array(saved.suffix(64))
             let configuration = AlarmManager.AlarmConfiguration<Metadata>.alarm(
                 schedule: .fixed(Date().addingTimeInterval(3)), attributes: attributes,
@@ -292,7 +296,7 @@ import UIKit
                 } catch { record("failed", reason: .settingChanged, error: error) }
                 return false
             }
-            status = "Silent alert alarm scheduled. Existing notifications continue."
+            status = request.isTest ? "Test alarm scheduled." : "Silent alert alarm scheduled. Existing notifications continue."
             trace("scheduled", request.eventID); record("scheduled")
             queueSchedulingReceipt(request)
             return true
@@ -317,6 +321,12 @@ import UIKit
 
     func snooze(episodeID: UUID) async {
         guard let record = records.first(where: { $0.episodeID == episodeID }) else { return }
+        if record.isTest == true {
+            // Stopping a test alarm acknowledges only that test; it never snoozes real alerts.
+            trace("acknowledged", record.eventID)
+            do { try await client().acknowledge(record.eventID, actedAt: Date()) } catch { trace("failed", record.eventID) }
+            return
+        }
         snoozeLocally(eventID: record.eventID, duration: record.snoozeDuration)
         do { try await flushAcknowledgements(using: client()) } catch { trace("ack_pending", record.eventID) }
     }
@@ -332,6 +342,7 @@ import UIKit
 
     func acknowledgeKnownEvent(_ eventID: UUID) {
         guard let record = records.first(where: { $0.eventID == eventID }) else { return }
+        guard record.isTest != true else { cancelTestAlarms(); return }
         snoozeLocally(eventID: eventID, duration: record.snoozeDuration)
     }
 
@@ -368,12 +379,22 @@ import UIKit
         guard !records.isEmpty else { return }
         let muted = (server.alertsMutedUntil ?? .distantPast) > Date()
         let obsolete = records.filter { record in
-            record.scheduledAt <= checkedAt && (!server.paired || muted ||
-                server.notificationRelevance.map { !$0.cryEpisodeIDs.contains(record.episodeID) } == true)
+            let isTest = record.isTest == true
+            return record.scheduledAt <= checkedAt && (!server.paired || (muted && !isTest) ||
+                server.notificationRelevance.map { !$0.contains(eventID: record.eventID, episodeID: record.episodeID, isTest: isTest) } == true)
         }
         do {
             let active = Set(try AlarmManager.shared.alarms.map(\.id))
             for record in obsolete where active.contains(record.episodeID) { try AlarmManager.shared.cancel(id: record.episodeID) }
+        } catch { trace("failed") }
+    }
+
+    /// Stopping or acknowledging a test ends its alarm without touching real ones.
+    func cancelTestAlarms() {
+        let ids = Set(records.filter { $0.isTest == true }.map(\.episodeID))
+        guard !ids.isEmpty else { return }
+        do {
+            for alarm in try AlarmManager.shared.alarms where ids.contains(alarm.id) { try AlarmManager.shared.cancel(id: alarm.id) }
         } catch { trace("failed") }
     }
 

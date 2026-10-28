@@ -35,7 +35,7 @@ import Foundation
 struct SilentCryAlarmRequest: Sendable {
     static let maximumPushAge: TimeInterval = 60
     enum Rejection: String, Error {
-        case notRequested = "not_requested", test, malformed, stale
+        case notRequested = "not_requested", malformed, stale
         case disabled, busy, acknowledgementPending = "acknowledgement_pending"
         case settingChanged = "setting_changed", serverDisabled = "server_disabled", unpaired
         case relevanceUnknown = "relevance_unknown", irrelevant, serverMuted = "server_muted"
@@ -70,6 +70,9 @@ struct SilentCryAlarmRequest: Sendable {
     let cycleID: UUID?
     let isDisconnected: Bool
     let isMonitoringFailure: Bool
+    /// A configured Test alert. It takes this same path and differs only where a
+    /// test must: its own relevance, no snooze checks and no snooze on Stop.
+    let isTest: Bool
 
     init?(payload: [AnyHashable: Any], now: Date = Date()) {
         guard case .success(let fields) = Self.parse(payload, now: now) else { return nil }
@@ -77,6 +80,7 @@ struct SilentCryAlarmRequest: Sendable {
         isDisconnected = payload["type"] as? String == "listener_disconnected"
         isMonitoringFailure = payload["type"] as? String == CryAlert.monitoringFailedType
         cycleID = (payload["alarmCycleId"] as? String).flatMap(UUID.init(uuidString:))
+        isTest = payload["isTest"] as? Bool == true
     }
 
     /// Explains rejected marked payloads without retaining payload text or arbitrary identifiers.
@@ -87,7 +91,6 @@ struct SilentCryAlarmRequest: Sendable {
 
     private static func parse(_ payload: [AnyHashable: Any], now: Date) -> Result<(UUID, UUID, Date), Rejection> {
         guard payload["silentCryAlarm"] as? Bool == true else { return .failure(.notRequested) }
-        guard payload["isTest"] as? Bool != true else { return .failure(.test) }
         if let cycle = payload["alarmCycleId"], (cycle as? String).flatMap(UUID.init(uuidString:)) == nil { return .failure(.malformed) }
         guard let event = payload["eventId"] as? String, let eventID = UUID(uuidString: event),
               let episode = payload["episodeId"] as? String, let episodeID = UUID(uuidString: episode),
@@ -112,7 +115,9 @@ struct SilentCryAlarmRequest: Sendable {
         if !paired { return .unpaired }
         if !(-5...Self.maximumPushAge).contains(now.timeIntervalSince(createdAt)) { return .stale }
         guard let relevance else { return .relevanceUnknown }
-        if !relevance.cryEpisodeIDs.contains(episodeID) { return .irrelevant }
+        if !relevance.contains(eventID: eventID, episodeID: episodeID, isTest: isTest) { return .irrelevant }
+        // A test is a deliberate request; snoozing real alerts does not suppress it.
+        if isTest { return nil }
         if !((mutedUntil ?? .distantPast) <= now) { return .serverMuted }
         if !((localMutedUntil ?? .distantPast) <= now) { return .locallyMuted }
         if !(createdAt > (stoppedBefore ?? .distantPast)) { return .stopped }
@@ -126,13 +131,13 @@ struct SilentCryAlarmRequest: Sendable {
         if !enabled { return .disabled }
         if acknowledgementPending { return .acknowledgementPending }
         if !(-5...Self.maximumPushAge).contains(now.timeIntervalSince(createdAt)) { return .stale }
-        if (localMutedUntil ?? .distantPast) > now { return .locallyMuted }
-        if createdAt <= (stoppedBefore ?? .distantPast) { return .stopped }
+        if !isTest, (localMutedUntil ?? .distantPast) > now { return .locallyMuted }
+        if !isTest, createdAt <= (stoppedBefore ?? .distantPast) { return .stopped }
         if let evidence, evidence.observedAt >= createdAt {
             if !evidence.paired { return .unpaired }
             if evidence.enabled == false { return .serverDisabled }
-            if let relevance = evidence.relevance, !relevance.cryEpisodeIDs.contains(episodeID) { return .irrelevant }
-            if (evidence.mutedUntil ?? .distantPast) > now { return .serverMuted }
+            if let relevance = evidence.relevance, !relevance.contains(eventID: eventID, episodeID: episodeID, isTest: isTest) { return .irrelevant }
+            if !isTest, (evidence.mutedUntil ?? .distantPast) > now { return .serverMuted }
         }
         return nil
     }

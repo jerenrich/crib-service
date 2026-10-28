@@ -111,12 +111,13 @@ final class SilentCryAlarmRequestTests: XCTestCase {
         XCTAssertNil(SilentCryAlarmRequest(payload: marked, now: now))
         XCTAssertEqual(SilentCryAlarmRequest.payloadRejection(marked, now: now), .malformed)
     }
-    func testOnlyFreshRealCryPayloadsAreAccepted() throws {
+    func testOnlyFreshMarkedPayloadsAreAccepted() throws {
         XCTAssertNotNil(SilentCryAlarmRequest(payload: payload(), now: now))
         XCTAssertNil(SilentCryAlarmRequest(payload: payload(age: 61), now: now))
         XCTAssertNil(SilentCryAlarmRequest(payload: payload(age: -6), now: now))
         var test = payload(); test["isTest"] = true
-        XCTAssertNil(SilentCryAlarmRequest(payload: test, now: now))
+        XCTAssertEqual(SilentCryAlarmRequest(payload: test, now: now)?.isTest, true)
+        XCTAssertEqual(SilentCryAlarmRequest(payload: payload(), now: now)?.isTest, false)
         var ordinary = payload(); ordinary.removeValue(forKey: "silentCryAlarm")
         XCTAssertNil(SilentCryAlarmRequest(payload: ordinary, now: now))
         var invalid = payload(); invalid["episodeId"] = "invalid"
@@ -148,7 +149,7 @@ final class SilentCryAlarmRequestTests: XCTestCase {
         let cases: [([AnyHashable: Any], SilentCryAlarmRequest.Rejection?)] = [
             (payload(), nil), (payload(age: 60), nil), (payload(age: -5), nil),
             (payload(age: 61), .stale), (payload(age: -6), .stale),
-            (test, .test), (ordinary, .notRequested), (malformed, .malformed), (badDate, .malformed)
+            (test, nil), (ordinary, .notRequested), (malformed, .malformed), (badDate, .malformed)
         ]
         for (value, reason) in cases {
             XCTAssertEqual(SilentCryAlarmRequest.payloadRejection(value, now: now), reason)
@@ -170,6 +171,30 @@ final class SilentCryAlarmRequestTests: XCTestCase {
         XCTAssertEqual(reason(relevance: relevant, stopped: now), .stopped)
         XCTAssertEqual(reason(relevance: relevant, at: now.addingTimeInterval(61)), .stale)
         XCTAssertNil(reason(relevance: relevant, muted: now, localMuted: now))
+    }
+    /// Configured tests share this path. They need the same opt-ins and their own
+    /// unacknowledged event, but a snooze or Stop of real alerts never blocks them.
+    func testConfiguredTestUsesTheSameChecksExceptSnooze() throws {
+        var value = payload(); value["isTest"] = true
+        let request = try XCTUnwrap(SilentCryAlarmRequest(payload: value, now: now))
+        let relevant = NotificationRelevance(testEventIDs: [request.eventID])
+        func reason(enabled: Bool = true, serverEnabled: Bool = true, relevance: NotificationRelevance? = nil,
+                    muted: Date? = nil) -> SilentCryAlarmRequest.Rejection? {
+            request.ineligibilityReason(enabled: enabled, serverEnabled: serverEnabled, paired: true, relevance: relevance ?? relevant,
+                mutedUntil: muted, localMutedUntil: muted, stoppedBefore: muted, now: now)
+        }
+        XCTAssertNil(reason())
+        XCTAssertNil(reason(muted: now.addingTimeInterval(60)))
+        XCTAssertEqual(reason(enabled: false), .disabled)
+        XCTAssertEqual(reason(serverEnabled: false), .serverDisabled)
+        // Acknowledged tests drop out of relevance; a real episode ID does not count.
+        XCTAssertEqual(reason(relevance: NotificationRelevance(cryEpisodeIDs: [episode])), .irrelevant)
+        XCTAssertNil(request.fallbackIneligibilityReason(enabled: true, acknowledgementPending: false,
+            localMutedUntil: now.addingTimeInterval(60), stoppedBefore: now, evidence: SilentCryAlarmRequest.ServerEvidence(observedAt: now, paired: true, enabled: true,
+            relevance: relevant, mutedUntil: now.addingTimeInterval(60)), now: now))
+        XCTAssertEqual(request.fallbackIneligibilityReason(enabled: true, acknowledgementPending: false,
+            localMutedUntil: nil, stoppedBefore: nil, evidence: SilentCryAlarmRequest.ServerEvidence(observedAt: now, paired: true, enabled: true,
+            relevance: NotificationRelevance(), mutedUntil: nil), now: now), .irrelevant)
     }
 }
 

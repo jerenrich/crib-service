@@ -28,7 +28,7 @@ struct AlertTestView: View {
                 }
                 Group {
                     Section {
-                        option("Use AlarmKit", detail: "Silent system alarm on the Parent, with system Watch routing.", selection: $configuration.alarmKit)
+                        option("Use AlarmKit", detail: "The same silent system alarm as a real alert, with system Watch routing.", selection: $configuration.alarmKit)
                             .disabled(!alarmKitAvailable)
                             .accessibilityIdentifier("testUseAlarmKit")
                         option("iPhone with forwarding", detail: "Send to the Parent iPhone; Apple decides whether to forward to its Watch.", selection: $configuration.phone)
@@ -40,12 +40,8 @@ struct AlertTestView: View {
                     }
                     if configuration.alarmKit {
                         Section("AlarmKit setup") {
-                            if model.role == .parent {
-                                Text("Starting requests alarm permission and arms the silent alarm experiment for 10 minutes. You can then lock this iPhone.")
-                            } else {
-                                Text("On the Parent running iOS 26 or later, first open Settings → Diagnostics & simulation → Locked-phone delivery experiment and arm the Listener test for 10 minutes.")
-                            }
-                            Text("The service sends a separate silent wake notification. When iOS allows background execution, the Parent schedules the alarm immediately. The OS may delay or omit this step. Test while everyone is awake; a fallback sound is possible.")
+                            Text("Uses the real alert path, so Silent Watch alarms must be on in Parent Settings. Start from either iPhone. Snoozed alerts do not block a test, and stopping a test alarm does not snooze.")
+                            Text("The service sends a silent wake notification. When iOS allows background execution, the Parent schedules the alarm three seconds later, as for real alerts. iOS may delay or skip this, especially while the Parent is running on battery. Test while everyone is awake; a fallback sound is possible.")
                                 .font(.footnote).foregroundStyle(.secondary)
                         }
                     }
@@ -178,9 +174,10 @@ struct AlertTestView: View {
         busy = true; error = nil
         defer { busy = false }
         if configuration.alarmKit, model.role == .parent {
+            // The service also refuses this test while the setting is off; fail early here.
             if #available(iOS 26.0, *) {
-                guard await SilentAlarmExperiment.shared.arm() else {
-                    error = SilentAlarmExperiment.shared.status
+                guard SilentCryAlarmService.shared.enabled else {
+                    error = "Turn on Silent Watch alarms in Settings before testing AlarmKit."
                     return
                 }
             } else { error = "AlarmKit requires iOS 26 or later on the Parent."; return }
@@ -207,10 +204,7 @@ struct AlertTestView: View {
                 return
             }
             if session.configuration.alarmKit, model.role == .parent {
-                if #available(iOS 26.0, *) {
-                    SilentAlarmExperiment.shared.disarm()
-                    SilentAlarmExperiment.shared.cancelAlarms()
-                }
+                if #available(iOS 26.0, *) { SilentCryAlarmService.shared.cancelTestAlarms() }
             }
             model.testPushStatus = "Test stopped. Notifications already sent may still arrive."
         } catch { self.error = "Could not confirm stopping: \(error.localizedDescription)" }

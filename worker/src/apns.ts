@@ -45,26 +45,22 @@ export async function sendPush(env:Env,encryptedToken:string,alert:Alert,target:
   ...(silentCryAlarm&&target==='phone'&&!alert.isTest?{silentCryAlarm:true,...(alarmCycle?{alarmCycleId:alarmCycle}:{}),aps:{...content.aps,'content-available':1}}:{})
  },target,identity.configuredTest?60:alert.isRepeat?15:3600,collapseID,latency,schedule);
 }
-export async function sendSilentCryAlarmPush(env:Env,encryptedToken:string,alert:Alert,latency=new Latency(),alarmCycle?:string):Promise<PushResult> {
- latency.details.alarm_wake_requested=true;
+// The single AlarmKit wake request for real and configured-test alerts. A test
+// carries the same marker and takes the same Parent path; it is labelled and
+// soundless so the test isolates the alarm from ordinary notification alerting.
+export async function sendSilentCryAlarmPush(env:Env,encryptedToken:string,alert:Alert,latency=new Latency(),alarmCycle?:string,collapseID=alert.episodeId):Promise<PushResult> {
+ latency.details.alarm_wake_requested=!alert.isTest;
  const content=payload(alert);
+ const aps=alert.isTest?{alert:{title:'Test · AlarmKit',body:'Configured test. The Parent will start a silent alarm for your Watch. Stop it there to end this round.'},
+  category:content.aps.category,'interruption-level':content.aps['interruption-level']}:content.aps;
  // Separate APNs request ID, preserving event/episode identity for acknowledgement.
- return sendNotification(env,encryptedToken,crypto.randomUUID(),{...content,silentCryAlarm:true,...(alarmCycle?{alarmCycleId:alarmCycle}:{}),
-  aps:{...content.aps,'content-available':1}},'phone',60,alert.episodeId,latency);
+ return sendNotification(env,encryptedToken,crypto.randomUUID(),{...content,silentCryAlarm:true,...(alert.isTest?{configuredAlertTest:true}:{}),
+  ...(alarmCycle?{alarmCycleId:alarmCycle}:{}),aps:{...aps,'content-available':1}},'phone',60,collapseID,latency);
 }
 export async function sendConnectionPush(env:Env,encryptedToken:string,id:string,state:'offline'|'stopped',target:'phone'|'watch',latency=new Latency()):Promise<PushResult> {
  const title=state==='stopped'?'Listener monitoring stopped':'Listener connection lost';
  const body=state==='stopped'?'The Listener reports that monitoring has stopped. Check the nursery phone.':'No Listener update for at least 3 minutes. Check power, internet, and monitoring.';
  return sendNotification(env,encryptedToken,id,{aps:{alert:{title,body},'thread-id':'listener-connection','interruption-level':'time-sensitive',sound:'default'},connectionState:state},target,180,id,latency);
-}
-// A user-visible, soundless notification also requests background execution.
-// It is deliberately separate from ordinary crying and Watch notification routing.
-export async function sendSilentAlarmTestPush(env:Env,encryptedToken:string,alert:Alert,latency=new Latency(),identity:PushIdentityOptions={}):Promise<PushResult> {
- const content={...payload(alert),silentAlarmTest:true,...(identity.configuredTest?{configuredAlertTest:true}:{}),aps:{
-  alert:{title:'Test · Silent alarm delivery',body:'Listener test received. If the Parent experiment is armed, it will try to start a silent alarm on your paired Watch.'},
-  'content-available':1,category:'SILENT_ALARM_TEST','thread-id':alert.episodeId,'interruption-level':'time-sensitive'
- }};
- return sendNotification(env,encryptedToken,identity.distinctRequestID?crypto.randomUUID():alert.eventId,content,'phone',60,identity.collapseID??alert.eventId,latency);
 }
 // Fixed, separate topic for the standalone proof of concept. Reuse the existing
 // provider-token authority so the experiment cannot introduce JWT churn.

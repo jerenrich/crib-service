@@ -1,7 +1,7 @@
 import {APIError,type Alert,type Device,type Env} from './types';
 import {pairFor} from './devices';
 import {uuid} from './security';
-import {sendPush,sendSilentAlarmTestPush,type PushResult} from './apns';
+import {sendPush,sendSilentCryAlarmPush,type PushResult} from './apns';
 import {PhoneHeadStart} from './notification-coordination';
 import {Latency} from './latency';
 import {eventReference,recordDiagnostic} from './diagnostics';
@@ -70,6 +70,8 @@ export class AlertTests {
    if(!tokens)return Response.json({error:'Pairing changed. Reopen Test alert.'},{status:409});
    if((input.configuration.phone||input.configuration.alarmKit)&&!tokens.push_token)return Response.json({error:'Enable notifications on the Parent iPhone before this test.'},{status:409});
    if(input.configuration.watch&&!tokens.watch_push_token)return Response.json({error:'Open the Apple Watch app and enable direct alerts before this test.'},{status:409});
+   // Tests use the real alarm path, so they need the same Parent setting.
+   if(input.configuration.alarmKit&&tokens.silent_watch_alarms!==1)return Response.json({error:'Turn on Silent Watch alarms on the Parent iPhone before testing AlarmKit.'},{status:409});
    const startsAt=new Date(Date.now()+10000).toISOString();
    session={id:input.id,pair:input.pair,configuration:input.configuration,startsAt,nextAt:startsAt,completedCount:0,state:'scheduled',message:null};
    await this.ctx.storage.put('session',session);
@@ -78,9 +80,9 @@ export class AlertTests {
   });
  }
  private tokens(pair:Pair) {
-  return this.env.DB.prepare(`SELECT d.push_token,d.watch_push_token FROM devices d JOIN pairs p ON p.parent_id=d.id
+  return this.env.DB.prepare(`SELECT d.push_token,d.watch_push_token,d.silent_watch_alarms FROM devices d JOIN pairs p ON p.parent_id=d.id
    WHERE p.parent_id=? AND p.listener_id=? AND p.created_at=?`).bind(pair.parent_id,pair.listener_id,pair.created_at)
-   .first<{push_token:string|null;watch_push_token:string|null}>();
+   .first<{push_token:string|null;watch_push_token:string|null;silent_watch_alarms:number}>();
  }
  async alarm():Promise<void> {
   await this.ctx.blockConcurrencyWhile(async()=>{
@@ -127,7 +129,7 @@ export class AlertTests {
      let result:PushResult={status:'blocked',reason:'no_push_token'};
      try {
       if(token)result=target==='alarm'
-       ?await sendSilentAlarmTestPush(this.env,token,alert,timing,{distinctRequestID:true,collapseID:`alarm:${collapseID}`,configuredTest:true})
+       ?await sendSilentCryAlarmPush(this.env,token,alert,timing,undefined,`alarm:${collapseID}`)
        :await sendPush(this.env,token,alert,target,timing,false,head?.schedule(target,timing),identity);
      }catch{result={status:'failed',reason:'apns_configuration'};}
      finally{if(target==='phone')head?.phoneFinished();}

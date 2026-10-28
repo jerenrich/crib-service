@@ -94,8 +94,7 @@ extension NotificationProviding {
     }
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
         let content = notification.request.content
-        let isSilentTest = SilentAlarmTestRequest(payload: content.userInfo) != nil
-        let options: UNNotificationPresentationOptions = isSilentTest ? [] : Self.foregroundOptions(for: content)
+        let options = Self.foregroundOptions(for: content)
         let alarmCallback = notification.request.content.userInfo["silentCryAlarm"] as? Bool == true
             ? SilentCryAlarmRequest.Callback(payload: notification.request.content.userInfo) : nil
         await recordReceipt(Self.receipt(notification), phase: "foreground", payloadHasSound: content.sound != nil,
@@ -107,10 +106,6 @@ extension NotificationProviding {
             if #available(iOS 26.0, *) {
                 Task { _ = await SilentCryAlarmService.shared.receive(alarmCallback, source: .foregroundNotification) }
             }
-        }
-        if let request = SilentAlarmTestRequest(payload: notification.request.content.userInfo) {
-            if #available(iOS 26.0, *) { _ = await SilentAlarmExperiment.shared.receive(request) }
-            return []
         }
         await refresh()
         return options
@@ -176,15 +171,10 @@ extension NotificationProviding {
 @MainActor final class AppDelegate: NSObject, UIApplicationDelegate {
     var notifications: (any NotificationProviding)?
     func application(_ application: UIApplication, didReceiveRemoteNotification userInfo: [AnyHashable: Any]) async -> UIBackgroundFetchResult {
-        if userInfo["silentCryAlarm"] as? Bool == true {
-            if #available(iOS 26.0, *) {
-                return await SilentCryAlarmService.shared.receive(.init(payload: userInfo), source: .remoteNotification) ? .newData : .noData
-            }
-            return .noData
-        }
-        guard let request = SilentAlarmTestRequest(payload: userInfo) else { return .noData }
+        // Real and configured-test alarms share this one marker and path.
+        guard userInfo["silentCryAlarm"] as? Bool == true else { return .noData }
         if #available(iOS 26.0, *) {
-            return await SilentAlarmExperiment.shared.receive(request) ? .newData : .noData
+            return await SilentCryAlarmService.shared.receive(.init(payload: userInfo), source: .remoteNotification) ? .newData : .noData
         }
         return .noData
     }

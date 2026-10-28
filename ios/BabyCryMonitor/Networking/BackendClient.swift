@@ -103,7 +103,6 @@ protocol BackendServing: AlertSending {
     func startAlertTest(id: UUID, configuration: AlertTestConfiguration) async throws -> AlertTestResponse
     func stopAlertTest(id: UUID) async throws -> AlertTestResponse
     func sendWatchTest() async throws
-    func sendSilentAlarmTest() async throws -> UUID
     func silentWatchAlarms(_ enabled: Bool) async throws
     func confirmAlarmScheduled(episodeID: UUID, eventID: UUID, cycleID: UUID) async throws
     func unpair() async throws
@@ -116,7 +115,6 @@ extension BackendServing {
     func stopAlertTest(id: UUID) async throws -> AlertTestResponse { throw BackendError.message("Configurable tests require an updated connection service.") }
     func confirmAlarmScheduled(episodeID: UUID, eventID: UUID, cycleID: UUID) async throws { throw BackendError.message("Alarm scheduling receipts require an updated connection service.") }
     func silentWatchAlarms(_ enabled: Bool) async throws { throw BackendError.message("Silent Watch alarms require an updated connection service.") }
-    func sendSilentAlarmTest() async throws -> UUID { throw BackendError.message("Silent alarm testing requires an updated connection service.") }
     func sendWatchTest() async throws { throw BackendError.message("Watch test mode requires an updated connection service.") }
     func resumeAlerts(until: Date) async throws { throw BackendError.message("Resume alerts requires an updated connection service.") }
     func setMonitoring(_ enabled: Bool, id: UUID) async throws -> MonitoringCommand { throw BackendError.message("Monitoring controls require an updated connection service.") }
@@ -184,11 +182,6 @@ struct BackendClient: BackendServing {
     func requestTestPush() async throws { let _: AlertReceipt = try await request("/v1/test-push", body: [String:String]()) }
     func sendWatchTest() async throws {
         let _: EmptyResponse = try await request("/v1/watch-test/push", body: [String:String]())
-    }
-    func sendSilentAlarmTest() async throws -> UUID {
-        struct Receipt: Decodable { let eventId: UUID }
-        let receipt: Receipt = try await request("/v1/listener/silent-alarm-test", body: [String:String]())
-        return receipt.eventId
     }
     func silentWatchAlarms(_ enabled: Bool) async throws {
         let _: EmptyResponse = try await request("/v1/silent-watch-alarms", body: ["enabled": enabled])

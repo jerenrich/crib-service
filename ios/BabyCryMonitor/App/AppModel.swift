@@ -215,7 +215,6 @@ import UIKit
             else { self?.remoteSound.disconnected() }
         }
         (notifications as? NotificationService)?.log = log
-        if #available(iOS 26.0, *) { SilentAlarmExperiment.shared.log = log }
         if #available(iOS 26.0, *) { SilentCryAlarmService.shared.log = log }
         watch.log = log
         (audio as? AudioLevelMonitor)?.log = log
@@ -271,15 +270,6 @@ import UIKit
             if automaticallyStart, UIApplication.shared.applicationState == .background { reportUnexpectedStop() }
         }
         #if DEBUG
-        if ProcessInfo.processInfo.arguments.contains("--silent-alarm-e2e-arm"), role == .parent {
-            if #available(iOS 26.0, *) { Task { await SilentAlarmExperiment.shared.arm() } }
-        }
-        if ProcessInfo.processInfo.arguments.contains("--silent-alarm-e2e-send"), role == .listener {
-            Task {
-                try? await Task.sleep(for: .seconds(5))
-                await sendSilentAlarmTest()
-            }
-        }
         if ProcessInfo.processInfo.arguments.contains("--refresh-experiment-start"), role == .parent {
             startBackgroundBenchmark()
             Task { await refreshExperiment?.setEnabled(true) }
@@ -804,21 +794,6 @@ import UIKit
         return response.session
     }
 
-    func sendSilentAlarmTest() async {
-        guard !sendingTestPush, role == .listener, paired, !managingDevice else { return }
-        sendingTestPush = true
-        defer { sendingTestPush = false }
-        log.silentAlarmTest(phase: "send_started", appActive: appActive, protectedDataAvailable: UIApplication.shared.isProtectedDataAvailable)
-        do {
-            let client = try await registeredClient()
-            let id = try await client.sendSilentAlarmTest()
-            testPushStatus = "Apple accepted the silent alarm test. Check Parent diagnostics for background receipt and alarm scheduling."
-            log.silentAlarmTest(phase: "send_accepted", eventID: id, appActive: appActive, protectedDataAvailable: UIApplication.shared.isProtectedDataAvailable)
-        } catch {
-            testPushStatus = "Silent alarm test could not be confirmed: \(error.localizedDescription)"
-            log.silentAlarmTest(phase: "send_failed", appActive: appActive, protectedDataAvailable: UIApplication.shared.isProtectedDataAvailable)
-        }
-    }
     func setSilentWatchAlarms(_ enabled: Bool) async {
         guard role == .parent else { return }
         if #available(iOS 26.0, *) {
@@ -1509,8 +1484,9 @@ import UIKit
         guard !acknowledgingAlert else { return false }
         acknowledgingAlert = true; defer { acknowledgingAlert = false }
         if let alert = parentStatus?.alerts?.first(where: { $0.eventId == id }) {
-            if alert.isTest != true, #available(iOS 26.0, *), defaults === UserDefaults.standard {
-                SilentCryAlarmService.shared.snoozeLocally(eventID: id, duration: configuration.snoozeDuration)
+            if #available(iOS 26.0, *), defaults === UserDefaults.standard {
+                if alert.isTest == true { SilentCryAlarmService.shared.cancelTestAlarms() }
+                else { SilentCryAlarmService.shared.snoozeLocally(eventID: id, duration: configuration.snoozeDuration) }
             }
             await notifications.dismissCryingAlerts(testEventID: alert.isTest == true ? id : nil)
         }
@@ -1778,7 +1754,8 @@ import UIKit
                 }
                 if #available(iOS 26.0, *), defaults === UserDefaults.standard {
                     if command.isTest == false { SilentCryAlarmService.shared.snoozeLocally(eventID: id, duration: configuration.snoozeDuration) }
-                    else if command.isTest == nil { SilentCryAlarmService.shared.acknowledgeKnownEvent(id) }
+                    else if command.isTest == true { SilentCryAlarmService.shared.cancelTestAlarms() }
+                    else { SilentCryAlarmService.shared.acknowledgeKnownEvent(id) }
                 }
                 var queue = defaults.stringArray(forKey: watchAcknowledgementsKey) ?? []
                 if !queue.contains(id.uuidString) { queue.append(id.uuidString) }

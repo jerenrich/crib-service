@@ -2235,47 +2235,11 @@ describe('slow initial upload checkpoints',()=>{
 });
 
 
-describe('Listener-originated silent alarm experiment',()=>{
- it('requires a paired Listener and a registered Parent phone token',async()=>{
-  const {parent,listener}=await paired();
-  expect((await call('listener/silent-alarm-test',parent)).status).toBe(403);
-  expect((await call('listener/silent-alarm-test',listener)).status).toBe(409);
-  const unpaired=device('listener');await register(unpaired);
-  expect((await call('listener/silent-alarm-test',unpaired)).status).toBe(409);
-  expect(pushRequests).toHaveLength(0);
- });
- it('sends one labelled soundless alert to the phone even when a Watch token exists, without creating episodes or reminders',async()=>{
-  const {parent,listener}=await paired();
-  await call('device/push-token',parent,{token:'ab'.repeat(32)});
-  await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
-  mockPush();const response=await call('listener/silent-alarm-test',listener);
-  expect(response.status).toBe(200);
-  const receipt=await response.json() as {eventId:string};
-  expect(pushRequests).toHaveLength(1);
-  expect(pushRequests[0].url).toContain('ab'.repeat(32));
-  const headers=pushRequests[0].init?.headers as Record<string,string>;
-  expect(headers['apns-topic']).toBe(testEnv.APNS_BUNDLE_ID);
-  expect(headers['apns-push-type']).toBe('alert');
-  expect(headers['apns-priority']).toBe('10');
-  const content=JSON.parse(String(pushRequests[0].init?.body));
-  expect(content.eventId).toBe(receipt.eventId);
-  expect(content.isTest).toBe(true);expect(content.silentAlarmTest).toBe(true);
-  expect(content.aps['content-available']).toBe(1);
-  expect(content.aps['interruption-level']).toBe('time-sensitive');
-  expect(content.aps.alert.title).toContain('Test');
-  expect(content.aps.sound).toBeUndefined();
-  expect(content.aps.category).toBe('SILENT_ALARM_TEST');
-  expect((await env.DB.prepare('SELECT COUNT(*) AS n FROM events').first<{n:number}>())?.n).toBe(0);
-  const row=await env.DB.prepare("SELECT target,outcome FROM diagnostics WHERE operation='silent_alarm_test_dispatch'").first<{target:string;outcome:string}>();
-  expect(row).toMatchObject({target:'phone',outcome:'sent'});
- });
- it('does not retry an ambiguous send or schedule a real reminder',async()=>{
+describe('retired Listener-originated silent alarm experiment',()=>{
+ it('is replaced by configured AlarmKit tests and sends nothing',async()=>{
   const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
-  pushResponses.push(new Error('network unavailable'));
-  expect((await call('listener/silent-alarm-test',listener)).status).toBe(503);
-  await flushPending(testEnv);
-  expect(pushRequests).toHaveLength(1);
-  expect((await env.DB.prepare('SELECT COUNT(*) AS n FROM events').first<{n:number}>())?.n).toBe(0);
+  expect((await call('listener/silent-alarm-test',listener)).status).toBe(410);
+  expect(pushRequests).toHaveLength(0);
  });
 });
 
@@ -3179,6 +3143,7 @@ describe('configurable delayed alert tests',()=>{
   const pair=await paired();
   expect((await call('device/push-token',pair.parent,{token:'a'.repeat(64)})).status).toBe(200);
   expect((await call('device/watch-push-token',pair.parent,{token:'b'.repeat(64)})).status).toBe(200);
+  expect((await call('silent-watch-alarms',pair.parent,{enabled:true})).status).toBe(200);
   const record=await env.DB.prepare('SELECT created_at FROM pairs WHERE parent_id=?').bind(pair.parent.deviceId).first<{created_at:number}>();
   const stub=env.ALERT_TESTS.get(env.ALERT_TESTS.idFromName(`${pair.parent.deviceId}|${pair.listener.deviceId}|${record!.created_at}`));
   return {...pair,stub};
@@ -3226,13 +3191,23 @@ describe('configurable delayed alert tests',()=>{
   mockPush(200,total);await fire(stub);
   const sent=requests();expect(sent).toHaveLength(total);
   expect(sent.filter(r=>r.headers.get('apns-topic')!.endsWith('.watchkitapp'))).toHaveLength(selection.watch?1:0);
-  expect(sent.filter(r=>r.body.silentAlarmTest)).toHaveLength(selection.alarmKit?1:0);
+  expect(sent.filter(r=>r.body.silentCryAlarm)).toHaveLength(selection.alarmKit?1:0);
   if(selection.alarmKit){
-   const wake=sent.find(r=>r.body.silentAlarmTest)!;
+   // The same AlarmKit marker as a real cry, labelled as a test.
+   const wake=sent.find(r=>r.body.silentCryAlarm)!;
+   expect(wake.body.isTest).toBe(true);expect(wake.body.silentAlarmTest).toBeUndefined();
    expect(wake.body.aps.sound).toBeUndefined();expect(wake.body.aps['content-available']).toBe(1);
-   expect(wake.body.configuredAlertTest).toBe(true);
+   expect(wake.body.configuredAlertTest).toBe(true);expect(wake.body.alarmCycleId).toBeUndefined();
    expect(wake.headers.get('apns-collapse-id')).toMatch(/^alarm:/);
   }
+ });
+ it('refuses an AlarmKit test while the Parent has Silent Watch alarms off',async()=>{
+  const {parent,listener}=await setup();
+  expect((await call('silent-watch-alarms',parent,{enabled:false})).status).toBe(200);
+  const response=await call('alert-test',listener,{id:crypto.randomUUID(),configuration:options({alarmKit:true})});
+  expect(response.status).toBe(409);
+  expect(((await response.json()) as {error:string}).error).toContain('Silent Watch alarms');
+  expect((await call('alert-test',listener,{id:crypto.randomUUID(),configuration:options()})).status).toBe(200);
  });
  it('shares or separates notification IDs independently from transport IDs and thread grouping',async()=>{
   const {parent,stub}=await setup();

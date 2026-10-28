@@ -18,10 +18,7 @@ import SwiftUI
     private struct TestMetadata: AlarmMetadata {}
 
     var body: some View {
-        Group {
-            manualTest
-            RemoteSilentAlarmSection()
-        }
+        manualTest
     }
 
     private var manualTest: some View {
@@ -151,30 +148,6 @@ import SwiftUI
             status = "Test alarm cancelled."
         } catch {
             self.error = "Could not cancel test alarm: \(error.localizedDescription)"
-        }
-    }
-}
-
-@available(iOS 26.0, *)
-private struct RemoteSilentAlarmSection: View {
-    @State private var experiment = SilentAlarmExperiment.shared
-    var body: some View {
-        Section {
-            SwiftUI.TimelineView(.periodic(from: .now, by: 1)) { context in
-                if let until = experiment.armedUntil, until > context.date {
-                    Text("Armed until \(until.formatted(date: .omitted, time: .standard))")
-                    Button("Disarm remote test") { experiment.disarm() }
-                } else {
-                    Button("Arm Listener test for 10 minutes") { Task { await experiment.arm() } }
-                        .disabled(experiment.busy)
-                        .accessibilityIdentifier("armSilentAlarmTest")
-                }
-            }
-            Text(experiment.status).font(.footnote)
-                .accessibilityIdentifier("remoteSilentAlarmStatus")
-            Button("Cancel remote test alarms", role: .destructive) { experiment.cancelAlarms() }
-        } header: { Text("Locked-phone delivery experiment") } footer: {
-            Text("Arm here, lock this iPhone, then use Listener Settings → Diagnostics & simulation → Send silent alarm test to Parent. The test sends one notification without a sound and requests background execution to schedule a silent alarm three seconds later. iOS may delay or omit background execution. Keep your Watch worn, unlocked and in Silent Mode. This does not enable alarms for real crying. First test while your partner is awake; system fallback sounds remain possible.")
         }
     }
 }
