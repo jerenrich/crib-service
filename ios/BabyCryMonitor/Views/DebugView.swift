@@ -182,6 +182,9 @@ private struct AlarmAttemptsSection: View {
         if let level = a.conditions.batteryLevel { parts.append("\(Int(level * 100))%") }
         if a.conditions.lowPower { parts.append("Low Power") }
         if let active = a.conditions.appActive { parts.append(active ? "app open" : "app in background") }
+        if let unlocked = a.conditions.protectedDataAvailable { parts.append(unlocked ? "unlocked" : "locked") }
+        if let age = a.snapshotAgeMS { parts.append("app state \(age / 1000) s old" + (a.evidenceApplied == true ? ", server checked" : "")) }
+        if let detail = a.detail { parts.append(detail) }
         return parts.joined(separator: " · ")
     }
     private func load() {

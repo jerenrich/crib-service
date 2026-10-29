@@ -111,6 +111,7 @@ protocol BackendServing: AlertSending {
     func sendWatchTest() async throws
     func silentWatchAlarms(_ enabled: Bool, appWake: Bool, extensionMethod: Bool) async throws
     func confirmAlarmScheduled(episodeID: UUID, eventID: UUID, cycleID: UUID) async throws
+    func reportAlarmAttempts(_ attempts: [AlarmAttempt]) async throws
     func unpair() async throws
     func deleteDevice() async throws
 }
@@ -121,6 +122,7 @@ extension BackendServing {
     func stopAlertTest(id: UUID) async throws -> AlertTestResponse { throw BackendError.message("Configurable tests require an updated connection service.") }
     func confirmAlarmScheduled(episodeID: UUID, eventID: UUID, cycleID: UUID) async throws { throw BackendError.message("Alarm scheduling receipts require an updated connection service.") }
     func silentWatchAlarms(_ enabled: Bool, appWake: Bool, extensionMethod: Bool) async throws { throw BackendError.message("Silent Watch alarms require an updated connection service.") }
+    func reportAlarmAttempts(_ attempts: [AlarmAttempt]) async throws { throw BackendError.message("Alarm attempt reports require an updated connection service.") }
     func sendWatchTest() async throws { throw BackendError.message("Watch test mode requires an updated connection service.") }
     func resumeAlerts(until: Date) async throws { throw BackendError.message("Resume alerts requires an updated connection service.") }
     func setMonitoring(_ enabled: Bool, id: UUID) async throws -> MonitoringCommand { throw BackendError.message("Monitoring controls require an updated connection service.") }
@@ -174,6 +176,22 @@ struct BackendClient: BackendServing {
         var bounded = self; bounded.requestTimeout = min(requestTimeout, 2)
         let _: EmptyResponse = try await bounded.request("/v1/alarm/scheduled", body: ["episodeId": episodeID.uuidString, "eventId": eventID.uuidString, "cycleId": cycleID.uuidString])
     }
+    /// Diagnostics only: fixed fields and bounded numbers, never error text.
+    func reportAlarmAttempts(_ attempts: [AlarmAttempt]) async throws {
+        struct Item: Encodable {
+            let method: String, outcome: String, reason: String?, eventId: UUID?, test: Bool, flags: [String]
+            let pushToStartMs: Int?, handlerMs: Int, pushToAlarmMs: Int?, snapshotAgeMs: Int?, evidenceApplied: Bool?
+            let charging: Bool?, batteryPct: Int?, lowPower: Bool, appActive: Bool?, protectedData: Bool?, startedAtMs: Int64
+        }
+        let items = attempts.map { a in
+            Item(method: a.method.rawValue, outcome: a.outcome.rawValue, reason: a.reason, eventId: a.eventID, test: a.isTest, flags: a.flags,
+                 pushToStartMs: a.pushToStartMS, handlerMs: a.handlerMS, pushToAlarmMs: a.pushToAlarmMS, snapshotAgeMs: a.snapshotAgeMS,
+                 evidenceApplied: a.evidenceApplied, charging: a.conditions.charging, batteryPct: a.conditions.batteryLevel.map { Int($0 * 100) },
+                 lowPower: a.conditions.lowPower, appActive: a.conditions.appActive, protectedData: a.conditions.protectedDataAvailable,
+                 startedAtMs: Int64((a.startedAt.timeIntervalSince1970 * 1000).rounded()))
+        }
+        let _: EmptyResponse = try await request("/v1/alarm/attempts", body: ["attempts": items])
+    }
     func connectionAlerts(_ enabled: Bool) async throws { let _: EmptyResponse = try await request("/v1/connection-alerts", body: ["enabled": enabled]) }
     func alertTest() async throws -> AlertTestResponse {
         try await request("/v1/alert-test", method: "GET", body: Optional<String>.none)
@@ -212,7 +230,7 @@ struct BackendClient: BackendServing {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(credential.deviceId.uuidString.lowercased()).\(credential.secret)", forHTTPHeaderField: "Authorization")
         let operation = ["/v1/device/register": "register", "/v1/pairing/create": "pairing_create", "/v1/pairing/claim": "pairing_claim",
-                         "/v1/alarm/scheduled": "alarm_scheduled", "/v1/device/push-token": "push_token", "/v1/device/watch-push-token": "watch_token",
+                         "/v1/alarm/scheduled": "alarm_scheduled", "/v1/alarm/attempts": "alarm_attempts", "/v1/silent-watch-alarms": "alarm_settings", "/v1/device/push-token": "push_token", "/v1/device/watch-push-token": "watch_token",
                          "/v1/listener/heartbeat": "heartbeat", "/v1/listener/event": "alert", "/v1/listener/status": "status",
                          "/v1/timeline": "timeline", "/v1/monitoring": "monitoring", "/v1/monitoring/complete": "monitoring_complete", "/v1/settings": "settings", "/v1/alert/acknowledge": "acknowledge", "/v1/test-push": "test_push", "/v1/alert-test": "test_push", "/v1/alert-test/stop": "test_push", "/v1/watch-test": "test_push", "/v1/watch-test/push": "test_push", "/v1/listener/silent-alarm-test": "test_push", "/v1/alert/resume": "resume_alerts",
                          "/v1/connection-alerts": "connection_preferences", "/v1/pairing/remove": "unpair", "/v1/device/delete": "delete_device"][path] ?? "unknown"

@@ -59,7 +59,7 @@ final class AlarmSharedTests: XCTestCase {
                          finishedAt: now.addingTimeInterval(Double(index) + 0.75), alarmAt: now.addingTimeInterval(Double(index) + 3.75),
                          conditions: .init(charging: false, batteryLevel: 0.5, lowPower: false))
         }
-        for index in 0..<(AlarmJournal.capacity + 5) { journal.append(attempt(index)) }
+        for index in 0..<(AlarmJournal.capacity + 5) { try journal.append(attempt(index)) }
         let entries = journal.read()
         XCTAssertEqual(entries.count, AlarmJournal.capacity)
         XCTAssertEqual(entries.first?.startedAt, attempt(5).startedAt)
@@ -67,9 +67,53 @@ final class AlarmSharedTests: XCTestCase {
         XCTAssertEqual(entries.last?.handlerMS, 250)
 
         var late = attempt(0); late.outcome = .timedOut
-        journal.append(late)
+        try journal.append(late)
         XCTAssertEqual(journal.read().last?.outcome, .timedOut)
         XCTAssertTrue(String(decoding: try Data(contentsOf: journal.url), as: UTF8.self).contains(#""outcome":"timed_out""#))
+    }
+
+    /// A `no_snapshot` rejection says why, and the extension records how old the state was.
+    func testSnapshotReadReportsWhyItIsUnavailable() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        XCTAssertEqual(AlarmSnapshot.read(from: nil).failure, .appGroupUnavailable)
+        XCTAssertEqual(AlarmSnapshot.read(from: directory).failure, .missing)
+        try Data("{".utf8).write(to: directory.appendingPathComponent("alarm-snapshot.json"))
+        XCTAssertEqual(AlarmSnapshot.read(from: directory).failure, .undecodable)
+
+        let request = try XCTUnwrap(SilentCryAlarmRequest(payload: payload(["alarmExtension": true], age: 2), now: now))
+        var value = snapshot()
+        XCTAssertFalse(value.evidenceApplies(to: request))
+        value.evidence = .init(observedAt: request.createdAt.addingTimeInterval(-1), paired: true, enabled: true, relevance: nil, mutedUntil: nil)
+        XCTAssertFalse(value.evidenceApplies(to: request))
+        value.evidence = .init(observedAt: request.createdAt, paired: true, enabled: true, relevance: nil, mutedUntil: nil)
+        XCTAssertTrue(value.evidenceApplies(to: request))
+
+        XCTAssertNil(AlarmShared.protectedDataAvailable(in: directory))
+        AlarmShared.writeLockProbe(to: directory)
+        XCTAssertEqual(AlarmShared.protectedDataAvailable(in: directory), true)
+    }
+
+    /// Concurrent appends keep every entry, and an unreadable journal is never replaced.
+    func testJournalAppendsAreSerializedAndNeverTruncateAnUnreadableJournal() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let journal = try XCTUnwrap(AlarmJournal.forMethod(.extension, directory: directory))
+        let start = now
+        DispatchQueue.concurrentPerform(iterations: 40) { index in
+            try? journal.append(AlarmAttempt(method: .extension, outcome: .timedOut, reason: nil, eventID: UUID(), episodeID: UUID(),
+                isTest: false, flags: [], pushCreatedAt: nil, startedAt: start.addingTimeInterval(Double(index)),
+                finishedAt: start.addingTimeInterval(Double(index)), alarmAt: nil, conditions: .init(lowPower: false)))
+        }
+        let entries = journal.read()
+        XCTAssertEqual(entries.count, 40)
+        XCTAssertEqual(Set(entries.map(\.key)).count, 40)
+
+        try Data([0xFF, 0xFE]).write(to: journal.url)
+        XCTAssertThrowsError(try journal.append(entries[0]))
+        XCTAssertEqual(try Data(contentsOf: journal.url), Data([0xFF, 0xFE]))
     }
 
     #if !canImport(MonitorCore)
@@ -79,4 +123,8 @@ final class AlarmSharedTests: XCTestCase {
         XCTAssertEqual(methods, ParentStatus.AlarmMethods(appWake: false, extensionMethod: true))
     }
     #endif
+}
+
+private extension Result {
+    var failure: Failure? { if case .failure(let value) = self { value } else { nil } }
 }

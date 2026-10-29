@@ -215,7 +215,10 @@ import UIKit
             else { self?.remoteSound.disconnected() }
         }
         (notifications as? NotificationService)?.log = log
-        if #available(iOS 26.0, *) { SilentCryAlarmService.shared.log = log }
+        if #available(iOS 26.0, *) {
+            SilentCryAlarmService.shared.log = log
+            if defaults === UserDefaults.standard { SilentCryAlarmService.shared.observeAlarmStates() }
+        }
         watch.log = log
         (audio as? AudioLevelMonitor)?.log = log
         notifications.onToken = { [weak self] token in self?.pushToken = token; self?.uploadedToken = nil; self?.log.record("push_token_received") }
@@ -430,7 +433,7 @@ import UIKit
     func acceptSafety() { safetyAccepted = true; defaults.set(true, forKey: "safetyAccepted") }
     func selectRole(_ value: DeviceRole) {
         guard !managingDevice else { return }
-        if value != .parent, #available(iOS 26.0, *), defaults === UserDefaults.standard { SilentCryAlarmService.shared.disableLocally() }
+        if value != .parent, #available(iOS 26.0, *), defaults === UserDefaults.standard { SilentCryAlarmService.shared.disableLocally(source: .roleChange) }
         clearLiveSound()
         setParentConnectionDeadline(nil)
         cancelCalibration()
@@ -450,7 +453,7 @@ import UIKit
         guard let url = URL(string: value.trimmingCharacters(in: .whitespacesAndNewlines)), url.scheme == "https",
               url.host != nil, url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
               url.path.isEmpty || url.path == "/" else { error = "Enter the HTTPS origin of your deployed Worker."; return }
-        if #available(iOS 26.0, *), defaults === UserDefaults.standard { SilentCryAlarmService.shared.disableLocally() }
+        if #available(iOS 26.0, *), defaults === UserDefaults.standard { SilentCryAlarmService.shared.disableLocally(source: .backendChanged) }
         setParentConnectionDeadline(nil)
         resetMonitoringControl()
         environmentRevision += 1; backendURL = url.absoluteString
@@ -806,7 +809,7 @@ import UIKit
         guard role == .parent else { return }
         if #available(iOS 26.0, *) {
             let service = SilentCryAlarmService.shared
-            if !enabled { service.disableLocally() }
+            if !enabled { service.disableLocally(source: .user) }
             do { let backend = try await registeredClient(); await service.setEnabled(enabled, using: backend) }
             catch { service.settingUnavailable() }
         }
@@ -1612,7 +1615,7 @@ import UIKit
         do {
             let client = try await registeredClient()
             if deleteDevice { try await client.deleteDevice() } else { try await client.unpair() }
-            if #available(iOS 26.0, *), defaults === UserDefaults.standard { SilentCryAlarmService.shared.disableLocally() }
+            if #available(iOS 26.0, *), defaults === UserDefaults.standard { SilentCryAlarmService.shared.disableLocally(source: .unpaired) }
             if deleteDevice, let old {
                 let replacement = try keychain.create(role: old.role)
                 try keychain.save(replacement, environment: backendURL)

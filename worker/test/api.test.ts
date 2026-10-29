@@ -326,6 +326,30 @@ describe('connection alerts, readiness and replacement',()=>{
   expect(await runReminder(testEnv,parent.deviceId)).toBe(false);
   expect((await call('alarm/scheduled',parent,{episodeId:phone.episodeId,eventId:phone.eventId,cycleId:phone.alarmCycleId})).status).toBe(409);
  });
+ it('records device-reported alarm attempts as bounded diagnostics only',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  await call('listener/heartbeat',listener,beat(listener));await stale();mockPush();await flushConnections(testEnv);
+  const phone=JSON.parse(String(pushRequests[0].init?.body));
+  const other=crypto.randomUUID(),started=Date.now()-5000;
+  const response=await call('alarm/attempts',parent,{attempts:[
+   {method:'extension',outcome:'scheduled',eventId:phone.eventId.toUpperCase(),test:false,flags:['extension','bogus'],pushToStartMs:180,handlerMs:240,pushToAlarmMs:1420,
+    snapshotAgeMs:60000,evidenceApplied:false,charging:false,batteryPct:54,lowPower:false,protectedData:false,startedAtMs:started},
+   {method:'app',outcome:'rejected',reason:'Error: secret text',eventId:other,handlerMs:12},
+   {method:'carrier-pigeon',outcome:'scheduled'}]});
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ok:true,recorded:2,ignored:1});
+  const rows=(await env.DB.prepare("SELECT event_ref,elapsed_ms,details FROM diagnostics WHERE operation='alarm_attempt' ORDER BY sequence").all<{event_ref:string|null;elapsed_ms:number;details:string}>()).results;
+  expect(rows).toHaveLength(2);
+  expect(rows[0].event_ref).toBe(await eventReference(testEnv,phone.eventId));
+  expect(rows[0].elapsed_ms).toBeGreaterThanOrEqual(5000);
+  expect(JSON.parse(rows[0].details).alarm_attempt).toEqual({method:'extension',outcome:'scheduled',test:false,flags:['extension'],push_to_start_ms:180,handler_ms:240,
+   push_to_alarm_ms:1420,snapshot_age_ms:60000,evidence_applied:false,charging:false,battery_pct:54,low_power:false,protected_data:false,started_at_ms:started});
+  // Another Parent's (or an unknown) event stays unlinked, and free text never reaches storage.
+  expect(rows[1].event_ref).toBeNull();
+  expect(rows[1].details).not.toContain('secret');
+  expect((await call('alarm/attempts',listener,{attempts:[]})).status).toBe(403);
+  expect((await call('alarm/attempts',parent,{attempts:Array(21).fill({method:'app',outcome:'scheduled'})})).status).toBe(400);
+ });
  it('suppresses a reminder if recovery overtakes its prepared snapshot',async()=>{
   const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
   await call('listener/heartbeat',listener,beat(listener));await stale();mockPush();await flushConnections(testEnv);

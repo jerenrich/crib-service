@@ -36,6 +36,22 @@ Experiment infrastructure for the two AlarmKit delivery methods. A simulator pro
 
 Attempts appear in Settings → Diagnostics → Recent alarm attempts and as `alarm_attempt` diagnostic lines. Extension launch overhead before the notification appears, and the Watch tap itself, are not recorded by the app.
 
+**Alarm logging.** Extension attempts also record:
+- why there was no snapshot (`detail=missing|unreadable|undecodable|app_group_unavailable`)
+- the snapshot's age
+- whether the server state in it was applied (it is applied only when observed after the push)
+- lock state, read from a probe file that is readable only while the phone is unlocked
+- a scheduling error's domain and code, never its description
+
+Each attempt is also written to the system log (subsystem `com.jordanerenrich.cribservice`, category `alarm-extension`), along with any journal write failure. Journal appends are serialized across threads and extension instances, and a journal that cannot be read is never replaced. The app logs these lines:
+- `silent_cry_alarm_setting`: enable, disable and method changes, with their source. This includes the server turning alarms off.
+- `silent_cry_alarm_cancelled`: every alarm the app removes, with the reason.
+- `silent_cry_alarm_stop`: every Stop, including one with no matching record.
+- `silent_cry_alarm_state`: AlarmKit state changes for owned alarms, seen only while the app runs.
+- `silent_cry_alarm phase=failed`: now includes the operation and error.
+
+In the foreground, the app reports both methods' attempts to `POST /v1/alarm/attempts`. These are stored as `alarm_attempt` server diagnostic rows, correlated by event reference.
+
 Not yet done: the extension does not use the app's clock-offset estimate for its freshness check.
 
 Validation passed 358 Worker tests, both TypeScript checks, 187 shared Swift tests, all 349 iOS simulator unit tests and the signed device build. Automatic provisioning registered the App Group and the extension App ID after the Program License Agreement update was accepted; both embedded profiles include the group. Migration `0016` was applied and Worker `860cb01a-81d6-42ea-b9cb-1a08b8640e22` was deployed with message `cd2ad4c`. The live health check returned 401 with diagnostics recorded. Installed on J17, J14 and the Watch. J17 published its snapshot (alarms enabled, extension off, no snooze or pending acknowledgement). J14 needs monitoring restarted. On-device comparison of the methods is pending.

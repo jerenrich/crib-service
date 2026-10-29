@@ -26,7 +26,7 @@ import Observation
     private var storagePrepared = false
     private static let timestampStyle = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
     private static let events: Set<String> = [
-        "alert_pipeline_ready", "app_launched", "alarm_snapshot_failed", "alarm_snapshot_unavailable", "monitoring_start_superseded", "foreground", "background", "monitoring_recovered_after_relaunch",
+        "alert_pipeline_ready", "app_launched", "alarm_snapshot_failed", "alarm_snapshot_unavailable", "alarm_journal_failed", "alarm_attempts_upload_discarded", "monitoring_start_superseded", "foreground", "background", "monitoring_recovered_after_relaunch",
         "paired_successfully", "pairing_created", "pairing_failed", "credential_failed", "metadata_load_failed",
         "monitoring_started", "monitoring_stopped", "monitoring_paused", "monitoring_start_failed", "microphone_permission_denied",
         "test_push_queued", "audio_active", "audio_recovering", "audio_interrupted", "audio_stalled",
@@ -94,7 +94,7 @@ import Observation
     func network(operation: String, outcome: String, status: Int? = nil, requestID: UUID? = nil,
                  elapsedMS: Int, storageUnavailable: Bool = false, error: (any Error)? = nil, eventID: UUID? = nil, benchmarkAttempt: UUID? = nil, serverDiagnosticMS: Int? = nil, diagnosticState: String? = nil,
                  metrics: DiagnosticNetworkTiming? = nil, clock: DiagnosticClockSample? = nil, monotonic: Bool = false, clientRequestID: UUID? = nil) {
-        let operations: Set<String> = ["alarm_scheduled", "register", "pairing_create", "pairing_claim", "push_token", "watch_token", "heartbeat", "alert", "status", "timeline", "monitoring", "monitoring_complete", "settings", "acknowledge", "test_push", "connection_preferences", "unpair", "delete_device", "resume_alerts"]
+        let operations: Set<String> = ["alarm_scheduled", "alarm_attempts", "alarm_settings", "register", "pairing_create", "pairing_claim", "push_token", "watch_token", "heartbeat", "alert", "status", "timeline", "monitoring", "monitoring_complete", "settings", "acknowledge", "test_push", "connection_preferences", "unpair", "delete_device", "resume_alerts"]
         guard operations.contains(operation), ["ok", "http_error", "transport_error", "decode_error", "encode_error", "cancelled", "invalid_response"].contains(outcome) else { return }
         if operation == "status" {
             benchmark.requestFinished(benchmarkAttempt, outcome: outcome, requestID: requestID, status: status, elapsedMS: elapsedMS)
@@ -189,9 +189,40 @@ import Observation
         let age = Int64(observed.rounded()) - Int64(created.rounded())
         append("alert_outbox phase=\(phase) event_id=\(alert.eventId.uuidString.lowercased()) generated_at_ms=\(Int64(created.rounded())) observed_at_ms=\(Int64(observed.rounded())) age_ms=\(age)" + extra + (age < 0 ? " clock_order=check" : ""))
     }
-    func silentCryAlarm(phase: String, eventID: UUID? = nil, appActive: Bool) {
+    func silentCryAlarm(phase: String, eventID: UUID? = nil, appActive: Bool, operation: String? = nil, error: (any Error)? = nil) {
         guard ["received", "scheduled", "ignored", "duplicate", "failed", "snoozed", "ack_pending", "acknowledged"].contains(phase) else { return }
-        append("silent_cry_alarm phase=\(phase) app_active=\(appActive)" + (eventID.map { " event_id=\($0.uuidString.lowercased())" } ?? ""))
+        let operations: Set<String> = ["set_enabled", "set_methods", "setting_sync", "reconcile_cancel", "cancel_tests", "cancel_all",
+                                       "test_acknowledge", "acknowledge", "receive"]
+        var entry = "silent_cry_alarm phase=\(phase) app_active=\(appActive)" + (eventID.map { " event_id=\($0.uuidString.lowercased())" } ?? "")
+        if let operation, operations.contains(operation) { entry += " operation=\(operation)" }
+        if let error { entry += " " + Self.errorDetails(error) }
+        append(entry)
+    }
+    /// Changes that decide whether later alarms can be scheduled at all.
+    func silentCryAlarmSetting(change: String, source: String, appWake: Bool? = nil, extensionMethod: Bool? = nil, reason: String? = nil) {
+        guard ["enabled", "disabled", "enable_blocked", "methods_changed", "local_mute_cleared"].contains(change),
+              ["user", "server", "role_change", "backend_changed", "unpaired", "server_resume"].contains(source) else { return }
+        var entry = "silent_cry_alarm_setting change=\(change) source=\(source)"
+        if let appWake { entry += " app_wake=\(appWake)" }
+        if let extensionMethod { entry += " extension=\(extensionMethod)" }
+        if let reason, ["unauthorized", "missing_asset"].contains(reason) { entry += " reason=\(reason)" }
+        append(entry)
+    }
+    /// Every alarm this app removes, with why, so a vanished alarm can be explained.
+    func silentCryAlarmCancelled(episodeID: UUID, eventID: UUID?, reason: String) {
+        guard ["snoozed", "disabled", "test_stopped", "unpaired", "server_muted", "irrelevant", "setting_changed"].contains(reason) else { return }
+        append("silent_cry_alarm_cancelled episode_id=\(episodeID.uuidString.lowercased())" + (eventID.map { " event_id=\($0.uuidString.lowercased())" } ?? "") + " reason=\(reason)")
+    }
+    /// Stop on an alarm, logged before anything else so an ignored Stop still leaves a line.
+    func silentCryAlarmStop(episodeID: UUID, eventID: UUID?, isTest: Bool?, sinceAlarmMS: Int?, appActive: Bool) {
+        append("silent_cry_alarm_stop episode_id=\(episodeID.uuidString.lowercased())" + (eventID.map { " event_id=\($0.uuidString.lowercased())" } ?? " record=missing")
+            + " test=\(isTest.map(String.init) ?? "unknown") since_alarm_ms=\(sinceAlarmMS.map(String.init) ?? "unknown") app_active=\(appActive)")
+    }
+    /// AlarmKit state for an alarm this app owns, as observed while the app runs.
+    func silentCryAlarmState(episodeID: UUID, eventID: UUID?, state: String, sinceAlarmMS: Int?, appActive: Bool) {
+        guard ["scheduled", "countdown", "alerting", "paused", "removed", "unknown"].contains(state) else { return }
+        append("silent_cry_alarm_state episode_id=\(episodeID.uuidString.lowercased())" + (eventID.map { " event_id=\($0.uuidString.lowercased())" } ?? "")
+            + " state=\(state) since_alarm_ms=\(sinceAlarmMS.map(String.init) ?? "unknown") app_active=\(appActive)")
     }
     #if os(iOS)
     /// One line per AlarmKit attempt by either method, for comparing delays.
@@ -204,6 +235,8 @@ import Observation
             + " push_to_start_ms=\(ms(a.pushToStartMS)) handler_ms=\(a.handlerMS) push_to_alarm_ms=\(ms(a.pushToAlarmMS))"
             + " charging=\(flag(a.conditions.charging)) battery=\(a.conditions.batteryLevel.map { String(Int($0 * 100)) } ?? "unknown")"
             + " low_power=\(a.conditions.lowPower) app_active=\(flag(a.conditions.appActive)) protected_data=\(flag(a.conditions.protectedDataAvailable))"
+            + (a.detail.map { " detail=\($0.replacingOccurrences(of: " ", with: "_"))" } ?? "")
+            + (a.snapshotAgeMS.map { " snapshot_age_ms=\($0)" } ?? "") + (a.evidenceApplied.map { " evidence_applied=\($0)" } ?? "")
             + " started_at=\(ISO8601DateFormatter().string(from: a.startedAt))")
     }
     func silentCryAlarmAttempt(phase: String, stage: SilentCryAlarmRequest.Stage, source: SilentCryAlarmRequest.Source,
