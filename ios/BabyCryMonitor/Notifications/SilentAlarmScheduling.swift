@@ -39,7 +39,7 @@ struct SnoozeSilentCryAlarmIntent: LiveActivityIntent {
         #if ALARM_EXTENSION
         // If iOS ever runs Stop in the extension, leave a marker; the app applies
         // the snooze the next time it runs.
-        AlarmJournal.forMethod(.extension)?.append(AlarmAttempt(method: .extension, outcome: .stopped, reason: nil,
+        try? AlarmJournal.forMethod(.extension)?.append(AlarmAttempt(method: .extension, outcome: .stopped, reason: nil,
             eventID: nil, episodeID: id, isTest: false, flags: [], pushCreatedAt: nil, startedAt: Date(), finishedAt: Date(),
             alarmAt: nil, conditions: .init(lowPower: ProcessInfo.processInfo.isLowPowerModeEnabled)))
         #else

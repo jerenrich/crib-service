@@ -16,11 +16,11 @@ const routes = {
  'POST /v1/listener/silent-alarm-test':'test_push',
  'POST /v1/silent-watch-alarms':'settings',
  'GET /v1/watch-test':'test_push','POST /v1/watch-test':'test_push',
- 'POST /v1/alarm/scheduled':'alarm_scheduled',
+ 'POST /v1/alarm/scheduled':'alarm_scheduled','POST /v1/alarm/attempts':'alarm_attempts',
  'POST /v1/connection-alerts':'connection_preferences','POST /v1/test-push':'test_push','GET /v1/alert-test':'test_push','POST /v1/alert-test':'test_push','POST /v1/alert-test/stop':'test_push',
  'GET /v1/live-sound':'live_sound'
 } as const;
-export type Operation = typeof routes[keyof typeof routes] | 'unknown_route' | 'status_journal' | 'heartbeat_journal' | 'alert_progress' | 'database_late_reply' | 'dispatch' | 'dispatch_outcome' | 'dispatch_skip' | 'reminder_prepare' | 'maintenance' | 'reminder_schedule' | 'reminder_alarm' | 'watch_test_dispatch' | 'silent_alarm_test_dispatch' | 'silent_cry_alarm_dispatch';
+export type Operation = typeof routes[keyof typeof routes] | 'unknown_route' | 'status_journal' | 'heartbeat_journal' | 'alert_progress' | 'database_late_reply' | 'dispatch' | 'dispatch_outcome' | 'dispatch_skip' | 'reminder_prepare' | 'maintenance' | 'reminder_schedule' | 'reminder_alarm' | 'watch_test_dispatch' | 'silent_alarm_test_dispatch' | 'silent_cry_alarm_dispatch' | 'alarm_attempt';
 export type Stage = 'validation' | 'rate_limit' | 'authentication' | 'handler' | 'claim' | 'push' | 'storage' | 'cleanup';
 export type Outcome = 'ok' | 'rejected' | 'internal_error' | 'sent' | 'retry' | 'blocked' | 'uncertain' | 'failed'
  | 'expired_event' | 'no_push_token' | 'transport_unknown' | 'invalid_device_token' | 'provider_configuration'

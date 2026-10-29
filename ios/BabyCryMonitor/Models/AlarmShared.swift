@@ -12,6 +12,21 @@ enum AlarmShared {
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
     }
+
+    /// A one-byte file with complete protection: readable only while the device is
+    /// unlocked. The extension cannot ask UIKit, so it reads this to record lock state.
+    private static let lockProbeName = "lock-probe"
+    static func writeLockProbe(to directory: URL? = directory) {
+        guard let url = directory?.appendingPathComponent(lockProbeName),
+              !FileManager.default.fileExists(atPath: url.path) else { return }
+        try? Data([1]).write(to: url, options: [.atomic, .completeFileProtection])
+    }
+    /// `nil` until the app has written the probe.
+    static func protectedDataAvailable(in directory: URL? = directory) -> Bool? {
+        guard let url = directory?.appendingPathComponent(lockProbeName),
+              FileManager.default.fileExists(atPath: url.path) else { return nil }
+        return (try? Data(contentsOf: url)) != nil
+    }
 }
 
 enum AlarmMethod: String, Codable, Sendable { case app, `extension` }
@@ -27,10 +42,23 @@ struct AlarmSnapshot: Codable, Equatable, Sendable {
     var snoozeDuration: Double
     var publishedAt: Date
 
-    static func load(from directory: URL? = AlarmShared.directory) -> AlarmSnapshot? {
-        guard let url = directory?.appendingPathComponent("alarm-snapshot.json"),
-              let data = try? Data(contentsOf: url) else { return nil }
-        return try? JSONDecoder().decode(Self.self, from: data)
+    /// Why the extension had no snapshot, recorded with its `no_snapshot` rejection.
+    enum Issue: String, Error { case appGroupUnavailable = "app_group_unavailable", missing, unreadable, undecodable }
+
+    static func read(from directory: URL? = AlarmShared.directory) -> Result<AlarmSnapshot, Issue> {
+        guard let url = directory?.appendingPathComponent("alarm-snapshot.json") else { return .failure(.appGroupUnavailable) }
+        guard FileManager.default.fileExists(atPath: url.path) else { return .failure(.missing) }
+        // Unreadable before the first unlock after a restart.
+        guard let data = try? Data(contentsOf: url) else { return .failure(.unreadable) }
+        guard let snapshot = try? JSONDecoder().decode(Self.self, from: data) else { return .failure(.undecodable) }
+        return .success(snapshot)
+    }
+
+    static func load(from directory: URL? = AlarmShared.directory) -> AlarmSnapshot? { try? read(from: directory).get() }
+
+    /// The server state is applied only when observed after the push was created.
+    func evidenceApplies(to request: SilentCryAlarmRequest) -> Bool {
+        evidence.map { $0.observedAt >= request.createdAt } ?? false
     }
 
     func save(to directory: URL? = AlarmShared.directory) throws {
@@ -72,11 +100,21 @@ struct AlarmAttempt: Codable, Equatable, Sendable {
     var finishedAt: Date
     var alarmAt: Date?
     var conditions: Conditions
+    /// Local-only context, e.g. why there was no snapshot or a scheduling error's domain and code.
+    var detail: String?
+    /// Extension only: how old the app's published state was, and whether its server state was applied.
+    var snapshotAgeMS: Int?
+    var evidenceApplied: Bool?
 
     /// Cross-device: the push time comes from the service clock.
     var pushToStartMS: Int? { pushCreatedAt.map { Int(startedAt.timeIntervalSince($0) * 1000) } }
     var handlerMS: Int { Int(finishedAt.timeIntervalSince(startedAt) * 1000) }
     var pushToAlarmMS: Int? { pushCreatedAt.flatMap { created in alarmAt.map { Int($0.timeIntervalSince(created) * 1000) } } }
+
+    /// Identifies an entry across journal rewrites, so each is merged exactly once.
+    var key: String {
+        "\(method.rawValue)|\(outcome.rawValue)|\(episodeID?.uuidString ?? "-")|\(startedAt.timeIntervalSince1970)|\(finishedAt.timeIntervalSince1970)"
+    }
 
     static func flags(in payload: [AnyHashable: Any]) -> [String] {
         let aps = payload["aps"] as? [AnyHashable: Any]
@@ -84,25 +122,48 @@ struct AlarmAttempt: Codable, Equatable, Sendable {
     }
 }
 
-/// A bounded JSON-lines journal written by exactly one process.
+/// A bounded JSON-lines journal written by exactly one process. Appends are
+/// serialized within the process and, with a file lock, across its instances.
 struct AlarmJournal: Sendable {
     static let capacity = 200
     let url: URL
+    private static let processLock = NSLock()
+
+    enum Failure: Error { case unreadable, busy, lockUnavailable(Int32) }
 
     static func forMethod(_ method: AlarmMethod, directory: URL? = AlarmShared.directory) -> AlarmJournal? {
         directory.map { AlarmJournal(url: $0.appendingPathComponent("alarm-attempts-\(method.rawValue).jsonl")) }
     }
 
-    func read() -> [AlarmAttempt] {
-        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return [] }
+    func read() -> [AlarmAttempt] { (try? entries()) ?? [] }
+
+    /// Throws only when an existing journal cannot be read.
+    func entries() throws -> [AlarmAttempt] {
+        guard FileManager.default.fileExists(atPath: url.path) else { return [] }
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { throw Failure.unreadable }
         let decoder = JSONDecoder()
         return text.split(separator: "\n").compactMap { try? decoder.decode(AlarmAttempt.self, from: Data($0.utf8)) }
     }
 
-    func append(_ attempt: AlarmAttempt) {
-        let entries = Array((read() + [attempt]).suffix(Self.capacity))
-        let encoder = JSONEncoder()
-        let lines = entries.compactMap { try? encoder.encode($0) }.compactMap { String(data: $0, encoding: .utf8) }
-        try? (lines.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
+    func append(_ attempt: AlarmAttempt) throws {
+        try Self.processLock.withLock {
+            let descriptor = open(url.path + ".lock", O_CREAT | O_RDWR | O_CLOEXEC, 0o644)
+            guard descriptor >= 0 else { throw Failure.lockUnavailable(errno) }
+            defer { close(descriptor) }
+            // Never wait indefinitely: a suspended holder must not stall the
+            // extension, which writes its cut-off entry on the main queue.
+            var locked = false
+            for _ in 0..<20 {
+                if flock(descriptor, LOCK_EX | LOCK_NB) == 0 { locked = true; break }
+                usleep(5_000)
+            }
+            guard locked else { throw Failure.busy }
+            defer { flock(descriptor, LOCK_UN) }
+            // An unreadable journal is left alone rather than replaced by one entry.
+            let entries = Array((try entries() + [attempt]).suffix(Self.capacity))
+            let encoder = JSONEncoder()
+            let lines = entries.compactMap { try? encoder.encode($0) }.compactMap { String(data: $0, encoding: .utf8) }
+            try (lines.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
+        }
     }
 }

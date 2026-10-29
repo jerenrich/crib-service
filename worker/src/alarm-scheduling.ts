@@ -1,5 +1,5 @@
-import {eventReference} from './diagnostics';
-import type {Latency} from './latency';
+import {eventReference,recordDiagnostic} from './diagnostics';
+import type {AlarmAttemptDetails,Latency} from './latency';
 import {APIError,requireRole,type Device,type Env} from './types';
 import {uuid} from './security';
 
@@ -53,4 +53,48 @@ export async function confirmAlarmScheduled(env:Env,device:Device,value:Record<s
   RETURNING cycle_id`).bind(now,device.id,episode,cycle,now,event).first();
  if(!result)throw new APIError(409,'Alarm scheduling cycle is no longer current.');
  return {ok:true};
+}
+
+// Device-reported AlarmKit attempts by either method, so delivery methods can be
+// compared without pulling files from the phone. Diagnostics only: this never
+// changes alert, alarm or receipt state. Each attempt becomes one bounded row.
+export const maximumAlarmAttempts=20;
+export async function recordAlarmAttempts(env:Env,device:Device,value:Record<string,unknown>,requestId:string) {
+ requireRole(device,'parent');
+ if(!Array.isArray(value.attempts)||value.attempts.length>maximumAlarmAttempts)throw new APIError(400,'Invalid alarm attempts.');
+ const attempts=value.attempts.map(item=>alarmAttempt(item)).filter(item=>item!==null);
+ // Correlate only events that belong to this Parent; anything else is kept unlinked.
+ const ids=[...new Set(attempts.map(item=>item.eventId).filter(id=>id!==undefined))];
+ const owned=new Set<string>();
+ if(ids.length){
+  const rows=await env.DB.prepare(`SELECT event_id FROM events WHERE parent_id=? AND event_id IN (${ids.map(()=>'?').join(',')})`)
+   .bind(device.id,...ids).all<{event_id:string}>();
+  for(const row of rows.results)owned.add(row.event_id);
+ }
+ let recorded=0;
+ for(const {eventId,started,details} of attempts){
+  const eventRef=eventId&&owned.has(eventId)?await eventReference(env,eventId):undefined;
+  if(await recordDiagnostic(env,{requestId,operation:'alarm_attempt',stage:'handler',outcome:'ok',started,eventRef,details:{alarm_attempt:details}}))recorded++;
+ }
+ return {ok:true,recorded,ignored:value.attempts.length-attempts.length};
+}
+function alarmAttempt(item:unknown):{eventId?:string;started:number;details:AlarmAttemptDetails}|null {
+ if(!item||typeof item!=='object')return null;
+ const v=item as Record<string,unknown>;
+ if(!['app','extension'].includes(v.method as string)||!['scheduled','duplicate','rejected','failed','stopped','timed_out'].includes(v.outcome as string))return null;
+ const ms=(n:unknown,max=3_600_000)=>typeof n==='number'&&Number.isFinite(n)&&n>=-max&&n<=max?Math.round(n):undefined;
+ const flag=(b:unknown)=>typeof b==='boolean'?b:undefined;
+ let eventId:string|undefined;
+ try{eventId=v.eventId===undefined?undefined:uuid(v.eventId);}catch{return null;}
+ const startedAt=typeof v.startedAtMs==='number'&&Number.isFinite(v.startedAtMs)?v.startedAtMs:Date.now();
+ const details:AlarmAttemptDetails={method:v.method as AlarmAttemptDetails['method'],outcome:v.outcome as AlarmAttemptDetails['outcome'],
+  reason:typeof v.reason==='string'&&/^[a-z_+]{1,64}$/.test(v.reason)?v.reason:undefined,test:flag(v.test),
+  flags:Array.isArray(v.flags)?v.flags.filter(f=>f==='wake'||f==='extension'):undefined,
+  push_to_start_ms:ms(v.pushToStartMs),handler_ms:ms(v.handlerMs),push_to_alarm_ms:ms(v.pushToAlarmMs),
+  snapshot_age_ms:ms(v.snapshotAgeMs,90*86_400_000),evidence_applied:flag(v.evidenceApplied),
+  charging:flag(v.charging),battery_pct:typeof v.batteryPct==='number'&&v.batteryPct>=0&&v.batteryPct<=100?Math.round(v.batteryPct):undefined,
+  low_power:flag(v.lowPower),app_active:flag(v.appActive),protected_data:flag(v.protectedData),
+  started_at_ms:startedAt>=0&&startedAt<=1e15?Math.round(startedAt):undefined};
+ // `started` sets the row's elapsed_ms: time from the attempt to this upload.
+ return {eventId,started:Math.min(Date.now(),Math.max(0,startedAt)),details};
 }

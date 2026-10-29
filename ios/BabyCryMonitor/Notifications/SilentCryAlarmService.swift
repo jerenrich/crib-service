@@ -43,7 +43,10 @@ import UIKit
     private struct Record: Codable {
         let episodeID: UUID; let eventID: UUID; let snoozeDuration: Double; let scheduledAt: Date
         var isTest: Bool? = nil // Absent in records saved before tests shared this path.
+        var alarmAt: Date? = nil
     }
+    /// Who turned alarms off, for the diagnostic log.
+    enum ChangeSource: String { case user, server, serverResume = "server_resume", roleChange = "role_change", backendChanged = "backend_changed", unpaired }
     private var records: [Record] {
         get { (defaults.data(forKey: recordsKey)).flatMap { try? JSONDecoder().decode([Record].self, from: $0) } ?? [] }
         set { defaults.set(try? JSONEncoder().encode(newValue), forKey: recordsKey) }
@@ -79,9 +82,11 @@ import UIKit
         do {
             if value {
                 guard try await AlarmManager.shared.requestAuthorization() == .authorized else {
+                    setting("enable_blocked", source: .user, reason: "unauthorized")
                     status = "Allow alarms in iPhone Settings before enabling silent Watch alarms."; return
                 }
                 guard Bundle.main.url(forResource: "AlarmTestSilence", withExtension: "caf") != nil else {
+                    setting("enable_blocked", source: .user, reason: "missing_asset")
                     status = "The silent tone is missing. Reinstall this app before enabling alarms."; return
                 }
                 try await client.silentWatchAlarms(true, appWake: appWakeEnabled, extensionMethod: extensionEnabled)
@@ -91,22 +96,24 @@ import UIKit
                 defaults.set(Date(), forKey: "silentWatchAlarmsChangedAt")
                 defaults.set(false, forKey: "silentWatchAlarmsSettingDirty")
                 status = "Enabled. Lock this iPhone for Watch delivery; existing notifications continue."
+                setting("enabled", source: .user)
                 publishSnapshot()
             } else {
-                disableLocally()
+                disableLocally(source: .user)
                 try await client.silentWatchAlarms(false, appWake: appWakeEnabled, extensionMethod: extensionEnabled)
                 defaults.set(false, forKey: "silentWatchAlarmsSettingDirty")
                 status = "Off. Existing notifications remain enabled."
             }
-        } catch { status = value ? "Could not enable silent Watch alarms: \(error.localizedDescription)" : "Off on this iPhone. Server setting will sync when connected."; trace("failed") }
+        } catch { status = value ? "Could not enable silent Watch alarms: \(error.localizedDescription)" : "Off on this iPhone. Server setting will sync when connected."; trace("failed", operation: "set_enabled", error: error) }
     }
 
-    func disableLocally() {
+    func disableLocally(source: ChangeSource) {
+        if enabled { setting("disabled", source: source) }
         enabled = false; revision += 1
         defaults.set(false, forKey: "silentWatchAlarmsEnabled")
         defaults.set(Date(), forKey: "silentWatchAlarmsChangedAt")
         defaults.set(true, forKey: "silentWatchAlarmsSettingDirty")
-        cancelAll()
+        cancelAll(reason: source == .unpaired ? "unpaired" : "disabled")
         publishSnapshot()
     }
 
@@ -116,11 +123,12 @@ import UIKit
         defaults.set(appWake, forKey: "alarmMethodAppWake"); defaults.set(extensionMethod, forKey: "alarmMethodExtension")
         defaults.set(Date(), forKey: "alarmMethodsChangedAt")
         defaults.set(true, forKey: "silentWatchAlarmsSettingDirty")
+        setting("methods_changed", source: .user, appWake: appWake, extensionMethod: extensionMethod)
         publishSnapshot()
         do {
             try await client.silentWatchAlarms(enabled, appWake: appWake, extensionMethod: extensionMethod)
             defaults.set(false, forKey: "silentWatchAlarmsSettingDirty")
-        } catch { status = "Alarm method change will sync when connected."; trace("failed") }
+        } catch { status = "Alarm method change will sync when connected."; trace("failed", operation: "set_methods", error: error) }
     }
 
     func settingUnavailable() { status = enabled ? "Setting could not sync. Check the connection." : "Off on this iPhone. Server setting will sync when connected." }
@@ -134,22 +142,24 @@ import UIKit
         let hadPendingAcknowledgements = !(defaults.stringArray(forKey: pendingKey) ?? []).isEmpty
         await flushAcknowledgements(using: client)
         await flushSchedulingReceipts(using: client)
+        await uploadAttempts(using: client)
         if defaults.bool(forKey: "silentWatchAlarmsSettingDirty") {
             do {
                 try await client.silentWatchAlarms(enabled, appWake: appWakeEnabled, extensionMethod: extensionEnabled)
                 defaults.set(false, forKey: "silentWatchAlarmsSettingDirty")
-            } catch { trace("failed") }
+            } catch { trace("failed", operation: "setting_sync", error: error) }
         } else if let methods = server.alarmMethods,
                   checkedAt >= (defaults.object(forKey: "alarmMethodsChangedAt") as? Date ?? .distantPast),
                   methods.appWake != appWakeEnabled || methods.extensionMethod != extensionEnabled {
             // Adopt the stored choice, e.g. after reinstalling the app.
             appWakeEnabled = methods.appWake; extensionEnabled = methods.extensionMethod
             defaults.set(methods.appWake, forKey: "alarmMethodAppWake"); defaults.set(methods.extensionMethod, forKey: "alarmMethodExtension")
+            setting("methods_changed", source: .server, appWake: methods.appWake, extensionMethod: methods.extensionMethod)
         }
         // Never turn the feature on as a side effect of a server read.
         let settingChangedAt = defaults.object(forKey: "silentWatchAlarmsChangedAt") as? Date ?? .distantPast
         if checkedAt >= settingChangedAt, !server.paired || server.silentWatchAlarmsEnabled == false {
-            if enabled { disableLocally() }
+            if enabled { disableLocally(source: .server) }
         }
         reconcile(server, checkedAt: checkedAt, canResumeLocalSnooze: !hadPendingAcknowledgements)
     }
@@ -305,10 +315,10 @@ import UIKit
             // Persist acknowledgement metadata before scheduling so an immediate Stop
             // can resolve the event even when the app has to relaunch for the intent.
             var saved = records.filter { $0.episodeID != request.episodeID }
-            saved.append(Record(episodeID: request.episodeID, eventID: request.eventID, snoozeDuration: snoozeDuration, scheduledAt: Date(),
-                                isTest: request.isTest ? true : nil))
-            records = Array(saved.suffix(64))
             let fireAt = Date().addingTimeInterval(SilentAlarmScheduling.delay)
+            saved.append(Record(episodeID: request.episodeID, eventID: request.eventID, snoozeDuration: snoozeDuration, scheduledAt: Date(),
+                                isTest: request.isTest ? true : nil, alarmAt: fireAt))
+            records = Array(saved.suffix(64))
             let configuration = SilentAlarmScheduling.configuration(for: request, at: fireAt)
             stage = .schedule; record("started")
             // Local processing can also stall. Discard expired validation and
@@ -328,6 +338,7 @@ import UIKit
                 do {
                     try AlarmManager.shared.cancel(id: request.episodeID)
                     record("cancelled", reason: .settingChanged)
+                    (log ?? DiagnosticLog()).silentCryAlarmCancelled(episodeID: request.episodeID, eventID: request.eventID, reason: "setting_changed")
                 } catch { record("failed", reason: .settingChanged, error: error) }
                 outcome = .rejected; outcomeReason = SilentCryAlarmRequest.Rejection.settingChanged.rawValue
                 return false
@@ -358,11 +369,14 @@ import UIKit
 
     func snooze(episodeID: UUID) async {
         mergeExtensionAttempts()
-        guard let record = records.first(where: { $0.episodeID == episodeID }) else { return }
+        let record = records.first(where: { $0.episodeID == episodeID })
+        (log ?? DiagnosticLog()).silentCryAlarmStop(episodeID: episodeID, eventID: record?.eventID, isTest: record.map { $0.isTest == true },
+            sinceAlarmMS: record.flatMap(Self.sinceAlarmMS), appActive: UIApplication.shared.applicationState == .active)
+        guard let record else { return }
         if record.isTest == true {
             // Stopping a test alarm acknowledges only that test; it never snoozes real alerts.
             trace("acknowledged", record.eventID)
-            do { try await client().acknowledge(record.eventID, actedAt: Date()) } catch { trace("failed", record.eventID) }
+            do { try await client().acknowledge(record.eventID, actedAt: Date()) } catch { trace("failed", record.eventID, operation: "test_acknowledge", error: error) }
             return
         }
         snoozeLocally(eventID: record.eventID, duration: record.snoozeDuration)
@@ -375,7 +389,7 @@ import UIKit
         guard enabled || records.contains(where: { $0.eventID == eventID }) else { return }
         guard SilentCryAlarmSnooze(defaults: defaults).apply(eventID: eventID, duration: duration, now: Date()) else { return }
         revision += 1
-        cancelAll()
+        cancelAll(reason: "snoozed")
         status = "Alerts snoozed. Acknowledgement syncs when connected."
         trace("snoozed", eventID)
     }
@@ -394,7 +408,7 @@ import UIKit
             guard let id = UUID(uuidString: text) else { continue }
             do { try await client.acknowledge(id, actedAt: SilentCryAlarmSnooze(defaults: defaults).actedAt(id)) }
             catch BackendError.response(404, _) { /* Old/deleted pairing: discard only this old action. */ }
-            catch { trace("ack_pending", id); return }
+            catch { trace("ack_pending", id, operation: "acknowledge", error: error); return }
             SilentCryAlarmSnooze(defaults: defaults).markHandled(id)
             defaults.removeObject(forKey: SilentCryAlarmSnooze.actedAtKey(id))
             var pending = defaults.stringArray(forKey: pendingKey) ?? []
@@ -415,6 +429,7 @@ import UIKit
            stoppedBefore <= checkedAt,
            defaults.object(forKey: "silentCryAlarmMutedUntil") != nil {
             defaults.removeObject(forKey: "silentCryAlarmMutedUntil")
+            setting("local_mute_cleared", source: .serverResume)
             if enabled { status = "Alerts resumed. Existing notifications continue." }
         }
         guard !records.isEmpty else { return }
@@ -426,8 +441,12 @@ import UIKit
         }
         do {
             let active = Set(try AlarmManager.shared.alarms.map(\.id))
-            for record in obsolete where active.contains(record.episodeID) { try AlarmManager.shared.cancel(id: record.episodeID) }
-        } catch { trace("failed") }
+            for record in obsolete where active.contains(record.episodeID) {
+                try AlarmManager.shared.cancel(id: record.episodeID)
+                let reason = !server.paired ? "unpaired" : muted && record.isTest != true ? "server_muted" : "irrelevant"
+                (log ?? DiagnosticLog()).silentCryAlarmCancelled(episodeID: record.episodeID, eventID: record.eventID, reason: reason)
+            }
+        } catch { trace("failed", operation: "reconcile_cancel", error: error) }
     }
 
     /// Stopping or acknowledging a test ends its alarm without touching real ones.
@@ -435,19 +454,24 @@ import UIKit
         mergeExtensionAttempts()
         let ids = Set(records.filter { $0.isTest == true }.map(\.episodeID))
         guard !ids.isEmpty else { return }
-        do {
-            for alarm in try AlarmManager.shared.alarms where ids.contains(alarm.id) { try AlarmManager.shared.cancel(id: alarm.id) }
-        } catch { trace("failed") }
+        cancel(ids, reason: "test_stopped", operation: "cancel_tests")
     }
 
-    private func cancelAll() {
+    private func cancelAll(reason: String) {
         mergeExtensionAttempts()
         pendingReceipts = []
         guard !records.isEmpty else { return }
+        cancel(Set(records.map(\.episodeID)), reason: reason, operation: "cancel_all")
+    }
+
+    private func cancel(_ ids: Set<UUID>, reason: String, operation: String) {
         do {
-            let ids = Set(records.map(\.episodeID))
-            for alarm in try AlarmManager.shared.alarms where ids.contains(alarm.id) { try AlarmManager.shared.cancel(id: alarm.id) }
-        } catch { trace("failed") }
+            for alarm in try AlarmManager.shared.alarms where ids.contains(alarm.id) {
+                try AlarmManager.shared.cancel(id: alarm.id)
+                (log ?? DiagnosticLog()).silentCryAlarmCancelled(episodeID: alarm.id,
+                    eventID: records.first(where: { $0.episodeID == alarm.id })?.eventID, reason: reason)
+            }
+        } catch { trace("failed", operation: operation, error: error) }
     }
 
     private func queueSchedulingReceipt(_ request: SilentCryAlarmRequest) {
@@ -483,9 +507,60 @@ import UIKit
         (log ?? DiagnosticLog()).silentCryAlarmReceipt(phase: phase, episodeID: receipt.episodeID, eventID: receipt.eventID, cycleID: receipt.cycleID)
     }
 
-    private func trace(_ phase: String, _ eventID: UUID? = nil) {
+    private func trace(_ phase: String, _ eventID: UUID? = nil, operation: String? = nil, error: (any Error)? = nil) {
         (log ?? DiagnosticLog()).silentCryAlarm(phase: phase, eventID: eventID,
-            appActive: UIApplication.shared.applicationState == .active)
+            appActive: UIApplication.shared.applicationState == .active, operation: operation, error: error)
+    }
+
+    private func setting(_ change: String, source: ChangeSource, appWake: Bool? = nil, extensionMethod: Bool? = nil, reason: String? = nil) {
+        (log ?? DiagnosticLog()).silentCryAlarmSetting(change: change, source: source.rawValue, appWake: appWake, extensionMethod: extensionMethod, reason: reason)
+    }
+
+    nonisolated private static func sinceAlarmMS(_ record: Record) -> Int? {
+        record.alarmAt.map { Int(Date().timeIntervalSince($0) * 1000) }
+    }
+
+    // MARK: Alarm state
+
+    private var stateObserver: Task<Void, Never>?
+    private var observedStates: [UUID: String] = [:]
+
+    /// Logs AlarmKit state changes for alarms this app owns. Updates arrive only
+    /// while the app runs, so an alarm that alerts while it is suspended is seen
+    /// on the next launch or not at all; the system log (mobiletimerd) has the rest.
+    func observeAlarmStates() {
+        guard stateObserver == nil else { return }
+        stateObserver = Task { [weak self] in
+            for await alarms in AlarmManager.shared.alarmUpdates {
+                guard let self, !Task.isCancelled else { return }
+                self.logStates(alarms)
+            }
+        }
+    }
+
+    private func logStates(_ alarms: [Alarm]) {
+        mergeExtensionAttempts()
+        let owned = Dictionary(records.map { ($0.episodeID, $0) }, uniquingKeysWith: { $1 })
+        var current: [UUID: String] = [:]
+        for alarm in alarms where owned[alarm.id] != nil {
+            current[alarm.id] = switch alarm.state {
+            case .scheduled: "scheduled"
+            case .countdown: "countdown"
+            case .paused: "paused"
+            case .alerting: "alerting"
+            @unknown default: "unknown"
+            }
+        }
+        let appActive = UIApplication.shared.applicationState == .active
+        for (id, state) in current where observedStates[id] != state {
+            (log ?? DiagnosticLog()).silentCryAlarmState(episodeID: id, eventID: owned[id]?.eventID, state: state,
+                sinceAlarmMS: owned[id].flatMap(Self.sinceAlarmMS), appActive: appActive)
+        }
+        for id in observedStates.keys where current[id] == nil {
+            (log ?? DiagnosticLog()).silentCryAlarmState(episodeID: id, eventID: owned[id]?.eventID, state: "removed",
+                sinceAlarmMS: owned[id].flatMap(Self.sinceAlarmMS), appActive: appActive)
+        }
+        observedStates = current
     }
 
     // MARK: Shared state for the notification extension
@@ -516,6 +591,7 @@ import UIKit
         guard let directory = AlarmShared.directory else {
             (log ?? DiagnosticLog()).record("alarm_snapshot_unavailable"); return
         }
+        AlarmShared.writeLockProbe(to: directory)
         // Remember only a saved state, so a failed write is retried on the next change or sync.
         do {
             try snapshot.save(to: directory); lastSnapshot = unstamped
@@ -525,27 +601,71 @@ import UIKit
     /// Adopt alarms the extension scheduled, so Stop, acknowledgement and cleanup
     /// find them, and apply any Stop iOS ran in the extension.
     private func mergeExtensionAttempts() {
-        let key = "alarmExtensionMergedThrough"
-        let mergedThrough = defaults.object(forKey: key) as? Date ?? .distantPast
-        let new = (AlarmJournal.forMethod(.extension)?.read() ?? []).filter { $0.finishedAt > mergedThrough }
-        guard let latest = new.map(\.finishedAt).max() else { return }
-        defaults.set(latest, forKey: key) // Before applying, so a nested call finds nothing new.
+        // Entries are tracked by key for a window behind the newest one, so an entry
+        // written after a later-finishing one is still merged, exactly once.
+        let floorKey = "alarmExtensionMergedThrough", keysKey = "alarmExtensionMergedKeys"
+        let floor = defaults.object(forKey: floorKey) as? Date ?? .distantPast
+        let entries: [AlarmAttempt]
+        do { entries = try AlarmJournal.forMethod(.extension)?.entries() ?? [] }
+        catch { (log ?? DiagnosticLog()).record("alarm_journal_failed", error: error); return }
+        var merged = Set(defaults.stringArray(forKey: keysKey) ?? [])
+        let new = entries.filter { $0.finishedAt > floor && !merged.contains($0.key) }
+        guard !new.isEmpty else { return }
+        // Saved before applying, so a nested call finds nothing new.
+        merged.formUnion(new.map(\.key))
+        let window = (entries.map(\.finishedAt).max() ?? floor).addingTimeInterval(-600)
+        let newFloor = max(floor, window)
+        defaults.set(newFloor, forKey: floorKey)
+        defaults.set(entries.filter { $0.finishedAt > newFloor && merged.contains($0.key) }.map(\.key), forKey: keysKey)
         var saved = records, stopped: [UUID] = []
         for attempt in new {
             (log ?? DiagnosticLog()).alarmAttempt(attempt)
             guard let episodeID = attempt.episodeID else { continue }
             if attempt.outcome == .scheduled, let eventID = attempt.eventID, !saved.contains(where: { $0.episodeID == episodeID }) {
                 saved.append(Record(episodeID: episodeID, eventID: eventID, snoozeDuration: snoozeDuration,
-                                    scheduledAt: attempt.finishedAt, isTest: attempt.isTest ? true : nil))
+                                    scheduledAt: attempt.finishedAt, isTest: attempt.isTest ? true : nil, alarmAt: attempt.alarmAt))
             }
             if attempt.outcome == .stopped { stopped.append(episodeID) }
         }
         records = Array(saved.suffix(64))
+        queueUpload(new)
         for episodeID in stopped {
-            if let record = records.first(where: { $0.episodeID == episodeID }), record.isTest != true {
+            let record = records.first(where: { $0.episodeID == episodeID })
+            (log ?? DiagnosticLog()).silentCryAlarmStop(episodeID: episodeID, eventID: record?.eventID, isTest: record.map { $0.isTest == true },
+                sinceAlarmMS: record.flatMap(Self.sinceAlarmMS), appActive: UIApplication.shared.applicationState == .active)
+            if let record, record.isTest != true {
                 snoozeLocally(eventID: record.eventID, duration: record.snoozeDuration)
             }
         }
+    }
+
+    // MARK: Attempt reports to the service
+
+    private let uploadKey = "alarmAttemptsPendingUpload"
+    private var uploadingAttempts = false
+
+    private func queueUpload(_ attempts: [AlarmAttempt]) {
+        guard !attempts.isEmpty else { return }
+        let pending = (defaults.data(forKey: uploadKey).flatMap { try? JSONDecoder().decode([AlarmAttempt].self, from: $0) } ?? []) + attempts
+        defaults.set(try? JSONEncoder().encode(Array(pending.suffix(40))), forKey: uploadKey)
+    }
+
+    /// Foreground only, so it never spends a background wake. Reports are
+    /// diagnostics: a rejected batch is dropped, never retried forever.
+    private func uploadAttempts(using client: any BackendServing) async {
+        guard !uploadingAttempts, UIApplication.shared.applicationState == .active,
+              let pending = defaults.data(forKey: uploadKey).flatMap({ try? JSONDecoder().decode([AlarmAttempt].self, from: $0) }),
+              !pending.isEmpty else { return }
+        uploadingAttempts = true; defer { uploadingAttempts = false }
+        let batch = Array(pending.prefix(20))
+        do { try await client.reportAlarmAttempts(batch) }
+        catch BackendError.response(let status, _) where (400..<500).contains(status) && status != 429 {
+            (log ?? DiagnosticLog()).record("alarm_attempts_upload_discarded", code: status)
+        } catch { return }
+        let keys = Set(batch.map(\.key))
+        let remaining = (defaults.data(forKey: uploadKey).flatMap { try? JSONDecoder().decode([AlarmAttempt].self, from: $0) } ?? [])
+            .filter { !keys.contains($0.key) }
+        defaults.set(try? JSONEncoder().encode(remaining), forKey: uploadKey)
     }
 
     private func journal(_ outcome: AlarmAttempt.Outcome, reason: String?, eventID: UUID?, episodeID: UUID?, isTest: Bool,
@@ -553,8 +673,10 @@ import UIKit
         let attempt = AlarmAttempt(method: .app, outcome: outcome, reason: reason, eventID: eventID, episodeID: episodeID,
             isTest: isTest, flags: callback.flags, pushCreatedAt: pushCreatedAt, startedAt: callback.receivedAt,
             finishedAt: Date(), alarmAt: alarmAt, conditions: Self.conditions())
-        AlarmJournal.forMethod(.app)?.append(attempt)
+        do { try AlarmJournal.forMethod(.app)?.append(attempt) }
+        catch { (log ?? DiagnosticLog()).record("alarm_journal_failed", error: error) }
         (log ?? DiagnosticLog()).alarmAttempt(attempt)
+        queueUpload([attempt])
     }
 
     static func conditions() -> AlarmAttempt.Conditions {

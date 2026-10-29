@@ -17,8 +17,13 @@ const databaseMetrics=['calls','completed','errors','statements','sql_ms','rows_
 interface StatementMetrics {index:number;sql_ms?:number;attempts?:number;colo?:string;region?:string;primary?:boolean}
 type DatabaseMetrics=Partial<Record<typeof databaseMetrics[number],number>> & {statement_meta?:StatementMetrics[]};
 const regions=['WNAM','ENAM','WEUR','EEUR','APAC','OC'];
+export interface AlarmAttemptDetails {
+ method:'app'|'extension';outcome:'scheduled'|'duplicate'|'rejected'|'failed'|'stopped'|'timed_out';reason?:string;test?:boolean;
+ flags?:('wake'|'extension')[];push_to_start_ms?:number;handler_ms?:number;push_to_alarm_ms?:number;snapshot_age_ms?:number;
+ evidence_applied?:boolean;charging?:boolean;battery_pct?:number;low_power?:boolean;app_active?:boolean;protected_data?:boolean;started_at_ms?:number;
+}
 export interface TimingDetails {
- alarm_wake_requested?:boolean;alarm_extension_requested?:boolean;
+ alarm_wake_requested?:boolean;alarm_extension_requested?:boolean;alarm_attempt?:AlarmAttemptDetails;
  spans?:Partial<Record<Span,number>>;
  db_stages?:Partial<Record<Span,DatabaseMetrics>>;
  db_calls?:number; db_sql_ms?:number; db_rows_read?:number; db_rows_written?:number; db_attempts?:number;
@@ -223,11 +228,23 @@ export class Latency {
  }
 }
 // Enforce the privacy boundary even if a future caller passes extra properties.
+function safeAlarmAttempt(a:AlarmAttemptDetails):Record<string,unknown> {
+ const safe:Record<string,unknown>={method:a.method==='extension'?'extension':'app',
+  outcome:['scheduled','duplicate','rejected','failed','stopped','timed_out'].includes(a.outcome)?a.outcome:'failed'};
+ if(typeof a.reason==='string'&&/^[a-z_+]{1,64}$/.test(a.reason))safe.reason=a.reason;
+ if(Array.isArray(a.flags))safe.flags=a.flags.filter(f=>f==='wake'||f==='extension');
+ for(const name of ['push_to_start_ms','handler_ms','push_to_alarm_ms','snapshot_age_ms','battery_pct','started_at_ms'] as const){
+  const n=a[name];if(typeof n==='number'&&Number.isFinite(n)&&Math.abs(n)<=1e15)safe[name]=Math.round(n);
+ }
+ for(const name of ['test','evidence_applied','charging','low_power','app_active','protected_data'] as const)if(typeof a[name]==='boolean')safe[name]=a[name];
+ return safe;
+}
 export function safeTimingDetails(value:TimingDetails|undefined):string|null {
  if(!value)return null;
  const safe:Record<string,unknown>={};
  if(typeof value.alarm_wake_requested==='boolean')safe.alarm_wake_requested=value.alarm_wake_requested;
  if(typeof value.alarm_extension_requested==='boolean')safe.alarm_extension_requested=value.alarm_extension_requested;
+ if(value.alarm_attempt)safe.alarm_attempt=safeAlarmAttempt(value.alarm_attempt);
  const number=(n:unknown)=>typeof n==='number'&&Number.isFinite(n)&&n>=0&&n<=1e15;
  const times:Record<string,number>={};
  for(const name of spans){const n=value.spans?.[name];if(number(n))times[name]=Math.round(n!*1000)/1000;}
