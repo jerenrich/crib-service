@@ -127,9 +127,12 @@ export async function saveWatchPushToken(env:Env,device:Device,value:Record<stri
 export async function saveSilentWatchAlarms(env:Env,device:Device,value:Record<string,unknown>) {
  requireRole(device,'parent');
  if(typeof value.enabled!=='boolean')throw new APIError(400,'Choose whether silent Watch alarms are enabled.');
+ // Optional delivery methods; older apps omit them and keep the stored choice.
+ for(const key of ['appWake','extension'])if(value[key]!==undefined&&typeof value[key]!=='boolean')throw new APIError(400,'Invalid alarm delivery method.');
  if(value.enabled&&!await pairFor(env,device))throw new APIError(409,'Pair a Listener first.');
  if(value.enabled&&!device.push_token)throw new APIError(409,'Enable notifications on the Parent iPhone first.');
- await env.DB.batch([env.DB.prepare('DELETE FROM silent_alarm_cycles WHERE parent_id=? AND EXISTS(SELECT 1 FROM devices WHERE id=? AND silent_watch_alarms!=?)').bind(device.id,device.id,Number(value.enabled)),
-  env.DB.prepare('UPDATE devices SET silent_watch_alarms=? WHERE id=?').bind(Number(value.enabled),device.id)]);
+ const appWake=value.appWake===undefined?null:Number(value.appWake),extension=value.extension===undefined?null:Number(value.extension);
+ await env.DB.batch([env.DB.prepare('DELETE FROM silent_alarm_cycles WHERE parent_id=? AND EXISTS(SELECT 1 FROM devices WHERE id=? AND (silent_watch_alarms!=? OR alarm_app_wake!=COALESCE(?,alarm_app_wake)))').bind(device.id,device.id,Number(value.enabled),appWake),
+  env.DB.prepare('UPDATE devices SET silent_watch_alarms=?,alarm_app_wake=COALESCE(?,alarm_app_wake),alarm_extension=COALESCE(?,alarm_extension) WHERE id=?').bind(Number(value.enabled),appWake,extension,device.id)]);
  return {ok:true};
 }

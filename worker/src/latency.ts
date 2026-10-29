@@ -18,7 +18,7 @@ interface StatementMetrics {index:number;sql_ms?:number;attempts?:number;colo?:s
 type DatabaseMetrics=Partial<Record<typeof databaseMetrics[number],number>> & {statement_meta?:StatementMetrics[]};
 const regions=['WNAM','ENAM','WEUR','EEUR','APAC','OC'];
 export interface TimingDetails {
- alarm_wake_requested?:boolean;
+ alarm_wake_requested?:boolean;alarm_extension_requested?:boolean;
  spans?:Partial<Record<Span,number>>;
  db_stages?:Partial<Record<Span,DatabaseMetrics>>;
  db_calls?:number; db_sql_ms?:number; db_rows_read?:number; db_rows_written?:number; db_attempts?:number;
@@ -227,6 +227,7 @@ export function safeTimingDetails(value:TimingDetails|undefined):string|null {
  if(!value)return null;
  const safe:Record<string,unknown>={};
  if(typeof value.alarm_wake_requested==='boolean')safe.alarm_wake_requested=value.alarm_wake_requested;
+ if(typeof value.alarm_extension_requested==='boolean')safe.alarm_extension_requested=value.alarm_extension_requested;
  const number=(n:unknown)=>typeof n==='number'&&Number.isFinite(n)&&n>=0&&n<=1e15;
  const times:Record<string,number>={};
  for(const name of spans){const n=value.spans?.[name];if(number(n))times[name]=Math.round(n!*1000)/1000;}

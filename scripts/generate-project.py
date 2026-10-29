@@ -72,9 +72,36 @@ watchProxy = obj('proxy'+watchName, fields(isa='PBXContainerItemProxy', containe
 watchDependency = obj('dep'+watchName, fields(isa='PBXTargetDependency', target=uid('target'+watchName), targetProxy=watchProxy))
 watchEmbed = obj('embedWatchProduct', fields(isa='PBXBuildFile', fileRef=watchProduct, settings='{ ATTRIBUTES = (RemoveHeadersOnCopy,); }'))
 watchEmbedPhase = obj('embedWatch', fields(isa='PBXCopyFilesBuildPhase', buildActionMask='2147483647', dstPath=q('$(CONTENTS_FOLDER_PATH)/Watch'), dstSubfolderSpec='16', files=array([watchEmbed]), name=q('Embed Watch Content'), runOnlyForDeploymentPostprocessing='0'))
+# Notification service extension: schedules the AlarmKit alarm on push delivery.
+# It compiles only Foundation models plus the shared alarm definition.
+nseName = 'BabyCryNotificationService'
+nseFiles = sorted((ios/nseName).glob('*.swift')) + [ios/'BabyCryMonitor/Models/AlarmShared.swift', ios/'BabyCryMonitor/Models/SilentCryAlarmRequest.swift', ios/'BabyCryMonitor/Models/NotificationRelevance.swift', ios/'BabyCryMonitor/Models/Models.swift', ios/'BabyCryMonitor/Models/Timeline.swift', ios/'BabyCryMonitor/Notifications/SilentAlarmScheduling.swift', ios/nseName/'Info.plist', ios/nseName/'BabyCryNotificationService.entitlements']
+nseFiles += sorted((ios/'BabyCryMonitor/Resources').glob('*.caf'))
+nseRefs = []; nseSources = []; nseResources = []
+for path in nseFiles:
+    rel = path.relative_to(ios).as_posix()
+    filetype = {'swift':'sourcecode.swift', 'plist':'text.plist.xml', 'entitlements':'text.plist.entitlements', 'caf':'file'}[path.suffix[1:]]
+    ref = obj('file'+rel, fields(isa='PBXFileReference', lastKnownFileType=filetype, path=q(rel), sourceTree=q('<group>')))
+    if rel.startswith(nseName+'/'): nseRefs.append(ref)
+    if path.suffix == '.swift': nseSources.append(obj('nsebuild'+rel, fields(isa='PBXBuildFile', fileRef=ref)))
+    elif path.suffix == '.caf': nseResources.append(obj('nsebuild'+rel, fields(isa='PBXBuildFile', fileRef=ref)))
+refs.append(obj('group'+nseName, fields(isa='PBXGroup', name=nseName, children=array(nseRefs), sourceTree=q('<group>'))))
+nseProduct = obj('product'+nseName, fields(isa='PBXFileReference', explicitFileType='wrapper.app-extension', includeInIndex='0', path=q(nseName+'.appex'), sourceTree='BUILT_PRODUCTS_DIR'))
+products.append(nseProduct)
+nsePhases = [obj('sources'+nseName, fields(isa='PBXSourcesBuildPhase', buildActionMask='2147483647', files=array(nseSources), runOnlyForDeploymentPostprocessing='0')), obj('frameworks'+nseName, fields(isa='PBXFrameworksBuildPhase', buildActionMask='2147483647', files='()', runOnlyForDeploymentPostprocessing='0')), obj('resources'+nseName, fields(isa='PBXResourcesBuildPhase', buildActionMask='2147483647', files=array(nseResources), runOnlyForDeploymentPostprocessing='0'))]
+nseConfigs = []
+for mode in ['Debug', 'Release']:
+    settings = dict(PRODUCT_NAME=q('$(TARGET_NAME)'), PRODUCT_BUNDLE_IDENTIFIER=q('com.jordanerenrich.cribservice.notificationservice'), SWIFT_VERSION='6.0', SWIFT_STRICT_CONCURRENCY='complete', IPHONEOS_DEPLOYMENT_TARGET='26.0', TARGETED_DEVICE_FAMILY='1', CODE_SIGN_STYLE='Automatic', GENERATE_INFOPLIST_FILE='NO', INFOPLIST_FILE=q(nseName+'/Info.plist'), CODE_SIGN_ENTITLEMENTS=q(nseName+'/BabyCryNotificationService.entitlements'), CURRENT_PROJECT_VERSION='1', MARKETING_VERSION='1.0', SKIP_INSTALL='YES', APPLICATION_EXTENSION_API_ONLY='YES', SWIFT_OPTIMIZATION_LEVEL=q('-Onone' if mode=='Debug' else '-O'), SWIFT_ACTIVE_COMPILATION_CONDITIONS=q('ALARM_EXTENSION DEBUG $(inherited)' if mode=='Debug' else 'ALARM_EXTENSION $(inherited)'), LD_RUNPATH_SEARCH_PATHS=q('$(inherited) @executable_path/Frameworks @executable_path/../../Frameworks'))
+    nseConfigs.append(obj('targetconfig'+nseName+mode, fields(isa='XCBuildConfiguration', baseConfigurationReference=configRefs[mode], buildSettings=fields(**settings), name=mode)))
+nseConfigList = obj('targetconfigs'+nseName, fields(isa='XCConfigurationList', buildConfigurations=array(nseConfigs), defaultConfigurationIsVisible='0', defaultConfigurationName='Release'))
+targets.append(obj('target'+nseName, fields(isa='PBXNativeTarget', buildConfigurationList=nseConfigList, buildPhases=array(nsePhases), buildRules='()', dependencies='()', name=nseName, productName=nseName, productReference=nseProduct, productType=q('com.apple.product-type.app-extension'))))
+nseProxy = obj('proxy'+nseName, fields(isa='PBXContainerItemProxy', containerPortal=uid('project'), proxyType='1', remoteGlobalIDString=uid('target'+nseName), remoteInfo=nseName))
+nseDependency = obj('dep'+nseName, fields(isa='PBXTargetDependency', target=uid('target'+nseName), targetProxy=nseProxy))
+nseEmbed = obj('embedNSEProduct', fields(isa='PBXBuildFile', fileRef=nseProduct, settings='{ ATTRIBUTES = (RemoveHeadersOnCopy,); }'))
+nseEmbedPhase = obj('embedNSE', fields(isa='PBXCopyFilesBuildPhase', buildActionMask='2147483647', dstPath=q(''), dstSubfolderSpec='13', files=array([nseEmbed]), name=q('Embed App Extensions'), runOnlyForDeploymentPostprocessing='0'))
 phoneTarget = objects[uid('targetBabyCryMonitor')]
 phonePhases = array([uid('sourcesBabyCryMonitor'), uid('frameworksBabyCryMonitor'), uid('resourcesBabyCryMonitor')])
-objects[uid('targetBabyCryMonitor')] = phoneTarget.replace('buildPhases = '+phonePhases, 'buildPhases = '+array([uid('sourcesBabyCryMonitor'), uid('frameworksBabyCryMonitor'), uid('resourcesBabyCryMonitor'), watchEmbedPhase])).replace('dependencies = ()', 'dependencies = '+array([watchDependency]))
+objects[uid('targetBabyCryMonitor')] = phoneTarget.replace('buildPhases = '+phonePhases, 'buildPhases = '+array([uid('sourcesBabyCryMonitor'), uid('frameworksBabyCryMonitor'), uid('resourcesBabyCryMonitor'), watchEmbedPhase, nseEmbedPhase])).replace('dependencies = ()', 'dependencies = '+array([watchDependency, nseDependency]))
 # Isolated watch-only latency probe. Never embed it in the iOS application or
 # declare an iOS companion: removing that relationship is the experimental variable.
 probeName = 'WatchLatencyProbe'

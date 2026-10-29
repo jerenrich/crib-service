@@ -795,6 +795,13 @@ import UIKit
         return response.session
     }
 
+    func setAlarmMethods(appWake: Bool, extensionMethod: Bool) async {
+        guard role == .parent, #available(iOS 26.0, *) else { return }
+        do {
+            let backend = try await registeredClient()
+            await SilentCryAlarmService.shared.setMethods(appWake: appWake, extensionMethod: extensionMethod, using: backend)
+        } catch { SilentCryAlarmService.shared.settingUnavailable() }
+    }
     func setSilentWatchAlarms(_ enabled: Bool) async {
         guard role == .parent else { return }
         if #available(iOS 26.0, *) {

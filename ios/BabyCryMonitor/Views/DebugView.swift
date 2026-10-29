@@ -41,6 +41,7 @@ struct DebugView: View {
                     if let status = model.testPushStatus { Text(status).font(.footnote) }
                 }
             }
+            if model.role == .parent { AlarmAttemptsSection() }
             if model.role == .parent {
                 Section("Background benchmark · Optional") {
                     Text(model.log.benchmark.enabled ? "Recording · Stops automatically after 24 hours" : "Not recording")
@@ -151,5 +152,40 @@ struct DebugView: View {
             }
         }.accessibilityIdentifier("diagnosticsForm").navigationTitle("Diagnostics")
             .onDisappear { model.stopWatchTest() }
+    }
+}
+
+/// Both alarm methods' recent attempts, newest first, with their delays.
+private struct AlarmAttemptsSection: View {
+    @State private var attempts: [AlarmAttempt] = []
+    var body: some View {
+        Section {
+            if attempts.isEmpty { Text("No alarm attempts recorded yet.").foregroundStyle(.secondary) }
+            ForEach(Array(attempts.prefix(30).enumerated()), id: \.offset) { _, attempt in
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("\(attempt.startedAt.formatted(date: .omitted, time: .standard)) · \(attempt.method == .app ? "App wake" : "Extension") · \(attempt.outcome.rawValue)\(attempt.reason.map { " (\($0))" } ?? "")")
+                        .font(.footnote.weight(.semibold))
+                    Text(detail(attempt)).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            Button("Refresh") { load() }
+        } header: { Text("Recent alarm attempts") } footer: {
+            Text("Push → start is measured from the service's clock. Alarm = when the alarm was set to go off, measured from the push. Wrist taps are not measured.")
+        }
+        .onAppear { load() }
+    }
+    private func detail(_ a: AlarmAttempt) -> String {
+        var parts = [a.isTest ? "test" : "real", "push → start \(a.pushToStartMS.map { "\($0) ms" } ?? "?")", "handler \(a.handlerMS) ms"]
+        if let alarm = a.pushToAlarmMS { parts.append("alarm at +\(alarm) ms") }
+        parts.append("flags \(a.flags.isEmpty ? "none" : a.flags.joined(separator: "+"))")
+        if let charging = a.conditions.charging { parts.append(charging ? "charging" : "on battery") }
+        if let level = a.conditions.batteryLevel { parts.append("\(Int(level * 100))%") }
+        if a.conditions.lowPower { parts.append("Low Power") }
+        if let active = a.conditions.appActive { parts.append(active ? "app open" : "app in background") }
+        return parts.joined(separator: " · ")
+    }
+    private func load() {
+        attempts = ((AlarmJournal.forMethod(.app)?.read() ?? []) + (AlarmJournal.forMethod(.extension)?.read() ?? []))
+            .sorted { $0.startedAt > $1.startedAt }
     }
 }

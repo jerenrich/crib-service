@@ -15,7 +15,7 @@ export function reserveAlarmRequest(env:Env,eventId:string,claimId:string,now:nu
   SELECT e.parent_id,e.episode_id,e.listener_id,p.created_at,d.alerts_muted_until,?,?,?,1,?,json_array(e.event_id)
   FROM events e JOIN devices d ON d.id=e.parent_id JOIN pairs p ON p.parent_id=e.parent_id AND p.listener_id=e.listener_id
   WHERE e.event_id=? AND e.claim_id=? AND e.status='sending' AND e.acknowledged_at IS NULL AND e.resolved_at IS NULL
-  AND d.silent_watch_alarms=1 AND d.alarm_receipts_version=1 AND d.push_token IS NOT NULL AND d.alerts_muted_until<=?
+  AND d.silent_watch_alarms=1 AND d.alarm_app_wake=1 AND d.alarm_receipts_version=1 AND d.push_token IS NOT NULL AND d.alerts_muted_until<=?
   AND COALESCE(json_extract(e.payload,'$.isTest'),0)=0 AND COALESCE(e.delivery_mode,'')!='watch_only'
   AND (e.delivery_state IS NULL OR json_extract(e.delivery_state,'$.phone') IN ('pending','blocked'))
   ON CONFLICT(parent_id,episode_id) DO UPDATE SET

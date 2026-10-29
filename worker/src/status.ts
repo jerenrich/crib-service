@@ -54,7 +54,7 @@ export async function listenerStatus(env:Env,device:Device,latency=new Latency()
  // reduces database/connection pressure from ordinary status polling.
  const snapshot=await latency.db<unknown>('status_snapshot_ms',()=>env.DB.batch([
   env.DB.prepare('SELECT * FROM heartbeats WHERE listener_id=?').bind(pair.listener_id),
-  env.DB.prepare('SELECT d.config,d.push_token,d.watch_push_token,d.connection_alerts,d.alerts_muted_until,d.silent_watch_alarms FROM devices d JOIN pairs p ON p.parent_id=d.id WHERE p.parent_id=? AND p.listener_id=? AND p.created_at=?').bind(pair.parent_id,pair.listener_id,pair.created_at),
+  env.DB.prepare('SELECT d.config,d.push_token,d.watch_push_token,d.connection_alerts,d.alerts_muted_until,d.silent_watch_alarms,d.alarm_app_wake,d.alarm_extension FROM devices d JOIN pairs p ON p.parent_id=d.id WHERE p.parent_id=? AND p.listener_id=? AND p.created_at=?').bind(pair.parent_id,pair.listener_id,pair.created_at),
   env.DB.prepare('SELECT payload,status,sent_at,acknowledged_at,resolved_at,push_target,delivery_state FROM events WHERE parent_id=? ORDER BY created_at DESC LIMIT 100').bind(pair.parent_id),
   env.DB.prepare('SELECT * FROM monitoring_commands WHERE parent_id=? AND listener_id=? AND pair_created_at=? ORDER BY sequence DESC LIMIT 1').bind(pair.parent_id,pair.listener_id,pair.created_at),
   env.DB.prepare(`SELECT DISTINCT CASE WHEN COALESCE(json_extract(payload,'$.isTest'),0)=1 THEN event_id ELSE episode_id END AS id,
@@ -62,7 +62,7 @@ export async function listenerStatus(env:Env,device:Device,latency=new Latency()
    .bind(pair.parent_id,pair.listener_id)
  ]));
  const last=snapshot[0].results[0] as {received_at:string;metadata:string}|undefined;
- const parent=snapshot[1].results[0] as {config:string;push_token:string|null;watch_push_token:string|null;connection_alerts:number;alerts_muted_until:number;silent_watch_alarms:number}|undefined;
+ const parent=snapshot[1].results[0] as {config:string;push_token:string|null;watch_push_token:string|null;connection_alerts:number;alerts_muted_until:number;silent_watch_alarms:number;alarm_app_wake:number;alarm_extension:number}|undefined;
  // Reject a pairing changed between lookup and this consistent snapshot.
  if(!parent)return unpaired();
  const events=snapshot[2] as D1Result<{payload:string;status:string;sent_at:string|null;acknowledged_at:string|null;resolved_at:string|null;push_target:string|null;delivery_state:string|null}>;
@@ -77,6 +77,7 @@ export async function listenerStatus(env:Env,device:Device,latency=new Latency()
  serverTime:new Date().toISOString(),nextHeartbeatExpectedAt,monitoringCommand,
  watchPushRegistered:parent?.watch_push_token!=null,phonePushRegistered:parent?.push_token!=null,
  silentWatchAlarmsEnabled:parent?.silent_watch_alarms===1,
+ alarmMethods:{appWake:parent?.alarm_app_wake!==0,extension:parent?.alarm_extension===1},
  alertsMutedUntil:parent?.alerts_muted_until?new Date(parent.alerts_muted_until).toISOString():null,
  connectionAlertsEnabled:parent?.connection_alerts===1,listenerConfiguration:metadata?.appliedConfiguration?configuration({...metadata.appliedConfiguration}):null,
  notificationRelevance:relevant.results.length>1000?null:{cryEpisodeIDs:relevant.results.filter(e=>!e.test).map(e=>e.id),testEventIDs:relevant.results.filter(e=>e.test).map(e=>e.id)},

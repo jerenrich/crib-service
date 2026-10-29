@@ -42,6 +42,7 @@ struct SilentCryAlarmRequest: Sendable {
         case staleStatus = "stale_status"
         case budgetExpired = "budget_expired"
         case locallyMuted = "locally_muted", stopped, unauthorized, missingAsset = "missing_asset"
+        case methodDisabled = "method_disabled", noSnapshot = "no_snapshot"
     }
     enum Source: String { case foregroundNotification = "foreground_notification", remoteNotification = "remote_notification" }
     enum Stage: String { case callback, preflight, acknowledgements, status, eligibility, alarmLookup = "alarm_lookup", schedule, cancel }
@@ -56,8 +57,9 @@ struct SilentCryAlarmRequest: Sendable {
         let rejection: Rejection?
         let receivedAt: Date
         let start: ContinuousClock.Instant
+        let flags: [String]
         init(payload: [AnyHashable: Any], now: Date = Date()) {
-            receivedAt = now; start = .now
+            receivedAt = now; start = .now; flags = AlarmAttempt.flags(in: payload)
             eventID = (payload["eventId"] as? String).flatMap(UUID.init(uuidString:))
             episodeID = (payload["episodeId"] as? String).flatMap(UUID.init(uuidString:))
             request = SilentCryAlarmRequest(payload: payload, now: now)
@@ -90,7 +92,8 @@ struct SilentCryAlarmRequest: Sendable {
     }
 
     private static func parse(_ payload: [AnyHashable: Any], now: Date) -> Result<(UUID, UUID, Date), Rejection> {
-        guard payload["silentCryAlarm"] as? Bool == true else { return .failure(.notRequested) }
+        // Either delivery method's marker: the app wake or the notification extension.
+        guard payload["silentCryAlarm"] as? Bool == true || payload["alarmExtension"] as? Bool == true else { return .failure(.notRequested) }
         if let cycle = payload["alarmCycleId"], (cycle as? String).flatMap(UUID.init(uuidString:)) == nil { return .failure(.malformed) }
         guard let event = payload["eventId"] as? String, let eventID = UUID(uuidString: event),
               let episode = payload["episodeId"] as? String, let episodeID = UUID(uuidString: episode),
@@ -142,7 +145,7 @@ struct SilentCryAlarmRequest: Sendable {
         return nil
     }
 
-    struct ServerEvidence: Codable, Sendable {
+    struct ServerEvidence: Codable, Equatable, Sendable {
         let observedAt: Date
         let paired: Bool
         let enabled: Bool?

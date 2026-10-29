@@ -194,6 +194,18 @@ import Observation
         append("silent_cry_alarm phase=\(phase) app_active=\(appActive)" + (eventID.map { " event_id=\($0.uuidString.lowercased())" } ?? ""))
     }
     #if os(iOS)
+    /// One line per AlarmKit attempt by either method, for comparing delays.
+    func alarmAttempt(_ a: AlarmAttempt) {
+        func ms(_ value: Int?) -> String { value.map(String.init) ?? "unknown" }
+        func flag(_ value: Bool?) -> String { value.map { $0 ? "true" : "false" } ?? "unknown" }
+        let ids = (a.eventID.map { " event_id=\($0.uuidString.lowercased())" } ?? "") + (a.episodeID.map { " episode_id=\($0.uuidString.lowercased())" } ?? "")
+        append("alarm_attempt method=\(a.method.rawValue) outcome=\(a.outcome.rawValue)" + (a.reason.map { " reason=\($0)" } ?? "")
+            + ids + " test=\(a.isTest) flags=\(a.flags.isEmpty ? "none" : a.flags.joined(separator: "+"))"
+            + " push_to_start_ms=\(ms(a.pushToStartMS)) handler_ms=\(a.handlerMS) push_to_alarm_ms=\(ms(a.pushToAlarmMS))"
+            + " charging=\(flag(a.conditions.charging)) battery=\(a.conditions.batteryLevel.map { String(Int($0 * 100)) } ?? "unknown")"
+            + " low_power=\(a.conditions.lowPower) app_active=\(flag(a.conditions.appActive)) protected_data=\(flag(a.conditions.protectedDataAvailable))"
+            + " started_at=\(ISO8601DateFormatter().string(from: a.startedAt))")
+    }
     func silentCryAlarmAttempt(phase: String, stage: SilentCryAlarmRequest.Stage, source: SilentCryAlarmRequest.Source,
                                attemptID: UUID, eventID: UUID?, episodeID: UUID? = nil,
                                reason: SilentCryAlarmRequest.Rejection? = nil, elapsedMS: Int,

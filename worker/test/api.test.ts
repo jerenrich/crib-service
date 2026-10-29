@@ -2404,6 +2404,42 @@ describe('optional overnight silent Watch alarms',()=>{
    expect(phoneEntered).toBe(true);expect(pushRequests).toHaveLength(2);expect(state?.watch).toBe('sent');
   }finally{release();await running;await Promise.all(jobs);}
  });
+ it('offers the notification extension on every phone alert and gates the app wake independently',async()=>{
+  const {parent,listener}=await receiptSetup(),base=Date.now(),clock=vi.spyOn(Date,'now').mockReturnValue(base);
+  expect((await call('silent-watch-alarms',parent,{enabled:true,appWake:false,extension:true})).status).toBe(200);
+  const status=await (await call('listener/status',parent,undefined,'GET')).json() as {alarmMethods:{appWake:boolean;extension:boolean}};
+  expect(status.alarmMethods).toEqual({appWake:false,extension:true});
+  await call('listener/event',listener,alert(listener));
+  for(const seconds of [5,30,60]){clock.mockReturnValue(base+seconds*1000);await runReminder(testEnv,parent.deviceId);}
+  expect(phoneBodies()).toHaveLength(4);
+  for(const body of phoneBodies()){
+   expect(body.alarmExtension).toBe(true);expect(body.aps['mutable-content']).toBe(1);
+   expect(body.silentCryAlarm).toBeUndefined();expect(body.aps['content-available']).toBeUndefined();
+   expect(body.aps.sound).toBe('default');
+  }
+  for(const request of pushRequests.filter(r=>new Headers(r.init?.headers).get('apns-topic')!.endsWith('.watchkitapp'))){
+   const body=JSON.parse(String(request.init?.body));
+   expect(body.alarmExtension).toBeUndefined();expect(body.aps['mutable-content']).toBeUndefined();
+  }
+  expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM silent_alarm_cycles').first<{n:number}>()).toEqual({n:0});
+ });
+ it('sends both markers when both methods are selected and keeps stored methods for older apps',async()=>{
+  const {parent,listener}=await receiptSetup();
+  expect((await call('silent-watch-alarms',parent,{enabled:true,appWake:true,extension:true})).status).toBe(200);
+  expect((await call('silent-watch-alarms',parent,{enabled:true})).status).toBe(200);
+  expect((await call('silent-watch-alarms',parent,{enabled:true,extension:'yes'})).status).toBe(400);
+  await call('listener/event',listener,alert(listener));
+  const [initial]=phoneBodies();
+  expect(initial).toMatchObject({silentCryAlarm:true,alarmExtension:true,aps:{'content-available':1,'mutable-content':1,sound:'default'}});
+ });
+ it('defaults to the app wake only',async()=>{
+  const {parent,listener}=await receiptSetup();
+  const status=await (await call('listener/status',parent,undefined,'GET')).json() as {alarmMethods:{appWake:boolean;extension:boolean}};
+  expect(status.alarmMethods).toEqual({appWake:true,extension:false});
+  await call('listener/event',listener,alert(listener));
+  const [initial]=phoneBodies();
+  expect(initial.silentCryAlarm).toBe(true);expect(initial.alarmExtension).toBeUndefined();expect(initial.aps['mutable-content']).toBeUndefined();
+ });
  it('adds processing to the existing phone notification without duplicating it when Watch routing is absent',async()=>{
   const {parent,listener}=await setup();await call('device/watch-push-token',parent,{token:null});
   await call('silent-watch-alarms',parent,{enabled:true});fanout();
@@ -3200,6 +3236,17 @@ describe('configurable delayed alert tests',()=>{
    expect(wake.body.configuredAlertTest).toBe(true);expect(wake.body.alarmCycleId).toBeUndefined();
    expect(wake.headers.get('apns-collapse-id')).toMatch(/^alarm:/);
   }
+ });
+ it('applies the Parent alarm methods to AlarmKit tests and refuses when none is selected',async()=>{
+  const {parent,listener,stub}=await setup();
+  expect((await call('silent-watch-alarms',parent,{enabled:true,appWake:false,extension:false})).status).toBe(200);
+  expect((await call('alert-test',listener,{id:crypto.randomUUID(),configuration:options({alarmKit:true})})).status).toBe(409);
+  expect((await call('silent-watch-alarms',parent,{enabled:true,appWake:false,extension:true})).status).toBe(200);
+  expect((await call('alert-test',listener,{id:crypto.randomUUID(),configuration:options({phone:false,watch:false,alarmKit:true})})).status).toBe(200);
+  mockPush(200,1);await fire(stub);
+  const [wake]=requests();
+  expect(wake.body).toMatchObject({alarmExtension:true,isTest:true,aps:{'mutable-content':1}});
+  expect(wake.body.silentCryAlarm).toBeUndefined();expect(wake.body.aps['content-available']).toBeUndefined();
  });
  it('refuses an AlarmKit test while the Parent has Silent Watch alarms off',async()=>{
   const {parent,listener}=await setup();

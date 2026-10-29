@@ -6,7 +6,7 @@ import {Latency,appleReasons,type AppleReason} from './latency';
 import {providerTokens} from './provider-token';
 
 export type PushResult = {status:'sent'|'retry'|'blocked'|'uncertain'|'failed';reason?:Outcome;httpStatus?:number};
-export interface PushIdentityOptions {distinctRequestID?:boolean;separateCollapseIDs?:boolean;collapseID?:string;threadID?:string;configuredTest?:boolean}
+export interface PushIdentityOptions {distinctRequestID?:boolean;separateCollapseIDs?:boolean;collapseID?:string;threadID?:string;configuredTest?:boolean;alarmExtension?:boolean}
 export async function apnsToken(env:Env,latency?:Latency):Promise<string> {
  return providerTokens.get(env,latency);
 }
@@ -24,6 +24,8 @@ export function payload(alert:Alert) {
 }
 export async function sendPush(env:Env,encryptedToken:string,alert:Alert,target:'phone'|'watch'='phone',latency=new Latency(),silentCryAlarm=false,schedule?:PushSchedule,identity:PushIdentityOptions={},alarmCycle?:string):Promise<PushResult> {
  latency.details.alarm_wake_requested=silentCryAlarm&&target==='phone'&&!alert.isTest;
+ const alarmExtension=identity.alarmExtension===true&&target==='phone'&&!alert.isTest;
+ latency.details.alarm_extension_requested=alarmExtension;
  const diagnosticRef=latency.eventRef,deliveryAttempt=latency.deliveryAttempt;
  const correlation=diagnosticRef&&/^[0-9a-f]{64}$/.test(diagnosticRef)&&deliveryAttempt!==undefined&&Number.isSafeInteger(deliveryAttempt)&&deliveryAttempt>0&&deliveryAttempt<=1_000_000?{diagnosticRef,deliveryAttempt}:{};
  const content=payload(alert);
@@ -42,20 +44,26 @@ export async function sendPush(env:Env,encryptedToken:string,alert:Alert,target:
    ...(identity.threadID?{'thread-id':identity.threadID}:{})}}:{}),
   // AlarmKit is additive: retain the phone's normal sound/haptic request so
   // Apple can forward an alert while the separate direct Watch copy also alerts.
-  ...(silentCryAlarm&&target==='phone'&&!alert.isTest?{silentCryAlarm:true,...(alarmCycle?{alarmCycleId:alarmCycle}:{}),aps:{...content.aps,'content-available':1}}:{})
+  ...(silentCryAlarm&&target==='phone'&&!alert.isTest?{silentCryAlarm:true,...(alarmCycle?{alarmCycleId:alarmCycle}:{}),aps:{...content.aps,'content-available':1}}:{}),
+  // The Parent's notification extension schedules the same alarm without an app wake.
+  ...(alarmExtension?{alarmExtension:true,aps:{...content.aps,...(silentCryAlarm?{'content-available':1}:{}),'mutable-content':1}}:{})
  },target,identity.configuredTest?60:alert.isRepeat?15:3600,collapseID,latency,schedule);
 }
 // The single AlarmKit wake request for real and configured-test alerts. A test
 // carries the same marker and takes the same Parent path; it is labelled and
 // soundless so the test isolates the alarm from ordinary notification alerting.
-export async function sendSilentCryAlarmPush(env:Env,encryptedToken:string,alert:Alert,latency=new Latency(),alarmCycle?:string,collapseID=alert.episodeId):Promise<PushResult> {
- latency.details.alarm_wake_requested=!alert.isTest;
+export async function sendSilentCryAlarmPush(env:Env,encryptedToken:string,alert:Alert,latency=new Latency(),alarmCycle?:string,collapseID=alert.episodeId,
+ methods:{appWake:boolean;extension:boolean}={appWake:true,extension:false}):Promise<PushResult> {
+ latency.details.alarm_wake_requested=methods.appWake&&!alert.isTest;
+ latency.details.alarm_extension_requested=methods.extension;
  const content=payload(alert);
  const aps=alert.isTest?{alert:{title:'Test · AlarmKit',body:'Configured test. The Parent will start a silent alarm for your Watch. Stop it there to end this round.'},
   category:content.aps.category,'interruption-level':content.aps['interruption-level']}:content.aps;
  // Separate APNs request ID, preserving event/episode identity for acknowledgement.
- return sendNotification(env,encryptedToken,crypto.randomUUID(),{...content,silentCryAlarm:true,...(alert.isTest?{configuredAlertTest:true}:{}),
-  ...(alarmCycle?{alarmCycleId:alarmCycle}:{}),aps:{...aps,'content-available':1}},'phone',60,collapseID,latency);
+ // Each selected method has its own marker; the Parent keeps one alarm per episode.
+ return sendNotification(env,encryptedToken,crypto.randomUUID(),{...content,...(alert.isTest?{configuredAlertTest:true}:{}),
+  ...(methods.appWake?{silentCryAlarm:true,...(alarmCycle?{alarmCycleId:alarmCycle}:{})}:{}),...(methods.extension?{alarmExtension:true}:{}),
+  aps:{...aps,...(methods.appWake?{'content-available':1}:{}),...(methods.extension?{'mutable-content':1}:{})}},'phone',60,collapseID,latency);
 }
 export async function sendConnectionPush(env:Env,encryptedToken:string,id:string,state:'offline'|'stopped',target:'phone'|'watch',latency=new Latency()):Promise<PushResult> {
  const title=state==='stopped'?'Listener monitoring stopped':'Listener connection lost';

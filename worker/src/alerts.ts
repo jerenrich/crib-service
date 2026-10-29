@@ -8,7 +8,7 @@ import {Latency} from './latency';
 import {APIError,requireRole,type Alert,type Device,type Env,type StoredEvent} from './types';
 import {alert as validateAlert,uuid,configuration,date} from './security';
 import {pairFor} from './devices';
-import {sendPush,sendSilentCryAlarmPush,type PushResult} from './apns';
+import {sendPush,sendSilentCryAlarmPush,type PushIdentityOptions,type PushResult} from './apns';
 import {eventReference,recordDiagnostic,observeLateWrites,PushPreparationError,type Outcome,type Stage} from './diagnostics';
 export async function receiveAlert(env:Env,device:Device,value:Record<string,unknown>,requestId=crypto.randomUUID(),latency=new Latency(),background?:Pick<ExecutionContext,'waitUntil'>) {
  latency.details.dispatch_source='upload';
@@ -95,7 +95,7 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  // An existing Watch-only opt-in wins if both settings name the same Parent.
  const phoneOnlyParent=env.PHONE_ONLY_TEST_PARENT_ID===env.WATCH_ONLY_PARENT_ID?'':env.PHONE_ONLY_TEST_PARENT_ID??'';
  const phoneOnlySQL="parent_id=? AND push_target IS NULL AND delivery_state IS NULL AND COALESCE(json_extract(payload,'$.isTest'),0)=1 AND EXISTS(SELECT 1 FROM devices WHERE id=events.parent_id AND push_token IS NOT NULL)";
- type Destination={token:string|null;phone_token:string|null;watch_token:string|null;silent_watch_alarms:number;alarm_receipts_version?:number;alarm_cycle_id?:string|null;alarm_request_claim_id?:string|null};
+ type Destination={token:string|null;phone_token:string|null;watch_token:string|null;silent_watch_alarms:number;alarm_app_wake?:number;alarm_extension?:number;alarm_receipts_version?:number;alarm_cycle_id?:string|null;alarm_request_claim_id?:string|null};
  type Receipt=StoredEvent & Destination & {pair_current:number};
  const claim=await latency.confirmedClaim<StoredEvent|Destination,Receipt>(()=>env.DB.batch<StoredEvent|Destination>([...(options.insert?[options.insert]:[]),env.DB.prepare(`UPDATE events SET resolved_at=COALESCE(resolved_at,
   CASE WHEN json_extract(payload,'$.type')='listener_disconnected' AND NOT EXISTS(
@@ -131,9 +131,9 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  // Read the selected token in the claim transaction, avoiding another remote
  // round trip. A losing claimant must still return before using this result.
  reserveAlarmRequest(env,eventId,claimId,now),
- env.DB.prepare(`SELECT CASE e.push_target WHEN 'watch' THEN d.watch_push_token ELSE d.push_token END AS token,d.push_token AS phone_token,d.watch_push_token AS watch_token,d.silent_watch_alarms,d.alarm_receipts_version,a.cycle_id AS alarm_cycle_id,a.request_claim_id AS alarm_request_claim_id
+ env.DB.prepare(`SELECT CASE e.push_target WHEN 'watch' THEN d.watch_push_token ELSE d.push_token END AS token,d.push_token AS phone_token,d.watch_push_token AS watch_token,d.silent_watch_alarms,d.alarm_app_wake,d.alarm_extension,d.alarm_receipts_version,a.cycle_id AS alarm_cycle_id,a.request_claim_id AS alarm_request_claim_id
   FROM events e JOIN devices d ON d.id=e.parent_id LEFT JOIN silent_alarm_cycles a ON a.parent_id=e.parent_id AND a.episode_id=e.episode_id WHERE e.event_id=? AND e.status='sending'`).bind(eventId)]),
- ()=>env.DB.prepare(`SELECT e.*,CASE e.push_target WHEN 'watch' THEN d.watch_push_token ELSE d.push_token END AS token,d.push_token AS phone_token,d.watch_push_token AS watch_token,d.silent_watch_alarms,d.alarm_receipts_version,a.cycle_id AS alarm_cycle_id,a.request_claim_id AS alarm_request_claim_id,
+ ()=>env.DB.prepare(`SELECT e.*,CASE e.push_target WHEN 'watch' THEN d.watch_push_token ELSE d.push_token END AS token,d.push_token AS phone_token,d.watch_push_token AS watch_token,d.silent_watch_alarms,d.alarm_app_wake,d.alarm_extension,d.alarm_receipts_version,a.cycle_id AS alarm_cycle_id,a.request_claim_id AS alarm_request_claim_id,
  EXISTS(SELECT 1 FROM pairs p WHERE p.parent_id=e.parent_id AND p.listener_id=e.listener_id) AS pair_current
  FROM events e JOIN devices d ON d.id=e.parent_id LEFT JOIN silent_alarm_cycles a ON a.parent_id=e.parent_id AND a.episode_id=e.episode_id WHERE e.event_id=? AND e.claim_id=?`).bind(eventId,claimId).all<Receipt>());
  const claims=claim.source==='reply'?claim.results:undefined;
@@ -175,7 +175,7 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  const alert=JSON.parse(event.payload) as Alert;
  // Keep forwarded phone and direct Watch copies distinct for crying alerts,
  // including reminders. Both copies still acknowledge the same logical event.
- const identity={distinctRequestID:alert.isTest===true&&env.DISTINCT_APNS_ID_TEST_PARENT_ID===event.parent_id,
+ const identity:PushIdentityOptions={distinctRequestID:alert.isTest===true&&env.DISTINCT_APNS_ID_TEST_PARENT_ID===event.parent_id,
   separateCollapseIDs:!alert.isTest||env.SEPARATE_COLLAPSE_ID_TEST_PARENT_ID===event.parent_id};
  // No replay after uncertain transport or a worker death during APNs dispatch. APNs does
  // not offer an exactly-once receipt transaction with D1. Surface uncertainty explicitly.
@@ -192,7 +192,10 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
   latency.details.notification_route='phone_only_test';latency.details.watch_suppressed=!!parent?.watch_token;
  }
  const alarmCycle=parent?.alarm_receipts_version===1?(parent.alarm_request_claim_id===claimId?parent.alarm_cycle_id??undefined:undefined):undefined;
- const requestAlarm=parent?.silent_watch_alarms===1&&!alert.isTest&&(parent.alarm_receipts_version!==1||!!alarmCycle);
+ const requestAlarm=parent?.silent_watch_alarms===1&&parent.alarm_app_wake!==0&&!alert.isTest&&(parent.alarm_receipts_version!==1||!!alarmCycle);
+ // The extension is not rationed by iOS, so every phone alert offers it a chance;
+ // the Parent keeps one alarm per episode.
+ if(parent?.silent_watch_alarms===1&&parent.alarm_extension===1&&!alert.isTest)identity.alarmExtension=true;
  if(event.delivery_state&&parent){
   stage='push';
   let checkpointed=false;
@@ -221,7 +224,7 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  if(silentAlarm&&target==='watch'&&parent.phone_token){
   auxiliary=(async()=>{
    const started=Date.now(),timing=new Latency();let result:PushResult;
-   try{result=await sendSilentCryAlarmPush(env,parent.phone_token!,alert,timing,alarmCycle);}
+   try{result=await sendSilentCryAlarmPush(env,parent.phone_token!,alert,timing,alarmCycle,undefined,{appWake:true,extension:identity.alarmExtension===true});}
    catch(error){result={status:'failed',reason:error instanceof PushPreparationError?error.code:'apns_configuration'};}
    await recordDiagnostic(env,{requestId,started,operation:'silent_cry_alarm_dispatch',stage:'push',outcome:result.reason??result.status,eventRef,target:'phone',attempt,httpStatus:result.httpStatus,details:timing.details});
   })().catch(()=>{});
