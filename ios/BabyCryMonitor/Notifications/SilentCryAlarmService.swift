@@ -519,7 +519,6 @@ import UIKit
         // Remember only a saved state, so a failed write is retried on the next change or sync.
         do {
             try snapshot.save(to: directory); lastSnapshot = unstamped
-            log?.record("alarm_snapshot_published")
         } catch { (log ?? DiagnosticLog()).record("alarm_snapshot_failed", error: error) }
     }
 

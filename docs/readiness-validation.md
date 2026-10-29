@@ -1,5 +1,21 @@
 # Readiness release checks
 
+## First device comparison and follow-up fixes — 29 October 2026
+
+Two real cries on J17, unplugged at 50% and locked:
+- **Extension only (13:55:42).** The extension started 1.45 s after the push and scheduled in 24 ms; the alarm went off 4.5 s after the push.
+- **Both methods (13:56:32).** The extension scheduled at 0.95 s. The app woke at 1.0 s, checked the service and found the alarm already scheduled.
+
+Stop on both extension-scheduled alarms ran in the app (background), applied the real snooze and was acknowledged by the service within 2 s. Later reminders found the alarm already scheduled. After Stop the extension declined while the acknowledgement was still uploading. Forwarded Watch taps came at 2.5 s and 1.4 s, in the usual range, and no crash reports appeared.
+
+Follow-ups:
+- **Alarm delay.** The alarm now goes off 1 s after scheduling instead of 3 s, for both methods.
+- **No background polling.** While in the background the Parent no longer starts status polls or push-token uploads, which iOS froze on suspension and which later timed out. Watch acknowledgement uploads still run in the background. A poll already in flight when the app is backgrounded gets background time to finish.
+- **Superseded audio start.** The Listener now logs a start that a route-change recovery replaced as `monitoring_start_superseded`, not `monitoring_start_failed`.
+- **Quieter logging.** Successful snapshot writes are no longer logged.
+
+Validation passed 187 shared Swift tests and all 350 iOS simulator unit tests, including a new test that the Parent does not poll in the background, plus the signed device build. Installed on J17 and J14. J14 recovered monitoring by itself and logged the new superseded line. The Watch could not be reached for installation; it runs the previous build, which needs no change for this. No Worker change.
+
 ## AlarmKit from a notification extension, with per-method settings — 29 October 2026
 
 Experiment infrastructure for the two AlarmKit delivery methods. A simulator probe on 29 October showed that a notification service extension can schedule an AlarmKit alarm for its app without the app running. It started 0.37 s after a real APNs push, scheduled in 57 ms, and the alarm alerted 5 s later. iOS did not involve the background push-launch scheduler (`dasd`) that held the app wake-up on J17 for 7 minutes on 28 October. `simctl push` never runs extensions; the probe used a real sandbox push from Apple's Push Notifications Console. Inside the extension `AlarmManager.authorizationState` reported `notDetermined` although the app was authorized, so the extension does not gate on it.

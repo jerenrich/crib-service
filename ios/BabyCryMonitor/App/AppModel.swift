@@ -938,11 +938,21 @@ import UIKit
     func setAppActive(_ active: Bool) {
         appActive = active
         if !active { stopWatchTest() }
+        if !active, role == .parent { finishParentRequestsBeforeSuspension() }
         synchronizeLiveSound()
         observeBackgroundBenchmark()
         if active, role == .parent, defaults === UserDefaults.standard, #available(iOS 26.0, *) {
             SilentCryAlarmService.shared.observeReadiness(source: .foreground, force: true)
         }
+    }
+    /// Ask iOS for the few seconds an in-flight Parent request needs, so it completes
+    /// instead of being frozen mid-request when the app is suspended.
+    private func finishParentRequestsBeforeSuspension() {
+        guard let task = parentRefreshTask else { return }
+        let grant = BackgroundTimeGrant()
+        grant.identifier = UIApplication.shared.beginBackgroundTask(withName: "parent-refresh") { grant.end() }
+        guard grant.identifier != .invalid else { return }
+        Task { @MainActor in await task.value; grant.end() }
     }
     func startBackgroundBenchmark() {
         guard role == .parent else { return }
@@ -1114,7 +1124,10 @@ import UIKit
             synchronizeSettings(using: client)
             guard revision == environmentRevision else { return }
             if role == .parent {
-                if let pushToken, pushToken != uploadedToken { try await client.pushToken(pushToken); uploadedToken = pushToken; log.record("push_token_uploaded") }
+                // iOS freezes requests when it suspends the app, leaving them to time out
+                // minutes later. In the background only Watch acknowledgements, which must
+                // not wait, are uploaded; polling and token upload resume in the foreground.
+                if appActive, let pushToken, pushToken != uploadedToken { try await client.pushToken(pushToken); uploadedToken = pushToken; log.record("push_token_uploaded") }
                 if now.timeIntervalSince(lastWatchRetryAt) >= 15 {
                     lastWatchRetryAt = now
                     if watch.activated, !watch.installed, parentStatus?.watchPushRegistered == true {
@@ -1122,7 +1135,7 @@ import UIKit
                     }
                     await syncWatchCommands()
                 }
-                if currentTime() >= nextParentRefreshAt { await refreshParent() }
+                if appActive, currentTime() >= nextParentRefreshAt { await refreshParent() }
             } else if role == .listener {
                 await flushLocalMonitoringReport(using: client)
                 guard revision == environmentRevision, role == .listener else { return }
@@ -1805,5 +1818,14 @@ import UIKit
             }
             return nil
         } catch { log.record("watch_sync_failed", error: error); return "Watch sync pending. Check the Parent iPhone connection and backend setup." }
+    }
+}
+
+/// Ends a background-time request exactly once, from completion or expiry.
+@MainActor private final class BackgroundTimeGrant {
+    var identifier = UIBackgroundTaskIdentifier.invalid
+    func end() {
+        guard identifier != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(identifier); identifier = .invalid
     }
 }

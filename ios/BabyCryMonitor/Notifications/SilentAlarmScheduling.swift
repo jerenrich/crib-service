@@ -7,7 +7,8 @@ import Foundation
 @available(iOS 26.0, *)
 enum SilentAlarmScheduling {
     struct Metadata: AlarmMetadata {}
-    static let delay: TimeInterval = 3
+    /// Leaves time for the scheduling call itself; both methods schedule within ~1 s of the push.
+    static let delay: TimeInterval = 1
     static let soundName = "AlarmTestSilence.caf"
     static var assetAvailable: Bool { Bundle.main.url(forResource: "AlarmTestSilence", withExtension: "caf") != nil }
 

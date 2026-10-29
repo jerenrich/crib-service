@@ -43,7 +43,9 @@ enum AudioCaptureStatus {
             onStatus?(.active)
         } catch {
             if generation == expected { wantsMonitoring = false }
-            log?.record("monitoring_start_failed", error: error)
+            // A newer start (e.g. route-change recovery) replaced this one; not a failure.
+            if error is CancellationError { log?.record("monitoring_start_superseded") }
+            else { log?.record("monitoring_start_failed", error: error) }
             throw error
         }
     }

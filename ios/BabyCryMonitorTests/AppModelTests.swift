@@ -904,6 +904,21 @@ final class AppModelTests: XCTestCase {
         await fixture.model.tick()
         requests = await fixture.backend.watchTestRequests; XCTAssertEqual(requests, 2)
     }
+    /// iOS freezes requests when it suspends the app; the Parent must not start polls it cannot finish.
+    @MainActor func testParentDoesNotPollInTheBackgroundAndResumesInTheForeground() async throws {
+        let fixture = try Fixture(); fixture.model.selectRole(.parent)
+        await fixture.model.refreshParent()
+        let before = await fixture.backend.statusCalls
+        fixture.model.setAppActive(false)
+        fixture.time.now = fixture.time.now.addingTimeInterval(60)
+        await fixture.model.tick()
+        let background = await fixture.backend.statusCalls
+        XCTAssertEqual(background, before)
+        fixture.model.setAppActive(true)
+        await fixture.model.tick()
+        let foreground = await fixture.backend.statusCalls
+        XCTAssertEqual(foreground, before + 1)
+    }
     @MainActor func testPhoneWatchTestStopsOnBackgroundAndNeverAutomaticallyResumes() async throws {
         let fixture = try Fixture(); fixture.model.selectRole(.parent)
         await fixture.model.refreshParent()
