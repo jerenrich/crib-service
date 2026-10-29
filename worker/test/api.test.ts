@@ -347,6 +347,11 @@ describe('connection alerts, readiness and replacement',()=>{
   // Another Parent's (or an unknown) event stays unlinked, and free text never reaches storage.
   expect(rows[1].event_ref).toBeNull();
   expect(rows[1].details).not.toContain('secret');
+  // A real event reported by a different Parent is stored unlinked.
+  const stranger=device('parent');await register(stranger);
+  expect(await (await call('alarm/attempts',stranger,{attempts:[{method:'app',outcome:'scheduled',eventId:phone.eventId,handlerMs:5}]})).json()).toEqual({ok:true,recorded:1,ignored:0});
+  const strangerRow=await env.DB.prepare("SELECT event_ref FROM diagnostics WHERE operation='alarm_attempt' ORDER BY sequence DESC LIMIT 1").first<{event_ref:string|null}>();
+  expect(strangerRow!.event_ref).toBeNull();
   expect((await call('alarm/attempts',listener,{attempts:[]})).status).toBe(403);
   expect((await call('alarm/attempts',parent,{attempts:Array(21).fill({method:'app',outcome:'scheduled'})})).status).toBe(400);
  });

@@ -130,6 +130,24 @@ final class DiagnosticsTests: XCTestCase {
         observe(muted: true)
         XCTAssertTrue(log.lines.last!.contains("local_checks_passed=false"))
     }
+    /// Foreground re-reads keep only the first value and changes; routine poll successes are sampled, failures kept.
+    @MainActor func testUnchangedForegroundStateAndRoutinePollsAreNotRepeated() {
+        let log = DiagnosticLog(directory: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
+        for _ in 0..<3 { log.record("notification_alert_permission", code: 2); log.record("push_token_uploaded") }
+        log.record("notification_alert_permission", code: 1)
+        log.record("notification_alert_permission", code: 2)
+        XCTAssertEqual(log.lines.filter { $0.contains("notification_alert_permission") }.map { $0.components(separatedBy: " ").last! },
+                       ["code=2", "code=1", "code=2"])
+        XCTAssertEqual(log.lines.filter { $0.contains("push_token_uploaded") }.count, 1)
+        for _ in 0..<3 {
+            log.network(operation: "alert_test_status", outcome: "ok", status: 200, elapsedMS: 100)
+            log.network(operation: "push_token", outcome: "ok", status: 200, elapsedMS: 100)
+        }
+        log.network(operation: "alert_test_status", outcome: "transport_error", elapsedMS: 100)
+        XCTAssertEqual(log.lines.filter { $0.contains("operation=alert_test_status outcome=ok") }.count, 1)
+        XCTAssertEqual(log.lines.filter { $0.contains("operation=push_token outcome=ok") }.count, 1)
+        XCTAssertEqual(log.lines.filter { $0.contains("operation=alert_test_status outcome=transport_error") }.count, 1)
+    }
     @MainActor func testPhoneReceiptRetainsOSDateAndPriorityWithoutInventingDeliveryOrRepeatingHistory() {
         let log = DiagnosticLog(directory: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
         let event = UUID(), episode = UUID(), delivered = Date(timeIntervalSince1970: 1_700_000_000)

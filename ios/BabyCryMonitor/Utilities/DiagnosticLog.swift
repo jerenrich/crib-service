@@ -20,6 +20,7 @@ import Observation
     private let batteryDrain: BatteryDrainLog
     let benchmark: BackgroundBenchmark
     private var recent: [String: Date] = [:]
+    private var lastStates: [String: String] = [:]
     private var watchTraceKeys: Set<String> = []
     private var phoneReceiptKeys: Set<String> = []
     private var persistedLineCount = 0
@@ -82,8 +83,17 @@ import Observation
                                       "listener_status_failed", "monitoring_start_blocked_storage", "monitoring_start_blocked_safety",
                                       "parent_connection_warning_armed", "parent_connection_warning_failed", "watch_payload_unrecognized",
                                       "alert_held_for_monitoring_report"]
+        // State re-read on every foreground: keep the first value and any change.
+        let states: Set<String> = ["notification_sound_permission_before_request", "notification_alert_permission",
+                                   "notification_sound_permission", "notification_time_sensitive_permission",
+                                   "notification_permission_allowed", "notification_permission_denied", "push_token_uploaded"]
         let details = error.map { Self.errorDetails($0) } ?? ""
         let fingerprint = "event_\(event)_\(code ?? 0)_\(details)"
+        if states.contains(event) {
+            let key = "state_\(event)"
+            if lastStates[key] == fingerprint { deduplicatedRecords += 1; return }
+            lastStates[key] = fingerprint
+        }
         if repetitive.contains(event), let last = recent[fingerprint], Date().timeIntervalSince(last) < 60 { sampledRecords += 1; return }
         recent[fingerprint] = Date()
         append(event + (code.map { " code=\($0)" } ?? "") + (details.isEmpty ? "" : " " + details))
@@ -94,7 +104,7 @@ import Observation
     func network(operation: String, outcome: String, status: Int? = nil, requestID: UUID? = nil,
                  elapsedMS: Int, storageUnavailable: Bool = false, error: (any Error)? = nil, eventID: UUID? = nil, benchmarkAttempt: UUID? = nil, serverDiagnosticMS: Int? = nil, diagnosticState: String? = nil,
                  metrics: DiagnosticNetworkTiming? = nil, clock: DiagnosticClockSample? = nil, monotonic: Bool = false, clientRequestID: UUID? = nil) {
-        let operations: Set<String> = ["alarm_scheduled", "alarm_attempts", "alarm_settings", "register", "pairing_create", "pairing_claim", "push_token", "watch_token", "heartbeat", "alert", "status", "timeline", "monitoring", "monitoring_complete", "settings", "acknowledge", "test_push", "connection_preferences", "unpair", "delete_device", "resume_alerts"]
+        let operations: Set<String> = ["alarm_scheduled", "alarm_attempts", "alarm_settings", "alert_test_status", "register", "pairing_create", "pairing_claim", "push_token", "watch_token", "heartbeat", "alert", "status", "timeline", "monitoring", "monitoring_complete", "settings", "acknowledge", "test_push", "connection_preferences", "unpair", "delete_device", "resume_alerts"]
         guard operations.contains(operation), ["ok", "http_error", "transport_error", "decode_error", "encode_error", "cancelled", "invalid_response"].contains(outcome) else { return }
         if operation == "status" {
             benchmark.requestFinished(benchmarkAttempt, outcome: outcome, requestID: requestID, status: status, elapsedMS: elapsedMS)
@@ -105,7 +115,8 @@ import Observation
         let fingerprint = "network_\(operation)_\(outcome)_\(status ?? 0)_\(details)"
         let recovered = outcome == "ok" && recent.removeValue(forKey: failureKey) != nil
         if outcome != "ok" { recent[failureKey] = Date() }
-        let routine = ["status", "heartbeat", "timeline"].contains(operation)
+        // Polls and the per-foreground token refresh: failures and slow requests are always kept.
+        let routine = ["status", "heartbeat", "timeline", "alert_test_status", "push_token"].contains(operation)
         let sample = outcome == "ok" ? routine : operation != "alert"
         if sample, elapsedMS < 2000, !recovered, !storageUnavailable, (serverDiagnosticMS ?? 0) < 2000, let last = recent[fingerprint], Date().timeIntervalSince(last) < (outcome == "ok" ? 900 : 60) { sampledRecords += 1; return }
         recent[fingerprint] = Date()

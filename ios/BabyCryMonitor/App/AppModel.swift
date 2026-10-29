@@ -221,7 +221,11 @@ import UIKit
         }
         watch.log = log
         (audio as? AudioLevelMonitor)?.log = log
-        notifications.onToken = { [weak self] token in self?.pushToken = token; self?.uploadedToken = nil; self?.log.record("push_token_received") }
+        notifications.onToken = { [weak self] token in
+            // iOS repeats the token on every registration; log only a new one. It is still re-uploaded.
+            if token != self?.pushToken { self?.log.record("push_token_received") }
+            self?.pushToken = token; self?.uploadedToken = nil
+        }
         notifications.onAlert = { [weak self] in self?.log.record("push_received"); Task { await self?.refreshParent() } }
         notifications.onAcknowledge = { [weak self] id in await self?.acknowledge(id) }
         watch.onCommand = { [weak self] command in

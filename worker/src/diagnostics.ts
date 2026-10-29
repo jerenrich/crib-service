@@ -41,26 +41,47 @@ export function operationFor(method:string,path:string):Operation {
 // Only event-level pseudonyms; never hash or record device identities. Namespace prevents
 // correlation with pairing/rate-limit hashes. The journal is deleted after seven days.
 export async function eventReference(env:Env,eventId:string):Promise<string> {
+ return (await eventReferences(env,[eventId]))[0];
+}
+/// One key import for any number of events; the signatures are local work, not storage calls.
+export async function eventReferences(env:Env,eventIds:string[]):Promise<string[]> {
  const key=await crypto.subtle.importKey('raw',new TextEncoder().encode(env.PAIRING_PEPPER),{name:'HMAC',hash:'SHA-256'},false,['sign']);
- const signature=await crypto.subtle.sign('HMAC',key,new TextEncoder().encode(`diagnostics:event:${eventId}`));
- return [...new Uint8Array(signature)].map(byte=>byte.toString(16).padStart(2,'0')).join('');
+ return Promise.all(eventIds.map(async eventId=>{
+  const signature=await crypto.subtle.sign('HMAC',key,new TextEncoder().encode(`diagnostics:event:${eventId}`));
+  return [...new Uint8Array(signature)].map(byte=>byte.toString(16).padStart(2,'0')).join('');
+ }));
 }
 // Best-effort isolate-local evidence only. A restart loses unreported failures;
 // concurrent successful rows may report overlapping counts, so do not sum them.
 let journalFailures=0,reportedJournalFailures=0;
+// Explicit columns prevent accidental object spreading of request/exception data.
+// With `owner`, the event reference is kept only if that Parent owns the event,
+// checked inside the insert so it costs no separate query.
+function diagnosticInsert(env:Env,value:Diagnostic,details:TimingDetails|undefined,owner?:{eventId:string;parentId:string}):D1PreparedStatement {
+ const release=env.CF_VERSION_METADATA?.id;
+ const columns=[Date.now(),value.requestId,value.operation,value.stage,value.outcome,value.httpStatus??null,Math.max(0,Date.now()-value.started)];
+ const tail=[value.attempt??null,value.target??null,release && /^[0-9a-f-]{36}$/i.test(release)?release:null,safeTimingDetails(details)];
+ if(!owner||!value.eventRef)return env.DB.prepare('INSERT INTO diagnostics(recorded_at,request_id,operation,stage,outcome,http_status,elapsed_ms,event_ref,attempt,target,release,details) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)')
+  .bind(...columns,value.eventRef??null,...tail);
+ return env.DB.prepare(`INSERT INTO diagnostics(recorded_at,request_id,operation,stage,outcome,http_status,elapsed_ms,event_ref,attempt,target,release,details)
+  VALUES(?,?,?,?,?,?,?,CASE WHEN EXISTS(SELECT 1 FROM events WHERE event_id=? AND parent_id=?) THEN ? END,?,?,?,?)`)
+  .bind(...columns,owner.eventId,owner.parentId,value.eventRef,...tail);
+}
 export async function recordDiagnostic(env:Env,value:Diagnostic):Promise<boolean> {
- // Explicit columns prevent accidental object spreading of request/exception data.
  // Fail open: diagnostics must never change delivery or turn acceptance into a retry.
  try {
-  const release=env.CF_VERSION_METADATA?.id,observedFailures=journalFailures;
+  const observedFailures=journalFailures;
   const details=observedFailures>reportedJournalFailures?{...value.details,journal_failures_before_write:observedFailures-reportedJournalFailures}:value.details;
-  await env.DB.prepare('INSERT INTO diagnostics(recorded_at,request_id,operation,stage,outcome,http_status,elapsed_ms,event_ref,attempt,target,release,details) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)')
-   .bind(Date.now(),value.requestId,value.operation,value.stage,value.outcome,value.httpStatus??null,
-    Math.max(0,Date.now()-value.started),value.eventRef??null,value.attempt??null,value.target??null,
-    release && /^[0-9a-f-]{36}$/i.test(release)?release:null,safeTimingDetails(details)).run();
+  await diagnosticInsert(env,value,details).run();
   reportedJournalFailures=Math.max(reportedJournalFailures,observedFailures);
   return true;
  } catch { journalFailures=Math.min(Number.MAX_SAFE_INTEGER,journalFailures+1);return false; }
+}
+/// Several rows in one storage round trip; all are written or none. Returns the number written.
+export async function recordDiagnostics(env:Env,values:(Diagnostic & {owner?:{eventId:string;parentId:string}})[]):Promise<number> {
+ if(!values.length)return 0;
+ try { await env.DB.batch(values.map(value=>diagnosticInsert(env,value,value.details,value.owner)));return values.length; }
+ catch { journalFailures=Math.min(Number.MAX_SAFE_INTEGER,journalFailures+1);return 0; }
 }
 
 // No new query on the normal path. A recovered write is kept alive only within
