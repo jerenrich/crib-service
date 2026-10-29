@@ -919,6 +919,24 @@ final class AppModelTests: XCTestCase {
         let foreground = await fixture.backend.statusCalls
         XCTAssertEqual(foreground, before + 1)
     }
+    /// The app can be back in the background before `foreground()` reaches its refresh,
+    /// or be launched in the background for a push: neither starts a poll or logs a foreground.
+    @MainActor func testForegroundWorkThatFinishesInTheBackgroundDoesNotPoll() async throws {
+        let fixture = try Fixture(); fixture.model.selectRole(.parent)
+        await fixture.model.refreshParent()
+        let before = await fixture.backend.statusCalls
+        let foregrounds = fixture.model.log.lines.filter { $0.hasSuffix(" foreground") }.count
+        fixture.model.setAppActive(false)
+        await fixture.model.foreground()
+        let background = await fixture.backend.statusCalls
+        XCTAssertEqual(background, before)
+        XCTAssertEqual(fixture.model.log.lines.filter { $0.hasSuffix(" foreground") }.count, foregrounds)
+        fixture.model.setAppActive(true)
+        await fixture.model.foreground()
+        let foreground = await fixture.backend.statusCalls
+        XCTAssertEqual(foreground, before + 1)
+        XCTAssertEqual(fixture.model.log.lines.filter { $0.hasSuffix(" foreground") }.count, foregrounds + 1)
+    }
     @MainActor func testPhoneWatchTestStopsOnBackgroundAndNeverAutomaticallyResumes() async throws {
         let fixture = try Fixture(); fixture.model.selectRole(.parent)
         await fixture.model.refreshParent()

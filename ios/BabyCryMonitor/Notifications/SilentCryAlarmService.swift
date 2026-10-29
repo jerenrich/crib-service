@@ -29,6 +29,7 @@ import UIKit
     private let recordsKey = "silentCryAlarmRecords"
     private let pendingKey = "silentCryAlarmPendingAcknowledgements"
     private var receiving = false
+    private var receivingEventID: UUID?
     private var flushingReceipts = false
     private var receiptRetry: (cycleID: UUID, afterUptime: Double)?
     private let receiptsKey = "silentCryAlarmSchedulingReceipts"
@@ -228,17 +229,24 @@ import UIKit
                 requestAgeMS: Int(Date().timeIntervalSince(request.createdAt) * 1000), error: error)
         }
         // One journal entry per attempt, whatever the exit.
-        var outcome = AlarmAttempt.Outcome.failed, outcomeReason: String?, alarmAt: Date?
-        defer { journal(outcome, reason: outcomeReason, eventID: request.eventID, episodeID: request.episodeID,
-                        isTest: request.isTest, callback: callback, pushCreatedAt: request.createdAt, alarmAt: alarmAt) }
+        var outcome = AlarmAttempt.Outcome.failed, outcomeReason: String?, alarmAt: Date?, journaled = true
+        defer { if journaled { journal(outcome, reason: outcomeReason, eventID: request.eventID, episodeID: request.episodeID,
+                        isTest: request.isTest, callback: callback, pushCreatedAt: request.createdAt, alarmAt: alarmAt) } }
         func reject(_ reason: SilentCryAlarmRequest.Rejection) -> Bool {
             record("rejected", reason: reason); outcome = .rejected; outcomeReason = reason.rawValue; return false
         }
         trace("received", request.eventID)
         guard appWakeEnabled else { return reject(.methodDisabled) }
         guard enabled else { return reject(.disabled) }
-        guard !receiving else { return reject(.busy) }
-        receiving = true; defer { receiving = false }
+        guard !receiving else {
+            // iOS can hand one push to both the foreground and the background callback.
+            // The attempt already running speaks for it; journaling this one would
+            // count a failure that did not happen.
+            if receivingEventID == request.eventID { journaled = false }
+            return reject(.busy)
+        }
+        receiving = true; receivingEventID = request.eventID
+        defer { receiving = false; receivingEventID = nil }
         let generation = revision
         let budget = SilentCryAlarmExecutionBudget(startedAt: start)
         func fallbackRejection() -> SilentCryAlarmRequest.Rejection? {

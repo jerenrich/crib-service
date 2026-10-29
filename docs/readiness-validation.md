@@ -64,6 +64,14 @@ The diagnostics log is capped at 10,000 lines, so noise reductions now keep more
 - `push_token_received` is logged only for a new token.
 - Successful test-status polls (`alert_test_status`, every few seconds on the test screen) and token refreshes are sampled like status polls. Failures and slow requests are always logged.
 
+The second rollout (Worker `c885b128`, message `004d119`) was validated the same afternoon:
+- Upload handler time fell from 1,025 ms to 103–186 ms for 1–3 rows, and every row was linked.
+- An unlocked and a locked AlarmKit test both had the extension schedule the alarm (push to alarm time 2,187 ms and 1,675 ms) and alert 1.0 s after the alarm time.
+- Lock state agreed with UIKit. It still read unlocked 7 s after locking, inside iOS's grace period.
+- Two problems showed up:
+  - With the app open, iOS gave one push to both the foreground and the background callback. The second callback was journaled as an app `busy` rejection. A `busy` rejection for the event already being handled is now logged but not journaled or reported.
+  - Status requests could still freeze for up to 267 s. `foreground()` awaited notification registration before starting its refresh, and the app had left the foreground 6–9 ms after arriving. So the refresh started after the suspension hook had found nothing to protect. Each Parent refresh now holds background time from its own start (`background_time_expired` is logged if iOS reclaims it). `foreground()` refreshes, and logs `foreground`, only while the app is active, which also covers background launches for a push.
+
 Not yet done: the extension does not use the app's clock-offset estimate for its freshness check.
 
 Validation passed 358 Worker tests, both TypeScript checks, 187 shared Swift tests, all 349 iOS simulator unit tests and the signed device build. Automatic provisioning registered the App Group and the extension App ID after the Program License Agreement update was accepted; both embedded profiles include the group. Migration `0016` was applied and Worker `860cb01a-81d6-42ea-b9cb-1a08b8640e22` was deployed with message `cd2ad4c`. The live health check returned 401 with diagnostics recorded. Installed on J17, J14 and the Watch. J17 published its snapshot (alarms enabled, extension off, no snooze or pending acknowledgement). J14 needs monitoring restarted. On-device comparison of the methods is pending.

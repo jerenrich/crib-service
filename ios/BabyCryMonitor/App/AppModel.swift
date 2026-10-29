@@ -945,21 +945,11 @@ import UIKit
     func setAppActive(_ active: Bool) {
         appActive = active
         if !active { stopWatchTest() }
-        if !active, role == .parent { finishParentRequestsBeforeSuspension() }
         synchronizeLiveSound()
         observeBackgroundBenchmark()
         if active, role == .parent, defaults === UserDefaults.standard, #available(iOS 26.0, *) {
             SilentCryAlarmService.shared.observeReadiness(source: .foreground, force: true)
         }
-    }
-    /// Ask iOS for the few seconds an in-flight Parent request needs, so it completes
-    /// instead of being frozen mid-request when the app is suspended.
-    private func finishParentRequestsBeforeSuspension() {
-        guard let task = parentRefreshTask else { return }
-        let grant = BackgroundTimeGrant()
-        grant.identifier = UIApplication.shared.beginBackgroundTask(withName: "parent-refresh") { grant.end() }
-        guard grant.identifier != .invalid else { return }
-        Task { @MainActor in await task.value; grant.end() }
     }
     func startBackgroundBenchmark() {
         guard role == .parent else { return }
@@ -1356,7 +1346,12 @@ import UIKit
         #endif
         guard role == .parent else { return }
         if let task = parentRefreshTask { await task.value; return }
+        // Hold background time for the whole refresh, from its start. iOS freezes a
+        // request when it suspends the app, and the app can leave the foreground
+        // before a refresh begins, so a hook at suspension cannot reliably cover it.
+        let grant = BackgroundTimeGrant.begin("parent-refresh") { [weak self] in self?.log.record("background_time_expired") }
         let task = Task { [weak self] in
+            defer { grant.end() }
             guard let self else { return }
             await self.fetchParentStatus()
         }
@@ -1681,15 +1676,16 @@ import UIKit
         calibrationPhase = "idle"; audio.stop()
     }
     func foreground() async {
-        log.record("foreground")
-        log.checkpointCoverage()
+        // Also runs at launch, which can be a background launch for a push.
+        if appActive { log.record("foreground"); log.checkpointCoverage() }
         #if DEBUG
         // These offline UI fixtures supply a complete paired snapshot. Loading
         // real credentials here would replace it with the empty test defaults.
         if ProcessInfo.processInfo.arguments.contains("--uitesting-timeline") || ProcessInfo.processInfo.arguments.contains("--uitesting-live-sound") { return }
         #endif
         if credential == nil { loadCredential() }
-        if role == .parent { await notifications.register(); await refreshParent() }
+        // Polling is foreground work. The app can leave the foreground while registration is pending.
+        if role == .parent { await notifications.register(); if appActive { await refreshParent() } }
         if role == .listener && needsRestart && !monitoring && !starting && !recoveringAudio { error = "Monitoring needs to be restarted. Check the microphone and tap Start Monitoring." }
     }
 
@@ -1831,6 +1827,11 @@ import UIKit
 /// Ends a background-time request exactly once, from completion or expiry.
 @MainActor private final class BackgroundTimeGrant {
     var identifier = UIBackgroundTaskIdentifier.invalid
+    static func begin(_ name: String, onExpiry: @escaping @MainActor () -> Void) -> BackgroundTimeGrant {
+        let grant = BackgroundTimeGrant()
+        grant.identifier = UIApplication.shared.beginBackgroundTask(withName: name) { MainActor.assumeIsolated { onExpiry(); grant.end() } }
+        return grant
+    }
     func end() {
         guard identifier != .invalid else { return }
         UIApplication.shared.endBackgroundTask(identifier); identifier = .invalid
