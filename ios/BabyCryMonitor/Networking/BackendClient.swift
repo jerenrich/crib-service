@@ -233,7 +233,9 @@ struct BackendClient: BackendServing {
                          "/v1/alarm/scheduled": "alarm_scheduled", "/v1/alarm/attempts": "alarm_attempts", "/v1/silent-watch-alarms": "alarm_settings", "/v1/device/push-token": "push_token", "/v1/device/watch-push-token": "watch_token",
                          "/v1/listener/heartbeat": "heartbeat", "/v1/listener/event": "alert", "/v1/listener/status": "status",
                          "/v1/timeline": "timeline", "/v1/monitoring": "monitoring", "/v1/monitoring/complete": "monitoring_complete", "/v1/settings": "settings", "/v1/alert/acknowledge": "acknowledge", "/v1/test-push": "test_push", "/v1/alert-test": "test_push", "/v1/alert-test/stop": "test_push", "/v1/watch-test": "test_push", "/v1/watch-test/push": "test_push", "/v1/listener/silent-alarm-test": "test_push", "/v1/alert/resume": "resume_alerts",
-                         "/v1/connection-alerts": "connection_preferences", "/v1/pairing/remove": "unpair", "/v1/device/delete": "delete_device"][path] ?? "unknown"
+                         "/v1/connection-alerts": "connection_preferences", "/v1/pairing/remove": "unpair", "/v1/device/delete": "delete_device"][path].map {
+                             // Test status is polled every few seconds; starting a test is not.
+                             method == "GET" && path == "/v1/alert-test" ? "alert_test_status" : $0 } ?? "unknown"
         // Generated for each transport attempt, before receiving any response.
         // It is diagnostic correlation only; the event UUID remains idempotency authority.
         let clientRequestID = eventID == nil ? nil : UUID()

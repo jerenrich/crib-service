@@ -1,4 +1,4 @@
-import {eventReference,recordDiagnostic} from './diagnostics';
+import {eventReference,eventReferences,recordDiagnostics} from './diagnostics';
 import type {AlarmAttemptDetails,Latency} from './latency';
 import {APIError,requireRole,type Device,type Env} from './types';
 import {uuid} from './security';
@@ -63,19 +63,10 @@ export async function recordAlarmAttempts(env:Env,device:Device,value:Record<str
  requireRole(device,'parent');
  if(!Array.isArray(value.attempts)||value.attempts.length>maximumAlarmAttempts)throw new APIError(400,'Invalid alarm attempts.');
  const attempts=value.attempts.map(item=>alarmAttempt(item)).filter(item=>item!==null);
- // Correlate only events that belong to this Parent; anything else is kept unlinked.
- const ids=[...new Set(attempts.map(item=>item.eventId).filter(id=>id!==undefined))];
- const owned=new Set<string>();
- if(ids.length){
-  const rows=await env.DB.prepare(`SELECT event_id FROM events WHERE parent_id=? AND event_id IN (${ids.map(()=>'?').join(',')})`)
-   .bind(device.id,...ids).all<{event_id:string}>();
-  for(const row of rows.results)owned.add(row.event_id);
- }
- let recorded=0;
- for(const {eventId,started,details} of attempts){
-  const eventRef=eventId&&owned.has(eventId)?await eventReference(env,eventId):undefined;
-  if(await recordDiagnostic(env,{requestId,operation:'alarm_attempt',stage:'handler',outcome:'ok',started,eventRef,details:{alarm_attempt:details}}))recorded++;
- }
+ // One storage round trip: each row keeps its event reference only for this Parent's own events.
+ const references=await eventReferences(env,attempts.map(item=>item.eventId??''));
+ const recorded=await recordDiagnostics(env,attempts.map(({eventId,started,details},index)=>({requestId,operation:'alarm_attempt' as const,stage:'handler' as const,
+  outcome:'ok' as const,started,details:{alarm_attempt:details},...(eventId?{eventRef:references[index],owner:{eventId,parentId:device.id}}:{})})));
  return {ok:true,recorded,ignored:value.attempts.length-attempts.length};
 }
 function alarmAttempt(item:unknown):{eventId?:string;started:number;details:AlarmAttemptDetails}|null {

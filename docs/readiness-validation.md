@@ -50,7 +50,19 @@ Each attempt is also written to the system log (subsystem `com.jordanerenrich.cr
 - `silent_cry_alarm_state`: AlarmKit state changes for owned alarms, seen only while the app runs.
 - `silent_cry_alarm phase=failed`: now includes the operation and error.
 
-In the foreground, the app reports both methods' attempts to `POST /v1/alarm/attempts`. These are stored as `alarm_attempt` server diagnostic rows, correlated by event reference.
+In the foreground, the app reports both methods' attempts to `POST /v1/alarm/attempts`. These are stored as `alarm_attempt` server diagnostic rows, correlated by event reference. One request writes all its rows in one storage round trip. The ownership check runs inside the insert, so a row is linked only to the reporting Parent's own events.
+
+Rollout on 29 October 2026: Worker `719037e4` (message `f3afd0c`) was deployed and the app was installed on J17. A Test alert with AlarmKit at 14:49 showed:
+- The extension scheduled the alarm: push to start 860 ms, handler 19 ms, push to alarm time 1,868 ms, snapshot 159 s old, unlocked.
+- The app wake arrived 920 ms after the push and found the alarm already scheduled (`duplicate`).
+- `silent_cry_alarm_state` went `scheduled` → `alerting`, 1.0 s after the alarm time, → `removed`.
+- `silent_cry_alarm_stop` was logged 3.8 s after the alarm time.
+- The next foreground status refresh uploaded both attempts, as linked `alarm_attempt` rows. That first version made a separate database round trip per row, so the request took about 1 s on the server.
+
+The diagnostics log is capped at 10,000 lines, so noise reductions now keep more useful history:
+- Notification permission lines and `push_token_uploaded` are logged on their first value and on any change, not on every foreground. The token itself is still uploaded each time.
+- `push_token_received` is logged only for a new token.
+- Successful test-status polls (`alert_test_status`, every few seconds on the test screen) and token refreshes are sampled like status polls. Failures and slow requests are always logged.
 
 Not yet done: the extension does not use the app's clock-offset estimate for its freshness check.
 
