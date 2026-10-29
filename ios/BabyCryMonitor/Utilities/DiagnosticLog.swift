@@ -26,7 +26,7 @@ import Observation
     private var storagePrepared = false
     private static let timestampStyle = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
     private static let events: Set<String> = [
-        "alert_pipeline_ready", "app_launched", "foreground", "background", "monitoring_recovered_after_relaunch",
+        "alert_pipeline_ready", "app_launched", "alarm_snapshot_published", "alarm_snapshot_failed", "alarm_snapshot_unavailable", "foreground", "background", "monitoring_recovered_after_relaunch",
         "paired_successfully", "pairing_created", "pairing_failed", "credential_failed", "metadata_load_failed",
         "monitoring_started", "monitoring_stopped", "monitoring_paused", "monitoring_start_failed", "microphone_permission_denied",
         "test_push_queued", "audio_active", "audio_recovering", "audio_interrupted", "audio_stalled",

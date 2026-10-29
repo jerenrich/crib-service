@@ -5,7 +5,13 @@ import Foundation
 /// journal, so neither process ever writes a file the other one writes.
 enum AlarmShared {
     static let appGroup = "group.com.jordanerenrich.cribservice"
-    static var directory: URL? { FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroup) }
+    /// Under Library so the files can be collected from a device for diagnosis.
+    static var directory: URL? {
+        guard let url = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroup)?
+            .appendingPathComponent("Library/Application Support/Alarms", isDirectory: true) else { return nil }
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }
 }
 
 enum AlarmMethod: String, Codable, Sendable { case app, `extension` }

@@ -1,5 +1,27 @@
 # Readiness release checks
 
+## AlarmKit from a notification extension, with per-method settings — 29 October 2026
+
+Experiment infrastructure for the two AlarmKit delivery methods. A simulator probe on 29 October showed that a notification service extension can schedule an AlarmKit alarm for its app without the app running. It started 0.37 s after a real APNs push, scheduled in 57 ms, and the alarm alerted 5 s later. iOS did not involve the background push-launch scheduler (`dasd`) that held the app wake-up on J17 for 7 minutes on 28 October. `simctl push` never runs extensions; the probe used a real sandbox push from Apple's Push Notifications Console. Inside the extension `AlarmManager.authorizationState` reported `notDetermined` although the app was authorized, so the extension does not gate on it.
+
+**Methods.** Parent Settings → Overnight wrist alarms shows **Wake the app in the background** (the existing method, default on) and **Schedule from the notification extension** (default off). The settings are stored per Parent (migration `0016_alarm_methods.sql`). The service sends `silentCryAlarm` plus `content-available`, and reserves app-wake recovery cycles, only while the app wake is selected. While the extension is selected, it marks **every** phone alert, including reminders, with `alarmExtension` plus `mutable-content`. Extension attempts are not rationed by iOS, so a failed attempt is retried by the next reminder. Each episode still gets one alarm. **Test alert → Use AlarmKit** follows the same choices and refuses to start when neither is selected.
+
+**Extension (`BabyCryNotificationService`).** It applies the app's push-only fallback rules: 60-second freshness, local snooze or Stop, pending acknowledgement and the last known service state. It reads them from a snapshot the app publishes, then schedules the same alarm definition (`SilentAlarmScheduling`, shared with the app). It never changes the notification and releases it within 1 second. If the snapshot is unreadable, for example before the first unlock after a restart, it does nothing. The app remains the only owner of alarm state. Each process writes only its own bounded attempt journal in the App Group `group.com.jordanerenrich.cribservice`, under `Library/Application Support/Alarms`, where `devicectl` can collect it. The app adopts extension-scheduled alarms so Stop, acknowledgement and cleanup find them. If iOS runs Stop inside the extension, the app applies that snooze when it next runs.
+
+**Measurement.** Every attempt by either method records:
+- the method and outcome
+- push → start (service clock)
+- handler time
+- push → planned alarm time
+- the markers actually present in the push
+- charging state, battery, Low Power Mode and app state
+
+Attempts appear in Settings → Diagnostics → Recent alarm attempts and as `alarm_attempt` diagnostic lines. Extension launch overhead before the notification appears, and the Watch tap itself, are not recorded by the app.
+
+Not yet done: the extension does not use the app's clock-offset estimate for its freshness check.
+
+Validation passed 358 Worker tests, both TypeScript checks, 187 shared Swift tests, all 349 iOS simulator unit tests and the signed device build. Automatic provisioning registered the App Group and the extension App ID after the Program License Agreement update was accepted; both embedded profiles include the group. Migration `0016` was applied and Worker `860cb01a-81d6-42ea-b9cb-1a08b8640e22` was deployed with message `cd2ad4c`. The live health check returned 401 with diagnostics recorded. Installed on J17, J14 and the Watch. J17 published its snapshot (alarms enabled, extension off, no snooze or pending acknowledgement). J14 needs monitoring restarted. On-device comparison of the methods is pending.
+
 ## Short real cry: one AlarmKit wake-up, held by iOS while charging — 28 October 2026
 
 A real cry test reached J14's threshold at 21:19:32.8. The server accepted phone and Watch delivery at 21:19:33.5, and that first alert carried the episode's AlarmKit wake request. J17 displayed the notification, and the Watch received the forwarded copy (`playLightsAndSirens: YES`, `watchNearby=YES`). J14 confirmed quiet at 21:19:53.7, which ended the episode. As intended, no AlarmKit recovery was sent: recoveries start 30 seconds after the first request, and only while the episode is still active, because no alarm is needed after crying stops. A short cry that settles first gets exactly one wake attempt.

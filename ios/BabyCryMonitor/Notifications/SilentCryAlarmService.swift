@@ -501,10 +501,26 @@ import UIKit
             localMutedUntil: defaults.object(forKey: "silentCryAlarmMutedUntil") as? Date,
             stoppedBefore: defaults.object(forKey: "silentCryAlarmStoppedBefore") as? Date,
             evidence: serverEvidence, snoozeDuration: snoozeDuration, publishedAt: .distantPast)
-        guard snapshot != lastSnapshot else { return }
-        lastSnapshot = snapshot
+        // Polling refreshes only the evidence timestamp; rewrite when anything else changes.
+        if let last = lastSnapshot {
+            var comparable = snapshot; comparable.evidence = last.evidence
+            let sameEvidence = switch (snapshot.evidence, last.evidence) {
+            case (nil, nil): true
+            case let (new?, old?): new.hasSameState(as: old)
+            default: false
+            }
+            if sameEvidence && comparable == last { return }
+        }
+        let unstamped = snapshot
         snapshot.publishedAt = Date()
-        do { try snapshot.save() } catch { trace("failed") }
+        guard let directory = AlarmShared.directory else {
+            (log ?? DiagnosticLog()).record("alarm_snapshot_unavailable"); return
+        }
+        // Remember only a saved state, so a failed write is retried on the next change or sync.
+        do {
+            try snapshot.save(to: directory); lastSnapshot = unstamped
+            log?.record("alarm_snapshot_published")
+        } catch { (log ?? DiagnosticLog()).record("alarm_snapshot_failed", error: error) }
     }
 
     /// Adopt alarms the extension scheduled, so Stop, acknowledgement and cleanup
