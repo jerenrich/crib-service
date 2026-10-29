@@ -48,7 +48,10 @@ struct AlarmSnapshot: Codable, Equatable, Sendable {
 /// One alarm attempt by either method, with the conditions it ran under, so
 /// delays can be compared across charging, lock and app states.
 struct AlarmAttempt: Codable, Equatable, Sendable {
-    enum Outcome: String, Codable, Sendable { case scheduled, duplicate, rejected, failed, stopped }
+    /// `timedOut`: the extension released the notification at its cut-off before the
+    /// attempt finished. A later entry for the same event carries the real outcome,
+    /// with reason `after_cutoff`, if iOS let the extension finish.
+    enum Outcome: String, Codable, Sendable { case scheduled, duplicate, rejected, failed, stopped, timedOut = "timed_out" }
     struct Conditions: Codable, Equatable, Sendable {
         var charging: Bool?
         var batteryLevel: Double?

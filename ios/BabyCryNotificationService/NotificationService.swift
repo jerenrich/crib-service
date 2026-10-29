@@ -11,6 +11,9 @@ final class NotificationService: UNNotificationServiceExtension, @unchecked Send
     private let lock = NSLock()
     private var handler: ((UNNotificationContent) -> Void)?
     private var content: UNNotificationContent?
+    /// Guarded by `lock`: whichever of the attempt and the cut-off finishes first wins.
+    private var attemptFinished = false
+    private var cutOff = false
 
     override func didReceive(_ request: UNNotificationRequest, withContentHandler contentHandler: @escaping (UNNotificationContent) -> Void) {
         let startedAt = Date()
@@ -22,11 +25,28 @@ final class NotificationService: UNNotificationServiceExtension, @unchecked Send
         let episodeID = (payload["episodeId"] as? String).flatMap(UUID.init(uuidString:))
         let parsed = SilentCryAlarmRequest(payload: payload)
         let rejection = parsed == nil ? SilentCryAlarmRequest.payloadRejection(payload) : nil
-        DispatchQueue.global().asyncAfter(deadline: .now() + Self.deadline) { [weak self] in self?.release() }
+        let journal = AlarmJournal.forMethod(.extension)
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.deadline) { [weak self] in
+            guard let self else { return }
+            let late = lock.withLock { () -> Bool in
+                guard !attemptFinished else { return false }
+                cutOff = true; return true
+            }
+            // Record the cut-off now: iOS may end the extension once it is released.
+            if late {
+                let conditions = MainActor.assumeIsolated { Self.conditions() }
+                journal?.append(AlarmAttempt(method: .extension, outcome: .timedOut, reason: nil, eventID: eventID,
+                    episodeID: episodeID, isTest: parsed?.isTest ?? false, flags: flags, pushCreatedAt: parsed?.createdAt,
+                    startedAt: startedAt, finishedAt: Date(), alarmAt: nil, conditions: conditions))
+            }
+            release()
+        }
         Task {
-            let attempt = await Self.attempt(parsed, rejection: rejection, eventID: eventID, episodeID: episodeID,
+            var attempt = await Self.attempt(parsed, rejection: rejection, eventID: eventID, episodeID: episodeID,
                                              flags: flags, startedAt: startedAt)
-            AlarmJournal.forMethod(.extension)?.append(attempt)
+            let afterCutOff = lock.withLock { () -> Bool in attemptFinished = true; return cutOff }
+            if afterCutOff { attempt.reason = attempt.reason.map { "after_cutoff+" + $0 } ?? "after_cutoff" }
+            journal?.append(attempt)
             release()
         }
     }

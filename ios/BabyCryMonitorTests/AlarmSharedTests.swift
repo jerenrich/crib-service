@@ -65,6 +65,11 @@ final class AlarmSharedTests: XCTestCase {
         XCTAssertEqual(entries.first?.startedAt, attempt(5).startedAt)
         XCTAssertEqual(entries.last?.pushToStartMS, (AlarmJournal.capacity + 4) * 1000 + 500)
         XCTAssertEqual(entries.last?.handlerMS, 250)
+
+        var late = attempt(0); late.outcome = .timedOut
+        journal.append(late)
+        XCTAssertEqual(journal.read().last?.outcome, .timedOut)
+        XCTAssertTrue(String(decoding: try Data(contentsOf: journal.url), as: UTF8.self).contains(#""outcome":"timed_out""#))
     }
 
     #if !canImport(MonitorCore)

@@ -14,6 +14,8 @@ Follow-ups:
 - **Superseded audio start.** The Listener now logs a start that a route-change recovery replaced as `monitoring_start_superseded`, not `monitoring_start_failed`.
 - **Quieter logging.** Successful snapshot writes are no longer logged.
 
+Cut-off visibility (follow-up): the extension now writes a `timed_out` attempt as soon as its 1-second notification cut-off passes, before iOS can end it, so a missed attempt is visible instead of silently absent. If the attempt still finishes, a second entry records the real outcome with reason `after_cutoff`. Measured scheduling times so far are 0–57 ms.
+
 Validation passed 187 shared Swift tests and all 350 iOS simulator unit tests, including a new test that the Parent does not poll in the background, plus the signed device build. Installed on J17 and J14. J14 recovered monitoring by itself and logged the new superseded line. The Watch could not be reached for installation; it runs the previous build, which needs no change for this. No Worker change.
 
 ## AlarmKit from a notification extension, with per-method settings — 29 October 2026

@@ -170,7 +170,7 @@ private struct AlarmAttemptsSection: View {
             }
             Button("Refresh") { load() }
         } header: { Text("Recent alarm attempts") } footer: {
-            Text("Push → start is measured from the service's clock. Alarm = when the alarm was set to go off, measured from the push. Wrist taps are not measured.")
+            Text("Push → start is measured from the service's clock. Alarm = when the alarm was set to go off, measured from the push. timed_out = the extension released the notification at its 1-second cut-off before finishing; a later entry marked after_cutoff shows the result if iOS let it finish. Wrist taps are not measured.")
         }
         .onAppear { load() }
     }
