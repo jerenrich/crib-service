@@ -145,6 +145,7 @@ export default {
      case 'POST /v1/alert/acknowledge':result=await acknowledge(env,shared,await body(request),device.id);break;
      default:throw new APIError(404,'Endpoint not found.');
     }});
+    if(shared.familyAuthorization&&!await pairFor(env,shared))throw new APIError(409,'Family membership changed. Refresh and pair again.');
     if(special instanceof Response)return special;
    }
    return await respond(result,200,'ok');

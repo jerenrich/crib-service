@@ -4,7 +4,7 @@ import {heartbeatTimeline} from './timeline';
 import {scheduleReminders} from './reminders';
 import {APIError,defaultConfiguration,requireRole,type Device,type Env,type Heartbeat} from './types';
 import {configuration,heartbeat as validateHeartbeat} from './security';
-import {pairFor} from './devices';
+import {pairFor,familyAccess} from './devices';
 export async function saveHeartbeat(env:Env,device:Device,value:Record<string,unknown>,latency=new Latency()) {
  requireRole(device,'listener');const heartbeat=validateHeartbeat(value);
  if(heartbeat.listenerId!==device.id)throw new APIError(403,'Listener identity mismatch.');
@@ -47,7 +47,8 @@ export async function saveHeartbeat(env:Env,device:Device,value:Record<string,un
  return parent?configuration(JSON.parse(parent.config)):defaultConfiguration;
 }
 export async function listenerStatus(env:Env,device:Device,latency=new Latency()) {
- const pair=await latency.read<{parent_id:string;listener_id:string;created_at:number}>('status_pair_ms',env.DB.prepare(`SELECT * FROM pairs WHERE ${device.role==='parent'?'parent_id':'listener_id'}=?`).bind(device.id));
+ const access=familyAccess(device);
+ const pair=await latency.read<{parent_id:string;listener_id:string;created_at:number}>('status_pair_ms',env.DB.prepare(`SELECT * FROM pairs WHERE ${device.role==='parent'?'parent_id':'listener_id'}=? AND ${access.sql}`).bind(device.id,...access.args));
  const unpaired=()=>({paired:false,watchPushRegistered:false,serverTime:new Date().toISOString(),nextHeartbeatExpectedAt:null,notificationRelevance:{cryEpisodeIDs:[],testEventIDs:[]},configuration:configuration(JSON.parse(device.config))});
  if(!pair)return unpaired();
  // One consistent snapshot instead of five concurrent binding calls. This
@@ -85,11 +86,11 @@ export async function listenerStatus(env:Env,device:Device,latency=new Latency()
  alerts:events.results.map(event=>({...JSON.parse(event.payload),status:event.status,deliveryTarget:event.delivery_state?'both':event.push_target,deliveryState:event.delivery_state?JSON.parse(event.delivery_state):undefined,alertSentAt:event.sent_at,acknowledgedAt:event.acknowledged_at,resolvedAt:event.resolved_at}))};
 }
 export async function saveSettings(env:Env,device:Device,value:Record<string,unknown>) {
- const config=configuration(value);const pair=await pairFor(env,device);
+ const config=configuration(value),access=familyAccess(device);const pair=await pairFor(env,device);
  if(!pair)throw new APIError(409,'Pair before changing shared settings.');
  const result=await env.DB.prepare(`UPDATE devices SET config=? WHERE id=?
-  AND EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?)`)
-  .bind(JSON.stringify(config),pair.parent_id,pair.parent_id,pair.listener_id,pair.created_at).run();
+  AND EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?) AND ${access.sql}`)
+  .bind(JSON.stringify(config),pair.parent_id,pair.parent_id,pair.listener_id,pair.created_at,...access.args).run();
  if(!result.meta.changes)throw new APIError(409,'Pairing changed. Refresh before changing settings.');
  // Apply a faster cadence to an already active reminder timer immediately.
  await scheduleReminders(env,pair.parent_id,true);

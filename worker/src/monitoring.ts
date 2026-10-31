@@ -1,6 +1,6 @@
 import {APIError,requireRole,type Device,type Env} from './types';
 import {onlyKeys,uuid} from './security';
-import {pairFor} from './devices';
+import {pairFor,familyAccess} from './devices';
 import type {Latency} from './latency';
 
 type Pair={parent_id:string;listener_id:string;created_at:number};
@@ -19,13 +19,13 @@ export async function requestMonitoring(env:Env,device:Device,value:Record<strin
  onlyKeys(value,['id','enabled']);const id=uuid(value.id);
  if(typeof value.enabled!=='boolean')throw new APIError(400,'Monitoring must be true or false.');
  const pair=await pairFor(env,device);if(!pair)throw new APIError(409,'Pair before controlling monitoring.');
- const now=Date.now(),enabled=Number(value.enabled),claim=crypto.randomUUID();
+ const now=Date.now(),enabled=Number(value.enabled),claim=crypto.randomUUID(),access=familyAccess(device);
  // Listener requests report a local action. Parent requests await actual microphone confirmation.
  const status=device.role==='listener'?'applied':'pending';
  await env.DB.batch([
   env.DB.prepare(`INSERT INTO monitoring_commands(id,claim_id,parent_id,listener_id,pair_created_at,enabled,status,created_at,expires_at)
-   SELECT ?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?) ON CONFLICT(id) DO NOTHING`)
-   .bind(id,claim,pair.parent_id,pair.listener_id,pair.created_at,enabled,status,now,now+30000,pair.parent_id,pair.listener_id,pair.created_at),
+   SELECT ?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?) AND ${access.sql} ON CONFLICT(id) DO NOTHING`)
+   .bind(id,claim,pair.parent_id,pair.listener_id,pair.created_at,enabled,status,now,now+30000,pair.parent_id,pair.listener_id,pair.created_at,...access.args),
   // Retire outstanding crying alerts as soon as Stop is requested. Test notifications stay independent.
   env.DB.prepare(`UPDATE events SET acknowledged_at=COALESCE(acknowledged_at,?) WHERE parent_id=? AND listener_id=?
    AND COALESCE(json_extract(payload,'$.isTest'),0)=0 AND ?=0

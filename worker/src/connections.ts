@@ -1,3 +1,4 @@
+import {familyAccess} from './devices';
 import {dispatchEvent} from './alerts';
 import {scheduleReminders} from './reminders';
 import {deliverToBoth} from './dual-delivery';
@@ -10,11 +11,12 @@ import {Latency} from './latency';
 export async function connectionPreferences(env:Env,device:Device,value:Record<string,unknown>) {
  requireRole(device,'parent');
  if(typeof value.enabled!=='boolean'||Object.keys(value).some(k=>k!=='enabled'))throw new APIError(400,'Choose whether to enable connection alerts.');
+ const access=familyAccess(device);
  await env.DB.batch([
-  env.DB.prepare('UPDATE devices SET connection_alerts=? WHERE id=?').bind(Number(value.enabled),device.id),
-  env.DB.prepare("UPDATE connection_notices SET status='cancelled' WHERE parent_id=? AND status IN ('pending','blocked','escalated') AND ?=0").bind(device.id,Number(value.enabled)),
-  env.DB.prepare("DELETE FROM connection_notices WHERE parent_id=? AND state='offline' AND status='cancelled' AND ?=1").bind(device.id,Number(value.enabled)),
-  env.DB.prepare("UPDATE events SET resolved_at=COALESCE(resolved_at,?) WHERE parent_id=? AND resolved_at IS NULL AND json_extract(payload,'$.type')='listener_disconnected' AND ?=0").bind(new Date().toISOString(),device.id,Number(value.enabled))
+  env.DB.prepare(`UPDATE devices SET connection_alerts=? WHERE id=? AND ${access.sql}`).bind(Number(value.enabled),device.id,...access.args),
+  env.DB.prepare(`UPDATE connection_notices SET status='cancelled' WHERE parent_id=? AND status IN ('pending','blocked','escalated') AND ?=0 AND ${access.sql}`).bind(device.id,Number(value.enabled),...access.args),
+  env.DB.prepare(`DELETE FROM connection_notices WHERE parent_id=? AND state='offline' AND status='cancelled' AND ?=1 AND ${access.sql}`).bind(device.id,Number(value.enabled),...access.args),
+  env.DB.prepare(`UPDATE events SET resolved_at=COALESCE(resolved_at,?) WHERE parent_id=? AND resolved_at IS NULL AND json_extract(payload,'$.type')='listener_disconnected' AND ?=0 AND ${access.sql}`).bind(new Date().toISOString(),device.id,Number(value.enabled),...access.args)
  ]);
  return {ok:true};
 }

@@ -1617,6 +1617,36 @@ describe('live sound relay',()=>{
   expect((await call('live-sound',outsider,undefined,'GET')).status).toBe(426);
   expect((await worker.fetch(new Request('https://monitor.test/v1/live-sound',{headers:{upgrade:'websocket',authorization:`Bearer ${outsider.deviceId}.${outsider.secret}`}}),testEnv)).status).toBe(409);
  });
+ it('keeps both caregivers connected and replaces only the reconnecting phone',async()=>{
+  const {parent,listener}=await paired(),partner=device('parent');await register(partner);
+  const {code}=await(await call('caregivers/invite',parent,{name:'Jordan'})).json() as {code:string};
+  expect((await call('caregivers/join',partner,{code,name:'Alex'})).status).toBe(200);
+  const source=await open(listener);await source.next();
+  const first=await open(parent);await source.next();
+  const second=await open(partner);await source.next();
+  const reconnected=await open(parent);await source.next();
+  const firstChallenge=crypto.randomUUID(),secondChallenge=crypto.randomUUID();
+  reconnected.socket.send(JSON.stringify({type:'ping',requestID:firstChallenge}));
+  expect(await source.next()).toEqual({type:'viewing',active:true,requestID:firstChallenge});await reconnected.next();
+  second.socket.send(JSON.stringify({type:'ping',requestID:secondChallenge}));
+  expect(await source.next()).toEqual({type:'viewing',active:true,requestID:secondChallenge});await second.next();
+  const value={...frame(),requestID:secondChallenge,requestIDs:[firstChallenge,secondChallenge]};source.socket.send(JSON.stringify(value));
+  expect(await reconnected.next()).toEqual(value);expect(await second.next()).toEqual(value);
+  expect(first.socket.readyState).not.toBe(WebSocket.OPEN);
+ });
+ it('revokes a departed caregiver on revalidation when immediate chart revocation fails',async()=>{
+  const {parent,listener}=await paired(),partner=device('parent');await register(partner);
+  const {code}=await(await call('caregivers/invite',parent,{name:'Jordan'})).json() as {code:string};
+  await call('caregivers/join',partner,{code,name:'Alex'});
+  const source=await open(listener);await source.next();
+  const owner=await open(parent);await source.next();const invited=await open(partner);await source.next();
+  const closed=new Promise<number>(resolve=>invited.socket.addEventListener('close',event=>resolve(event.code)));
+  const failing=vi.spyOn(testEnv.LIVE_SOUND,'get').mockImplementation(()=>{throw new Error('Relay unavailable');});
+  expect((await call('pairing/remove',partner)).status).toBe(200);failing.mockRestore();
+  vi.spyOn(Date,'now').mockReturnValue(Date.now()+16000);
+  const value=frame();source.socket.send(JSON.stringify(value));
+  expect(await closed).toBe(1008);expect(await owner.next()).toEqual(value);
+ });
  it('relays the exact nursery chart only to its paired Parent and signals viewing demand',async()=>{
   const a=await paired(),b=await paired();
   const listener=await open(a.listener);
@@ -1675,7 +1705,7 @@ describe('live sound relay',()=>{
  it('rejects recordings, extra fields, invalid scales, and oversized windows',()=>{
   expect(soundFrame(frame()).levels).toHaveLength(32);
   expect(soundFrame({...frame(),levels:Array(120).fill(-40)}).levels).toHaveLength(120);
-  for(const value of [{...frame(),audio:'recording'},{...frame(),levels:[0]},
+  for(const value of [{...frame(),audio:'recording'},{...frame(),levels:[0]},{...frame(),requestIDs:['bad']},{...frame(),requestIDs:Array(17).fill(crypto.randomUUID())},
    {...frame(),levels:Array(32).fill(-101)},{...frame(),levels:Array(32).fill(NaN)},
    {...frame(),threshold:-90},{...frame(),episodeStartedAt:Date.now()/1000+100},
    {...frame(),levels:Array(121).fill(-40)},{...frame(),notificationTimes:[Date.now()/1000-31]},
@@ -3629,6 +3659,101 @@ describe('two caregiver families',()=>{
   expect(repeat.silentCryAlarm).toBeUndefined();
  });
 
+ it.each(['pairing/remove','device/delete'])('clears family membership when the nursery calls %s and allows a fresh invitation',async(route)=>{
+  const {parent,partner,listener}=await family();
+  expect((await call(route,listener)).status).toBe(200);
+  expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM caregiver_families').first('n')).toBe(0);
+  expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM caregiver_invites').first('n')).toBe(0);
+  expect((await status(partner)).paired).toBe(false);
+  const replacement=device('listener');await register(replacement);
+  const nursery=await(await call('pairing/create',parent)).json() as {code:string};
+  expect((await call('pairing/claim',replacement,{code:nursery.code})).status).toBe(200);
+  const invite=await(await call('caregivers/invite',parent,{name:'Jordan'})).json() as {code:string};
+  expect((await call('caregivers/join',partner,{code:invite.code,name:'Alex'})).status).toBe(200);
+ });
+ it('does not send secondary notifications after an opt-out during primary delivery',async()=>{
+  const {parent,partner,listener}=await family();await tokens(parent,'a');await tokens(partner,'c');
+  const event=alert(listener);mockPush(200,2);await call('listener/event',listener,event);
+  vi.spyOn(Date,'now').mockReturnValue(Date.now()+121000);
+  const duty=(await status(parent)).caregiverDuty;let changed=false;
+  vi.mocked(fetch).mockImplementation(async(input,init)=>{
+   pushRequests.push({url:String(input),init});
+   if(!changed){changed=true;expect((await call('caregivers/duty',parent,{revision:duty.revision,caregiverId:partner.deviceId,secondaryEnabled:false})).status).toBe(200);}
+   return new Response(null,{status:200});
+  });
+  await runReminder(testEnv,parent.deviceId);
+  expect(pushRequests).toHaveLength(4);
+  expect(pushRequests.every(p=>!p.url.includes('c'.repeat(64))&&!p.url.includes('d'.repeat(64)))).toBe(true);
+ });
+ it('does not dispatch family notifications from a claim reply received after its lease',async()=>{
+  const {parent,listener}=await family();await tokens(parent,'a');const event=alert(listener);
+  // Prepare an unsent event without making an APNs request.
+  await env.DB.prepare('UPDATE devices SET push_token=NULL,watch_push_token=NULL WHERE id=?').bind(parent.deviceId).run();
+  await call('listener/event',listener,event);await tokens(parent,'a');
+  await env.DB.prepare("UPDATE events SET status='pending',next_attempt=0 WHERE event_id=?").bind(event.eventId).run();
+  const now=Date.now();vi.spyOn(Date,'now').mockReturnValue(now);
+  const db=interceptDB(async(sql,_args,method,execute)=>{
+   const result=await execute();
+   if(sql.startsWith("UPDATE events SET status='sending',claim_id=")&&method==='first')vi.mocked(Date.now).mockReturnValue(now+31000);
+   return result;
+  });
+  vi.mocked(fetch).mockImplementation(async(input,init)=>{pushRequests.push({url:String(input),init});return new Response(null,{status:200});});
+  await dispatchEvent({...testEnv,DB:db},event.eventId);expect(pushRequests).toHaveLength(0);
+ });
+ it('keeps a successful partner disconnect successful when the chart service is unavailable',async()=>{
+  const {parent,partner}=await family();
+  vi.spyOn(testEnv.LIVE_SOUND,'get').mockImplementation(()=>{throw new Error('Relay unavailable');});
+  expect((await call('pairing/remove',partner)).status).toBe(200);
+  expect((await status(partner)).paired).toBe(false);expect((await status(parent)).paired).toBe(true);
+ });
+ it.each(['settings','monitoring','alert/acknowledge','alert/resume','connection-alerts'])('rejects a revoked partner’s in-flight %s mutation',async(route)=>{
+  const {parent,partner,listener}=await family();const event=alert(listener);await call('listener/event',listener,event);
+  if(route==='alert/resume')await call('alert/acknowledge',parent,{eventId:event.eventId});
+  const original=await env.DB.prepare('SELECT config,alerts_muted_until,connection_alerts FROM devices WHERE id=?').bind(parent.deviceId).first();
+  const body=route==='settings'?{...defaultConfiguration,alertDuration:120}:route==='monitoring'?{id:crypto.randomUUID(),enabled:false}:route==='alert/acknowledge'?{eventId:event.eventId}:route==='alert/resume'?{expectedUntil:(original as any).alerts_muted_until}:{enabled:false};
+  let revoked=false;
+  const db=interceptDB(async(sql,_args,method,execute)=>{
+   if(!revoked&&(['run','batch'].includes(method))&&(/^(UPDATE devices SET (config|connection_alerts)|INSERT INTO monitoring_commands|INSERT INTO alert_snoozes|UPDATE timeline_events)/.test(sql))){
+    revoked=true;expect((await call('pairing/remove',partner)).status).toBe(200);
+   }
+   return execute();
+  });
+  const response=await worker.fetch(new Request('https://monitor.test/v1/'+route,{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${partner.deviceId}.${partner.secret}`},body:JSON.stringify(body)}),{...testEnv,DB:db});
+  expect(revoked).toBe(true);expect(response.status).toBe(409);
+  expect(await env.DB.prepare('SELECT config,alerts_muted_until,connection_alerts FROM devices WHERE id=?').bind(parent.deviceId).first()).toEqual(original);
+  expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM monitoring_commands').first('n')).toBe(0);
+ });
+ it('repairs stale family records from an earlier nursery pairing when inviting again',async()=>{
+  const {parent,partner}=await family();
+  await env.DB.prepare('UPDATE caregiver_families SET pair_created_at=pair_created_at-1').run();
+  const response=await call('caregivers/invite',parent,{name:'Jordan'});expect(response.status).toBe(200);
+  const {code}=await response.json() as {code:string};
+  expect((await call('caregivers/join',partner,{code,name:'Alex'})).status).toBe(200);
+  expect((await status(parent)).caregiverDuty.caregivers).toHaveLength(2);
+ });
+ it('acknowledges only the requesting caregiver’s tests',async()=>{
+  const {parent,partner,listener}=await family();
+  const own={...alert(listener),isTest:true},invited={...alert(listener),isTest:true,targetCaregiverId:partner.deviceId};
+  for(const event of [own,invited])await env.DB.prepare('INSERT INTO events(event_id,episode_id,listener_id,parent_id,is_repeat,payload,created_at) VALUES(?,?,?,?,0,?,?)').bind(event.eventId,event.episodeId,listener.deviceId,parent.deviceId,JSON.stringify(event),Date.now()).run();
+  expect((await call('alert/acknowledge',partner,{eventId:own.eventId})).status).toBe(403);
+  expect((await call('alert/acknowledge',partner,{eventId:invited.eventId})).status).toBe(200);
+  expect((await status(parent)).alerts.find((e:any)=>e.eventId===own.eventId).acknowledgedAt).toBeNull();
+  expect((await status(partner)).alerts.find((e:any)=>e.eventId===invited.eventId).acknowledgedAt).not.toBeNull();
+  expect((await status(parent)).alertsMutedUntil).toBeNull();
+ });
+ it.each(['listener/status','timeline'])('withholds an in-flight %s response after partner revocation',async(route)=>{
+  const {parent,partner}=await family();let revoked=false;
+  const db=interceptDB(async(sql,_args,method,execute)=>{
+   const result=await execute();
+   if(!revoked&&method==='first'&&sql.startsWith('SELECT * FROM devices WHERE id=')){
+    revoked=true;expect((await call('pairing/remove',partner)).status).toBe(200);
+   }
+   return result;
+  });
+  const response=await worker.fetch(new Request('https://monitor.test/v1/'+route,{headers:{authorization:`Bearer ${partner.deviceId}.${partner.secret}`}}),{...testEnv,DB:db});
+  expect(revoked).toBe(true);expect(response.status).toBe(409);expect(await response.text()).not.toContain('caregiverDuty');
+  expect((await status(parent)).paired).toBe(true);
+ });
  it('invalidates an unused nursery pairing code when a caregiver joins a family',async()=>{
   const {parent,listener}=await paired(),partner=device('parent');await register(partner);
   const nurseryCode=await(await call('pairing/create',partner)).json() as {code:string};

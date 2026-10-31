@@ -195,6 +195,9 @@ struct AlertTimingView: View {
                             ForEach([60, 120, 180, 300], id: \.self) { Text(spokenDuration(Double($0))).tag($0) }
                         }.disabled(model.changingCaregiverDuty || duty.secondary?.secondaryEnabled != true)
                         Text("Duty changes apply to future cry alerts. Turning secondary alerts off also stops escalation to that person for an ongoing alert.").font(.footnote)
+                        if let error = model.caregiverError {
+                            Text(error).font(.footnote).foregroundStyle(Palette.amber)
+                        }
                     }
                 }
                 Section("Reminders & snooze") {

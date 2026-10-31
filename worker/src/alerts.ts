@@ -8,7 +8,7 @@ import {scheduleReminders} from './reminders';
 import {Latency} from './latency';
 import {APIError,requireRole,type Alert,type Device,type Env,type StoredEvent} from './types';
 import {alert as validateAlert,uuid,configuration,date} from './security';
-import {pairFor} from './devices';
+import {pairFor,familyAccess} from './devices';
 import {sendPush,sendSilentCryAlarmPush,type PushIdentityOptions,type PushResult} from './apns';
 import {eventReference,recordDiagnostic,observeLateWrites,PushPreparationError,type Outcome,type Stage} from './diagnostics';
 export async function receiveAlert(env:Env,device:Device,value:Record<string,unknown>,requestId=crypto.randomUUID(),latency=new Latency(),background?:Pick<ExecutionContext,'waitUntil'>) {
@@ -265,11 +265,13 @@ export async function acknowledge(env:Env,device:Device,value:Record<string,unkn
  requireRole(device,'parent');const id=uuid(value.eventId);
  const event=await env.DB.prepare('SELECT * FROM events WHERE event_id=? AND parent_id=?').bind(id,device.id).first<StoredEvent>();
  if(!event)throw new APIError(404,'Alert not found.');
+ const payload=JSON.parse(event.payload) as Alert;
+ if(payload.isTest&&(payload.targetCaregiverId??event.parent_id)!==actorId)throw new APIError(403,'This test belongs to another caregiver.');
  if(event.acknowledged_at){
   if(!(JSON.parse(event.payload) as Alert).isTest)await scheduleReminders(env,device.id);
   return {ok:true};
  }
- const now=Date.now(),timestamp=new Date(now).toISOString();
+ const now=Date.now(),timestamp=new Date(now).toISOString(),access=familyAccess(device);
  const pair=await pairFor(env,device);if(!pair||pair.listener_id!==event.listener_id)throw new APIError(409,'Pairing changed.');
  const isTest=(JSON.parse(event.payload) as Alert).isTest===true;
  // A queued Snooze (Watch relay, offline AlarmKit Stop) can arrive long after the
@@ -280,24 +282,25 @@ export async function acknowledge(env:Env,device:Device,value:Record<string,unkn
   ...(isTest?{}:{endAt:new Date(until).toISOString()})};
  const journal=env.DB.prepare(`INSERT INTO timeline_events(id,parent_id,listener_id,pair_created_at,kind,occurred_at,payload)
   SELECT ?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?)
-  AND EXISTS(SELECT 1 FROM events WHERE event_id=? AND acknowledged_at IS NULL) ON CONFLICT DO NOTHING`)
-  .bind(journalEvent.id,pair.parent_id,pair.listener_id,pair.created_at,journalEvent.kind,actedAt,JSON.stringify(journalEvent),pair.parent_id,pair.listener_id,pair.created_at,id);
+  AND EXISTS(SELECT 1 FROM events WHERE event_id=? AND acknowledged_at IS NULL) AND ${access.sql} ON CONFLICT DO NOTHING`)
+  .bind(journalEvent.id,pair.parent_id,pair.listener_id,pair.created_at,journalEvent.kind,actedAt,JSON.stringify(journalEvent),pair.parent_id,pair.listener_id,pair.created_at,id,...access.args);
  if(isTest) {
-  // Tests never expire, so confirming one also confirms this pair's earlier unconfirmed tests.
-  // Otherwise repeated tests would each need a separate confirmation. Real alerts are untouched.
+  // Confirm this caregiver's earlier tests without clearing the other person's
+  // independent delivery check. Real alerts are untouched.
   await env.DB.batch([journal,env.DB.prepare(`UPDATE events SET acknowledged_at=COALESCE(acknowledged_at,?) WHERE parent_id=? AND listener_id=?
    AND acknowledged_at IS NULL AND COALESCE(json_extract(payload,'$.isTest'),0)=1 AND (event_id=? OR created_at<=?)
-   AND EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?)`)
-   .bind(timestamp,device.id,event.listener_id,id,event.created_at,pair.parent_id,pair.listener_id,pair.created_at)]);
+   AND COALESCE(json_extract(payload,'$.targetCaregiverId'),parent_id)=?
+   AND EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?) AND ${access.sql}`)
+   .bind(timestamp,device.id,event.listener_id,id,event.created_at,actorId,pair.parent_id,pair.listener_id,pair.created_at,...access.args)]);
  }else{
   const claim=crypto.randomUUID();
   // A unique request claim gates every side effect in the same D1 transaction.
   // A duplicate or a request overtaken by unpairing cannot affect newer alerts.
   await env.DB.batch([
    env.DB.prepare(`INSERT INTO alert_snoozes(event_id,claim_id,parent_id,listener_id,pair_created_at,started_at,until_at)
-    SELECT ?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?)
+    SELECT ?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?) AND ${access.sql}
     AND EXISTS(SELECT 1 FROM events WHERE event_id=? AND parent_id=? AND listener_id=? AND acknowledged_at IS NULL)
-    ON CONFLICT DO NOTHING`).bind(id,claim,device.id,pair.listener_id,pair.created_at,actedAt,until,pair.parent_id,pair.listener_id,pair.created_at,id,device.id,pair.listener_id),
+    ON CONFLICT DO NOTHING`).bind(id,claim,device.id,pair.listener_id,pair.created_at,actedAt,until,pair.parent_id,pair.listener_id,pair.created_at,...access.args,id,device.id,pair.listener_id),
    // Never shorten a longer snooze that is already running; an expired one mutes nothing.
    env.DB.prepare(`UPDATE devices SET alerts_muted_until=?,alerts_muted_at=?,alerts_muted_by=? WHERE id=? AND ?>? AND ?>alerts_muted_until
     AND EXISTS(SELECT 1 FROM alert_snoozes WHERE event_id=? AND claim_id=?)`).bind(until,actedAt,actorId,device.id,until,now,until,id,claim),
@@ -317,10 +320,10 @@ export async function resumeAlerts(env:Env,device:Device,value:Record<string,unk
  const expected=value.expectedUntil;
  if(typeof expected!=='number'||!Number.isSafeInteger(expected)||expected<=0)throw new APIError(400,'A valid snooze deadline is required.');
  const pair=await pairFor(env,device);if(!pair)throw new APIError(409,'Pair a Listener first.');
- const now=Date.now();
+ const now=Date.now(),access=familyAccess(device);
  const guardSQL=`EXISTS(SELECT 1 FROM devices d JOIN pairs p ON p.parent_id=d.id
-  WHERE d.id=? AND d.alerts_muted_until=? AND p.listener_id=? AND p.created_at=?)`;
- const scope=[device.id,expected,pair.listener_id,pair.created_at];
+  WHERE d.id=? AND d.alerts_muted_until=? AND p.listener_id=? AND p.created_at=?) AND ${access.sql}`;
+ const scope=[device.id,expected,pair.listener_id,pair.created_at,...access.args];
  await env.DB.batch([
   // Retain the actual muted interval so delayed uploads from that interval stay silent.
   env.DB.prepare(`UPDATE timeline_events SET payload=json_set(payload,'$.endAt',?)
