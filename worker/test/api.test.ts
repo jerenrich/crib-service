@@ -1263,11 +1263,12 @@ describe('configurable reminders and acknowledgement mute',()=>{
   const afterRetry=await (await call('listener/status',parent,undefined,'GET')).json() as {alertsMutedUntil:string};
   expect(afterRetry.alertsMutedUntil).toBe(newer.alertsMutedUntil);
  });
- it('restricts resume to the current parent and validates the expected deadline',async()=>{
+ it('restricts resume to the current pairing and validates the expected deadline',async()=>{
   const {parent,listener,event}=await ready();await call('alert/acknowledge',parent,{eventId:event.eventId});
   const status=await (await call('listener/status',parent,undefined,'GET')).json() as {alertsMutedUntil:string};
   const expectedUntil=Date.parse(status.alertsMutedUntil);
-  expect((await call('alert/resume',listener,{expectedUntil})).status).toBe(403);
+  const unpaired=device('listener');await register(unpaired);
+  expect((await call('alert/resume',unpaired,{expectedUntil})).status).toBe(409);
   expect((await call('alert/resume',parent,{})).status).toBe(400);
   const other=await paired();
   await call('alert/resume',other.parent,{expectedUntil});
@@ -3753,6 +3754,48 @@ describe('two caregiver families',()=>{
   const response=await worker.fetch(new Request('https://monitor.test/v1/'+route,{headers:{authorization:`Bearer ${partner.deviceId}.${partner.secret}`}}),{...testEnv,DB:db});
   expect(revoked).toBe(true);expect(response.status).toBe(409);expect(await response.text()).not.toContain('caregiverDuty');
   expect((await status(parent)).paired).toBe(true);
+ });
+ it('lets the paired nursery snooze and resume the household without stopping monitoring',async()=>{
+  const {parent,partner,listener}=await family(),event=alert(listener);
+  expect((await call('listener/heartbeat',listener,{listenerId:listener.deviceId,timestamp:new Date().toISOString(),monitoring:true,microphoneActive:true,powerConnected:true,state:'quiet',episodes:[]})).status).toBe(200);
+  await call('listener/event',listener,event);
+  expect((await call('alert/acknowledge',listener,{eventId:event.eventId})).status).toBe(200);
+  const owner=await status(parent),member=await status(partner),nursery=await status(listener);
+  expect(Date.parse(owner.alertsMutedUntil)).toBeGreaterThan(Date.now());
+  expect(member.alertsMutedUntil).toBe(owner.alertsMutedUntil);expect(nursery.alertsMutedUntil).toBe(owner.alertsMutedUntil);
+  expect(owner.snoozedBy).toBe(listener.deviceId);expect(nursery.monitoring).toBe(true);expect(nursery.microphoneActive).toBe(true);
+  const expectedUntil=Date.parse(nursery.alertsMutedUntil);
+  expect((await call('alert/resume',listener,{expectedUntil})).status).toBe(200);
+  expect(Date.parse((await status(parent)).alertsMutedUntil)).toBeLessThanOrEqual(Date.now());
+  expect((await status(listener)).monitoring).toBe(true);
+  expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM monitoring_commands').first('n')).toBe(0);
+ });
+ it('rejects an unpaired or different nursery and does not let the Listener acknowledge caregiver tests',async()=>{
+  const {parent,listener}=await family(),event=alert(listener);await call('listener/event',listener,event);
+  const other=await paired(),unpaired=device('listener');await register(unpaired);
+  expect((await call('alert/acknowledge',unpaired,{eventId:event.eventId})).status).toBe(409);
+  expect((await call('alert/acknowledge',other.listener,{eventId:event.eventId})).status).toBe(404);
+  const test={...alert(listener),isTest:true};await call('listener/event',listener,test);
+  expect((await call('alert/acknowledge',listener,{eventId:test.eventId})).status).toBe(403);
+  expect((await status(parent)).alertsMutedUntil).toBeNull();
+ });
+ it.each(['alert/acknowledge','alert/resume'])('does not let an in-flight nursery %s affect a replacement pairing',async(route)=>{
+  const {parent,listener}=await family(),event=alert(listener);await call('listener/event',listener,event);
+  if(route==='alert/resume')await call('alert/acknowledge',parent,{eventId:event.eventId});
+  const until=Date.parse((await status(parent)).alertsMutedUntil);let replaced=false;
+  const db=interceptDB(async(sql,_args,method,execute)=>{
+   if(!replaced&&method==='batch'&&(sql.startsWith('INSERT INTO alert_snoozes')||sql.startsWith('UPDATE timeline_events'))){
+    replaced=true;expect((await call('pairing/remove',listener)).status).toBe(200);
+    const replacement=device('listener');await register(replacement);
+    const {code}=await(await call('pairing/create',parent)).json() as {code:string};
+    await call('pairing/claim',replacement,{code});
+   }
+   return execute();
+  });
+  const response=await worker.fetch(new Request('https://monitor.test/v1/'+route,{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${listener.deviceId}.${listener.secret}`},body:JSON.stringify(route==='alert/resume'?{expectedUntil:until}:{eventId:event.eventId})}),{...testEnv,DB:db});
+  expect(replaced).toBe(true);expect(response.status).toBe(409);
+  expect((await status(parent)).alertsMutedUntil).toBeNull();
+  expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM alert_snoozes').first('n')).toBe(0);
  });
  it('invalidates an unused nursery pairing code when a caregiver joins a family',async()=>{
   const {parent,listener}=await paired(),partner=device('parent');await register(partner);

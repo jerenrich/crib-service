@@ -13,7 +13,7 @@ import {providerTokens} from './provider-token';
 import {openLiveSound} from './live-sound';
 import {APIError,type Env} from './types';
 import {body,rateLimit} from './security';
-import {admitAlert,admitHeartbeat,authenticate,register,savePushToken,saveWatchPushToken,saveSilentWatchAlarms,removeDeviceData,pairFor} from './devices';
+import {admitAlert,admitHeartbeat,authenticate,register,savePushToken,saveWatchPushToken,saveSilentWatchAlarms,removeDeviceData,pairFor,listenerSnoozeDevice} from './devices';
 import {connectionPreferences,flushConnections} from './connections';
 import {createPairing,claimPairing} from './pairing';
 import {receiveAlert,acknowledge,resumeAlerts,flushPending} from './alerts';
@@ -78,7 +78,8 @@ export default {
     stage='handler';
     const family=device.role==='parent'?await familyFor(env,device):null;
     const sharedRoutes=['GET /v1/listener/status','GET /v1/timeline','GET /v1/live-sound','POST /v1/monitoring','POST /v1/settings','POST /v1/alert/resume','POST /v1/alert/acknowledge','POST /v1/connection-alerts'];
-    const shared=sharedRoutes.includes(route)?await sharedDevice(env,device,family):device;
+    const nurserySnooze=device.role==='listener'&&['POST /v1/alert/acknowledge','POST /v1/alert/resume'].includes(route);
+    const shared=nurserySnooze?await listenerSnoozeDevice(env,device):sharedRoutes.includes(route)?await sharedDevice(env,device,family):device;
     const special=await latency.measure('handler_ms',async()=>{switch(route){
      case 'POST /v1/caregivers/invite':result=await inviteCaregiver(env,device,await body(request));break;
      case 'POST /v1/caregivers/join':result=await joinCaregiver(env,device,await body(request),ip);break;
@@ -145,7 +146,7 @@ export default {
      case 'POST /v1/alert/acknowledge':result=await acknowledge(env,shared,await body(request),device.id);break;
      default:throw new APIError(404,'Endpoint not found.');
     }});
-    if(shared.familyAuthorization&&!await pairFor(env,shared))throw new APIError(409,'Family membership changed. Refresh and pair again.');
+    if((shared.familyAuthorization||shared.listenerAuthorization)&&!await pairFor(env,shared))throw new APIError(409,'Pairing changed. Refresh and pair again.');
     if(special instanceof Response)return special;
    }
    return await respond(result,200,'ok');

@@ -51,6 +51,36 @@ final class OnboardingUITests: XCTestCase {
         XCTAssertFalse(app.staticTexts["Test notification"].exists)
     }
 
+    @MainActor func testNurseryAlertCircleOffersSnoozeAndKeepsPauseVisible() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", "--uitesting-listener", "--uitesting-active-alert"]
+        app.launch()
+        let snooze = app.buttons["nightstandSnooze"]
+        XCTAssertTrue(snooze.waitForExistence(timeout: 5))
+        XCTAssertTrue(snooze.isHittable)
+        XCTAssertEqual(snooze.label, "Snooze alerts for 1 min")
+        XCTAssertTrue(app.buttons["nightstandMonitoringControl"].isHittable)
+        XCTAssertFalse(app.buttons["nightstandTestAlert"].exists)
+        XCTAssertTrue(app.windows.firstMatch.frame.contains(snooze.frame))
+        XCTAssertTrue(app.descendants(matching: .any)["soundLevelChart"].firstMatch.isHittable)
+        let shot = XCTAttachment(screenshot: app.screenshot()); shot.name = "Nursery alert Snooze circle"; shot.lifetime = .keepAlways; add(shot)
+    }
+
+    @MainActor func testNurserySnoozedCircleShowsResumeAndCountdown() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", "--uitesting-listener", "--uitesting-snoozed"]
+        app.launch()
+        let resume = app.buttons["nightstandResumeAlerts"]
+        XCTAssertTrue(resume.waitForExistence(timeout: 5))
+        XCTAssertTrue(resume.isHittable)
+        XCTAssertTrue(app.windows.firstMatch.frame.contains(resume.frame))
+        XCTAssertFalse(app.buttons["nightstandSnooze"].exists)
+        XCTAssertTrue(app.buttons["nightstandMonitoringControl"].isHittable)
+        app.buttons["nightstandDetails"].tap()
+        XCTAssertTrue(app.buttons["resumeAlerts"].waitForExistence(timeout: 5))
+        let shot = XCTAttachment(screenshot: app.screenshot()); shot.name = "Nursery snooze countdown"; shot.lifetime = .keepAlways; add(shot)
+    }
+
     @MainActor func testCompactCaregiverControlsFitWithoutScrolling() {
         let app = XCUIApplication()
         app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", "--uitesting-active-alert", "--uitesting-caregivers"]

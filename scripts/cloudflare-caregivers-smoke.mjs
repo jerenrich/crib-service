@@ -60,6 +60,13 @@ try {
  const a = (await status(parent)).body, b = (await status(partner)).body;
  check(a.alertsMutedUntil === b.alertsMutedUntil && Date.parse(a.alertsMutedUntil) > Date.now() && a.snoozedBy === partner.deviceId, 'shared snooze and caregiver attribution');
  check((await request('alert/resume', parent, {expectedUntil: Date.parse(a.alertsMutedUntil)})).status === 200, 'original Parent resumes shared alerts');
+ const nurseryNow = new Date().toISOString();
+ const nurseryEvent = {...event, eventId: randomUUID(), episodeId: randomUUID(), cryStartedAt: nurseryNow, createdAt: nurseryNow};
+ check((await request('listener/event', listener, nurseryEvent)).status === 200, 'fresh alert for nursery snooze check');
+ check((await request('alert/acknowledge', listener, {eventId: nurseryEvent.eventId})).status === 200, 'nursery snoozes household alerts');
+ const nurserySnooze = (await status(listener)).body;
+ check(nurserySnooze.snoozedBy === listener.deviceId && Date.parse(nurserySnooze.alertsMutedUntil) > Date.now(), 'nursery snooze confirmed and attributed');
+ check((await request('alert/resume', listener, {expectedUntil: Date.parse(nurserySnooze.alertsMutedUntil)})).status === 200, 'nursery resumes shared alerts');
  check((await request('pairing/remove', partner)).status === 200, 'invited caregiver disconnects independently');
  check(!(await status(partner)).body.paired && (await status(parent)).body.paired, 'original nursery pairing survives partner disconnect');
  console.log('Caregiver deployment smoke check passed; no APNs tokens were registered.');

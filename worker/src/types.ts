@@ -22,7 +22,7 @@ export interface Env {
  TOKEN_ENCRYPTION_KEY: string;
  PAIRING_PEPPER: string;
 }
-export interface Device { id: string; role: 'parent' | 'listener'; secret_hash: string; push_token: string | null; config: string; familyAuthorization?:{memberId:string;pairCreatedAt:number} }
+export interface Device { id: string; role: 'parent' | 'listener'; secret_hash: string; push_token: string | null; config: string; familyAuthorization?:{memberId:string;pairCreatedAt:number};listenerAuthorization?:{listenerId:string;pairCreatedAt:number} }
 export interface Configuration { alertDuration: number; quietResetDuration: number; repeatInterval?: number | null; absoluteThreshold: number; snoozeDuration: number }
 export const defaultConfiguration: Configuration = {alertDuration:5, quietResetDuration:20, repeatInterval:5, absoluteThreshold:-35, snoozeDuration:60};
 export interface Episode {id:string; startedAt:string; endedAt?:string|null; alertSentAt?:string|null; quietConfirmed?:boolean}
