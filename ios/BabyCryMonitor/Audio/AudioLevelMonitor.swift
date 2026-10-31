@@ -18,6 +18,7 @@ struct NurseryAudioFailure: Error {
 /// be tested without a microphone or an audio route belonging to the test host.
 protocol AudioCaptureDriving: Sendable {
     var isRunning: Bool { get async }
+    var engineID: ObjectIdentifier { get async }
     func activate(generation: Int, clearSound: Bool) async throws
     func setSound(_ state: NurserySoundState, capture: Bool, generation: Int) async throws
     func pause(generation: Int) async
@@ -234,20 +235,29 @@ extension AudioLevelProviding {
             let options = notification.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
             let reason = notification.userInfo?[AVAudioSessionInterruptionReasonKey] as? UInt
                 ?? notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
-            Task { @MainActor [weak self] in await self?.handle(name: name, type: type, options: options, reason: reason) }
+            let engineID = (notification.object as? AVAudioEngine).map(ObjectIdentifier.init)
+            Task { @MainActor [weak self] in await self?.handle(name: name, type: type, options: options, reason: reason, engineID: engineID) }
         })
     }
-    private func handle(name: Notification.Name, type: UInt?, options: UInt, reason: UInt?) async {
+    private func handle(name: Notification.Name, type: UInt?, options: UInt, reason: UInt?, engineID: ObjectIdentifier?) async {
         // Notifications can arrive while a rebuild is still awaiting its actor.
         // Let that operation publish its state before deciding what to recover.
         let notificationGeneration = generation
-        while configuringGeneration == notificationGeneration {
+        let isConfigurationChange = name == .AVAudioEngineConfigurationChange ||
+            (name == AVAudioSession.routeChangeNotification &&
+             (reason == AVAudioSession.RouteChangeReason.categoryChange.rawValue ||
+              reason == AVAudioSession.RouteChangeReason.routeConfigurationChange.rawValue))
+        while isConfigurationChange && configuringGeneration == notificationGeneration {
             try? await Task.sleep(for: .milliseconds(20))
             guard generation == notificationGeneration else { return }
         }
         // Graph/category notifications from our own successful configuration are
         // not an external route change and must not stop a newly started sound.
         let observedGeneration = generation
+        if name == .AVAudioEngineConfigurationChange, let engineID {
+            let currentEngineID = await driver.engineID
+            guard observedGeneration == generation, engineID == currentEngineID else { return }
+        }
         let running = await driver.isRunning
         guard observedGeneration == generation else { return }
         if name == .AVAudioEngineConfigurationChange, running { return }
@@ -259,11 +269,11 @@ extension AudioLevelProviding {
         // category or route-configuration notification and stop the engine. In
         // that case restore the existing graph, including sound, rather than
         // treating our own transition as a disconnected audio device.
-        if name == AVAudioSession.routeChangeNotification,
-           (reason == AVAudioSession.RouteChangeReason.categoryChange.rawValue ||
-            reason == AVAudioSession.RouteChangeReason.routeConfigurationChange.rawValue) {
+        if isConfigurationChange {
             guard wantsMonitoring || nurseryState.playing else { return }
             generation += 1; let expected = generation
+            configuringGeneration = expected
+            defer { if configuringGeneration == expected { configuringGeneration = nil } }
             if wantsMonitoring { onStatus?(.recovering("Recovering speaker and microphone…")) }
             do {
                 if wantsMonitoring { try await driver.activate(generation: expected, clearSound: false) }
@@ -350,6 +360,7 @@ private actor AudioCaptureDriver: AudioCaptureDriving {
     private let continuation: AsyncStream<AudioLevelSample>.Continuation
     init(continuation: AsyncStream<AudioLevelSample>.Continuation) { self.continuation = continuation }
     var isRunning: Bool { engine.isRunning }
+    var engineID: ObjectIdentifier { ObjectIdentifier(engine) }
     func activate(generation requested: Int, clearSound: Bool) throws {
         try Task.checkCancellation()
         guard requested >= generation else { throw CancellationError() }; generation = requested

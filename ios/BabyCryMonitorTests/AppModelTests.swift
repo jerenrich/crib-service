@@ -147,6 +147,7 @@ final class AppModelTests: XCTestCase {
     actor AudioDriver: AudioCaptureDriving {
         struct Operation: Sendable { var capture: Bool; var state: NurserySoundState }
         var isRunning = false
+        var engineID = ObjectIdentifier(NSObject())
         var generation = 0
         var current = Operation(capture: false, state: .init())
         var operations: [Operation] = []
@@ -157,6 +158,7 @@ final class AppModelTests: XCTestCase {
             nextSetGate = gate; self.failRestoration = failRestoration
         }
         func simulateEngineStopped() { isRunning = false }
+        func setEngineID(_ id: ObjectIdentifier) { engineID = id }
         func activate(generation requested: Int, clearSound: Bool) throws {
             guard requested >= generation else { throw CancellationError() }; generation = requested
             current.capture = true
@@ -361,6 +363,51 @@ final class AppModelTests: XCTestCase {
         let current = await driver.current
         XCTAssertTrue(current.capture)
         XCTAssertTrue(current.state.playing)
+        audio.stop()
+    }
+    @MainActor func testEngineConfigurationRecoveryPreservesPlaybackAndIgnoresOldEngine() async throws {
+        for capture in [false, true] {
+            let driver = AudioDriver(), audio = AudioLevelMonitor(driver: driver)
+            let currentEngine = AVAudioEngine(), oldEngine = AVAudioEngine()
+            await driver.setEngineID(ObjectIdentifier(currentEngine))
+            var state = NurserySoundState()
+            audio.onNurserySoundChange = { state = $0 }
+            if capture { try await audio.start() }
+            try await audio.setNurserySound(.init(settings: .init(), action: .play))
+            await driver.simulateEngineStopped()
+            NotificationCenter.default.post(name: .AVAudioEngineConfigurationChange, object: oldEngine)
+            try await Task.sleep(for: .milliseconds(100))
+            let stillStopped = await driver.isRunning
+            XCTAssertFalse(stillStopped, "A notification from a replaced engine must be ignored")
+            XCTAssertTrue(state.playing)
+            NotificationCenter.default.post(name: .AVAudioEngineConfigurationChange, object: currentEngine)
+            let recovered = await eventually { await driver.isRunning }
+            XCTAssertTrue(recovered)
+            let current = await driver.current
+            XCTAssertEqual(current.capture, capture)
+            XCTAssertTrue(current.state.playing)
+            XCTAssertTrue(state.playing)
+            audio.stop()
+        }
+    }
+    @MainActor func testInterruptionDuringPlaySupersedesThePendingStart() async throws {
+        let driver = AudioDriver(), gate = RequestGate(), audio = AudioLevelMonitor(driver: driver)
+        var state = NurserySoundState()
+        audio.onNurserySoundChange = { state = $0 }
+        try await audio.start()
+        await driver.configure(gate: gate)
+        let play = Task { try await audio.setNurserySound(.init(settings: .init(), action: .play)) }
+        let entered = await eventually { await driver.setAttempts == 1 }
+        XCTAssertTrue(entered)
+        NotificationCenter.default.post(name: AVAudioSession.interruptionNotification, object: nil,
+            userInfo: [AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.began.rawValue])
+        let paused = await eventually { !(await driver.isRunning) }
+        XCTAssertTrue(paused)
+        await gate.open()
+        if case .success = await play.result { XCTFail("An interrupted start must not succeed") }
+        XCTAssertFalse(state.playing)
+        let current = await driver.current
+        XCTAssertFalse(current.state.playing)
         audio.stop()
     }
     @MainActor func testOtherCaregiverCannotUndoTimerChangeWithAStaleVolumeCommand() async throws {
