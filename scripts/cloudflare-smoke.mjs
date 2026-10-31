@@ -148,8 +148,8 @@ try {
     const afterTest = await request('listener/status', parent, null, 'GET');
     check(afterTest.body.alertsMutedUntil === snoozed.body.alertsMutedUntil, 'test acknowledgement does not extend the real snooze');
     const expectedUntil = Date.parse(snoozed.body.alertsMutedUntil);
-    check((await request('alert/resume', listener, {expectedUntil})).status === 403, 'early resume restricted to Parent');
-    check((await request('alert/resume', parent, {expectedUntil})).status === 200, 'Parent can end the observed snooze early');
+    check((await request('alert/resume', listener, {expectedUntil})).status === 200, 'paired Listener can end the shared snooze early');
+    check((await request('alert/resume', parent, {expectedUntil})).status === 200, 'Parent can repeat the shared resume safely');
     const resumed = await request('listener/status', parent, null, 'GET');
     check(Date.parse(resumed.body.alertsMutedUntil) <= Date.now() && Date.parse(resumed.body.alertsMutedUntil) < expectedUntil, 'early resume is confirmed by authoritative status');
     const nextCreatedAt = new Date();
@@ -195,4 +195,16 @@ try {
 } catch (error) {
     console.error(`Smoke check failed: ${error instanceof Error ? error.message : 'unknown failure'}. Cleanup SQL remains available.`);
     process.exitCode = 1;
+} finally {
+    let cleanupFailed = false;
+    for (const device of [listener, parent]) {
+        try {
+            const result = await request('device/delete', device);
+            if (result.status !== 200 && result.status !== 401) cleanupFailed = true;
+        } catch { cleanupFailed = true; }
+    }
+    if (cleanupFailed) {
+        console.error(`Temporary-device cleanup incomplete. Apply the generated cleanup SQL: ${cleanupPath}`);
+        process.exitCode = 1;
+    } else console.log('PASS temporary-device cleanup completed');
 }
