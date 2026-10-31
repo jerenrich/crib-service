@@ -146,7 +146,25 @@ final class AppModelTests: XCTestCase {
     }
     actor AudioDriver: AudioCaptureDriving {
         struct Operation: Sendable { var capture: Bool; var state: NurserySoundState }
-        var isRunning = false
+        private var running = false
+        var statusReads = 0
+        var statusGate: RequestGate?
+        var recoveryGate: RequestGate?
+        var recoveryAttempts = 0
+        var failRecovery = false
+        var isRunning: Bool {
+            get async {
+                statusReads += 1
+                let snapshot = running, gate = statusGate
+                // Keep the gate installed until it opens so any second status
+                // query also blocks. This reproduces competing notification reads.
+                await gate?.wait()
+                statusGate = nil
+                return snapshot
+            }
+        }
+        func blockNextStatusRead(_ gate: RequestGate) { statusGate = gate }
+        func configureRecovery(gate: RequestGate? = nil, fail: Bool = false) { recoveryGate = gate; failRecovery = fail }
         var engineID = ObjectIdentifier(NSObject())
         var generation = 0
         var current = Operation(capture: false, state: .init())
@@ -157,13 +175,21 @@ final class AppModelTests: XCTestCase {
         func configure(gate: RequestGate? = nil, failRestoration: Bool = false) {
             nextSetGate = gate; self.failRestoration = failRestoration
         }
-        func simulateEngineStopped() { isRunning = false }
+        func simulateEngineStopped() { running = false }
         func setEngineID(_ id: ObjectIdentifier) { engineID = id }
+        func recoverConfiguration(generation requested: Int) async throws {
+            recoveryAttempts += 1
+            let gate = recoveryGate; recoveryGate = nil
+            await gate?.wait()
+            guard requested >= generation else { throw CancellationError() }; generation = requested
+            if failRecovery { throw URLError(.cannotOpenFile) }
+            running = current.capture || current.state.playing
+        }
         func activate(generation requested: Int, clearSound: Bool) throws {
             guard requested >= generation else { throw CancellationError() }; generation = requested
             current.capture = true
             if clearSound { current.state.playing = false; current.state.remainingSeconds = 0 }
-            operations.append(current); isRunning = true
+            operations.append(current); running = true
         }
         func setSound(_ state: NurserySoundState, capture: Bool, generation requested: Int) async throws {
             setAttempts += 1
@@ -171,17 +197,17 @@ final class AppModelTests: XCTestCase {
             await gate?.wait()
             guard requested >= generation else { throw CancellationError() }; generation = requested
             if state.playing { try Task.checkCancellation() }
-            if capture, !state.playing, failRestoration { isRunning = false; throw URLError(.cannotOpenFile) }
+            if capture, !state.playing, failRestoration { running = false; throw URLError(.cannotOpenFile) }
             current = Operation(capture: capture, state: state); operations.append(current)
-            isRunning = capture || state.playing
+            running = capture || state.playing
         }
         func pause(generation requested: Int) {
             guard requested >= generation else { return }; generation = requested
-            current.state.playing = false; current.state.remainingSeconds = 0; isRunning = false
+            current.state.playing = false; current.state.remainingSeconds = 0; running = false
         }
         func stop(generation requested: Int) {
             guard requested >= generation else { return }; generation = requested
-            current = Operation(capture: false, state: .init()); operations.append(current); isRunning = false
+            current = Operation(capture: false, state: .init()); operations.append(current); running = false
         }
     }
     @MainActor func testQueuedRemotePlayCannotRunAfterLocalStopAndOldTokensAreRevoked() async throws {
@@ -408,6 +434,124 @@ final class AppModelTests: XCTestCase {
         XCTAssertFalse(state.playing)
         let current = await driver.current
         XCTAssertFalse(current.state.playing)
+        audio.stop()
+    }
+    @MainActor func testRepeatedConfigurationFailuresStopVisiblyWithoutRebuilding() async throws {
+        let driver = AudioDriver(), audio = AudioLevelMonitor(driver: driver)
+        var state = NurserySoundState(), failed = false
+        audio.onNurserySoundChange = { state = $0 }
+        audio.onStatus = { if case .failed = $0 { failed = true } }
+        try await audio.start()
+        try await audio.setNurserySound(.init(settings: .init(), action: .play))
+        for _ in 0..<2 {
+            await driver.simulateEngineStopped()
+            NotificationCenter.default.post(name: .AVAudioEngineConfigurationChange, object: nil)
+            let recovered = await eventually { await driver.isRunning }
+            XCTAssertTrue(recovered)
+        }
+        await driver.simulateEngineStopped()
+        NotificationCenter.default.post(name: .AVAudioEngineConfigurationChange, object: nil)
+        let stopped = await eventually { !state.playing }
+        XCTAssertTrue(stopped)
+        let reported = await eventually { failed }
+        XCTAssertTrue(reported)
+        let running = await driver.isRunning
+        XCTAssertFalse(running)
+        let current = await driver.current
+        XCTAssertFalse(current.capture)
+        let attempts = await driver.setAttempts
+        XCTAssertEqual(attempts, 1, "The limit must not launch a fallback graph rebuild")
+        XCTAssertFalse(current.state.playing)
+        audio.stop()
+    }
+    @MainActor func testExternalEventsAreNotLostWhileConfigurationReadsDriverStatus() async throws {
+        for event in [AVAudioSession.interruptionNotification, AVAudioSession.routeChangeNotification,
+                      AVAudioSession.mediaServicesWereResetNotification] {
+            let driver = AudioDriver(), gate = RequestGate(), audio = AudioLevelMonitor(driver: driver)
+            var state = NurserySoundState()
+            audio.onNurserySoundChange = { state = $0 }
+            try await audio.start()
+            try await audio.setNurserySound(.init(settings: .init(), action: .play))
+            await driver.simulateEngineStopped()
+            let before = await driver.statusReads
+            await driver.blockNextStatusRead(gate)
+            NotificationCenter.default.post(name: .AVAudioEngineConfigurationChange, object: nil)
+            let reading = await eventually { await driver.statusReads > before }
+            XCTAssertTrue(reading)
+            NotificationCenter.default.post(name: event, object: nil, userInfo: [
+                AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.began.rawValue,
+                AVAudioSessionRouteChangeReasonKey: AVAudioSession.RouteChangeReason.oldDeviceUnavailable.rawValue])
+            let stopped = await eventually { !state.playing }
+            XCTAssertTrue(stopped, "External events must not wait for configuration status reads")
+            await gate.open()
+            try await Task.sleep(for: .milliseconds(80))
+            XCTAssertFalse(state.playing)
+            let attempts = await driver.recoveryAttempts
+            XCTAssertEqual(attempts, 0, "Stale configuration recovery must not resurrect playback")
+            if event == AVAudioSession.interruptionNotification {
+                do { try await audio.setNurserySound(.init(settings: .init(), action: .play)); XCTFail("Cannot play during interruption") }
+                catch {}
+            }
+            audio.stop()
+        }
+    }
+    @MainActor func testStopSoundDuringInterruptionCannotReactivateCapture() async throws {
+        let driver = AudioDriver(), audio = AudioLevelMonitor(driver: driver)
+        var state = NurserySoundState()
+        audio.onNurserySoundChange = { state = $0 }
+        try await audio.start()
+        try await audio.setNurserySound(.init(settings: .init(), action: .play))
+        NotificationCenter.default.post(name: AVAudioSession.interruptionNotification, object: nil,
+            userInfo: [AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.began.rawValue])
+        let stopped = await eventually { !state.playing }
+        XCTAssertTrue(stopped)
+        try await audio.setNurserySound(.init(settings: .init(), action: .stop))
+        let running = await driver.isRunning
+        XCTAssertFalse(running)
+        let attempts = await driver.setAttempts
+        XCTAssertEqual(attempts, 1)
+        audio.stop()
+    }
+    @MainActor func testStopSupersedesConfigurationRecoveryInFlight() async throws {
+        let driver = AudioDriver(), gate = RequestGate(), audio = AudioLevelMonitor(driver: driver)
+        var state = NurserySoundState(), active = 0
+        audio.onNurserySoundChange = { state = $0 }
+        audio.onStatus = { if case .active = $0 { active += 1 } }
+        try await audio.start()
+        try await audio.setNurserySound(.init(settings: .init(), action: .play))
+        await driver.simulateEngineStopped()
+        await driver.configureRecovery(gate: gate)
+        NotificationCenter.default.post(name: .AVAudioEngineConfigurationChange, object: nil)
+        let entered = await eventually { await driver.recoveryAttempts == 1 }
+        XCTAssertTrue(entered)
+        let activeBefore = active
+        audio.stop()
+        await gate.open()
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertFalse(state.playing)
+        XCTAssertEqual(active, activeBefore)
+        let running = await driver.isRunning
+        XCTAssertFalse(running)
+    }
+    @MainActor func testRecoveryFailureStopsAndReportsFailureInsteadOfRebuilding() async throws {
+        let driver = AudioDriver(), audio = AudioLevelMonitor(driver: driver)
+        var state = NurserySoundState(), failed = false
+        audio.onNurserySoundChange = { state = $0 }
+        audio.onStatus = { if case .failed = $0 { failed = true } }
+        try await audio.start()
+        try await audio.setNurserySound(.init(settings: .init(), action: .play))
+        await driver.simulateEngineStopped()
+        await driver.configureRecovery(fail: true)
+        NotificationCenter.default.post(name: .AVAudioEngineConfigurationChange, object: nil)
+        let reported = await eventually { failed }
+        XCTAssertTrue(reported)
+        XCTAssertFalse(state.playing)
+        let attempts = await driver.setAttempts
+        XCTAssertEqual(attempts, 1)
+        NotificationCenter.default.post(name: .AVAudioEngineConfigurationChange, object: nil)
+        try await Task.sleep(for: .milliseconds(80))
+        let recoveries = await driver.recoveryAttempts
+        XCTAssertEqual(recoveries, 1, "A failed session must not restart from a later configuration event")
         audio.stop()
     }
     @MainActor func testOtherCaregiverCannotUndoTimerChangeWithAStaleVolumeCommand() async throws {
@@ -2876,6 +3020,84 @@ final class AppModelTests: XCTestCase {
         let beats = await fixture.backend.beats
         XCTAssertEqual(beats.map(\.monitoring), [true, false, false])
         XCTAssertTrue(beats.allSatisfy { $0.listenerId == fixture.listener.deviceId })
+    }
+}
+final class AudioGraphIntegrationTests: XCTestCase {
+    private func buffer(rate: Double, channels: AVAudioChannelCount = 1, frames: Int,
+                        amplitude: Float, interleaved: Bool = false) throws -> AVAudioPCMBuffer {
+        let format = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: rate,
+                                               channels: channels, interleaved: interleaved))
+        let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frames)))
+        buffer.frameLength = buffer.frameCapacity
+        let pointers = try XCTUnwrap(buffer.floatChannelData)
+        for channel in 0..<(interleaved ? 1 : Int(channels)) {
+            pointers[channel].initialize(repeating: amplitude, count: frames * (interleaved ? Int(channels) : 1))
+        }
+        return buffer
+    }
+    func testReducerDiscardsPartialOldFormatAndMeasuresNewQuarterSecondWindow() async throws {
+        for interleaved in [false, true] {
+            let pair = AsyncStream<AudioLevelSample>.makeStream()
+            let reducer = RMSReducer(continuation: pair.continuation)
+            reducer.consume(try buffer(rate: 8000, frames: 1000, amplitude: 1))
+            reducer.consume(try buffer(rate: 16000, channels: 2, frames: 4000, amplitude: 0.1, interleaved: interleaved))
+            pair.continuation.finish()
+            var samples: [AudioLevelSample] = []
+            for await sample in pair.stream { samples.append(sample) }
+            XCTAssertEqual(samples.count, 1)
+            XCTAssertEqual(try XCTUnwrap(samples.first).dbFS, -20, accuracy: 0.01)
+        }
+    }
+    func testNativeEngineRestartsInputTapAndPlayerWithoutReplacingEngine() async throws {
+        let engine = AVAudioEngine(), identity = ObjectIdentifier(engine)
+        let pair = AsyncStream<AudioLevelSample>.makeStream()
+        let tap = AudioCaptureTap(continuation: pair.continuation)
+        let player = AVAudioPlayerNode()
+        engine.attach(player)
+        let sound = try buffer(rate: 22050, frames: 8192, amplitude: 0.05)
+        defer { AudioGraphLifecycle.tearDown(engine: engine, captureTap: tap, player: player) }
+        for (rate, channels, amplitude) in [(16000.0, 1, Float(0.1)), (48000.0, 1, Float(0.2)), (48000.0, 2, Float(0.3))] {
+            engine.stop()
+            let inputBuffer = try buffer(rate: rate, channels: AVAudioChannelCount(channels), frames: 8192, amplitude: amplitude)
+            engine.disconnectNodeOutput(engine.inputNode)
+            engine.disconnectNodeOutput(player)
+            engine.disableManualRenderingMode()
+            try engine.enableManualRenderingMode(.offline, format: inputBuffer.format, maximumFrameCount: 1024)
+            XCTAssertTrue(engine.inputNode.setManualRenderingInputPCMFormat(inputBuffer.format) { frames in
+                inputBuffer.frameLength = frames
+                return inputBuffer.audioBufferList
+            })
+            // Offline-only connection: no physical microphone or speaker opens.
+            engine.connect(engine.inputNode, to: engine.mainMixerNode, format: inputBuffer.format)
+            engine.connect(player, to: engine.mainMixerNode, format: sound.format)
+            let output = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: engine.manualRenderingFormat, frameCapacity: 1024))
+            try AudioGraphLifecycle.restart(engine: engine, captureTap: tap) {
+                player.stop(); player.scheduleBuffer(sound, at: nil, options: .loops)
+            }
+            player.play()
+            XCTAssertTrue(engine.isRunning)
+            XCTAssertEqual(ObjectIdentifier(engine), identity)
+            for _ in 0..<20 {
+                XCTAssertEqual(try engine.renderOffline(1024, to: output), .success)
+            }
+            // AVAudioMixerNode uses equal-power centre panning for a mono
+            // player routed to stereo (each side receives -3 dB).
+            let playbackPerChannel: Float = channels == 2 ? 0.05 / sqrt(2) : 0.05
+            XCTAssertEqual(try XCTUnwrap(output.floatChannelData)[0][100], amplitude + playbackPerChannel, accuracy: 0.005)
+            try await Task.sleep(for: .milliseconds(150))
+            AudioGraphLifecycle.tearDown(engine: engine, captureTap: tap, player: player)
+            XCTAssertNil(player.engine, "Teardown must detach the stopped player")
+            engine.attach(player)
+        }
+        engine.stop(); tap.remove()
+        pair.continuation.finish()
+        var samples: [AudioLevelSample] = []
+        for await sample in pair.stream { samples.append(sample) }
+        XCTAssertFalse(samples.isEmpty, "The real engine must deliver microphone-tap buffers")
+        for amplitude in [0.1, 0.2, 0.3] {
+            let expected = 20 * log10(amplitude)
+            XCTAssertTrue(samples.contains { abs($0.dbFS - expected) < 0.1 }, "Each new input format must produce correctly measured tap buffers")
+        }
     }
 }
 #endif

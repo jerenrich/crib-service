@@ -20,6 +20,7 @@ protocol AudioCaptureDriving: Sendable {
     var isRunning: Bool { get async }
     var engineID: ObjectIdentifier { get async }
     func activate(generation: Int, clearSound: Bool) async throws
+    func recoverConfiguration(generation: Int) async throws
     func setSound(_ state: NurserySoundState, capture: Bool, generation: Int) async throws
     func pause(generation: Int) async
     func stop(generation: Int) async
@@ -46,6 +47,8 @@ extension AudioLevelProviding {
     private var wantsMonitoring = false
     private var generation = 0
     private var configuringGeneration: Int?
+    private var configurationRecoveryAttempts = 0
+    private var interrupted = false
     var onStatus: ((AudioCaptureStatus) -> Void)?
     var onNurserySoundChange: ((NurserySoundState) -> Void)?
     private var playback = NurserySoundPlayback()
@@ -72,6 +75,8 @@ extension AudioLevelProviding {
     func requestPermission() async -> Bool { await AVAudioApplication.requestRecordPermission() }
     func start() async throws {
         try Task.checkCancellation()
+        guard !interrupted else { throw AudioError.unavailable }
+        configurationRecoveryAttempts = 0
         wantsMonitoring = true; generation += 1
         let expected = generation
         configuringGeneration = expected
@@ -117,7 +122,8 @@ extension AudioLevelProviding {
     }
     private func applyNurserySound(_ request: NurserySoundRequest, commandID: UUID?, stopReason: String) async throws {
         try Task.checkCancellation()
-        guard request.settings.isValid else { throw AudioError.unavailable }
+        guard request.settings.isValid, !interrupted || request.action == .stop else { throw AudioError.unavailable }
+        if request.action == .play { configurationRecoveryAttempts = 0 }
         generation += 1; let expected = generation
         configuringGeneration = expected
         defer { if configuringGeneration == expected { configuringGeneration = nil } }
@@ -132,7 +138,8 @@ extension AudioLevelProviding {
         if reconfiguringCapture { onStatus?(.recovering("Updating nursery speaker and microphone…")) }
         do {
             guard expected == generation else { throw CancellationError() }
-            try await driver.setSound(next.state, capture: wantsMonitoring, generation: expected)
+            if interrupted { await driver.pause(generation: expected) }
+            else { try await driver.setSound(next.state, capture: wantsMonitoring, generation: expected) }
             guard expected == generation else { throw CancellationError() }
             try Task.checkCancellation()
             // A settings edit may expire while synthesis or graph setup is in flight.
@@ -180,6 +187,7 @@ extension AudioLevelProviding {
             } catch {
                 if expected == generation, wantsMonitoring {
                     logSound(phase: "capture_restore_failed", commandID: commandID, error: error)
+                    wantsMonitoring = false
                     onStatus?(.failed("Microphone unavailable. Open the app to restart monitoring."))
                 }
             }
@@ -253,18 +261,24 @@ extension AudioLevelProviding {
         }
         // Graph/category notifications from our own successful configuration are
         // not an external route change and must not stop a newly started sound.
-        let observedGeneration = generation
-        if name == .AVAudioEngineConfigurationChange, let engineID {
-            let currentEngineID = await driver.engineID
-            guard observedGeneration == generation, engineID == currentEngineID else { return }
+        // Only configuration notifications consult the actor before reserving
+        // a generation. A real interruption/route removal must supersede pending
+        // work synchronously, rather than being discarded after an actor await.
+        if isConfigurationChange {
+            guard !interrupted else { return }
+            let observedGeneration = generation
+            if name == .AVAudioEngineConfigurationChange, let engineID {
+                let currentEngineID = await driver.engineID
+                guard observedGeneration == generation, engineID == currentEngineID else { return }
+            }
+            let running = await driver.isRunning
+            guard observedGeneration == generation else { return }
+            if running { return }
+        } else if name == AVAudioSession.routeChangeNotification,
+                  reason == AVAudioSession.RouteChangeReason.override.rawValue {
+            // The speaker override does not represent a disconnected device.
+            return
         }
-        let running = await driver.isRunning
-        guard observedGeneration == generation else { return }
-        if name == .AVAudioEngineConfigurationChange, running { return }
-        if name == AVAudioSession.routeChangeNotification, running,
-           (reason == AVAudioSession.RouteChangeReason.categoryChange.rawValue ||
-            reason == AVAudioSession.RouteChangeReason.override.rawValue ||
-            reason == AVAudioSession.RouteChangeReason.routeConfigurationChange.rawValue) { return }
         // Changing between measurement and voice processing can itself cause a
         // category or route-configuration notification and stop the engine. In
         // that case restore the existing graph, including sound, rather than
@@ -274,10 +288,26 @@ extension AudioLevelProviding {
             generation += 1; let expected = generation
             configuringGeneration = expected
             defer { if configuringGeneration == expected { configuringGeneration = nil } }
+            log?.record(name == .AVAudioEngineConfigurationChange ? "audio_engine_changed" : "audio_route_changed",
+                        code: reason.map { Int($0) })
+            if configurationRecoveryAttempts >= 2 {
+                let stopped = finishSound(reason: "engine_configuration_changed")
+                log?.record("audio_recovery_limit", code: configurationRecoveryAttempts)
+                // Do not enter another graph rebuild from the failure path.
+                // Stop visibly if the existing graph cannot remain running.
+                await driver.stop(generation: expected)
+                guard generation == expected else { return }
+                logStop(stopped, phase: "stopped", reason: "engine_configuration_changed")
+                if wantsMonitoring {
+                    wantsMonitoring = false
+                    onStatus?(.failed("Audio recovery failed. Open the app to restart monitoring."))
+                }
+                return
+            }
+            configurationRecoveryAttempts += 1
             if wantsMonitoring { onStatus?(.recovering("Recovering speaker and microphone…")) }
             do {
-                if wantsMonitoring { try await driver.activate(generation: expected, clearSound: false) }
-                else { try await driver.setSound(nurseryState, capture: false, generation: expected) }
+                try await driver.recoverConfiguration(generation: expected)
                 guard generation == expected else { return }
                 armSoundTimer(generation: expected)
                 if wantsMonitoring { onStatus?(.active) }
@@ -288,7 +318,7 @@ extension AudioLevelProviding {
                 await driver.stop(generation: expected)
                 guard generation == expected else { return }
                 logStop(stopped, phase: "stopped", reason: "route_change")
-                if wantsMonitoring { onStatus?(.failed("Microphone unavailable. Open the app to restart monitoring.")) }
+                if wantsMonitoring { wantsMonitoring = false; onStatus?(.failed("Microphone unavailable. Open the app to restart monitoring.")) }
             }
             return
         }
@@ -297,6 +327,9 @@ extension AudioLevelProviding {
         let stopReason = name == AVAudioSession.interruptionNotification ? "interruption" :
             name == AVAudioSession.routeChangeNotification ? "route_change" :
             name == AVAudioSession.mediaServicesWereResetNotification ? "media_services_reset" : "engine_configuration_changed"
+        if name == AVAudioSession.interruptionNotification {
+            interrupted = type == AVAudioSession.InterruptionType.began.rawValue
+        }
         generation += 1; let expected = generation
         let stopped = finishSound(reason: stopReason)
         // Playback-only sessions need the same interruption evidence as capture.
@@ -317,7 +350,7 @@ extension AudioLevelProviding {
         }
         // Codes: began → AVAudioSession.InterruptionReason, ended → InterruptionOptions
         // (1 = shouldResume; without it one restart is still tried), route → RouteChangeReason.
-        if name == AVAudioSession.interruptionNotification, type == AVAudioSession.InterruptionType.began.rawValue {
+        if interrupted {
             onStatus?(.recovering("Audio interrupted. Waiting for microphone…"))
             guard expected == generation else { return }
             await driver.pause(generation: expected)
@@ -341,6 +374,7 @@ extension AudioLevelProviding {
         } catch {
             guard generation == expected, wantsMonitoring else { return }
             log?.record("audio_interrupted", code: unprompted ? 1 : 0, error: error)
+            wantsMonitoring = false
             onStatus?(.failed(unprompted ? "Audio could not resume. Open the app to restart monitoring."
                                          : "Microphone unavailable. Open the app to restart monitoring."))
         }
@@ -350,17 +384,33 @@ extension AudioLevelProviding {
 /// acquisition, reconfiguration, and teardown off the main UI executor.
 private actor AudioCaptureDriver: AudioCaptureDriving {
     private var engine = AVAudioEngine()
-    private var tapInstalled = false
+    private let captureTap: AudioCaptureTap
     private var sessionActive = false
     private var generation = 0
     private var captureEnabled = false
     private var sound: NurserySoundSettings?
     private var player: AVAudioPlayerNode?
     private var buffers: [NurserySound: AVAudioPCMBuffer] = [:]
-    private let continuation: AsyncStream<AudioLevelSample>.Continuation
-    init(continuation: AsyncStream<AudioLevelSample>.Continuation) { self.continuation = continuation }
+    init(continuation: AsyncStream<AudioLevelSample>.Continuation) {
+        captureTap = AudioCaptureTap(continuation: continuation)
+    }
     var isRunning: Bool { engine.isRunning }
     var engineID: ObjectIdentifier { ObjectIdentifier(engine) }
+    func recoverConfiguration(generation requested: Int) throws {
+        guard requested >= generation else { throw CancellationError() }; generation = requested
+        try Task.checkCancellation()
+        // A configuration notification stops the engine but retains its graph.
+        // Restart that graph without replacing Voice Processing I/O or changing
+        // the session category, which can itself trigger another notification.
+        try AudioGraphLifecycle.restart(engine: engine, captureTap: captureEnabled ? captureTap : nil) {
+            if let sound, let player {
+                player.stop()
+                player.scheduleBuffer(try buffer(for: sound.sound), at: nil, options: .loops)
+            }
+        }
+        player?.play()
+    }
+
     func activate(generation requested: Int, clearSound: Bool) throws {
         try Task.checkCancellation()
         guard requested >= generation else { throw CancellationError() }; generation = requested
@@ -388,11 +438,7 @@ private actor AudioCaptureDriver: AudioCaptureDriving {
                 stage = .voiceProcessing
                 if sound != nil { try input.setVoiceProcessingEnabled(true); input.isVoiceProcessingAGCEnabled = false }
                 stage = .input
-                let format = input.outputFormat(forBus: 0)
-                guard format.sampleRate > 0, format.channelCount > 0 else { throw AudioError.unavailable }
-                let reducer = RMSReducer(sampleRate: format.sampleRate, continuation: continuation)
-                input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in reducer.consume(buffer) }
-                tapInstalled = true
+                try captureTap.replace(on: input)
             }
             stage = .player
             if let sound { try preparePlayer(sound) }
@@ -459,9 +505,8 @@ private actor AudioCaptureDriver: AudioCaptureDriving {
         tearDown(); deactivateSession()
     }
     private func tearDown() {
-        player?.stop(); player = nil
-        if tapInstalled { engine.inputNode.removeTap(onBus: 0); tapInstalled = false }
-        engine.stop()
+        AudioGraphLifecycle.tearDown(engine: engine, captureTap: captureTap, player: player)
+        player = nil
     }
     private func deactivateSession() {
         guard sessionActive else { return }
@@ -476,24 +521,77 @@ private enum AudioError: LocalizedError, CustomNSError {
     case unavailable
     var errorDescription: String? { "Microphone unavailable. Check the audio input and try again." }
 }
-/// Single audio callback queue owns these accumulators; lock protects reconfiguration overlap.
-private final class RMSReducer: @unchecked Sendable {
+/// Shared by the device driver and native-engine integration tests. Reinstalling
+/// with no pinned format lets the input follow the hardware after a route change.
+final class AudioCaptureTap {
+    private weak var node: AVAudioInputNode?
+    private let continuation: AsyncStream<AudioLevelSample>.Continuation
+    init(continuation: AsyncStream<AudioLevelSample>.Continuation) { self.continuation = continuation }
+    func replace(on input: AVAudioInputNode) throws {
+        remove()
+        let format = input.outputFormat(forBus: 0)
+        guard format.sampleRate.isFinite, format.sampleRate > 0, format.channelCount > 0,
+              format.commonFormat == .pcmFormatFloat32 else {
+            throw NurseryAudioFailure(stage: .input, underlying: AudioError.unavailable)
+        }
+        let reducer = RMSReducer(continuation: continuation)
+        input.installTap(onBus: 0, bufferSize: 1024, format: nil) { buffer, _ in reducer.consume(buffer) }
+        node = input
+    }
+    func remove() {
+        node?.removeTap(onBus: 0)
+        node = nil
+    }
+}
+
+enum AudioGraphLifecycle {
+    static func tearDown(engine: AVAudioEngine, captureTap: AudioCaptureTap, player: AVAudioPlayerNode?) {
+        engine.stop()
+        player?.stop()
+        captureTap.remove()
+        if let player { engine.disconnectNodeOutput(player); engine.detach(player) }
+    }
+
+    static func restart(engine: AVAudioEngine, captureTap: AudioCaptureTap?,
+                        reschedulePlayback: () throws -> Void) throws {
+        guard !engine.isRunning else { return }
+        // Input taps carry the previous hardware format. Refresh the tap before
+        // restarting; the main mixer's default output connection tracks hardware.
+        if let captureTap { try captureTap.replace(on: engine.inputNode) }
+        try reschedulePlayback()
+        do { try engine.start() }
+        catch { throw NurseryAudioFailure(stage: .engine, underlying: error) }
+    }
+}
+
+/// Single audio callback queue owns these accumulators; lock protects overlap.
+final class RMSReducer: @unchecked Sendable {
     private let lock = NSLock()
-    private let windowFrames: Int
+    private var sampleRate = 0.0
+    private var channelCount = 0
+    private var windowFrames = 1
     private let continuation: AsyncStream<AudioLevelSample>.Continuation
     private var sum = 0.0
     private var count = 0
-    init(sampleRate: Double, continuation: AsyncStream<AudioLevelSample>.Continuation) {
-        windowFrames = max(1, Int(sampleRate * 0.25)); self.continuation = continuation
-    }
+    init(continuation: AsyncStream<AudioLevelSample>.Continuation) { self.continuation = continuation }
     func consume(_ buffer: AVAudioPCMBuffer) {
-        guard let channels = buffer.floatChannelData else { return }
+        let format = buffer.format
+        guard format.sampleRate.isFinite, format.sampleRate > 0, format.channelCount > 0,
+              format.commonFormat == .pcmFormatFloat32, let channels = buffer.floatChannelData else { return }
         lock.lock(); defer { lock.unlock() }
-        let channelCount = Int(buffer.format.channelCount)
+        let numberOfChannels = Int(format.channelCount)
+        if sampleRate != format.sampleRate || channelCount != numberOfChannels {
+            sampleRate = format.sampleRate; channelCount = numberOfChannels
+            windowFrames = max(1, Int(sampleRate * 0.25))
+            sum = 0; count = 0
+        }
         for index in 0..<Int(buffer.frameLength) {
             var energy = 0.0
-            for channel in 0..<channelCount { let value = Double(channels[channel][index]); energy += value * value }
-            sum += energy / Double(channelCount); count += 1
+            for channel in 0..<numberOfChannels {
+                let value = Double(format.isInterleaved ? channels[0][index * numberOfChannels + channel] : channels[channel][index])
+                energy += value * value
+            }
+            sum += energy / Double(numberOfChannels); count += 1
             if count >= windowFrames {
                 let rms = sqrt(sum / Double(count))
                 continuation.yield(AudioLevelSample(timestamp: Date(), dbFS: min(0, max(-100, 20 * log10(max(rms, 0.00001))))))
