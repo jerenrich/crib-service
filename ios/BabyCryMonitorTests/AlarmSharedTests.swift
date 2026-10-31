@@ -64,6 +64,10 @@ final class AlarmSharedTests: XCTestCase {
                                conditions: .init(lowPower: false))
         XCTAssertEqual(snapshot().stopRejection(for: request, attempts: [stop], now: now.addingTimeInterval(5)), .locallyMuted)
         XCTAssertEqual(snapshot().stopRejection(for: request, attempts: [stop], now: now.addingTimeInterval(65)), .stopped)
+        var resumed = snapshot()
+        resumed.handledExtensionStopKeys = [stop.key]
+        XCTAssertNil(resumed.stopRejection(for: request, attempts: [stop], now: now.addingTimeInterval(5)),
+                     "After the app consumes Stop, its resumed snapshot must override the journal")
         var test = stop; test.isTest = true; test.eventID = request.eventID
         XCTAssertNil(snapshot().stopRejection(for: request, attempts: [test], now: now))
     }

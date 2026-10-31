@@ -584,7 +584,8 @@ import UIKit
             acknowledgementPending: !(defaults.stringArray(forKey: pendingKey) ?? []).isEmpty,
             localMutedUntil: defaults.object(forKey: "silentCryAlarmMutedUntil") as? Date,
             stoppedBefore: defaults.object(forKey: "silentCryAlarmStoppedBefore") as? Date,
-            evidence: serverEvidence, snoozeDuration: snoozeDuration, publishedAt: .distantPast)
+            evidence: serverEvidence, snoozeDuration: snoozeDuration, publishedAt: .distantPast,
+            handledExtensionStopKeys: defaults.stringArray(forKey: "alarmExtensionConsumedStopKeys") ?? [])
         // Polling refreshes only the evidence timestamp; rewrite when anything else changes.
         if let last = lastSnapshot {
             var comparable = snapshot; comparable.evidence = last.evidence
@@ -634,6 +635,10 @@ import UIKit
             if attempt.outcome == .stopped { stopped.append(attempt) }
         }
         records = Array(saved.suffix(64))
+        // Keep consumed Stop identities separately from the moving merge window.
+        // Otherwise an old journal Stop could reapply its mute after early Resume.
+        let consumed = defaults.stringArray(forKey: "alarmExtensionConsumedStopKeys") ?? []
+        defaults.set(Array((consumed + stopped.map(\.key)).suffix(AlarmJournal.capacity)), forKey: "alarmExtensionConsumedStopKeys")
         queueUpload(new)
         for attempt in stopped {
             guard let episodeID = attempt.episodeID else { continue }
