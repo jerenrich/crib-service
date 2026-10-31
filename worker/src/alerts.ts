@@ -1,3 +1,4 @@
+import {dispatchFamilyEvent} from './caregivers';
 import {reserveAlarmRequest} from './alarm-scheduling';
 import {phoneHeadStartFor} from './notification-coordination';
 import {deliverToBoth} from './dual-delivery';
@@ -18,10 +19,10 @@ export async function receiveAlert(env:Env,device:Device,value:Record<string,unk
  try{latency.eventRef=await eventReference(env,alert.eventId);}catch{/* Best effort. */}
  // Both reads share one consistent snapshot and one remote call. The bounded
  // fallback is read-only; insertion and delivery claims are never hedged.
- type Pair={parent_id:string;listener_id:string;created_at:number};
+ type Pair={parent_id:string;listener_id:string;created_at:number;has_caregivers?:number};
  const snapshot=await latency.readOnly<StoredEvent|Pair>('alert_snapshot_ms',()=>env.DB.batch<StoredEvent|Pair>([
   env.DB.prepare('SELECT * FROM events WHERE event_id=?').bind(alert.eventId),
-  env.DB.prepare('SELECT * FROM pairs WHERE listener_id=?').bind(device.id)
+  env.DB.prepare('SELECT p.*,EXISTS(SELECT 1 FROM caregiver_families f WHERE f.owner_id=p.parent_id AND f.partner_id IS NOT NULL AND f.pair_created_at=p.created_at) AS has_caregivers FROM pairs p WHERE p.listener_id=?').bind(device.id)
  ]),250);
  const previous=snapshot[0].results[0] as StoredEvent|undefined;
  const pair=snapshot[1].results[0] as Pair|undefined;if(!pair)throw new APIError(409,'Listener is not paired.');
@@ -50,7 +51,7 @@ export async function receiveAlert(env:Env,device:Device,value:Record<string,unk
  // Start durable scheduling independently of push delivery. The minute recovery
  // job repairs an interrupted or failed scheduling request from stored events.
  try {await dispatchEvent(env,record.event_id,requestId,latency,
-  background&&!alert.isTest?{accepted:delivery=>queueAcceptedDelivery(env,delivery),background}:{});}
+  background&&!alert.isTest?{accepted:delivery=>queueAcceptedDelivery(env,delivery),background,family:pair.has_caregivers===1}:{family:pair.has_caregivers===1});}
  finally {
   if(!alert.isTest){
    const scheduling=scheduleRemindersSafely(env,pair.parent_id,requestId);
@@ -70,11 +71,13 @@ async function scheduleRemindersSafely(env:Env,parentId:string,requestId:string)
  catch {await recordDiagnostic(env,{requestId,started,operation:'reminder_schedule',stage:'handler',outcome:'internal_error',details:latency.details});}
 }
 export interface DispatchOptions {
+ family?:boolean;
  insert?:D1PreparedStatement;
  accepted?:(delivery:AcceptedDelivery)=>Promise<void>;
  background?:Pick<ExecutionContext,'waitUntil'>;
 }
 export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.randomUUID(),latency=new Latency(),options:DispatchOptions={}):Promise<void> {
+ if(options.family!==false&&!options.insert&&await dispatchFamilyEvent(env,eventId))return;
  const now=Date.now();
  observeLateWrites(env,latency,options.background,requestId,now);
  let stage:Stage='claim',eventRef:string|undefined,attempt:number|undefined,target:'phone'|'watch'|undefined;
@@ -258,7 +261,7 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  } catch(error) { latency.failure(error);await record('internal_error',pushResult?.httpStatus);throw error; }
  finally {if(auxiliary)await auxiliary;}
 }
-export async function acknowledge(env:Env,device:Device,value:Record<string,unknown>) {
+export async function acknowledge(env:Env,device:Device,value:Record<string,unknown>,actorId=device.id) {
  requireRole(device,'parent');const id=uuid(value.eventId);
  const event=await env.DB.prepare('SELECT * FROM events WHERE event_id=? AND parent_id=?').bind(id,device.id).first<StoredEvent>();
  if(!event)throw new APIError(404,'Alert not found.');
@@ -296,8 +299,8 @@ export async function acknowledge(env:Env,device:Device,value:Record<string,unkn
     AND EXISTS(SELECT 1 FROM events WHERE event_id=? AND parent_id=? AND listener_id=? AND acknowledged_at IS NULL)
     ON CONFLICT DO NOTHING`).bind(id,claim,device.id,pair.listener_id,pair.created_at,actedAt,until,pair.parent_id,pair.listener_id,pair.created_at,id,device.id,pair.listener_id),
    // Never shorten a longer snooze that is already running; an expired one mutes nothing.
-   env.DB.prepare(`UPDATE devices SET alerts_muted_until=?,alerts_muted_at=? WHERE id=? AND ?>? AND ?>alerts_muted_until
-    AND EXISTS(SELECT 1 FROM alert_snoozes WHERE event_id=? AND claim_id=?)`).bind(until,actedAt,device.id,until,now,until,id,claim),
+   env.DB.prepare(`UPDATE devices SET alerts_muted_until=?,alerts_muted_at=?,alerts_muted_by=? WHERE id=? AND ?>? AND ?>alerts_muted_until
+    AND EXISTS(SELECT 1 FROM alert_snoozes WHERE event_id=? AND claim_id=?)`).bind(until,actedAt,actorId,device.id,until,now,until,id,claim),
    journal,
    // Alerts created after the snooze window ended stay active.
    env.DB.prepare(`UPDATE events SET acknowledged_at=COALESCE(acknowledged_at,?) WHERE parent_id=? AND listener_id=?

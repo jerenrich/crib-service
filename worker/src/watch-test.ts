@@ -18,9 +18,9 @@ export async function sendWatchTest(env:Env,device:Device,latency=new Latency(),
  requireRole(device,'parent');
  const pair=await latency.measure('pair_ms',()=>pairFor(env,device));
  if(!pair)throw new APIError(409,'Pair a Listener first.');
- const watch=await latency.read<{watch_push_token:string|null}>('destination_ms',env.DB.prepare(`SELECT d.watch_push_token FROM devices d JOIN pairs p ON p.parent_id=d.id
-  WHERE d.id=? AND p.listener_id=? AND p.created_at=?`)
-  .bind(device.id,pair.listener_id,pair.created_at));
+ const watch=await latency.read<{watch_push_token:string|null}>('destination_ms',env.DB.prepare(`SELECT d.watch_push_token FROM devices d JOIN pairs p ON p.parent_id=?
+  WHERE d.id=? AND p.listener_id=? AND p.created_at=? AND (d.id=p.parent_id OR EXISTS(SELECT 1 FROM caregiver_families f WHERE f.owner_id=p.parent_id AND f.partner_id=d.id AND f.pair_created_at=p.created_at))`)
+  .bind(pair.parent_id,device.id,pair.listener_id,pair.created_at));
  if(!watch?.watch_push_token)throw new APIError(409,'Open the Watch app and enable alerts first.');
  const now=new Date(Date.now()).toISOString();
  const alert:Alert={eventId:crypto.randomUUID(),episodeId:crypto.randomUUID(),listenerId:pair.listener_id,

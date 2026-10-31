@@ -97,6 +97,9 @@ import UIKit
     @ObservationIgnored private let liveSound: any LiveSoundStreaming
     @ObservationIgnored private var appActive = true
     @ObservationIgnored private let alerts = AlertCoordinator()
+    var changingCaregiverDuty = false
+    var caregiverInvite: PairingCode?
+    var caregiverError: String?
     @ObservationIgnored private var credential: DeviceCredential?
     @ObservationIgnored private var loopTask: Task<Void, Never>?
     @ObservationIgnored private var audioTask: Task<Void, Never>?
@@ -313,6 +316,12 @@ import UIKit
             if ProcessInfo.processInfo.arguments.contains("--uitesting-listener-stale") {
                 status.lastHeartbeat = now.addingTimeInterval(-180)
             }
+            if ProcessInfo.processInfo.arguments.contains("--uitesting-caregivers") {
+                let me = UUID(), partner = UUID()
+                status.caregiverDuty = CaregiverDuty(myId: me, primaryId: me, revision: 1, escalationSeconds: 120,
+                    caregivers: [.init(id: me, name: "Jordan", secondaryEnabled: true, phoneRegistered: true, watchRegistered: true),
+                                 .init(id: partner, name: "Alex", secondaryEnabled: true, phoneRegistered: true, watchRegistered: true)])
+            }
             if role == .parent { parentStatus = status }
             else { listenerPairStatus = status; listenerPairStatusReceivedAt = now }
             seedLiveSoundFrameForUITest()
@@ -444,7 +453,7 @@ import UIKit
         stop(); environmentRevision += 1; role = value; defaults.set(value.rawValue, forKey: "role")
         resetMonitoringControl()
         timeline = nil; timelineError = nil
-        parentStatus = nil; pairingCode = nil; credential = nil; uploadedToken = nil; loadCredential()
+        parentStatus = nil; pairingCode = nil; caregiverInvite = nil; caregiverError = nil; credential = nil; uploadedToken = nil; loadCredential()
         nextParentRefreshAt = .distantPast
         testPushStatus = nil; latestTestEventID = nil
         stopWatchTest(); watchTestError = nil
@@ -464,7 +473,7 @@ import UIKit
         clearLiveSound()
         defaults.set(backendURL, forKey: "backendURL")
         timeline = nil; timelineError = nil
-        credential = nil; parentStatus = nil; pairingCode = nil; uploadedToken = nil
+        credential = nil; parentStatus = nil; pairingCode = nil; caregiverInvite = nil; caregiverError = nil; uploadedToken = nil
         nextParentRefreshAt = .distantPast
         testPushStatus = nil; latestTestEventID = nil
         stopWatchTest(); watchTestError = nil
@@ -1363,8 +1372,14 @@ import UIKit
         let revision = environmentRevision, generation = settingsGeneration
         let checkedAt = currentTime()
         do {
-            let client = try await registeredClient(); let status = try await client.status()
+            let client = try await registeredClient(); var status = try await client.status()
             guard revision == environmentRevision, role == .parent else { return }
+            // A poll started before a confirmed swap must not undo that swap.
+            if status.pairingID == parentStatus?.pairingID,
+               let currentDuty = parentStatus?.caregiverDuty,
+               let incomingDuty = status.caregiverDuty, currentDuty.revision > incomingDuty.revision {
+                status.caregiverDuty = currentDuty
+            }
             if #available(iOS 26.0, *), defaults === UserDefaults.standard {
                 await SilentCryAlarmService.shared.synchronize(using: client, status: status, checkedAt: checkedAt)
                 guard revision == environmentRevision, role == .parent else { return }
@@ -1631,7 +1646,7 @@ import UIKit
             paired = false; defaults.set(false, forKey: pairingKey)
             setParentConnectionDeadline(nil)
             timeline = nil; timelineError = nil
-            parentStatus = nil; pairingCode = nil; needsRestart = false
+            parentStatus = nil; pairingCode = nil; caregiverInvite = nil; caregiverError = nil; needsRestart = false
             listenerPairStatus = nil; listenerPairStatusReceivedAt = nil
             settingsDirty = false; defaults.set(false, forKey: "settingsDirty")
             engine = CrySessionManager(); configuration = engine.snapshot.configuration; persist()
@@ -1835,5 +1850,66 @@ import UIKit
     func end() {
         guard identifier != .invalid else { return }
         UIApplication.shared.endBackgroundTask(identifier); identifier = .invalid
+    }
+}
+
+
+extension AppModel {
+    var caregiverDuty: CaregiverDuty? { parentStatus?.caregiverDuty }
+
+    func inviteCaregiver(name: String) async {
+        guard !changingCaregiverDuty else { return }
+        changingCaregiverDuty = true; caregiverError = nil
+        defer { changingCaregiverDuty = false }
+        let revision = environmentRevision
+        do {
+            let client = try await registeredClient()
+            let invite = try await client.inviteCaregiver(name: name)
+            guard revision == environmentRevision else { return }
+            caregiverInvite = invite
+            await refreshParent()
+        } catch {
+            guard revision == environmentRevision else { return }
+            caregiverError = error.localizedDescription
+        }
+    }
+
+    func joinCaregiver(code: String, name: String) async {
+        guard !changingCaregiverDuty else { return }
+        changingCaregiverDuty = true; caregiverError = nil
+        defer { changingCaregiverDuty = false }
+        let revision = environmentRevision
+        do {
+            let client = try await registeredClient()
+            try await client.joinCaregiver(code: code, name: name)
+            guard revision == environmentRevision else { return }
+            environmentRevision += 1
+            parentRefreshTask?.cancel(); parentRefreshTask = nil
+            paired = true; defaults.set(true, forKey: pairingKey)
+            await refreshParent()
+        } catch {
+            guard revision == environmentRevision else { return }
+            caregiverError = error.localizedDescription
+        }
+    }
+
+    func updateCaregiverDuty(primaryId: UUID? = nil, caregiverId: UUID? = nil,
+                             secondaryEnabled: Bool? = nil, escalationSeconds: Int? = nil) async {
+        guard let duty = caregiverDuty, !changingCaregiverDuty else { return }
+        changingCaregiverDuty = true; caregiverError = nil
+        defer { changingCaregiverDuty = false }
+        let revision = environmentRevision
+        do {
+            let client = try await registeredClient()
+            let confirmed = try await client.updateDuty(DutyUpdate(revision: duty.revision, primaryId: primaryId,
+                caregiverId: caregiverId, secondaryEnabled: secondaryEnabled, escalationSeconds: escalationSeconds))
+            guard revision == environmentRevision else { return }
+            parentStatus?.caregiverDuty = confirmed
+            await refreshParent()
+        } catch {
+            guard revision == environmentRevision else { return }
+            await refreshParent()
+            caregiverError = error.localizedDescription
+        }
     }
 }
