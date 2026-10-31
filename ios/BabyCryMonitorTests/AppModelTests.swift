@@ -199,6 +199,83 @@ final class AppModelTests: XCTestCase {
         XCTAssertFalse(fixture.model.resumingAlerts)
     }
 
+    @MainActor func testNurserySnoozeAndResumeUseSharedStateWithoutStoppingTheMicrophone() async throws {
+        let fixture = try Fixture()
+        let now = fixture.time.now
+        let alert = RemoteAlert(eventId: UUID(), episodeId: UUID(), cryStartedAt: now, durationSeconds: 5,
+                                createdAt: now, status: "sent", acknowledgedAt: nil, isTest: false)
+        await fixture.backend.setStatus(ParentStatus(paired: true, lastHeartbeat: now, monitoring: true, alerts: [alert],
+                                                   configuration: MonitoringConfiguration()))
+        await fixture.model.start()
+        XCTAssertEqual(fixture.model.activeAlert?.eventId, alert.eventId)
+        let stops = fixture.audio.stops
+        await fixture.backend.setSnoozeResult(until: now.addingTimeInterval(60))
+        let snoozed = await fixture.model.acknowledge(alert.eventId)
+        XCTAssertTrue(snoozed)
+        XCTAssertNil(fixture.model.activeAlert)
+        XCTAssertEqual(fixture.model.listenerPairStatus?.alertsMutedUntil, now.addingTimeInterval(60))
+        XCTAssertTrue(fixture.model.monitoring); XCTAssertTrue(fixture.model.microphoneActive)
+        XCTAssertEqual(fixture.audio.stops, stops)
+        let resumed = await fixture.model.resumeAlerts()
+        XCTAssertTrue(resumed)
+        XCTAssertLessThan(try XCTUnwrap(fixture.model.listenerPairStatus?.alertsMutedUntil), now)
+        XCTAssertTrue(fixture.model.monitoring); XCTAssertTrue(fixture.model.microphoneActive)
+        XCTAssertEqual(fixture.audio.stops, stops)
+        fixture.model.stop()
+    }
+
+    @MainActor func testSlowNurseryPollCannotDelayOrUndoConfirmedSnooze() async throws {
+        let fixture = try Fixture(), now = Date(), gate = RequestGate()
+        let alert = RemoteAlert(eventId: UUID(), episodeId: UUID(), cryStartedAt: now, durationSeconds: 5,
+                                createdAt: now, status: "sent", acknowledgedAt: nil, isTest: false)
+        await fixture.backend.setStatus(ParentStatus(paired: true, alerts: [alert], configuration: MonitoringConfiguration()))
+        await fixture.model.start()
+        await fixture.backend.holdNextStatus(gate)
+        await fixture.model.tick()
+        let polling = await eventually { await fixture.backend.statusCalls >= 2 }
+        XCTAssertTrue(polling)
+        let until = fixture.time.now.addingTimeInterval(60)
+        await fixture.backend.setSnoozeResult(until: until)
+        let action = Task { await fixture.model.acknowledge(alert.eventId) }
+        let confirmed = await eventually { fixture.model.listenerPairStatus?.alertsMutedUntil == until && !fixture.model.acknowledgingAlert }
+        await gate.open()
+        let succeeded = await action.value
+        XCTAssertTrue(confirmed, "Snooze must not wait for a slow poll begun before the tap")
+        XCTAssertTrue(succeeded)
+        // Give the stale response a chance to finish and attempt its assignment.
+        for _ in 0..<10 { await Task.yield() }
+        XCTAssertEqual(fixture.model.listenerPairStatus?.alertsMutedUntil, until)
+        XCTAssertNil(fixture.model.activeAlert)
+        XCTAssertTrue(fixture.model.monitoring)
+        fixture.model.stop()
+    }
+
+    @MainActor func testFailedNurserySnoozeOrResumeDoesNotShowAConfirmedChange() async throws {
+        let fixture = try Fixture(), now = Date()
+        let alert = RemoteAlert(eventId: UUID(), episodeId: UUID(), cryStartedAt: now, durationSeconds: 5,
+                                createdAt: now, status: "sent", acknowledgedAt: nil, isTest: false)
+        await fixture.backend.setStatus(ParentStatus(paired: true, alerts: [alert], configuration: MonitoringConfiguration()))
+        await fixture.model.start()
+        await fixture.backend.setSnoozeFailure(true)
+        let result = await fixture.model.acknowledge(alert.eventId)
+        XCTAssertFalse(result)
+        XCTAssertEqual(fixture.model.activeAlert?.eventId, alert.eventId)
+        XCTAssertNil(fixture.model.listenerPairStatus?.alertsMutedUntil)
+        XCTAssertTrue(fixture.model.monitoring)
+        let until = fixture.time.now.addingTimeInterval(60)
+        await fixture.backend.setStatus(ParentStatus(paired: true, alertsMutedUntil: until, configuration: MonitoringConfiguration()))
+        fixture.time.now = fixture.time.now.addingTimeInterval(4)
+        await fixture.model.tick()
+        let received = await eventually { fixture.model.listenerPairStatus?.alertsMutedUntil == until }
+        XCTAssertTrue(received)
+        await fixture.backend.setResumeFailure(true)
+        let resumed = await fixture.model.resumeAlerts()
+        XCTAssertFalse(resumed)
+        XCTAssertEqual(fixture.model.listenerPairStatus?.alertsMutedUntil, until)
+        XCTAssertTrue(fixture.model.monitoring)
+        fixture.model.stop()
+    }
+
     @MainActor final class Audio: AudioLevelProviding {
         let levels: AsyncStream<AudioLevelSample>
         private let continuation: AsyncStream<AudioLevelSample>.Continuation
@@ -317,8 +394,16 @@ final class AppModelTests: XCTestCase {
         func register() async throws {}
         func createPairing() async throws -> PairingCode { PairingCode(code: "123456", expiresAt: .distantFuture) }
         func claim(_ code: String) async throws {}
+        private var nextStatusGate: RequestGate?
+        func holdNextStatus(_ gate: RequestGate) { nextStatusGate = gate }
         func status() async throws -> ParentStatus {
             statusCalls += 1
+            if let gate = nextStatusGate {
+                nextStatusGate = nil
+                let captured = statusValue ?? ParentStatus(paired: true, configuration: MonitoringConfiguration())
+                await gate.wait()
+                return captured
+            }
             await statusGate?.wait()
             if statusFails { throw URLError(.timedOut) }
             return statusValue ?? ParentStatus(paired: true, configuration: MonitoringConfiguration())
@@ -372,7 +457,21 @@ final class AppModelTests: XCTestCase {
             statusValue?.alertsMutedUntil = Date().addingTimeInterval(-1)
         }
         private(set) var acknowledgements: [UUID] = []
-        func acknowledge(_ id: UUID, actedAt: Date?) async throws { acknowledgements.append(id) }
+        var snoozeFails = false
+        var snoozeUntil: Date?
+        func setSnoozeFailure(_ value: Bool) { snoozeFails = value }
+        func setSnoozeResult(until: Date) { snoozeUntil = until }
+        func acknowledge(_ id: UUID, actedAt: Date?) async throws {
+            if snoozeFails { throw URLError(.notConnectedToInternet) }
+            acknowledgements.append(id)
+            if let snoozeUntil {
+                statusValue?.alertsMutedUntil = snoozeUntil
+                if let index = statusValue?.alerts?.firstIndex(where: { $0.eventId == id }), let old = statusValue?.alerts?[index] {
+                    statusValue?.alerts?[index] = RemoteAlert(eventId: old.eventId, episodeId: old.episodeId, cryStartedAt: old.cryStartedAt,
+                        durationSeconds: old.durationSeconds, createdAt: old.createdAt, status: old.status, acknowledgedAt: Date(), isTest: old.isTest)
+                }
+            }
+        }
         func pushToken(_ token: String) async throws {}
         func watchPushToken(_ token: String?) async throws {}
     }

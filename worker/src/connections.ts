@@ -1,4 +1,4 @@
-import {familyAccess} from './devices';
+import {sharedAccess} from './devices';
 import {dispatchEvent} from './alerts';
 import {scheduleReminders} from './reminders';
 import {deliverToBoth} from './dual-delivery';
@@ -11,7 +11,7 @@ import {Latency} from './latency';
 export async function connectionPreferences(env:Env,device:Device,value:Record<string,unknown>) {
  requireRole(device,'parent');
  if(typeof value.enabled!=='boolean'||Object.keys(value).some(k=>k!=='enabled'))throw new APIError(400,'Choose whether to enable connection alerts.');
- const access=familyAccess(device);
+ const access=sharedAccess(device);
  await env.DB.batch([
   env.DB.prepare(`UPDATE devices SET connection_alerts=? WHERE id=? AND ${access.sql}`).bind(Number(value.enabled),device.id,...access.args),
   env.DB.prepare(`UPDATE connection_notices SET status='cancelled' WHERE parent_id=? AND status IN ('pending','blocked','escalated') AND ?=0 AND ${access.sql}`).bind(device.id,Number(value.enabled),...access.args),

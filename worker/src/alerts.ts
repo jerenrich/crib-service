@@ -8,7 +8,7 @@ import {scheduleReminders} from './reminders';
 import {Latency} from './latency';
 import {APIError,requireRole,type Alert,type Device,type Env,type StoredEvent} from './types';
 import {alert as validateAlert,uuid,configuration,date} from './security';
-import {pairFor,familyAccess} from './devices';
+import {pairFor,sharedAccess} from './devices';
 import {sendPush,sendSilentCryAlarmPush,type PushIdentityOptions,type PushResult} from './apns';
 import {eventReference,recordDiagnostic,observeLateWrites,PushPreparationError,type Outcome,type Stage} from './diagnostics';
 export async function receiveAlert(env:Env,device:Device,value:Record<string,unknown>,requestId=crypto.randomUUID(),latency=new Latency(),background?:Pick<ExecutionContext,'waitUntil'>) {
@@ -271,7 +271,7 @@ export async function acknowledge(env:Env,device:Device,value:Record<string,unkn
   if(!(JSON.parse(event.payload) as Alert).isTest)await scheduleReminders(env,device.id);
   return {ok:true};
  }
- const now=Date.now(),timestamp=new Date(now).toISOString(),access=familyAccess(device);
+ const now=Date.now(),timestamp=new Date(now).toISOString(),access=sharedAccess(device);
  const pair=await pairFor(env,device);if(!pair||pair.listener_id!==event.listener_id)throw new APIError(409,'Pairing changed.');
  const isTest=(JSON.parse(event.payload) as Alert).isTest===true;
  // A queued Snooze (Watch relay, offline AlarmKit Stop) can arrive long after the
@@ -320,7 +320,7 @@ export async function resumeAlerts(env:Env,device:Device,value:Record<string,unk
  const expected=value.expectedUntil;
  if(typeof expected!=='number'||!Number.isSafeInteger(expected)||expected<=0)throw new APIError(400,'A valid snooze deadline is required.');
  const pair=await pairFor(env,device);if(!pair)throw new APIError(409,'Pair a Listener first.');
- const now=Date.now(),access=familyAccess(device);
+ const now=Date.now(),access=sharedAccess(device);
  const guardSQL=`EXISTS(SELECT 1 FROM devices d JOIN pairs p ON p.parent_id=d.id
   WHERE d.id=? AND d.alerts_muted_until=? AND p.listener_id=? AND p.created_at=?) AND ${access.sql}`;
  const scope=[device.id,expected,pair.listener_id,pair.created_at,...access.args];

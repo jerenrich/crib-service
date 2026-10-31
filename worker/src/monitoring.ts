@@ -1,6 +1,6 @@
 import {APIError,requireRole,type Device,type Env} from './types';
 import {onlyKeys,uuid} from './security';
-import {pairFor,familyAccess} from './devices';
+import {pairFor,sharedAccess} from './devices';
 import type {Latency} from './latency';
 
 type Pair={parent_id:string;listener_id:string;created_at:number};
@@ -19,7 +19,7 @@ export async function requestMonitoring(env:Env,device:Device,value:Record<strin
  onlyKeys(value,['id','enabled']);const id=uuid(value.id);
  if(typeof value.enabled!=='boolean')throw new APIError(400,'Monitoring must be true or false.');
  const pair=await pairFor(env,device);if(!pair)throw new APIError(409,'Pair before controlling monitoring.');
- const now=Date.now(),enabled=Number(value.enabled),claim=crypto.randomUUID(),access=familyAccess(device);
+ const now=Date.now(),enabled=Number(value.enabled),claim=crypto.randomUUID(),access=sharedAccess(device);
  // Listener requests report a local action. Parent requests await actual microphone confirmation.
  const status=device.role==='listener'?'applied':'pending';
  await env.DB.batch([

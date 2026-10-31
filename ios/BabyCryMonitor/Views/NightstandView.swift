@@ -46,7 +46,7 @@ struct NightstandView: View {
         model.snapshot.current.map { model.snapshot.alertStatus(for: $0) == .failed } == true
     }
     private var snoozedUntil: Date? {
-        guard !listener, let until = model.parentStatus?.alertsMutedUntil, until > model.now else { return nil }
+        guard let until = model.alertStatus?.alertsMutedUntil, until > model.now else { return nil }
         return until
     }
 
@@ -112,7 +112,9 @@ struct NightstandView: View {
         }
         if let until = snoozedUntil {
             let remaining = max(0, until.timeIntervalSince(date)) / max(1, model.configuration.snoozeDuration)
-            let actor = model.caregiverDuty?.caregivers.first { $0.id == model.parentStatus?.snoozedBy }?.name
+            let actor = (model.alertStatus?.snoozedBy).flatMap { id in
+                id == model.alertStatus?.listenerId ? "Nursery iPhone" : model.caregiverDuty?.caregivers.first { $0.id == id }?.name
+            }
             return Hero(title: "Alerts snoozed", detail: actor.map { "\($0) snoozed · Resumes in" } ?? "Resumes in", tone: .caution, ring: .progress(min(1, remaining)), icon: "bell.slash", resumesAt: until)
         }
         if standby {
@@ -147,6 +149,11 @@ struct NightstandView: View {
         if !model.paired && !model.monitoring {
             return Hero(title: "Not paired", detail: "Pair with the Parent iPhone to begin.", tone: .inactive, icon: "link")
         }
+        if let until = snoozedUntil {
+            let remaining = max(0, until.timeIntervalSince(date)) / max(1, model.configuration.snoozeDuration)
+            return Hero(title: "Alerts snoozed", detail: "Resumes in", tone: .caution,
+                        ring: .progress(min(1, remaining)), icon: "bell.slash", resumesAt: until)
+        }
         if standby {
             return Hero(title: "Standby", detail: "Microphone active · Detection paused", tone: .inactive, icon: "pause.circle")
         }
@@ -157,6 +164,9 @@ struct NightstandView: View {
         }
         if model.paired, model.connectivity.checked, !model.connectivity.available {
             return Hero(title: "Internet unavailable", detail: "Alerts can't be delivered right now.", tone: .caution, ring: .dashed, icon: "wifi.slash")
+        }
+        if model.activeAlert != nil {
+            return Hero(title: "Check on baby", detail: "Crying-like sound detected", tone: .alert, ring: .full, icon: "bell.fill")
         }
         return liveHero(alertSent: model.snapshot.current?.alertSentAt != nil, at: date)
     }
@@ -412,6 +422,7 @@ struct NightstandView: View {
                 VStack(spacing: 10) {
                     heroText(value)
                     if !listener { parentHeroControl(value) }
+                    else if snoozedUntil != nil || model.activeAlert != nil { listenerHeroRing(value) }
                 }
             } else {
                 heroRing(value)
@@ -473,7 +484,50 @@ struct NightstandView: View {
         .contentShape(Circle())
     }
 
-    private func listenerHeroRing(_ hero: Hero) -> some View {
+    @ViewBuilder private func listenerHeroRing(_ hero: Hero) -> some View {
+        if let until = snoozedUntil {
+            Button { Task { await model.resumeAlerts(until: until) } } label: {
+                listenerAlertCircle(hero, title: model.resumingAlerts ? "Resuming…" : "Resume", icon: "play.fill")
+            }
+            .buttonStyle(.plain)
+            .disabled(model.resumingAlerts || model.acknowledgingAlert || model.managingDevice)
+            .accessibilityLabel("Resume alerts")
+            .accessibilityIdentifier("nightstandResumeAlerts")
+        } else if let alert = model.activeAlert {
+            Button { Task { await model.acknowledge(alert.eventId) } } label: {
+                listenerAlertCircle(hero, title: model.acknowledgingAlert ? "Snoozing…" : "Snooze", icon: "bell.slash")
+            }
+            .buttonStyle(.plain)
+            .disabled(model.acknowledgingAlert || model.resumingAlerts || model.managingDevice)
+            .accessibilityLabel("Snooze alerts for \(spokenDuration(model.configuration.snoozeDuration))")
+            .accessibilityIdentifier("nightstandSnooze")
+        } else {
+            listenerStatusRing(hero)
+        }
+    }
+
+    private func listenerAlertCircle(_ hero: Hero, title: String, icon: String) -> some View {
+        ZStack {
+            StatusRing(fill: snoozedUntil == nil ? .full : hero.ring, color: Palette.amber, glow: snoozedUntil == nil)
+            VStack(spacing: 6) {
+                Image(systemName: icon).font(.title2).accessibilityHidden(true)
+                heroTitle(hero).font(.subheadline.weight(.medium))
+                Text(title).font(.system(.title, design: .rounded).weight(.semibold))
+                if snoozedUntil != nil {
+                    heroDetail(hero).font(.footnote).foregroundStyle(Palette.muted)
+                } else {
+                    Text(spokenDuration(model.configuration.snoozeDuration)).font(.subheadline)
+                    Text(model.monitoring ? "Nursery keeps listening" : hero.title).font(.caption).foregroundStyle(Palette.muted)
+                }
+            }
+            .foregroundStyle(Palette.amber).multilineTextAlignment(.center)
+            .frame(width: ringSize - 48)
+        }
+        .frame(width: ringSize, height: ringSize).contentShape(Circle())
+        .frame(maxWidth: .infinity)
+    }
+
+    private func listenerStatusRing(_ hero: Hero) -> some View {
         ZStack {
             StatusRing(fill: hero.ring, color: hero.tone.color, glow: hero.tone == .alert)
             VStack(spacing: 4) {
@@ -664,7 +718,7 @@ struct NightstandView: View {
             if !model.paired {
                 Button { pairing = true } label: { actionLabel(listener ? "Pair with Parent" : "Pair iPhones", icon: "link", style: .primary) }
                     .disabled(model.managingDevice)
-            } else if !listener && (model.activeAlert != nil || snoozedUntil != nil) {
+            } else if (model.activeAlert != nil || snoozedUntil != nil) && (!listener || monitoringActive || busy) {
                 // The status circle owns Snooze/Resume. Keep Pause available here.
                 secondaryMonitoringControl
             } else if !listener, [.connectionLost, .unavailable].contains(model.parentMonitoringDisplayState) {
@@ -771,8 +825,8 @@ struct NightstandView: View {
                         Text(hero.title).font(.title2)
                         heroDetail(hero).font(.subheadline).foregroundStyle(Palette.muted)
                     }
-                    if !listener, let alert = model.activeAlert { alertPanel(alert) }
-                    if !listener, let until = model.parentStatus?.alertsMutedUntil, until > model.now { snoozePanel(until: until) }
+                    if let alert = model.activeAlert { alertPanel(alert) }
+                    if let until = snoozedUntil { snoozePanel(until: until) }
                     if needsConnectionRecovery { connectionRecovery }
                     if !listener, let error = model.monitoringControlError {
                         VStack(alignment: .leading, spacing: 8) {
