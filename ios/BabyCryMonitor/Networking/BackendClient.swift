@@ -129,6 +129,7 @@ protocol BackendServing: AlertSending {
     /// `actedAt` is when the person tapped Snooze, for a queued/late delivery.
     func acknowledge(_ id: UUID, actedAt: Date?) async throws
     func resumeAlerts(until: Date) async throws
+    func stopAlerts(eventIDs: [UUID]) async throws
     func pushToken(_ token: String) async throws
     func watchPushToken(_ token: String?) async throws
     func connectionAlerts(_ enabled: Bool) async throws
@@ -144,6 +145,7 @@ protocol BackendServing: AlertSending {
     func deleteDevice() async throws
 }
 extension BackendServing {
+    func stopAlerts(eventIDs: [UUID]) async throws { throw BackendError.message("Stop alerts requires an updated connection service.") }
     func inviteCaregiver(name: String) async throws -> PairingCode { throw BackendError.message("Caregiver sharing requires the updated connection service.") }
     func joinCaregiver(code: String, name: String) async throws { throw BackendError.message("Caregiver sharing requires the updated connection service.") }
     func updateDuty(_ update: DutyUpdate) async throws -> CaregiverDuty { throw BackendError.message("Caregiver sharing requires the updated connection service.") }
@@ -199,6 +201,9 @@ struct BackendClient: BackendServing {
         var body = ["eventId": id.uuidString]
         if let actedAt { body["actedAt"] = actedAt.formatted(Date.ISO8601FormatStyle(includingFractionalSeconds: true)) }
         let _: EmptyResponse = try await request("/v1/alert/acknowledge", body: body)
+    }
+    func stopAlerts(eventIDs: [UUID]) async throws {
+        let _: EmptyResponse = try await request("/v1/alert/stop", body: ["eventIds": eventIDs.map(\.uuidString)])
     }
     func resumeAlerts(until: Date) async throws {
         let _: EmptyResponse = try await request("/v1/alert/resume", body: ["expectedUntil": Int64((until.timeIntervalSince1970 * 1000).rounded())])
@@ -269,7 +274,7 @@ struct BackendClient: BackendServing {
         let operation = ["/v1/device/register": "register", "/v1/pairing/create": "pairing_create", "/v1/pairing/claim": "pairing_claim",
                          "/v1/alarm/scheduled": "alarm_scheduled", "/v1/alarm/attempts": "alarm_attempts", "/v1/silent-watch-alarms": "alarm_settings", "/v1/device/push-token": "push_token", "/v1/device/watch-push-token": "watch_token",
                          "/v1/listener/heartbeat": "heartbeat", "/v1/listener/event": "alert", "/v1/listener/status": "status",
-                         "/v1/timeline": "timeline", "/v1/monitoring": "monitoring", "/v1/monitoring/complete": "monitoring_complete", "/v1/settings": "settings", "/v1/alert/acknowledge": "acknowledge", "/v1/test-push": "test_push", "/v1/alert-test": "test_push", "/v1/alert-test/stop": "test_push", "/v1/watch-test": "test_push", "/v1/watch-test/push": "test_push", "/v1/listener/silent-alarm-test": "test_push", "/v1/alert/resume": "resume_alerts",
+                         "/v1/timeline": "timeline", "/v1/monitoring": "monitoring", "/v1/monitoring/complete": "monitoring_complete", "/v1/settings": "settings", "/v1/alert/acknowledge": "acknowledge", "/v1/test-push": "test_push", "/v1/alert-test": "test_push", "/v1/alert-test/stop": "test_push", "/v1/watch-test": "test_push", "/v1/watch-test/push": "test_push", "/v1/listener/silent-alarm-test": "test_push", "/v1/alert/resume": "resume_alerts", "/v1/alert/stop": "stop_alerts",
                          "/v1/connection-alerts": "connection_preferences", "/v1/pairing/remove": "unpair", "/v1/device/delete": "delete_device"][path].map {
                              // Test status is polled every few seconds; starting a test is not.
                              method == "GET" && path == "/v1/alert-test" ? "alert_test_status" : $0 } ?? "unknown"

@@ -55,6 +55,18 @@ final class SilentCryAlarmSnoozeTests: XCTestCase {
         }
     }
 
+    @MainActor func testDelayedExtensionStopPreservesANewerLongerSnooze() throws {
+        try withDefaults { defaults in
+            let snooze = SilentCryAlarmSnooze(defaults: defaults)
+            XCTAssertTrue(snooze.apply(eventID: UUID(), duration: 300, now: now))
+            let older = UUID(), tappedAt = now.addingTimeInterval(-30)
+            XCTAssertTrue(snooze.apply(eventID: older, duration: 60, now: tappedAt))
+            XCTAssertEqual(snooze.actedAt(older), tappedAt)
+            XCTAssertEqual(defaults.object(forKey: "silentCryAlarmMutedUntil") as? Date, now.addingTimeInterval(300))
+            XCTAssertEqual(defaults.object(forKey: "silentCryAlarmStoppedBefore") as? Date, now)
+        }
+    }
+
     @MainActor func testLegacyPendingCopyRemainsHandledAfterItsQueueDrains() throws {
         try withDefaults { defaults in
             let id = UUID(), deadline = now.addingTimeInterval(60)

@@ -199,6 +199,66 @@ final class AppModelTests: XCTestCase {
         XCTAssertFalse(fixture.model.resumingAlerts)
     }
 
+    @MainActor func testStopAlertsWorksWithMonitoringOffAndIncludesSnoozedEpisodes() async throws {
+        let fixture = try Fixture(), now = Date()
+        let real = RemoteAlert(eventId: UUID(), episodeId: UUID(), cryStartedAt: now, durationSeconds: 5,
+                               createdAt: now, status: "sent", acknowledgedAt: now, isTest: false)
+        let test = RemoteAlert(eventId: UUID(), episodeId: UUID(), cryStartedAt: now, durationSeconds: 5,
+                               createdAt: now, status: "sent", acknowledgedAt: nil, isTest: true)
+        await fixture.backend.setStatus(ParentStatus(paired: true, monitoring: false, alerts: [real, test], configuration: MonitoringConfiguration()))
+        await fixture.model.tick()
+        let loaded = await eventually { fixture.model.listenerPairStatus != nil }
+        XCTAssertTrue(loaded)
+        XCTAssertEqual(fixture.model.stoppableAlertIDs, [real.eventId])
+        let stops = fixture.audio.stops
+        let result = await fixture.model.stopAlerts()
+        XCTAssertTrue(result)
+        XCTAssertTrue(fixture.model.stoppableAlertIDs.isEmpty)
+        XCTAssertFalse(fixture.model.monitoring)
+        XCTAssertEqual(fixture.audio.stops, stops)
+        let requests = await fixture.backend.stoppedAlertIDs
+        XCTAssertEqual(requests, [[real.eventId]])
+        let controls = await fixture.backend.monitoringRequests
+        XCTAssertTrue(controls.isEmpty)
+    }
+
+    @MainActor func testOldParentPollCannotRestoreAlertsAfterStop() async throws {
+        let fixture = try Fixture(), now = Date(), gate = RequestGate()
+        fixture.model.role = .parent; fixture.model.paired = true
+        let alert = RemoteAlert(eventId: UUID(), episodeId: UUID(), cryStartedAt: now, durationSeconds: 5,
+                                createdAt: now, status: "sent", acknowledgedAt: nil, isTest: false)
+        let status = ParentStatus(paired: true, monitoring: false, alerts: [alert], configuration: MonitoringConfiguration())
+        fixture.model.parentStatus = status
+        await fixture.backend.setStatus(status)
+        await fixture.backend.holdNextStatus(gate)
+        let poll = Task { await fixture.model.refreshParent() }
+        let started = await eventually { await fixture.backend.statusCalls == 1 }
+        XCTAssertTrue(started)
+        let stop = Task { await fixture.model.stopAlerts() }
+        let ended = await eventually { fixture.model.stoppableAlertIDs.isEmpty && !fixture.model.stoppingAlerts }
+        await gate.open()
+        let result = await stop.value
+        await poll.value
+        XCTAssertTrue(ended, "Stop must not wait for the older status request")
+        XCTAssertTrue(result)
+        XCTAssertTrue(fixture.model.stoppableAlertIDs.isEmpty)
+        XCTAssertNil(fixture.model.activeAlert)
+    }
+
+    @MainActor func testFailedStopAlertsPreservesTheOutstandingAlert() async throws {
+        let fixture = try Fixture(), now = Date()
+        fixture.model.role = .parent; fixture.model.paired = true
+        let alert = RemoteAlert(eventId: UUID(), episodeId: UUID(), cryStartedAt: now, durationSeconds: 5,
+                                createdAt: now, status: "sent", acknowledgedAt: nil, isTest: false)
+        fixture.model.parentStatus = ParentStatus(paired: true, monitoring: false, alerts: [alert], configuration: MonitoringConfiguration())
+        await fixture.backend.setSnoozeFailure(true)
+        let result = await fixture.model.stopAlerts()
+        XCTAssertFalse(result)
+        XCTAssertEqual(fixture.model.activeAlert?.eventId, alert.eventId)
+        XCTAssertTrue(fixture.model.error?.contains("Could not confirm alerts stopped") == true)
+        XCTAssertFalse(fixture.model.stoppingAlerts)
+    }
+
     @MainActor func testNurserySnoozeAndResumeUseSharedStateWithoutStoppingTheMicrophone() async throws {
         let fixture = try Fixture()
         let now = fixture.time.now
@@ -447,6 +507,18 @@ final class AppModelTests: XCTestCase {
             await sendGate?.wait()
             if sendFail { throw URLError(.notConnectedToInternet) }
             return AlertReceipt(status: receipt)
+        }
+        private(set) var stoppedAlertIDs: [[UUID]] = []
+        func stopAlerts(eventIDs: [UUID]) async throws {
+            if snoozeFails { throw URLError(.notConnectedToInternet) }
+            stoppedAlertIDs.append(eventIDs)
+            let episodes = Set((statusValue?.alerts ?? []).filter { eventIDs.contains($0.eventId) }.map(\.episodeId))
+            let updated = statusValue?.alerts?.map { value in
+                var alert = value
+                if episodes.contains(alert.episodeId) { alert.resolvedAt = Date() }
+                return alert
+            }
+            statusValue?.alerts = updated
         }
         private(set) var resumedDeadlines: [Date] = []
         var resumeFails = false

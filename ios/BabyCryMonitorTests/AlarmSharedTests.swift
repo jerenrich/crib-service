@@ -32,6 +32,42 @@ final class AlarmSharedTests: XCTestCase {
         XCTAssertEqual(AlarmAttempt.flags(in: [:]), [])
     }
 
+    @MainActor func testRearmedAlarmStopsUsingTheNewReminderAfterFirstSnooze() throws {
+        let suite = "AlarmSharedTests.\(UUID())", firstID = UUID(), reminderID = UUID()
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        func scheduled(_ id: UUID, at time: Date) -> AlarmAttempt {
+            AlarmAttempt(method: .extension, outcome: .scheduled, eventID: id, episodeID: episode,
+                         isTest: false, flags: [], startedAt: time, finishedAt: time,
+                         conditions: .init(lowPower: false))
+        }
+        let first = scheduled(firstID, at: now)
+        let snooze = SilentCryAlarmSnooze(defaults: defaults)
+        XCTAssertTrue(snooze.apply(eventID: firstID, duration: 60, now: now))
+        defaults.set([], forKey: "silentCryAlarmPendingAcknowledgements")
+        let later = now.addingTimeInterval(70)
+        var records = SilentAlarmRecord.merging(first, into: [], snoozeDuration: 60)
+        records = SilentAlarmRecord.merging(scheduled(reminderID, at: later), into: records, snoozeDuration: 60)
+        records = SilentAlarmRecord.merging(first, into: records, snoozeDuration: 60)
+        let current = try XCTUnwrap(records.first)
+        XCTAssertEqual(records.count, 1)
+        XCTAssertEqual(current.eventID, reminderID, "Late journal entries must not restore the already handled notification")
+        XCTAssertTrue(snooze.apply(eventID: current.eventID, duration: current.snoozeDuration, now: later))
+        XCTAssertEqual(defaults.object(forKey: "silentCryAlarmMutedUntil") as? Date, later.addingTimeInterval(60))
+        XCTAssertFalse(snooze.apply(eventID: firstID, duration: 60, now: later), "Duplicate old actions remain idempotent")
+    }
+
+    func testExtensionStopBlocksRearmingBeforeAppConsumesTheJournal() throws {
+        let request = try XCTUnwrap(SilentCryAlarmRequest(payload: payload(["alarmExtension": true]), now: now))
+        let stop = AlarmAttempt(method: .extension, outcome: .stopped, eventID: UUID(), episodeID: episode,
+                               isTest: false, flags: [], startedAt: now, finishedAt: now,
+                               conditions: .init(lowPower: false))
+        XCTAssertEqual(snapshot().stopRejection(for: request, attempts: [stop], now: now.addingTimeInterval(5)), .locallyMuted)
+        XCTAssertEqual(snapshot().stopRejection(for: request, attempts: [stop], now: now.addingTimeInterval(65)), .stopped)
+        var test = stop; test.isTest = true; test.eventID = request.eventID
+        XCTAssertNil(snapshot().stopRejection(for: request, attempts: [test], now: now))
+    }
+
     /// The extension applies the app's push-only rules from the app's published state.
     func testExtensionUsesThePublishedSnapshotAndItsMethodSetting() throws {
         let request = try XCTUnwrap(SilentCryAlarmRequest(payload: payload(["alarmExtension": true], age: 2), now: now))

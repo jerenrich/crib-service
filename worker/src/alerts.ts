@@ -314,6 +314,32 @@ export async function acknowledge(env:Env,device:Device,value:Record<string,unkn
  }
  return {ok:true};
 }
+// End only the episodes visible when Stop alerts was tapped. Persist resolution
+// tombstones so late outbox uploads and reminder retries cannot revive them.
+export async function stopAlerts(env:Env,device:Device,value:Record<string,unknown>) {
+ requireRole(device,'parent');
+ if(Object.keys(value).some(k=>k!=='eventIds')||!Array.isArray(value.eventIds)||!value.eventIds.length||value.eventIds.length>100)throw new APIError(400,'Choose the alerts to stop.');
+ const ids=[...new Set(value.eventIds.map(uuid))],pair=await pairFor(env,device);
+ if(!pair)throw new APIError(409,'Pair a Listener first.');
+ const access=sharedAccess(device),timestamp=new Date().toISOString(),selection=JSON.stringify(ids);
+ // Validate the whole selection before any write, including test/foreign alerts.
+ const selected=await env.DB.prepare(`SELECT event_id FROM events WHERE event_id IN (SELECT value FROM json_each(?)) AND parent_id=? AND listener_id=?
+  AND created_at>=? AND COALESCE(json_extract(payload,'$.isTest'),0)=0`).bind(selection,pair.parent_id,pair.listener_id,pair.created_at).all();
+ if(selected.results.length!==ids.length)throw new APIError(404,'Alert not found in this pairing.');
+ await env.DB.batch([
+  env.DB.prepare(`INSERT INTO resolved_episodes(parent_id,listener_id,pair_created_at,episode_id,resolved_at)
+   SELECT DISTINCT ?,?,?,e.episode_id,? FROM events e WHERE e.event_id IN (SELECT value FROM json_each(?)) AND e.parent_id=? AND e.listener_id=?
+   AND EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?) AND ${access.sql}
+   ON CONFLICT DO NOTHING`).bind(pair.parent_id,pair.listener_id,pair.created_at,timestamp,selection,pair.parent_id,pair.listener_id,pair.parent_id,pair.listener_id,pair.created_at,...access.args),
+  env.DB.prepare(`UPDATE events SET resolved_at=COALESCE(resolved_at,?) WHERE parent_id=? AND listener_id=?
+   AND COALESCE(json_extract(payload,'$.isTest'),0)=0 AND EXISTS(SELECT 1 FROM resolved_episodes r JOIN pairs p
+    ON p.parent_id=r.parent_id AND p.listener_id=r.listener_id AND p.created_at=r.pair_created_at
+    WHERE r.parent_id=events.parent_id AND r.listener_id=events.listener_id AND r.episode_id=events.episode_id) AND ${access.sql}`)
+   .bind(timestamp,pair.parent_id,pair.listener_id,...access.args)
+ ]);
+ await scheduleReminders(env,pair.parent_id);
+ return {ok:true};
+}
 // End only the snooze the user saw. A delayed retry must not cancel a newer snooze.
 export async function resumeAlerts(env:Env,device:Device,value:Record<string,unknown>) {
  requireRole(device,'parent');
