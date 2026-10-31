@@ -32,6 +32,8 @@ Monitor shows a swap card once both caregivers join. Exactly one caregiver is pr
 
 Snooze from the nursery Listener or either caregiver’s iPhone or Watch stops future reminders and escalation for the household for the configured snooze duration. Both iPhones show the snooze and who initiated it. As before, this also snoozes server connection-loss alerts; local overdue-check warnings remain separate. An already dispatched notification can still arrive, and delivered notifications on the other device clear when it next syncs. Nursery monitoring continues. Disconnecting the invited caregiver removes only that caregiver; disconnecting the original Parent ends the nursery pairing for both.
 
+Pausing monitoring also ends the household's current snooze, so the countdown clears once the change syncs. Stopping the nursery microphone has the same effect. A later snooze remains independent. Pause still requires confirmation from the nursery before the Parent can show Standby.
+
 Caregiver sharing requires deploying the updated Worker and applying **`0016_caregivers.sql`** before using the updated apps. The migration preserves existing single-Parent pairings. Existing Watch notification permissions and device setup still apply. The server stores per-destination delivery receipts and runs escalation independently of the iPhone apps being open. Device-registration indicators do not prove delivery or connectivity. Connection-loss and stopped-monitoring pushes continue to the original Parent; caregiver duty routing applies to crying alerts.
 
 ### What you need
