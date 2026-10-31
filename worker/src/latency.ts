@@ -23,6 +23,12 @@ export interface AlarmAttemptDetails {
  evidence_applied?:boolean;charging?:boolean;battery_pct?:number;low_power?:boolean;app_active?:boolean;protected_data?:boolean;started_at_ms?:number;
 }
 export interface TimingDetails {
+ caregiver?:{
+  phase:'plan_created'|'plan_repaired'|'retry'|'skipped'|'destination'|'member_removed'|'family_removed'|'duty_changed';
+  reason?:'primary_departed'|'secondary_departed'|'family_changed'|'secondary_disabled'|'member_departed'|'no_push_token'|'not_eligible'|'receipt_retained'|'claim_unavailable'|'expired_lease'|'dispatch_error';
+  member?:'owner'|'partner';duty?:'primary'|'secondary';primary?:'owner'|'partner';
+  revision?:number;repaired_events?:number;escalation_seconds?:number;secondary_enabled?:boolean;
+ };
  live_sound?:{
   phase:'connected'|'command_relayed'|'confirmation_relayed'|'rejected'|'failed'|'closed';
   role?:'parent'|'listener';reason?:'invalid_message'|'rate_limit'|'wrong_role'|'pairing_store'|'internal_error'|'transport'|'pairing_ended'|'peer_closed'|'playbackFailed'|'expired'|'unavailable';
@@ -247,6 +253,17 @@ function safeAlarmAttempt(a:AlarmAttemptDetails):Record<string,unknown> {
 export function safeTimingDetails(value:TimingDetails|undefined):string|null {
  if(!value)return null;
  const safe:Record<string,unknown>={};
+ const caregiver=value.caregiver;
+ if(caregiver&&['plan_created','plan_repaired','retry','skipped','destination','member_removed','family_removed','duty_changed'].includes(caregiver.phase)){
+  const detail:Record<string,unknown>={phase:caregiver.phase};
+  if(['primary_departed','secondary_departed','family_changed','secondary_disabled','member_departed','no_push_token','not_eligible','receipt_retained','claim_unavailable','expired_lease','dispatch_error'].includes(caregiver.reason!))detail.reason=caregiver.reason;
+  for(const key of ['member','primary'] as const)if(['owner','partner'].includes(caregiver[key]!))detail[key]=caregiver[key];
+  if(['primary','secondary'].includes(caregiver.duty!))detail.duty=caregiver.duty;
+  for(const key of ['revision','repaired_events'] as const)if(Number.isSafeInteger(caregiver[key])&&caregiver[key]!>=0)detail[key]=caregiver[key];
+  if([60,120,180,300].includes(caregiver.escalation_seconds!))detail.escalation_seconds=caregiver.escalation_seconds;
+  if(typeof caregiver.secondary_enabled==='boolean')detail.secondary_enabled=caregiver.secondary_enabled;
+  safe.caregiver=detail;
+ }
  const live=value.live_sound;
  if(live&&['connected','command_relayed','confirmation_relayed','rejected','failed','closed'].includes(live.phase)){
   const detail:Record<string,unknown>={phase:live.phase};

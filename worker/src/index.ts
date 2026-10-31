@@ -83,7 +83,7 @@ export default {
     const special=await latency.measure('handler_ms',async()=>{switch(route){
      case 'POST /v1/caregivers/invite':result=await inviteCaregiver(env,device,await body(request));break;
      case 'POST /v1/caregivers/join':result=await joinCaregiver(env,device,await body(request),ip);break;
-     case 'POST /v1/caregivers/duty':result=await updateDuty(env,device,await body(request));break;
+     case 'POST /v1/caregivers/duty':result=await updateDuty(env,device,await body(request),latency);break;
 
      case 'POST /v1/pairing/create':result=await createPairing(env,device);break;
      case 'POST /v1/pairing/claim':result=await claimPairing(env,device,await body(request),ip);break;
@@ -100,8 +100,8 @@ export default {
      case 'POST /v1/alarm/scheduled':result=await confirmAlarmScheduled(env,device,await body(request),latency);break;
      case 'POST /v1/alarm/attempts':result=await recordAlarmAttempts(env,device,await body(request),requestId);break;
      case 'POST /v1/silent-watch-alarms':result=await saveSilentWatchAlarms(env,device,await body(request));break;
-     case 'POST /v1/pairing/remove':result=family&&await detachCaregiver(env,device,family)?{ok:true}:await removeDeviceData(env,device);break;
-     case 'POST /v1/device/delete':result=family&&await detachCaregiver(env,device,family,true)?{ok:true}:await removeDeviceData(env,device,true);break;
+     case 'POST /v1/pairing/remove':result=family&&await detachCaregiver(env,device,family,false,latency)?{ok:true}:await removeDeviceData(env,device);break;
+     case 'POST /v1/device/delete':result=family&&await detachCaregiver(env,device,family,true,latency)?{ok:true}:await removeDeviceData(env,device,true);break;
      case 'POST /v1/connection-alerts':result=await connectionPreferences(env,shared,await body(request));break;
      case 'GET /v1/alert-test':result=await configureAlertTest(env,device,'status');break;
      case 'POST /v1/alert-test':

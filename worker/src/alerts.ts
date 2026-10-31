@@ -77,7 +77,7 @@ export interface DispatchOptions {
  background?:Pick<ExecutionContext,'waitUntil'>;
 }
 export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.randomUUID(),latency=new Latency(),options:DispatchOptions={}):Promise<void> {
- if(options.family!==false&&!options.insert&&await dispatchFamilyEvent(env,eventId))return;
+ if(options.family!==false&&!options.insert&&await dispatchFamilyEvent(env,eventId,requestId,latency,options.background))return;
  const now=Date.now();
  observeLateWrites(env,latency,options.background,requestId,now);
  let stage:Stage='claim',eventRef:string|undefined,attempt:number|undefined,target:'phone'|'watch'|undefined;

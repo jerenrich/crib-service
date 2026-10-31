@@ -1,5 +1,15 @@
 # Logging and diagnostics review
 
+## Caregiver delivery logging — 31 October 2026
+
+Caregiver phone and Watch pushes now carry the same validated `diagnosticRef` and claimed `deliveryAttempt` as other alert paths. Each destination's journal row shares the dispatch request reference and adds fixed `details.caregiver` labels for `member=owner|partner`, `duty=primary|secondary`, and the observed family revision. This distinguishes the two caregivers without logging their names, device identities, invitation codes, credentials, or push tokens. A diagnostic HMAC failure omits correlation without stopping delivery. Optional correlation work finishes before the delivery lease starts.
+
+The dispatch collects at most 16 diagnostic observations and begins its journal batch only after APNs attempts, destination receipt writes, and the aggregate outcome have finished or failed. Production attaches that batch to the Worker or Durable Object background lifetime. Direct callers without a background lifetime flush afterward. A slow or failed diagnostic batch cannot consume the lease for a remaining destination. Per-destination `elapsed_ms` is frozen from a monotonic clock before the journal is queued; `recorded_at` remains the persistence time. A functional receipt failure retains the known `push_outcome` with a storage error, without authorizing a replay. Journal loss remains possible during storage outages or process termination and is not proof of failed delivery.
+
+Invite, join, and duty requests use `caregiver_invite`, `caregiver_join`, and `caregiver_duty`. Duty/removal request rows retain bounded revision, role, escalation preference, and repaired-event count where available. Event-scoped `caregiver_routing` rows distinguish initial plan creation, departed-member fallback, family-change retries, missing tokens, disabled secondary delivery, retained receipts, failed eligibility, and claim/lease rejection. Ordinary reminders do not add another plan-creation row when they inherit an existing episode plan. New fields pass through the same strict allowlist and seven-day / 10,000-row journal limits; no migration is needed.
+
+Local validation passed 434 Worker tests, both TypeScript checks, and the Worker bundle dry run. Coverage includes HMAC failure/delay, failed and stalled diagnostic writes, API and reminder background lifetimes, frozen durations, receipt-write failure evidence, both caregivers' phone/Watch correlation, retry attempts, routing decisions and private-input exclusion. These logging changes have not been deployed.
+
 ## Nursery sound diagnostics — 31 October 2026
 
 Sound diagnostics version 1 emits `nursery_sound_pipeline_ready code=1` on app initialization. The existing protected, bounded local log and export screen retain the new events; there is no automatic device-log upload. Sound events are transitions and commands, never countdown ticks, sound-level frames, or keepalive pings.

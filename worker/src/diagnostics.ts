@@ -11,6 +11,7 @@ const routes = {
  'POST /v1/alert/resume':'resume_alerts', 'POST /v1/alert/stop':'stop_alerts',
  'POST /v1/settings':'settings', 'POST /v1/alert/acknowledge':'acknowledge',
  'POST /v1/pairing/remove':'unpair','POST /v1/device/delete':'delete_device',
+ 'POST /v1/caregivers/invite':'caregiver_invite','POST /v1/caregivers/join':'caregiver_join','POST /v1/caregivers/duty':'caregiver_duty',
  'POST /v1/watch-test/push':'test_push',
  'POST /v1/watch-latency-probe/push':'test_push',
  'POST /v1/listener/silent-alarm-test':'test_push',
@@ -20,7 +21,7 @@ const routes = {
  'POST /v1/connection-alerts':'connection_preferences','POST /v1/test-push':'test_push','GET /v1/alert-test':'test_push','POST /v1/alert-test':'test_push','POST /v1/alert-test/stop':'test_push',
  'GET /v1/live-sound':'live_sound'
 } as const;
-export type Operation = typeof routes[keyof typeof routes] | 'unknown_route' | 'status_journal' | 'heartbeat_journal' | 'alert_progress' | 'database_late_reply' | 'dispatch' | 'dispatch_outcome' | 'dispatch_skip' | 'reminder_prepare' | 'maintenance' | 'reminder_schedule' | 'reminder_alarm' | 'watch_test_dispatch' | 'silent_alarm_test_dispatch' | 'silent_cry_alarm_dispatch' | 'alarm_attempt';
+export type Operation = typeof routes[keyof typeof routes] | 'unknown_route' | 'status_journal' | 'heartbeat_journal' | 'alert_progress' | 'database_late_reply' | 'dispatch' | 'dispatch_outcome' | 'dispatch_skip' | 'reminder_prepare' | 'maintenance' | 'reminder_schedule' | 'reminder_alarm' | 'watch_test_dispatch' | 'silent_alarm_test_dispatch' | 'silent_cry_alarm_dispatch' | 'alarm_attempt' | 'caregiver_routing';
 export type Stage = 'validation' | 'rate_limit' | 'authentication' | 'handler' | 'claim' | 'push' | 'storage' | 'cleanup';
 export type Outcome = 'ok' | 'rejected' | 'internal_error' | 'sent' | 'retry' | 'blocked' | 'uncertain' | 'failed'
  | 'expired_event' | 'no_push_token' | 'transport_unknown' | 'invalid_device_token' | 'provider_configuration'
@@ -34,6 +35,8 @@ export interface Diagnostic {
  requestId:string; operation:Operation; stage:Stage; outcome:Outcome; started:number;
  httpStatus?:number; eventRef?:string; attempt?:number; target?:'phone'|'watch';
  details?:TimingDetails;
+ // Frozen monotonic duration for records queued after functional work finishes.
+ elapsedMS?:number;
 }
 export function operationFor(method:string,path:string):Operation {
  return routes[`${method} ${path}` as keyof typeof routes] ?? 'unknown_route';
@@ -55,17 +58,22 @@ export async function eventReferences(env:Env,eventIds:string[]):Promise<string[
 // concurrent successful rows may report overlapping counts, so do not sum them.
 let journalFailures=0,reportedJournalFailures=0;
 // Explicit columns prevent accidental object spreading of request/exception data.
-// With `owner`, the event reference is kept only if that Parent owns the event,
+// With `owner`, the reference requires ownership or current caregiver access,
 // checked inside the insert so it costs no separate query.
 function diagnosticInsert(env:Env,value:Diagnostic,details:TimingDetails|undefined,owner?:{eventId:string;parentId:string}):D1PreparedStatement {
  const release=env.CF_VERSION_METADATA?.id;
- const columns=[Date.now(),value.requestId,value.operation,value.stage,value.outcome,value.httpStatus??null,Math.max(0,Date.now()-value.started)];
+ const elapsed=typeof value.elapsedMS==='number'&&Number.isFinite(value.elapsedMS)&&value.elapsedMS>=0?value.elapsedMS:Math.max(0,Date.now()-value.started);
+ const columns=[Date.now(),value.requestId,value.operation,value.stage,value.outcome,value.httpStatus??null,elapsed];
  const tail=[value.attempt??null,value.target??null,release && /^[0-9a-f-]{36}$/i.test(release)?release:null,safeTimingDetails(details)];
  if(!owner||!value.eventRef)return env.DB.prepare('INSERT INTO diagnostics(recorded_at,request_id,operation,stage,outcome,http_status,elapsed_ms,event_ref,attempt,target,release,details) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)')
   .bind(...columns,value.eventRef??null,...tail);
  return env.DB.prepare(`INSERT INTO diagnostics(recorded_at,request_id,operation,stage,outcome,http_status,elapsed_ms,event_ref,attempt,target,release,details)
-  VALUES(?,?,?,?,?,?,?,CASE WHEN EXISTS(SELECT 1 FROM events WHERE event_id=? AND parent_id=?) THEN ? END,?,?,?,?)`)
-  .bind(...columns,owner.eventId,owner.parentId,value.eventRef,...tail);
+  VALUES(?,?,?,?,?,?,?,CASE WHEN EXISTS(SELECT 1 FROM events e WHERE e.event_id=? AND (e.parent_id=? OR EXISTS(
+   SELECT 1 FROM caregiver_families f JOIN pairs p ON p.parent_id=f.owner_id AND p.created_at=f.pair_created_at
+   WHERE f.owner_id=e.parent_id AND f.partner_id=? AND p.listener_id=e.listener_id AND e.created_at>=p.created_at
+   AND (COALESCE(json_extract(e.payload,'$.isTest'),0)=0 OR json_extract(e.payload,'$.targetCaregiverId')=?)
+  ))) THEN ? END,?,?,?,?)`)
+  .bind(...columns,owner.eventId,owner.parentId,owner.parentId,owner.parentId,value.eventRef,...tail);
 }
 export async function recordDiagnostic(env:Env,value:Diagnostic):Promise<boolean> {
  // Fail open: diagnostics must never change delivery or turn acceptance into a retry.
