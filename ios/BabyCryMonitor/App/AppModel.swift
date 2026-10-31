@@ -18,6 +18,7 @@ import UIKit
     var error: String?
     var audioStatus = "Stopped"
     var deliveryStatus = "Not connected"
+    var stoppingAlerts = false
     var resumingAlerts = false
     var acknowledgingAlert = false
     var retryingConnection = false
@@ -414,8 +415,42 @@ import UIKit
             : "Monitoring is not confirmed. Check internet on both phones, then reopen Crib Service on the nursery iPhone."
     }
 
+    /// Includes snoozed episodes so Stop also prevents them resuming later.
+    var stoppableAlertIDs: [UUID] {
+        var episodes = Set<UUID>()
+        return (alertStatus?.alerts ?? []).filter {
+            $0.isTest != true && $0.resolvedAt == nil && episodes.insert($0.episodeId).inserted
+        }.map(\.eventId)
+    }
+
+    @discardableResult func stopAlerts() async -> Bool {
+        let ids = stoppableAlertIDs
+        guard role != nil, paired, !ids.isEmpty, !stoppingAlerts, !acknowledgingAlert, !resumingAlerts, !managingDevice else { return false }
+        stoppingAlerts = true; defer { stoppingAlerts = false }
+        let revision = environmentRevision
+        let episodes = Set((alertStatus?.alerts ?? []).filter { ids.contains($0.eventId) }.map(\.episodeId))
+        do {
+            let client = try await registeredClient()
+            guard revision == environmentRevision else { return false }
+            try await client.stopAlerts(eventIDs: ids)
+            guard revision == environmentRevision else { return false }
+            if #available(iOS 26.0, *), defaults === UserDefaults.standard {
+                SilentCryAlarmService.shared.cancelEpisodes(episodes)
+            }
+            await notifications.dismissCryingAlerts(testEventID: nil)
+            try await refreshAlertStatus(using: client)
+            guard revision == environmentRevision else { return false }
+            return true
+        } catch {
+            guard revision == environmentRevision else { return false }
+            self.error = "Could not confirm alerts stopped. Retry when connected. \(error.localizedDescription)"
+            log.record("stop_alerts_failed", error: error)
+            return false
+        }
+    }
+
     @discardableResult func resumeAlerts(until expected: Date? = nil) async -> Bool {
-        guard role != nil, paired, !resumingAlerts, !acknowledgingAlert, !managingDevice,
+        guard role != nil, paired, !resumingAlerts, !acknowledgingAlert, !stoppingAlerts, !managingDevice,
               let until = expected ?? alertStatus?.alertsMutedUntil, until > currentTime() else { return false }
         resumingAlerts = true; defer { resumingAlerts = false }
         let revision = environmentRevision
@@ -1373,11 +1408,11 @@ import UIKit
         parentRefreshTask = nil
     }
     private func fetchParentStatus() async {
-        let revision = environmentRevision, generation = settingsGeneration
+        let revision = environmentRevision, generation = settingsGeneration, alerts = listenerAlertGeneration
         let checkedAt = currentTime()
         do {
             let client = try await registeredClient(); var status = try await client.status()
-            guard revision == environmentRevision, role == .parent else { return }
+            guard revision == environmentRevision, alerts == listenerAlertGeneration, role == .parent else { return }
             // A poll started before a confirmed swap must not undo that swap.
             if status.pairingID == parentStatus?.pairingID,
                let currentDuty = parentStatus?.caregiverDuty,
@@ -1386,7 +1421,7 @@ import UIKit
             }
             if #available(iOS 26.0, *), defaults === UserDefaults.standard {
                 await SilentCryAlarmService.shared.synchronize(using: client, status: status, checkedAt: checkedAt)
-                guard revision == environmentRevision, role == .parent else { return }
+                guard revision == environmentRevision, alerts == listenerAlertGeneration, role == .parent else { return }
             }
             if !status.paired || (parentStatus?.pairingID != nil && parentStatus?.pairingID != status.pairingID) {
                 timeline = nil; timelineError = nil; clearLiveSound()
@@ -1460,13 +1495,23 @@ import UIKit
         }
     }
     private func refreshAlertStatus(using client: any BackendServing) async throws {
-        guard role == .listener else { await refreshParent(); return }
-        // A poll begun before this confirmed action cannot restore an old snooze.
+        // A poll begun before this confirmed action cannot restore its alerts.
         listenerAlertGeneration += 1
         let revision = environmentRevision, generation = listenerAlertGeneration
+        let checkedAt = currentTime()
         let status = try await client.status()
-        guard revision == environmentRevision, generation == listenerAlertGeneration, role == .listener else { return }
-        observePairing(status)
+        guard revision == environmentRevision, generation == listenerAlertGeneration else { return }
+        if role == .listener { observePairing(status) }
+        else if role == .parent {
+            if #available(iOS 26.0, *), defaults === UserDefaults.standard {
+                await SilentCryAlarmService.shared.synchronize(using: client, status: status, checkedAt: checkedAt)
+                guard revision == environmentRevision, generation == listenerAlertGeneration else { return }
+            }
+            parentStatus = status
+            paired = status.paired; defaults.set(paired, forKey: pairingKey)
+            notificationsCheckedAt = checkedAt
+            publishWatch()
+        }
     }
     func refreshTimeline() async {
         #if DEBUG
@@ -1507,7 +1552,7 @@ import UIKit
     }
     #endif
     @discardableResult func acknowledge(_ id: UUID) async -> Bool {
-        guard role != nil, paired, !acknowledgingAlert, !resumingAlerts, !managingDevice else { return false }
+        guard role != nil, paired, !acknowledgingAlert, !resumingAlerts, !stoppingAlerts, !managingDevice else { return false }
         acknowledgingAlert = true; defer { acknowledgingAlert = false }
         if let alert = parentStatus?.alerts?.first(where: { $0.eventId == id }) {
             if #available(iOS 26.0, *), defaults === UserDefaults.standard {

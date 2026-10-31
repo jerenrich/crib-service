@@ -3755,6 +3755,16 @@ describe('two caregiver families',()=>{
   expect(revoked).toBe(true);expect(response.status).toBe(409);expect(await response.text()).not.toContain('caregiverDuty');
   expect((await status(parent)).paired).toBe(true);
  });
+ it('lets a caregiver stop shared episodes without stopping nursery monitoring',async()=>{
+  const {parent,partner,listener}=await family(),event=alert(listener);
+  await call('listener/heartbeat',listener,{listenerId:listener.deviceId,timestamp:new Date().toISOString(),monitoring:true,microphoneActive:true,powerConnected:true,state:'quiet',episodes:[]});
+  await call('listener/event',listener,event);
+  expect((await call('alert/stop',partner,{eventIds:[event.eventId]})).status).toBe(200);
+  expect((await status(parent)).notificationRelevance.cryEpisodeIDs).toEqual([]);
+  expect((await status(partner)).notificationRelevance.cryEpisodeIDs).toEqual([]);
+  expect((await status(listener)).monitoring).toBe(true);
+  expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM monitoring_commands').first('n')).toBe(0);
+ });
  it('lets the paired nursery snooze and resume the household without stopping monitoring',async()=>{
   const {parent,partner,listener}=await family(),event=alert(listener);
   expect((await call('listener/heartbeat',listener,{listenerId:listener.deviceId,timestamp:new Date().toISOString(),monitoring:true,microphoneActive:true,powerConnected:true,state:'quiet',episodes:[]})).status).toBe(200);
@@ -3779,12 +3789,12 @@ describe('two caregiver families',()=>{
   expect((await call('alert/acknowledge',listener,{eventId:test.eventId})).status).toBe(403);
   expect((await status(parent)).alertsMutedUntil).toBeNull();
  });
- it.each(['alert/acknowledge','alert/resume'])('does not let an in-flight nursery %s affect a replacement pairing',async(route)=>{
+ it.each(['alert/acknowledge','alert/resume','alert/stop'])('does not let an in-flight nursery %s affect a replacement pairing',async(route)=>{
   const {parent,listener}=await family(),event=alert(listener);await call('listener/event',listener,event);
   if(route==='alert/resume')await call('alert/acknowledge',parent,{eventId:event.eventId});
   const until=Date.parse((await status(parent)).alertsMutedUntil);let replaced=false;
   const db=interceptDB(async(sql,_args,method,execute)=>{
-   if(!replaced&&method==='batch'&&(sql.startsWith('INSERT INTO alert_snoozes')||sql.startsWith('UPDATE timeline_events'))){
+   if(!replaced&&method==='batch'&&(sql.startsWith('INSERT INTO alert_snoozes')||sql.startsWith('UPDATE timeline_events')||sql.startsWith('INSERT INTO resolved_episodes'))){
     replaced=true;expect((await call('pairing/remove',listener)).status).toBe(200);
     const replacement=device('listener');await register(replacement);
     const {code}=await(await call('pairing/create',parent)).json() as {code:string};
@@ -3792,7 +3802,7 @@ describe('two caregiver families',()=>{
    }
    return execute();
   });
-  const response=await worker.fetch(new Request('https://monitor.test/v1/'+route,{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${listener.deviceId}.${listener.secret}`},body:JSON.stringify(route==='alert/resume'?{expectedUntil:until}:{eventId:event.eventId})}),{...testEnv,DB:db});
+  const response=await worker.fetch(new Request('https://monitor.test/v1/'+route,{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${listener.deviceId}.${listener.secret}`},body:JSON.stringify(route==='alert/resume'?{expectedUntil:until}:route==='alert/stop'?{eventIds:[event.eventId]}:{eventId:event.eventId})}),{...testEnv,DB:db});
   expect(replaced).toBe(true);expect(response.status).toBe(409);
   expect((await status(parent)).alertsMutedUntil).toBeNull();
   expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM alert_snoozes').first('n')).toBe(0);
@@ -3807,4 +3817,37 @@ describe('two caregiver families',()=>{
   expect((await status(partner)).listenerId).toBe(listener.deviceId);
  });
 
+});
+
+
+describe('Stop alerts without changing monitoring',()=>{
+ it.each(['listener','parent'] as const)('lets %s end outstanding and snoozed episodes while monitoring is off',async(actor)=>{
+  const {parent,listener}=await paired(),first=alert(listener),second=alert(listener);
+  await call('listener/event',listener,first);await call('listener/event',listener,second);
+  await call('listener/heartbeat',listener,{listenerId:listener.deviceId,timestamp:new Date().toISOString(),monitoring:false,microphoneActive:false,powerConnected:true,state:'quiet',episodes:[]});
+  await call('alert/acknowledge',parent,{eventId:first.eventId});
+  const commands=await env.DB.prepare('SELECT COUNT(*) AS n FROM monitoring_commands').first('n');
+  expect((await call('alert/stop',actor==='listener'?listener:parent,{eventIds:[first.eventId,second.eventId]})).status).toBe(200);
+  expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM events WHERE parent_id=? AND resolved_at IS NULL').bind(parent.deviceId).first('n')).toBe(0);
+  expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM resolved_episodes WHERE parent_id=?').bind(parent.deviceId).first('n')).toBe(2);
+  expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM monitoring_commands').first('n')).toBe(commands);
+  const status=await(await call('listener/status',parent,undefined,'GET')).json() as {monitoring:boolean;microphoneActive:boolean;notificationRelevance:{cryEpisodeIDs:string[]}};
+  expect(status.monitoring).toBe(false);expect(status.microphoneActive).toBe(false);expect(status.notificationRelevance.cryEpisodeIDs).toEqual([]);
+  expect((await call('alert/stop',parent,{eventIds:[first.eventId]})).status).toBe(200);
+  // A late reminder/upload for a stopped episode stays resolved; a new episode remains eligible.
+  await call('listener/event',listener,{...first,eventId:crypto.randomUUID(),isRepeat:true,createdAt:new Date().toISOString()});
+  expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM events WHERE episode_id=? AND resolved_at IS NULL').bind(first.episodeId).first('n')).toBe(0);
+  const fresh=alert(listener);await call('listener/event',listener,fresh);
+  expect(await env.DB.prepare('SELECT resolved_at FROM events WHERE event_id=?').bind(fresh.eventId).first('resolved_at')).toBeNull();
+ });
+ it('rejects tests, foreign alerts, invalid selections and old-pair retries without modifying real alerts',async()=>{
+  const {parent,listener}=await paired(),other=await paired(),real=alert(listener),test={...alert(listener),isTest:true},foreign=alert(other.listener);
+  await call('listener/event',listener,real);await call('listener/event',listener,test);await call('listener/event',other.listener,foreign);
+  for(const eventIds of [[test.eventId],[foreign.eventId],[real.eventId,foreign.eventId]])expect((await call('alert/stop',parent,{eventIds})).status).toBe(404);
+  expect((await call('alert/stop',parent,{eventIds:[]})).status).toBe(400);
+  expect((await call('alert/stop',parent,{eventIds:['invalid']})).status).toBe(400);
+  expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM resolved_episodes').first('n')).toBe(0);
+  await call('pairing/remove',parent);
+  expect((await call('alert/stop',listener,{eventIds:[real.eventId]})).status).toBe(409);
+ });
 });

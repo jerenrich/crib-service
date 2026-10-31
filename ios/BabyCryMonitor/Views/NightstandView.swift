@@ -294,6 +294,7 @@ struct NightstandView: View {
                         chips
                         soundPanel.frame(height: 100 + chartHeader)
                         actions
+                        stopAlertsControl
                         disclaimer
                     }
                     .padding(.horizontal, 20)
@@ -307,6 +308,7 @@ struct NightstandView: View {
                     chips
                     soundPanel.frame(minHeight: 60, maxHeight: .infinity)
                     actions
+                    stopAlertsControl
                     disclaimer
                 }
                 .padding(.horizontal, 20)
@@ -354,6 +356,7 @@ struct NightstandView: View {
         VStack(spacing: 8) {
             header
             timedHero
+            stopAlertsControl
             soundPanel.frame(height: hasTwoCaregivers ? 56 : 72)
             if hasTwoCaregivers { CaregiverDutyCard() }
             timingSummary
@@ -709,6 +712,20 @@ struct NightstandView: View {
         .frame(minHeight: 54)
         .foregroundStyle(style == .secondary ? Palette.lavender : Palette.background)
         .background(style == .primary ? Palette.mint : style == .alert ? Palette.amber : Palette.panel, in: RoundedRectangle(cornerRadius: 18))
+    }
+
+    @ViewBuilder private var stopAlertsControl: some View {
+        if model.paired, !model.stoppableAlertIDs.isEmpty {
+            Button { Task { await model.stopAlerts() } } label: {
+                Label(model.stoppingAlerts ? "Stopping alerts…" : "Stop alerts", systemImage: "bell.slash.fill")
+                    .font(.subheadline.weight(.semibold)).frame(maxWidth: .infinity, minHeight: 44)
+            }
+            .buttonStyle(.bordered)
+            .tint(Palette.amber)
+            .disabled(model.stoppingAlerts || model.acknowledgingAlert || model.resumingAlerts || model.managingDevice)
+            .accessibilityHint("Ends current alert episodes. Monitoring keeps its current setting.")
+            .accessibilityIdentifier("nightstandStopAlerts")
+        }
     }
 
     /// The contextual primary action, paired with the monitoring control when it still applies.

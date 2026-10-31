@@ -41,11 +41,7 @@ import UIKit
     private var flushing = false
     private var revision = 0
     private var lastReadinessUptime: Double?
-    private struct Record: Codable {
-        let episodeID: UUID; let eventID: UUID; let snoozeDuration: Double; let scheduledAt: Date
-        var isTest: Bool? = nil // Absent in records saved before tests shared this path.
-        var alarmAt: Date? = nil
-    }
+    private typealias Record = SilentAlarmRecord
     /// Who turned alarms off, for the diagnostic log.
     enum ChangeSource: String { case user, server, serverResume = "server_resume", roleChange = "role_change", backendChanged = "backend_changed", unpaired }
     private var records: [Record] {
@@ -375,27 +371,27 @@ import UIKit
             callbackAt: callbackAt, executionBudgetRemainingMS: SilentCryAlarmExecutionBudget(startedAt: start).remainingMilliseconds(), error: error)
     }
 
-    func snooze(episodeID: UUID) async {
+    func snooze(episodeID: UUID, eventID: UUID? = nil, isTest: Bool? = nil) async {
         mergeExtensionAttempts()
         let record = records.first(where: { $0.episodeID == episodeID })
         (log ?? DiagnosticLog()).silentCryAlarmStop(episodeID: episodeID, eventID: record?.eventID, isTest: record.map { $0.isTest == true },
             sinceAlarmMS: record.flatMap(Self.sinceAlarmMS), appActive: UIApplication.shared.applicationState == .active)
-        guard let record else { return }
-        if record.isTest == true {
+        guard let target = eventID ?? record?.eventID else { return }
+        if (isTest ?? record?.isTest) == true {
             // Stopping a test alarm acknowledges only that test; it never snoozes real alerts.
-            trace("acknowledged", record.eventID)
-            do { try await client().acknowledge(record.eventID, actedAt: Date()) } catch { trace("failed", record.eventID, operation: "test_acknowledge", error: error) }
+            trace("acknowledged", target)
+            do { try await client().acknowledge(target, actedAt: Date()) } catch { trace("failed", target, operation: "test_acknowledge", error: error) }
             return
         }
-        snoozeLocally(eventID: record.eventID, duration: record.snoozeDuration)
-        do { try await flushAcknowledgements(using: client()) } catch { trace("ack_pending", record.eventID) }
+        snoozeLocally(eventID: target, duration: record?.snoozeDuration ?? snoozeDuration)
+        do { try await flushAcknowledgements(using: client()) } catch { trace("ack_pending", target) }
     }
 
-    func snoozeLocally(eventID: UUID, duration: Double) {
+    func snoozeLocally(eventID: UUID, duration: Double, actedAt: Date? = nil) {
         mergeExtensionAttempts()
         defer { publishSnapshot() }
         guard enabled || records.contains(where: { $0.eventID == eventID }) else { return }
-        guard SilentCryAlarmSnooze(defaults: defaults).apply(eventID: eventID, duration: duration, now: Date()) else { return }
+        guard SilentCryAlarmSnooze(defaults: defaults).apply(eventID: eventID, duration: duration, now: actedAt ?? Date()) else { return }
         revision += 1
         cancelAll(reason: "snoozed")
         status = "Alerts snoozed. Acknowledgement syncs when connected."
@@ -455,6 +451,11 @@ import UIKit
                 (log ?? DiagnosticLog()).silentCryAlarmCancelled(episodeID: record.episodeID, eventID: record.eventID, reason: reason)
             }
         } catch { trace("failed", operation: "reconcile_cancel", error: error) }
+    }
+
+    func cancelEpisodes(_ ids: Set<UUID>) {
+        mergeExtensionAttempts()
+        cancel(ids, reason: "irrelevant", operation: "stop_alerts")
     }
 
     /// Stopping or acknowledging a test ends its alarm without touching real ones.
@@ -625,24 +626,24 @@ import UIKit
         let newFloor = max(floor, window)
         defaults.set(newFloor, forKey: floorKey)
         defaults.set(entries.filter { $0.finishedAt > newFloor && merged.contains($0.key) }.map(\.key), forKey: keysKey)
-        var saved = records, stopped: [UUID] = []
+        var saved = records, stopped: [AlarmAttempt] = []
         for attempt in new {
             (log ?? DiagnosticLog()).alarmAttempt(attempt)
-            guard let episodeID = attempt.episodeID else { continue }
-            if attempt.outcome == .scheduled, let eventID = attempt.eventID, !saved.contains(where: { $0.episodeID == episodeID }) {
-                saved.append(Record(episodeID: episodeID, eventID: eventID, snoozeDuration: snoozeDuration,
-                                    scheduledAt: attempt.finishedAt, isTest: attempt.isTest ? true : nil, alarmAt: attempt.alarmAt))
-            }
-            if attempt.outcome == .stopped { stopped.append(episodeID) }
+            guard attempt.episodeID != nil else { continue }
+            saved = Record.merging(attempt, into: saved, snoozeDuration: snoozeDuration)
+            if attempt.outcome == .stopped { stopped.append(attempt) }
         }
         records = Array(saved.suffix(64))
         queueUpload(new)
-        for episodeID in stopped {
+        for attempt in stopped {
+            guard let episodeID = attempt.episodeID else { continue }
             let record = records.first(where: { $0.episodeID == episodeID })
             (log ?? DiagnosticLog()).silentCryAlarmStop(episodeID: episodeID, eventID: record?.eventID, isTest: record.map { $0.isTest == true },
                 sinceAlarmMS: record.flatMap(Self.sinceAlarmMS), appActive: UIApplication.shared.applicationState == .active)
-            if let record, record.isTest != true {
-                snoozeLocally(eventID: record.eventID, duration: record.snoozeDuration)
+            if !attempt.isTest, let target = attempt.eventID ?? record?.eventID {
+                snoozeLocally(eventID: target, duration: record?.snoozeDuration ?? snoozeDuration, actedAt: attempt.startedAt)
+            } else if attempt.isTest, let target = attempt.eventID ?? record?.eventID {
+                Task { try? await client().acknowledge(target, actedAt: attempt.startedAt) }
             }
         }
     }

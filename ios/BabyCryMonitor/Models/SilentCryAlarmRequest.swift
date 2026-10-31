@@ -22,8 +22,10 @@ import Foundation
             markHandled(eventID)
             return false
         }
-        defaults.set(now, forKey: "silentCryAlarmStoppedBefore")
-        defaults.set(now.addingTimeInterval(duration), forKey: "silentCryAlarmMutedUntil")
+        let cutoff = max(now, defaults.object(forKey: "silentCryAlarmStoppedBefore") as? Date ?? .distantPast)
+        let until = max(now.addingTimeInterval(duration), defaults.object(forKey: "silentCryAlarmMutedUntil") as? Date ?? .distantPast)
+        defaults.set(cutoff, forKey: "silentCryAlarmStoppedBefore")
+        defaults.set(until, forKey: "silentCryAlarmMutedUntil")
         defaults.set(now, forKey: Self.actedAtKey(eventID))
         pending.append(id)
         defaults.set(Array(pending.suffix(100)), forKey: "silentCryAlarmPendingAcknowledgements")

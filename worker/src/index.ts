@@ -16,7 +16,7 @@ import {body,rateLimit} from './security';
 import {admitAlert,admitHeartbeat,authenticate,register,savePushToken,saveWatchPushToken,saveSilentWatchAlarms,removeDeviceData,pairFor,listenerSnoozeDevice} from './devices';
 import {connectionPreferences,flushConnections} from './connections';
 import {createPairing,claimPairing} from './pairing';
-import {receiveAlert,acknowledge,resumeAlerts,flushPending} from './alerts';
+import {receiveAlert,acknowledge,resumeAlerts,stopAlerts,flushPending} from './alerts';
 import {saveHeartbeat,listenerStatus,saveSettings} from './status';
 import {operationFor,recordDiagnostic,observeLateWrites,type Stage} from './diagnostics';
 import {queueStatusDiagnostic,queueHeartbeatDiagnostic} from './status-diagnostics';
@@ -77,8 +77,8 @@ export default {
     if(!alertUpload&&!heartbeatUpload&&!alertTestStart)await latency.measure('rate_limit_ms',()=>rateLimit(env,scope,device.id,requestLimit,600,latency,'device_rate_limit_ms'));
     stage='handler';
     const family=device.role==='parent'?await familyFor(env,device):null;
-    const sharedRoutes=['GET /v1/listener/status','GET /v1/timeline','GET /v1/live-sound','POST /v1/monitoring','POST /v1/settings','POST /v1/alert/resume','POST /v1/alert/acknowledge','POST /v1/connection-alerts'];
-    const nurserySnooze=device.role==='listener'&&['POST /v1/alert/acknowledge','POST /v1/alert/resume'].includes(route);
+    const sharedRoutes=['GET /v1/listener/status','GET /v1/timeline','GET /v1/live-sound','POST /v1/monitoring','POST /v1/settings','POST /v1/alert/resume','POST /v1/alert/stop','POST /v1/alert/acknowledge','POST /v1/connection-alerts'];
+    const nurserySnooze=device.role==='listener'&&['POST /v1/alert/acknowledge','POST /v1/alert/resume','POST /v1/alert/stop'].includes(route);
     const shared=nurserySnooze?await listenerSnoozeDevice(env,device):sharedRoutes.includes(route)?await sharedDevice(env,device,family):device;
     const special=await latency.measure('handler_ms',async()=>{switch(route){
      case 'POST /v1/caregivers/invite':result=await inviteCaregiver(env,device,await body(request));break;
@@ -142,6 +142,7 @@ export default {
      case 'POST /v1/monitoring':result=await requestMonitoring(env,shared,await body(request));break;
      case 'POST /v1/monitoring/complete':result=await completeMonitoring(env,device,await body(request));break;
      case 'POST /v1/settings':result=await saveSettings(env,shared,await body(request));break;
+     case 'POST /v1/alert/stop':result=await stopAlerts(env,shared,await body(request));break;
      case 'POST /v1/alert/resume':result=await resumeAlerts(env,shared,await body(request));break;
      case 'POST /v1/alert/acknowledge':result=await acknowledge(env,shared,await body(request),device.id);break;
      default:throw new APIError(404,'Endpoint not found.');

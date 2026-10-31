@@ -67,6 +67,13 @@ try {
  const nurserySnooze = (await status(listener)).body;
  check(nurserySnooze.snoozedBy === listener.deviceId && Date.parse(nurserySnooze.alertsMutedUntil) > Date.now(), 'nursery snooze confirmed and attributed');
  check((await request('alert/resume', listener, {expectedUntil: Date.parse(nurserySnooze.alertsMutedUntil)})).status === 200, 'nursery resumes shared alerts');
+ const stoppedAt = new Date().toISOString();
+ check((await request('listener/heartbeat', listener, {listenerId: listener.deviceId, timestamp: stoppedAt,
+  monitoring: false, microphoneActive: false, powerConnected: true, state: 'quiet', episodes: []})).status === 200, 'nursery reports monitoring off');
+ check((await request('alert/stop', partner, {eventIds: [event.eventId, nurseryEvent.eventId]})).status === 200, 'caregiver stops current episodes while monitoring is off');
+ check((await request('alert/stop', listener, {eventIds: [event.eventId, nurseryEvent.eventId]})).status === 200, 'nursery Stop alerts is safely repeatable');
+ const stoppedStatus = (await status(parent)).body;
+ check(stoppedStatus.monitoring === false && stoppedStatus.microphoneActive === false && stoppedStatus.notificationRelevance.cryEpisodeIDs.length === 0, 'Stop alerts ends relevance without starting monitoring or microphone');
  check((await request('pairing/remove', partner)).status === 200, 'invited caregiver disconnects independently');
  check(!(await status(partner)).body.paired && (await status(parent)).body.paired, 'original nursery pairing survives partner disconnect');
  console.log('Caregiver deployment smoke check passed; no APNs tokens were registered.');

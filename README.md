@@ -55,6 +55,10 @@ If the Listener stops sending heartbeats while monitoring, the server detects it
 
 If the nursery iPhone stops listening without anyone tapping Stop or Pause (the microphone fails or stalls, an interruption does not end within a minute, or the app is relaunched in the background after being closed), the Listener sends a persistent **Nursery monitoring stopped** alert. It repeats and uses Snooze and silent Watch alarms like crying, resumes after Snooze, and ends when the Listener reports monitoring again, a person stops monitoring or the devices are unpaired. After an interruption ends without the system's permission to resume, the Listener still tries once to restart the microphone before reporting the stop.
 
+**Stop alerts** on the Monitor screen ends the outstanding real alert episodes, including snoozed episodes, on either iPhone even when nursery monitoring is off. It leaves the microphone, monitoring and existing snooze setting unchanged. Unlike Snooze, those episodes do not resume later; delayed uploads cannot revive them. New episodes follow the existing alert settings. Test alerts keep their separate controls. A failed request stays visible so you can retry when connected.
+
+AlarmKit **Stop** still snoozes real alerts for the configured duration. When the same episode alarms again after that snooze, Stop applies to the new reminder rather than the already acknowledged original notification. Stopping a test alarm only acknowledges that test.
+
 Snooze runs from the moment it was tapped. A Snooze queued on the Watch or from an offline alarm Stop that reaches the server later pauses alerts only for the rest of that window, so it cannot silence a newer episode after the window has passed, and it never shortens a longer snooze already running.
 
 This change requires the updated Worker, D1 migration `0014_listener_disconnect_alerts.sql`, and updated iPhone/Watch apps. Existing ongoing one-shot outages are promoted to persistent alert episodes on the next server check.

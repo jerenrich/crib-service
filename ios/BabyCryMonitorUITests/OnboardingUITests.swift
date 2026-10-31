@@ -75,6 +75,18 @@ final class OnboardingUITests: XCTestCase {
         XCTAssertTrue(app.buttons["nightstandMonitoringControl"].isHittable)
         XCTAssertTrue(app.staticTexts["Microphone inactive"].firstMatch.exists)
         XCTAssertFalse(app.staticTexts["Nursery keeps listening"].exists)
+        XCTAssertTrue(app.buttons["nightstandStopAlerts"].exists)
+        XCTAssertTrue(app.buttons["nightstandStopAlerts"].isHittable)
+    }
+
+    @MainActor func testStoppedParentOffersStopAlerts() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", "--uitesting-active-alert", "--uitesting-microphone-off", "--uitesting-caregivers"]
+        app.launch()
+        let stop = app.buttons["nightstandStopAlerts"]
+        XCTAssertTrue(stop.waitForExistence(timeout: 5))
+        XCTAssertTrue(stop.isHittable)
+        XCTAssertTrue(app.windows.firstMatch.frame.contains(stop.frame))
     }
 
     @MainActor func testNurserySnoozedCircleShowsResumeAndCountdown() {

@@ -94,6 +94,8 @@ final class NotificationService: UNNotificationServiceExtension, @unchecked Send
         snapshotAgeMS = Int(Date().timeIntervalSince(snapshot.publishedAt) * 1000)
         evidenceApplied = snapshot.evidenceApplies(to: request)
         if let reason = snapshot.ineligibilityReason(for: request, now: Date()) { return result(.rejected, reason.rawValue) }
+        let stops = AlarmJournal.forMethod(.extension)?.read() ?? []
+        if let reason = snapshot.stopRejection(for: request, attempts: stops, now: Date()) { return result(.rejected, reason.rawValue) }
         // The extension sees `notDetermined` even when the app is authorized, so
         // leave authorization to AlarmKit's own check when scheduling.
         guard SilentAlarmScheduling.assetAvailable else { return result(.rejected, SilentCryAlarmRequest.Rejection.missingAsset.rawValue) }
@@ -102,6 +104,13 @@ final class NotificationService: UNNotificationServiceExtension, @unchecked Send
             let fireAt = Date().addingTimeInterval(SilentAlarmScheduling.delay)
             _ = try await AlarmManager.shared.schedule(id: request.episodeID,
                                                        configuration: SilentAlarmScheduling.configuration(for: request, at: fireAt))
+            // Stop can race a suspended schedule call in another process.
+            let latest = AlarmSnapshot.load() ?? snapshot
+            if let reason = latest.ineligibilityReason(for: request, now: Date()) ??
+                latest.stopRejection(for: request, attempts: AlarmJournal.forMethod(.extension)?.read() ?? [], now: Date()) {
+                try AlarmManager.shared.cancel(id: request.episodeID)
+                return result(.rejected, reason.rawValue)
+            }
             return result(.scheduled, alarmAt: fireAt)
         } catch {
             // Domain and code only: error descriptions can carry arbitrary text.
