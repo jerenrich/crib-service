@@ -1730,6 +1730,61 @@ describe('live sound relay',()=>{
   const closed=new Promise<number>(resolve=>parent.socket.addEventListener('close',event=>resolve(event.code)));
   parent.socket.send(JSON.stringify(frame()));expect(await closed).toBe(1008);
  });
+ it('relays sound controls only within their pair and journals correlation without their contents',async()=>{
+  const a=await paired(),b=await paired();
+  const listener=await open(a.listener);await listener.next();
+  const parent=await open(a.parent);await listener.next();
+  const other=await open(b.parent);
+  const settings={sound:'twinkleTwinkle',volume:0.3,timerMinutes:10};
+  const controlToken=crypto.randomUUID(),requestID=crypto.randomUUID();
+  const state={type:'nurserySoundState',state:{settings,playing:false,remainingSeconds:0},controlToken,requestID};
+  listener.socket.send(JSON.stringify(state));expect(await parent.next()).toEqual(state);
+  const command={type:'nurserySoundCommand',id:crypto.randomUUID(),controlToken,request:{settings,action:'play',restartTimer:true}};
+  parent.socket.send(JSON.stringify(command));expect(await listener.next()).toEqual(command);
+  const confirmation={...state,state:{settings,playing:true,remainingSeconds:600},commandID:command.id};
+  listener.socket.send(JSON.stringify(confirmation));expect(await parent.next()).toEqual(confirmation);
+  listener.socket.send(JSON.stringify(confirmation));expect(await parent.next()).toEqual(confirmation);
+  await vi.waitFor(async()=>{
+   const rows=await env.DB.prepare("SELECT details FROM diagnostics WHERE operation='live_sound' AND request_id=?").bind(command.id).all<{details:string}>();
+   expect(rows.results).toHaveLength(2);
+   expect(rows.results.map(row=>JSON.parse(row.details).live_sound.phase).sort()).toEqual(['command_relayed','confirmation_relayed']);
+  },{timeout:2000,interval:10});
+  // A control/state message can be adjacent to a level frame or keepalive.
+  listener.socket.send(JSON.stringify(frame()));expect((await parent.next()).type).toBe('levels');
+  other.socket.send(JSON.stringify({type:'ping'}));expect(await other.next()).toEqual({type:'pong'});
+  expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM heartbeats').first('n')).toBe(0);
+  const diagnostics=await env.DB.prepare('SELECT * FROM diagnostics').all();
+  expect(JSON.stringify(diagnostics.results)).not.toContain('nurserySound');
+  expect(JSON.stringify(diagnostics.results)).not.toContain(controlToken);
+  expect(JSON.stringify(diagnostics.results)).not.toContain('twinkleTwinkle');
+ });
+ it('keeps both caregivers connected and echoes their sound-state freshness challenges together',async()=>{
+  const pair=await paired(),partner=device('parent');await register(partner);
+  const invitation=await(await call('caregivers/invite',pair.parent,{name:'Jordan'})).json() as {code:string};
+  expect((await call('caregivers/join',partner,{code:invitation.code,name:'Alex'})).status).toBe(200);
+  const listener=await open(pair.listener);await listener.next();
+  const parent=await open(pair.parent);await listener.next();
+  const second=await open(partner);await listener.next();
+  const a=crypto.randomUUID(),b=crypto.randomUUID();
+  parent.socket.send(JSON.stringify({type:'ping',requestID:a}));
+  expect(await listener.next()).toMatchObject({type:'viewing',requestID:a});expect(await parent.next()).toEqual({type:'pong'});
+  second.socket.send(JSON.stringify({type:'ping',requestID:b}));
+  expect(await listener.next()).toMatchObject({type:'viewing',requestID:b});expect(await second.next()).toEqual({type:'pong'});
+  const settings={sound:'whiteNoise',volume:0.3,timerMinutes:20};
+  const state={type:'nurserySoundState',state:{settings,playing:false,remainingSeconds:0},requestID:b,requestIDs:[a,b],controlToken:crypto.randomUUID()};
+  listener.socket.send(JSON.stringify(state));expect(await parent.next()).toEqual(state);expect(await second.next()).toEqual(state);
+  const command={type:'nurserySoundCommand',id:crypto.randomUUID(),controlToken:state.controlToken,request:{settings,action:'play',restartTimer:false}};
+  second.socket.send(JSON.stringify(command));expect(await listener.next()).toEqual(command);
+ });
+ it.each(['parent','listener'] as const)('rejects sound role spoofing by the %s',async role=>{
+  const pair=await paired();const reader=await open(pair[role]);if(role==='listener')await reader.next();
+  const closed=new Promise<number>(resolve=>reader.socket.addEventListener('close',event=>resolve(event.code)));
+  const settings={sound:'whiteNoise',volume:0.3,timerMinutes:20};
+  reader.socket.send(JSON.stringify(role==='parent'
+   ?{type:'nurserySoundState',state:{settings,playing:false,remainingSeconds:0},controlToken:crypto.randomUUID()}
+   :{type:'nurserySoundCommand',id:crypto.randomUUID(),controlToken:crypto.randomUUID(),request:{settings,action:'play',restartTimer:false}}));
+  expect(await closed).toBe(1008);
+ });
  it.each([false,true])('preserves device removal when the live relay is unavailable (delete=%s)',async(removeDevice)=>{
   const pair=await paired();
   vi.spyOn(testEnv.LIVE_SOUND,'get').mockImplementation(()=>{throw new Error('Relay unavailable');});

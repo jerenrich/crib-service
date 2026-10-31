@@ -53,7 +53,10 @@ public struct LiveSoundRequests: Sendable {
         issued.filter { (0..<3).contains(now.timeIntervalSince($0.value)) }.keys.sorted()
     }
     public func accepts(_ frame: SoundLevelFrame, at now: Date) -> Bool {
-        let ids = (frame.requestID.map { [$0] } ?? []) + (frame.requestIDs ?? [])
+        accepts(requestID: frame.requestID, requestIDs: frame.requestIDs, at: now)
+    }
+    public func accepts(requestID: String?, requestIDs: [String]? = nil, at now: Date) -> Bool {
+        let ids = (requestID.map { [$0] } ?? []) + (requestIDs ?? [])
         return ids.contains { id in issued[id].map { (0..<3).contains(now.timeIntervalSince($0)) } ?? false }
     }
 }

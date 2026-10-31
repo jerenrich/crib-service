@@ -3,6 +3,53 @@ import Foundation
 import XCTest
 @testable import BabyCryMonitor
 
+extension DiagnosticsTests {
+    @MainActor func testNurseryDiagnosticsKeepCorrelationAndSafeErrorsButRejectPrivateFields() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let log = DiagnosticLog(directory: directory), command = UUID(), playback = UUID()
+        let secret = "private-url-token-recording"
+        let underlying = NSError(domain: NSURLErrorDomain, code: -1009, userInfo: [NSLocalizedDescriptionKey: secret, NSURLErrorFailingURLStringErrorKey: secret])
+        let error = NurseryAudioFailure(stage: .engine, underlying: underlying)
+        log.nurserySound(phase: "requested", role: "parent", origin: "remote", commandID: command, playbackID: playback,
+            action: "play", sound: "whiteNoise", timerMinutes: 5, volume: 0.29, playing: false, remainingSeconds: 0, elapsedMS: 42)
+        log.nurserySound(phase: "audio_failed", role: "listener", commandID: command, reason: "playback_failed", error: error)
+        log.nurserySound(phase: "requested", role: secret, origin: secret, action: secret, sound: secret, timerMinutes: 15,
+                         volume: .nan, remainingSeconds: .infinity, reason: secret, captureMode: secret)
+        let count = log.lines.count
+        log.nurserySound(phase: secret)
+        XCTAssertEqual(log.lines.count, count)
+        let text = log.export
+        for value in ["command_id=\(command.uuidString.lowercased())", "playback_id=\(playback.uuidString.lowercased())", "volume_percent=29",
+                      "elapsed_ms=42 elapsed_source=monotonic", "stage=engine domain=NSURLErrorDomain code=-1009"] { XCTAssertTrue(text.contains(value), value) }
+        for value in [secret, "timer_minutes=15", "nan", "inf", "control_token"] { XCTAssertFalse(text.contains(value), value) }
+        let restored = DiagnosticLog(directory: directory)
+        XCTAssertTrue(restored.export.contains("command_id=\(command.uuidString.lowercased())"))
+    }
+    @MainActor func testLiveSoundFailureSamplingKeepsFirstFailureAndRecoveryWithoutMessagesOrURLs() {
+        let log = DiagnosticLog(directory: URL(fileURLWithPath: "/dev/null")), id = UUID(), command = UUID()
+        let error = URLError(.timedOut, userInfo: [NSURLErrorFailingURLStringErrorKey: "https://private-host/private-token"])
+        for _ in 0..<100 {
+            log.liveSound(phase: "failed", role: "listener", connectionID: id, commandID: command, reason: "transport", closeCode: 1011, httpStatus: 503, error: error)
+            log.liveSound(phase: "retrying", role: "listener", connectionID: UUID(), retrySeconds: 15)
+        }
+        XCTAssertEqual(log.lines.filter { $0.contains("live_sound phase=failed") }.count, 1)
+        XCTAssertEqual(log.lines.filter { $0.contains("live_sound phase=retrying") }.count, 1)
+        log.liveSound(phase: "recovered", role: "listener", connectionID: UUID(), elapsedMS: 100)
+        log.liveSound(phase: "failed", role: "listener", connectionID: UUID(), reason: "transport", closeCode: 1011, httpStatus: 503, error: error)
+        XCTAssertEqual(log.lines.filter { $0.contains("live_sound phase=failed") }.count, 2)
+        let text = log.export
+        for value in ["command_id=\(command.uuidString.lowercased())", "close_code=1011", "http_status=503", "code=-1001", "phase=recovered"] { XCTAssertTrue(text.contains(value), value) }
+        XCTAssertFalse(text.contains("private-host")); XCTAssertFalse(text.contains("private-token"))
+        let before = log.lines.count
+        log.liveSound(phase: "failed", role: "Bearer secret")
+        log.liveSound(phase: "private-message", role: "listener")
+        XCTAssertEqual(log.lines.count, before)
+        log.liveSound(phase: "disconnected", role: "listener", reason: "private-reason", closeCode: -1, httpStatus: 999)
+        XCTAssertFalse(log.lines.last!.contains("private-reason")); XCTAssertFalse(log.lines.last!.contains("close_code")); XCTAssertFalse(log.lines.last!.contains("http_status"))
+    }
+}
+
 private final class DiagnosticsURLProtocol: URLProtocol, @unchecked Sendable {
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }

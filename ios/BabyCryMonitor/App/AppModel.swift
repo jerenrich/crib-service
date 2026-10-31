@@ -64,6 +64,24 @@ import UIKit
     var chartSampledAt: Date?
     private(set) var remoteSound = RemoteSoundState()
     private(set) var liveSoundConnected = false
+    private(set) var nurserySound = NurserySoundState()
+    private(set) var remoteNurserySound = RemoteNurserySound()
+    private(set) var changingNurserySound = false
+    var nurserySoundError: String?
+    @ObservationIgnored private var soundControlTokens = NurserySoundControlTokens()
+    @ObservationIgnored private var handledSoundCommands: [UUID] = []
+    @ObservationIgnored private var soundAcknowledgement: (id: UUID, failure: String?)?
+    @ObservationIgnored private var pendingSoundCommand: UUID?
+    @ObservationIgnored private var soundCommandTimeout: Task<Void, Never>?
+    @ObservationIgnored private var soundCommandTask: Task<Void, Never>?
+    @ObservationIgnored private var soundControlGeneration = 0
+    @ObservationIgnored private var soundOperationID: UUID?
+    @ObservationIgnored private var activeRemoteSoundCommand: UUID?
+    @ObservationIgnored private var pendingSoundRequest: NurserySoundRequest?
+    @ObservationIgnored private var pendingSoundStartedAt: ContinuousClock.Instant?
+    @ObservationIgnored private var activeSoundDiagnosticID: UUID?
+    @ObservationIgnored private var activeSoundRequest: NurserySoundRequest?
+    @ObservationIgnored private var activeSoundStartedAt: ContinuousClock.Instant?
     var batteryLevel: Double?
     var powerConnected = false
     var now = Date()
@@ -219,6 +237,70 @@ import UIKit
             self?.liveSoundConnected = connected
             if connected { self?.remoteSound = RemoteSoundState() }
             else { self?.remoteSound.disconnected() }
+            self?.remoteNurserySound.disconnect()
+            self?.invalidateNurserySoundCommands(reason: connected ? "context_changed" : "connection_lost")
+            if !connected, self?.pendingSoundCommand != nil {
+                self?.finishNurserySoundCommand(error: "Connection lost. Sound change was not confirmed. Check the nursery iPhone.", phase: "cancelled", reason: "connection_lost")
+            }
+        }
+        if let data = defaults.data(forKey: "nurserySoundSettings"),
+           let saved = try? JSONDecoder().decode(NurserySoundSettings.self, from: data), saved.isValid {
+            nurserySound.settings = saved
+        }
+        audio.onNurserySoundChange = { [weak self] state in
+            guard let self else { return }
+            var state = state
+            if !state.playing, !self.nurserySound.playing, !self.changingNurserySound {
+                state.settings = self.nurserySound.settings
+            }
+            let changed = state.playing != self.nurserySound.playing || state.settings != self.nurserySound.settings
+            if self.nurserySound.playing, !state.playing { self.soundControlTokens = NurserySoundControlTokens() }
+            self.nurserySound = state
+            if changed { self.publishNurserySoundState(); self.synchronizeLiveSound() }
+        }
+        self.liveSound.onNurserySoundRequest = { [weak self] in self?.publishNurserySoundState() }
+        self.liveSound.onNurserySoundUpdate = { [weak self] update in
+            guard let self, self.role == .parent, self.paired, self.appActive, update.isValid else { return }
+            self.remoteNurserySound.receive(update, at: self.currentTime())
+            if let id = self.pendingSoundCommand, update.commandID == id {
+                self.finishNurserySoundCommand(error: update.failure == nil ? nil : "The nursery could not apply that sound change. Try again on the nursery iPhone.",
+                    phase: update.failure == nil ? "confirmed" : "rejected", reason: update.failure)
+            }
+        }
+        self.liveSound.onNurserySoundCommand = { [weak self] command in
+            guard let self, self.role == .listener, self.paired, command.type == "nurserySoundCommand", command.request.settings.isValid else { return }
+            if self.handledSoundCommands.contains(command.id) {
+                self.logSoundCommand(phase: "duplicate", id: command.id, request: command.request, origin: "remote")
+                self.publishNurserySoundState(); return
+            }
+            let receivedAt = ContinuousClock.now
+            self.logSoundCommand(phase: "received", id: command.id, request: command.request, origin: "remote")
+            guard self.soundControlTokens.accepts(command.controlToken, at: self.currentTime()) else {
+                self.logSoundCommand(phase: "rejected", id: command.id, request: command.request, origin: "remote", reason: "expired")
+                self.soundAcknowledgement = (command.id, "expired"); self.publishNurserySoundState(); return
+            }
+            guard !self.changingNurserySound, !self.managingDevice, !self.calibrationActive, !self.recoveringAudio, self.safetyAccepted else {
+                self.logSoundCommand(phase: "rejected", id: command.id, request: command.request, origin: "remote", reason: "unavailable")
+                self.soundAcknowledgement = (command.id, "unavailable"); self.publishNurserySoundState(); return
+            }
+            self.handledSoundCommands.append(command.id)
+            self.handledSoundCommands = Array(self.handledSoundCommands.suffix(64))
+            // Reserve before scheduling; a second callback cannot overtake this one.
+            self.changingNurserySound = true; self.activeRemoteSoundCommand = command.id
+            self.activeSoundDiagnosticID = command.id; self.activeSoundRequest = command.request; self.activeSoundStartedAt = receivedAt
+            let control = self.soundControlGeneration, revision = self.environmentRevision
+            self.soundCommandTask = Task { [weak self] in
+                guard let self, !Task.isCancelled, control == self.soundControlGeneration,
+                      revision == self.environmentRevision, self.role == .listener, self.paired else { return }
+                // Revalidate at execution, not just when the packet was received.
+                guard self.soundControlTokens.accepts(command.controlToken, at: self.currentTime()) else {
+                    self.changingNurserySound = false; self.activeRemoteSoundCommand = nil
+                    self.logSoundCommand(phase: "rejected", id: command.id, request: command.request, origin: "remote", reason: "expired", startedAt: receivedAt)
+                    self.activeSoundDiagnosticID = nil; self.activeSoundRequest = nil; self.activeSoundStartedAt = nil
+                    self.soundAcknowledgement = (command.id, "expired"); self.publishNurserySoundState(); return
+                }
+                await self.applyNurserySound(command.request, commandID: command.id, receivedAt: receivedAt)
+            }
         }
         (notifications as? NotificationService)?.log = log
         if #available(iOS 26.0, *) {
@@ -227,6 +309,8 @@ import UIKit
         }
         watch.log = log
         (audio as? AudioLevelMonitor)?.log = log
+        (self.liveSound as? LiveSoundStream)?.log = log
+        log.record("nursery_sound_pipeline_ready", code: 1)
         notifications.onToken = { [weak self] token in
             // iOS repeats the token on every registration; log only a new one. It is still re-uploaded.
             if token != self?.pushToken { self?.log.record("push_token_received") }
@@ -354,6 +438,7 @@ import UIKit
         publishWatch()
     }
     deinit {
+        soundCommandTimeout?.cancel(); soundCommandTask?.cancel()
         watchTestRequestTask?.cancel()
         loopTask?.cancel(); networkTask?.cancel(); audioTask?.cancel(); immediateAlertTask?.cancel(); alertDeliveryTask?.cancel()
         settingsTask?.cancel(); heartbeatTask?.cancel()
@@ -501,6 +586,7 @@ import UIKit
         if value == .parent { Task { await notifications.register(); await refreshParent() } }
     }
     func setBackend(_ value: String) {
+        guard !changingNurserySound else { error = "Wait for the nursery sound change to finish before changing the backend."; return }
         guard !microphoneActive, !monitoring, !starting, !recoveringAudio, snapshot.pending.isEmpty else { error = "Stop the microphone and deliver pending alerts before changing the backend."; return }
         guard let url = URL(string: value.trimmingCharacters(in: .whitespacesAndNewlines)), url.scheme == "https",
               url.host != nil, url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
@@ -509,6 +595,7 @@ import UIKit
         setParentConnectionDeadline(nil)
         resetMonitoringControl()
         environmentRevision += 1; backendURL = url.absoluteString
+        if nurserySound.playing { audio.stop() }
         clearLiveSound()
         defaults.set(backendURL, forKey: "backendURL")
         timeline = nil; timelineError = nil
@@ -641,6 +728,7 @@ import UIKit
         catch { self.error = error.localizedDescription; log.record("monitoring_start_failed", error: error) }
     }
     func stop(remote: Bool = false) {
+        invalidateNurserySoundCommands(cancelLocal: true, reason: "microphone_stop")
         if !remote { controlGeneration += 1 }
         clearMonitoringFailure()
         if !remote, role == .listener, paired { queueLocalMonitoringReport(false) }
@@ -1017,8 +1105,126 @@ import UIKit
             lowPower: ProcessInfo.processInfo.isLowPowerModeEnabled, networkAvailable: connectivity.available,
             battery: device.batteryLevel >= 0 ? Double(device.batteryLevel) : nil))
     }
+    var displayedNurserySound: NurserySoundState {
+        _ = now
+        return role == .parent ? remoteNurserySound.state(at: currentTime()) ?? NurserySoundState() : nurserySound
+    }
+    var canControlNurserySound: Bool {
+        _ = now
+        return !changingNurserySound && !managingDevice && !starting && !calibrationActive &&
+        (role == .listener ? !recoveringAudio : paired && liveSoundConnected && remoteNurserySound.isLive(at: currentTime()))
+    }
+    var nurserySoundConnectionText: String {
+        _ = now
+        if changingNurserySound { return role == .parent ? "Waiting for nursery confirmation…" : "Updating nursery sound…" }
+        if role == .listener { return "Plays on this nursery iPhone" }
+        return remoteNurserySound.isLive(at: currentTime()) ? "Plays on the nursery iPhone · Confirmed" : "Nursery unavailable · Open its app to connect"
+    }
+    func changeNurserySound(_ request: NurserySoundRequest) async {
+        guard !Task.isCancelled, canControlNurserySound, request.settings.isValid else { return }
+        nurserySoundError = nil
+        if role == .listener {
+            // A local action supersedes commands that were already in flight.
+            invalidateNurserySoundCommands(cancelLocal: true, reason: "superseded")
+            let id = UUID()
+            logSoundCommand(phase: "requested", id: id, request: request, origin: "local")
+            await applyNurserySound(request, commandID: id)
+        } else {
+            guard let update = remoteNurserySound.update else { return }
+            let command = NurserySoundCommand(id: UUID(), controlToken: update.controlToken, request: request)
+            changingNurserySound = true; pendingSoundCommand = command.id
+            pendingSoundRequest = request; pendingSoundStartedAt = .now
+            logSoundCommand(phase: "requested", id: command.id, request: request, origin: "remote")
+            soundCommandTimeout?.cancel()
+            soundCommandTimeout = Task { [weak self] in
+                do { try await Task.sleep(for: .seconds(8)) } catch { return }
+                guard self?.pendingSoundCommand == command.id else { return }
+                self?.finishNurserySoundCommand(error: "Sound change was not confirmed. Check the nursery iPhone before trying again.", phase: "timed_out", reason: "confirmation_timeout")
+            }
+            do {
+                try await liveSound.sendNurserySoundCommand(command)
+                if pendingSoundCommand == command.id {
+                    logSoundCommand(phase: "sent", id: command.id, request: request, origin: "remote", startedAt: pendingSoundStartedAt)
+                }
+            }
+            catch {
+                if pendingSoundCommand == command.id {
+                    finishNurserySoundCommand(error: "Could not reach the nursery. Sound change was not confirmed.", phase: "failed", reason: "transport", underlyingError: error)
+                }
+            }
+        }
+    }
+    private func applyNurserySound(_ request: NurserySoundRequest, commandID: UUID, receivedAt: ContinuousClock.Instant? = nil) async {
+        guard !Task.isCancelled, request.settings.isValid, safetyAccepted, role == .listener else { return }
+        changingNurserySound = true
+        nurserySoundError = nil
+        let operation = UUID(); soundOperationID = operation
+        let origin = activeRemoteSoundCommand == commandID ? "remote" : "local"
+        let started = receivedAt ?? .now
+        activeSoundDiagnosticID = commandID; activeSoundRequest = request; activeSoundStartedAt = started
+        logSoundCommand(phase: "applying", id: commandID, request: request, origin: origin, startedAt: started)
+        let revision = environmentRevision
+        var failure: String?
+        do {
+            try await audio.setNurserySound(request, commandID: commandID)
+            guard !Task.isCancelled, soundOperationID == operation, revision == environmentRevision, role == .listener else { return }
+            defaults.set(try JSONEncoder().encode(request.settings), forKey: "nurserySoundSettings")
+            logSoundCommand(phase: "applied", id: commandID, request: request, origin: origin, state: nurserySound, startedAt: started)
+        } catch {
+            guard soundOperationID == operation, revision == environmentRevision else { return }
+            failure = "playbackFailed"
+            logSoundCommand(phase: "failed", id: commandID, request: request, origin: origin, reason: "playback_failed", startedAt: started, error: error)
+            nurserySoundError = "Could not play nursery sound. Check the speaker on the nursery iPhone and try again."
+        }
+        changingNurserySound = false; soundOperationID = nil; activeRemoteSoundCommand = nil
+        activeSoundDiagnosticID = nil; activeSoundRequest = nil; activeSoundStartedAt = nil
+        soundAcknowledgement = origin == "remote" ? (commandID, failure) : nil
+        publishNurserySoundState(); synchronizeLiveSound()
+    }
+    private func invalidateNurserySoundCommands(cancelLocal: Bool = false, reason: String = "context_changed") {
+        soundControlGeneration += 1; soundControlTokens = NurserySoundControlTokens()
+        soundCommandTask?.cancel(); soundCommandTask = nil
+        if let id = activeRemoteSoundCommand { soundAcknowledgement = (id, "unavailable") }
+        if cancelLocal || activeRemoteSoundCommand != nil {
+            if let id = activeSoundDiagnosticID {
+                logSoundCommand(phase: "cancelled", id: id, request: activeSoundRequest,
+                    origin: activeRemoteSoundCommand == nil ? "local" : "remote", reason: reason, startedAt: activeSoundStartedAt)
+            }
+            activeSoundDiagnosticID = nil; activeSoundRequest = nil; activeSoundStartedAt = nil
+            soundOperationID = nil; changingNurserySound = false
+        }
+        activeRemoteSoundCommand = nil
+    }
+    private func publishNurserySoundState() {
+        guard role == .listener, paired else { return }
+        let token = soundControlTokens.issue(at: currentTime())
+        liveSound.publishNurserySound(NurserySoundUpdate(state: nurserySound, controlToken: token,
+            commandID: soundAcknowledgement?.id, failure: soundAcknowledgement?.failure))
+    }
+    private func finishNurserySoundCommand(error: String?, phase: String, reason: String? = nil, underlyingError: (any Error)? = nil) {
+        if let id = pendingSoundCommand {
+            logSoundCommand(phase: phase, id: id, request: pendingSoundRequest, origin: "remote", reason: reason,
+                            startedAt: pendingSoundStartedAt, error: underlyingError)
+        }
+        soundCommandTimeout?.cancel(); soundCommandTimeout = nil
+        pendingSoundRequest = nil; pendingSoundStartedAt = nil
+        pendingSoundCommand = nil; changingNurserySound = false; nurserySoundError = error
+    }
+    private func logSoundCommand(phase: String, id: UUID, request: NurserySoundRequest?, origin: String,
+                                 state: NurserySoundState? = nil, reason: String? = nil,
+                                 startedAt: ContinuousClock.Instant? = nil, error: (any Error)? = nil) {
+        let settings = request?.settings ?? state?.settings
+        log.nurserySound(phase: phase, role: role?.rawValue, origin: origin, commandID: id,
+            action: request?.action.rawValue, sound: settings?.sound.rawValue, timerMinutes: settings?.timerMinutes,
+            volume: settings?.volume, playing: state?.playing, remainingSeconds: state?.remainingSeconds, reason: reason,
+            elapsedMS: startedAt.map { DiagnosticTiming.elapsedMS(since: $0) }, error: error)
+    }
     private func clearLiveSound() {
+        invalidateNurserySoundCommands()
         liveSound.disconnect(); remoteSound = RemoteSoundState(); liveSoundConnected = false
+        remoteNurserySound = RemoteNurserySound(); soundControlTokens = NurserySoundControlTokens()
+        soundAcknowledgement = nil; handledSoundCommands.removeAll()
+        if pendingSoundCommand != nil { finishNurserySoundCommand(error: "Sound change was not confirmed. Check the nursery iPhone.", phase: "cancelled", reason: "context_changed") }
         parentMonitoringEvidence = ParentMonitoringEvidence(); parentMonitoringPairingID = nil
     }
     private func synchronizeLiveSound() {
@@ -1027,7 +1233,7 @@ import UIKit
         #endif
         // Keep the Parent's current chart ready across tab changes. Backgrounding
         // still closes the display channel and invalidates the last live reading.
-        let needed = role == .listener ? monitoring : role == .parent && appActive
+        let needed = role == .listener ? microphoneActive || recoveringAudio || nurserySound.playing || appActive : role == .parent && appActive
         guard needed, paired, !managingDevice, connectivity.available,
               let credential, credential.registered, let url = URL(string: backendURL) else {
             liveSound.disconnect(); return
@@ -1721,6 +1927,7 @@ import UIKit
         guard role == .listener, !microphoneActive, !monitoring, !starting, !recoveringAudio, !calibrationActive else {
             calibrationMessage = "Stop the microphone before checking sound."; return
         }
+        if nurserySound.playing { audio.stop() }
         calibration = SoundCalibration(); calibrationMessage = nil; calibrationPhase = "background"
         let revision = environmentRevision
         guard await audio.requestPermission() else {

@@ -23,6 +23,11 @@ export interface AlarmAttemptDetails {
  evidence_applied?:boolean;charging?:boolean;battery_pct?:number;low_power?:boolean;app_active?:boolean;protected_data?:boolean;started_at_ms?:number;
 }
 export interface TimingDetails {
+ live_sound?:{
+  phase:'connected'|'command_relayed'|'confirmation_relayed'|'rejected'|'failed'|'closed';
+  role?:'parent'|'listener';reason?:'invalid_message'|'rate_limit'|'wrong_role'|'pairing_store'|'internal_error'|'transport'|'pairing_ended'|'peer_closed'|'playbackFailed'|'expired'|'unavailable';
+  close_code?:number;recipients?:number;connection_id?:string;
+ };
  alarm_wake_requested?:boolean;alarm_extension_requested?:boolean;alarm_attempt?:AlarmAttemptDetails;
  spans?:Partial<Record<Span,number>>;
  db_stages?:Partial<Record<Span,DatabaseMetrics>>;
@@ -242,6 +247,16 @@ function safeAlarmAttempt(a:AlarmAttemptDetails):Record<string,unknown> {
 export function safeTimingDetails(value:TimingDetails|undefined):string|null {
  if(!value)return null;
  const safe:Record<string,unknown>={};
+ const live=value.live_sound;
+ if(live&&['connected','command_relayed','confirmation_relayed','rejected','failed','closed'].includes(live.phase)){
+  const detail:Record<string,unknown>={phase:live.phase};
+  if(['parent','listener'].includes(live.role!))detail.role=live.role;
+  if(['invalid_message','rate_limit','wrong_role','pairing_store','internal_error','transport','pairing_ended','peer_closed','playbackFailed','expired','unavailable'].includes(live.reason!))detail.reason=live.reason;
+  if(Number.isInteger(live.close_code)&&live.close_code!>=1000&&live.close_code!<=4999)detail.close_code=live.close_code;
+  if(Number.isInteger(live.recipients)&&live.recipients!>=0&&live.recipients!<=8)detail.recipients=live.recipients;
+  if(typeof live.connection_id==='string'&&/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(live.connection_id))detail.connection_id=live.connection_id.toLowerCase();
+  safe.live_sound=detail;
+ }
  if(typeof value.alarm_wake_requested==='boolean')safe.alarm_wake_requested=value.alarm_wake_requested;
  if(typeof value.alarm_extension_requested==='boolean')safe.alarm_extension_requested=value.alarm_extension_requested;
  if(value.alarm_attempt)safe.alarm_attempt=safeAlarmAttempt(value.alarm_attempt);
