@@ -27,7 +27,7 @@ import Observation
     private var storagePrepared = false
     private static let timestampStyle = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
     private static let events: Set<String> = [
-        "alert_pipeline_ready", "app_launched", "background_time_expired", "alarm_snapshot_failed", "alarm_snapshot_unavailable", "alarm_journal_failed", "alarm_attempts_upload_discarded", "monitoring_start_superseded", "foreground", "background", "monitoring_recovered_after_relaunch",
+        "alert_pipeline_ready", "nursery_sound_pipeline_ready", "app_launched", "background_time_expired", "alarm_snapshot_failed", "alarm_snapshot_unavailable", "alarm_journal_failed", "alarm_attempts_upload_discarded", "monitoring_start_superseded", "foreground", "background", "monitoring_recovered_after_relaunch",
         "paired_successfully", "pairing_created", "pairing_failed", "credential_failed", "metadata_load_failed",
         "monitoring_started", "monitoring_stopped", "monitoring_paused", "monitoring_start_failed", "microphone_permission_denied",
         "test_push_queued", "audio_active", "audio_recovering", "audio_interrupted", "audio_stalled",
@@ -100,6 +100,73 @@ import Observation
     }
     func alertRequestStarted(eventID: UUID, clientRequestID: UUID) {
         append("alert_upload phase=started event_id=\(eventID.uuidString.lowercased()) client_request_id=\(clientRequestID.uuidString.lowercased())")
+    }
+    /// Fixed vocabulary and bounded values only. Never accept a control token,
+    /// device identity, audio samples, raw socket message, or error description.
+    func nurserySound(phase: String, role: String? = nil, origin: String? = nil,
+                      commandID: UUID? = nil, playbackID: UUID? = nil, action: String? = nil,
+                      sound: String? = nil, timerMinutes: Int? = nil, volume: Double? = nil,
+                      playing: Bool? = nil, remainingSeconds: Double? = nil, reason: String? = nil,
+                      elapsedMS: Int? = nil, captureMode: String? = nil, error: (any Error)? = nil) {
+        guard ["requested", "received", "sent", "applying", "applied", "confirmed", "rejected", "duplicate",
+               "timed_out", "cancelled", "failed", "audio_applying", "audio_applied", "audio_failed", "started",
+               "stop_requested", "stopped", "capture_restored", "capture_restore_failed"].contains(phase) else { return }
+        var entry = "nursery_sound phase=\(phase)"
+        if let role, ["parent", "listener"].contains(role) { entry += " role=\(role)" }
+        if let origin, ["local", "remote"].contains(origin) { entry += " origin=\(origin)" }
+        if let commandID { entry += " command_id=\(commandID.uuidString.lowercased())" }
+        if let playbackID { entry += " playback_id=\(playbackID.uuidString.lowercased())" }
+        if let action, ["play", "stop", "updateSettings"].contains(action) { entry += " action=\(action)" }
+        if let sound, ["whiteNoise", "twinkleTwinkle"].contains(sound) { entry += " sound=\(sound)" }
+        if let timerMinutes, [5, 10, 20, 30, 60].contains(timerMinutes) { entry += " timer_minutes=\(timerMinutes)" }
+        if let volume, volume.isFinite, (0...1).contains(volume) { entry += " volume_percent=\(Int((volume * 100).rounded()))" }
+        if let playing { entry += " playing=\(playing)" }
+        if let remainingSeconds, remainingSeconds.isFinite, (0...3600).contains(remainingSeconds) {
+            entry += " remaining_seconds=\(Int(ceil(remainingSeconds)))"
+        }
+        let reasons = ["user_stop", "timer_expired", "microphone_stop", "interruption", "route_change", "media_services_reset",
+                       "engine_configuration_changed", "playback_failed", "start_failed", "replaced", "expired", "unavailable",
+                       "playbackFailed", "connection_lost", "context_changed", "confirmation_timeout", "transport", "superseded", "invalid_message"]
+        if let reason, reasons.contains(reason) { entry += " reason=\(reason)" }
+        if let elapsedMS { entry += " elapsed_ms=\(min(3_600_000, max(0, elapsedMS))) elapsed_source=monotonic" }
+        if let captureMode, ["measurement", "voiceChat", "playback", "inactive"].contains(captureMode) { entry += " capture_mode=\(captureMode)" }
+        if let error { entry += " " + Self.errorDetails(error) }
+        // One repeated duplicate cannot evict the useful command history.
+        if phase == "duplicate" {
+            let key = "nursery_duplicate_\(role ?? "")"
+            if recent[key].map({ Date().timeIntervalSince($0) < 60 }) == true { sampledRecords += 1; return }
+            recent[key] = Date()
+        }
+        append(entry)
+    }
+    func liveSound(phase: String, role: String, connectionID: UUID? = nil, commandID: UUID? = nil, reason: String? = nil,
+                   closeCode: Int? = nil, httpStatus: Int? = nil, retrySeconds: Int? = nil,
+                   elapsedMS: Int? = nil, error: (any Error)? = nil) {
+        guard ["parent", "listener"].contains(role),
+              ["connecting", "connected", "recovered", "peer_changed", "disconnected", "failed", "retrying", "send_failed"].contains(phase) else { return }
+        var entry = "live_sound phase=\(phase) role=\(role)"
+        if let connectionID { entry += " connection_id=\(connectionID.uuidString.lowercased())" }
+        if let commandID { entry += " command_id=\(commandID.uuidString.lowercased())" }
+        let safeReason = reason.flatMap { ["transport", "decoding", "invalid_message", "keepalive_timeout", "keepalive_send",
+            "send_timeout", "levels_send", "sound_state_send", "command_send", "requested", "connection_closed"].contains($0) ? $0 : nil }
+        if let safeReason { entry += " reason=\(safeReason)" }
+        if let closeCode, (1000...4999).contains(closeCode) { entry += " close_code=\(closeCode)" }
+        if let httpStatus, (100...599).contains(httpStatus) { entry += " http_status=\(httpStatus)" }
+        if let retrySeconds, (1...15).contains(retrySeconds) { entry += " retry_seconds=\(retrySeconds)" }
+        if let elapsedMS { entry += " elapsed_ms=\(min(3_600_000, max(0, elapsedMS))) elapsed_source=monotonic" }
+        let details = error.map { Self.errorDetails($0) } ?? ""
+        if !details.isEmpty { entry += " " + details }
+        let failureKey = "live_sound_failure_\(role)"
+        if phase == "recovered" { recent = recent.filter { !$0.key.hasPrefix("live_sound_sample_\(role)_") } }
+        if ["failed", "send_failed", "connecting", "retrying"].contains(phase) || (phase == "disconnected" && safeReason != "requested") {
+            let key = "live_sound_sample_\(role)_\(phase)_\(safeReason ?? "")_\(closeCode ?? 0)_\(httpStatus ?? 0)_\(retrySeconds ?? 0)_\(details)"
+            if recent[key].map({ Date().timeIntervalSince($0) < 60 }) == true { sampledRecords += 1; return }
+            recent[key] = Date()
+        }
+        // Retain the first fault and the first recovery, without heartbeat/ping rows.
+        if phase == "failed" || phase == "send_failed" { recent[failureKey] = Date() }
+        if phase == "recovered" { recent.removeValue(forKey: failureKey) }
+        append(entry)
     }
     func network(operation: String, outcome: String, status: Int? = nil, requestID: UUID? = nil,
                  elapsedMS: Int, storageUnavailable: Bool = false, error: (any Error)? = nil, eventID: UUID? = nil, benchmarkAttempt: UUID? = nil, serverDiagnosticMS: Int? = nil, diagnosticState: String? = nil,
@@ -309,6 +376,9 @@ import Observation
     /// Export only known categories, numeric codes and allowlisted schema keys, with a bounded cause chain.
     private static func errorDetails(_ error: any Error, depth: Int = 0) -> String {
         #if os(iOS)
+        if let failure = error as? NurseryAudioFailure {
+            return "stage=\(failure.stage.rawValue) " + (depth < 3 ? errorDetails(failure.underlying, depth: depth + 1) : "underlying=truncated")
+        }
         if let failure = error as? MetadataStoreError {
             return "operation=metadata_\(failure.operation.rawValue) " + errorDetails(failure.underlyingError, depth: depth)
         }
@@ -369,7 +439,8 @@ import Observation
             "durationSeconds", "createdAt", "isRepeat", "isTest", "paired", "pairingID", "watchPushRegistered", "phonePushRegistered",
             "connectionAlertsEnabled", "listenerConfiguration", "lastHeartbeat", "serverTime", "nextHeartbeatExpectedAt", "monitoring", "batteryLevel", "powerConnected",
             "state", "currentEpisode", "episodes", "alerts", "status", "acknowledgedAt", "deliveryTarget", "ok", "expiresAt",
-            "deviceId", "role", "registered", "updatedAt", "parentMode", "message", "acknowledgedEventId", "kind"
+            "deviceId", "role", "registered", "updatedAt", "parentMode", "message", "acknowledgedEventId", "kind",
+            "settings", "sound", "volume", "timerMinutes", "action", "restartTimer", "playing", "remainingSeconds", "commandID", "controlToken", "requestID"
         ]
         return "$" + keys.prefix(12).map { key in
             if let index = key.intValue, index >= 0 { return "[\(index)]" }

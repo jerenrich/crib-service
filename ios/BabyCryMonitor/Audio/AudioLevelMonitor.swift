@@ -8,26 +8,60 @@ enum AudioCaptureStatus {
     case failed(String)
 }
 
+struct NurseryAudioFailure: Error {
+    enum Stage: String, Sendable { case session, voiceProcessing = "voice_processing", input, synthesis, player, engine }
+    let stage: Stage
+    let underlying: any Error
+}
+
+/// Actor boundary is injectable so operation ordering and capture restoration can
+/// be tested without a microphone or an audio route belonging to the test host.
+protocol AudioCaptureDriving: Sendable {
+    var isRunning: Bool { get async }
+    func activate(generation: Int, clearSound: Bool) async throws
+    func setSound(_ state: NurserySoundState, capture: Bool, generation: Int) async throws
+    func pause(generation: Int) async
+    func stop(generation: Int) async
+}
+
 @MainActor protocol AudioLevelProviding: AnyObject {
     var levels: AsyncStream<AudioLevelSample> { get }
     var onStatus: ((AudioCaptureStatus) -> Void)? { get set }
+    var onNurserySoundChange: ((NurserySoundState) -> Void)? { get set }
     func requestPermission() async -> Bool
     func start() async throws
     func stop()
+    func setNurserySound(_ request: NurserySoundRequest, commandID: UUID?) async throws
+}
+extension AudioLevelProviding {
+    func setNurserySound(_ request: NurserySoundRequest) async throws { try await setNurserySound(request, commandID: nil) }
 }
 /// Only the RMS scalar leaves the real-time callback. Buffers are never retained.
 @MainActor final class AudioLevelMonitor: AudioLevelProviding {
     let levels: AsyncStream<AudioLevelSample>
-    private let driver: AudioCaptureDriver
+    private let driver: any AudioCaptureDriving
+    private let currentTime: () -> ContinuousClock.Instant
     private var observers: [NSObjectProtocol] = []
     private var wantsMonitoring = false
     private var generation = 0
     var onStatus: ((AudioCaptureStatus) -> Void)?
+    var onNurserySoundChange: ((NurserySoundState) -> Void)?
+    private var playback = NurserySoundPlayback()
+    private var nurseryState: NurserySoundState { playback.state }
+    private var soundTask: Task<Void, Never>?
+    private var playbackID: UUID?
+    private var playbackCommandID: UUID?
+    private struct PlaybackLogContext {
+        var state: NurserySoundState
+        let playbackID: UUID?
+        let commandID: UUID?
+    }
     weak var log: DiagnosticLog?
 
-    init() {
+    init(driver: (any AudioCaptureDriving)? = nil, currentTime: @escaping () -> ContinuousClock.Instant = { .now }) {
         let pair = AsyncStream<AudioLevelSample>.makeStream(bufferingPolicy: .bufferingNewest(16))
-        levels = pair.stream; driver = AudioCaptureDriver(continuation: pair.continuation)
+        levels = pair.stream; self.driver = driver ?? AudioCaptureDriver(continuation: pair.continuation)
+        self.currentTime = currentTime
         observe(AVAudioSession.interruptionNotification)
         observe(AVAudioSession.routeChangeNotification)
         observe(AVAudioSession.mediaServicesWereResetNotification)
@@ -35,14 +69,29 @@ enum AudioCaptureStatus {
     }
     func requestPermission() async -> Bool { await AVAudioApplication.requestRecordPermission() }
     func start() async throws {
+        try Task.checkCancellation()
         wantsMonitoring = true; generation += 1
         let expected = generation
         do {
-            try await driver.activate(generation: expected)
+            try await driver.activate(generation: expected, clearSound: false)
             guard generation == expected, wantsMonitoring else { throw CancellationError() }
+            try Task.checkCancellation()
+            if playback.expired(at: currentTime()) {
+                let stopped = finishSound(reason: "timer_expired")
+                try await driver.setSound(nurseryState, capture: true, generation: expected)
+                guard generation == expected, wantsMonitoring else { throw CancellationError() }
+                logStop(stopped, phase: "stopped", reason: "timer_expired")
+            }
+            armSoundTimer(generation: expected)
+            logSound(phase: "audio_applied")
             onStatus?(.active)
         } catch {
-            if generation == expected { wantsMonitoring = false }
+            if generation == expected {
+                logSound(phase: "audio_failed", reason: "start_failed", error: error)
+                wantsMonitoring = false; let stopped = finishSound(reason: "start_failed")
+                await driver.stop(generation: expected)
+                if generation == expected { logStop(stopped, phase: "stopped", reason: "start_failed") }
+            }
             // A newer start (e.g. route-change recovery) replaced this one; not a failure.
             if error is CancellationError { log?.record("monitoring_start_superseded") }
             else { log?.record("monitoring_start_failed", error: error) }
@@ -52,8 +101,127 @@ enum AudioCaptureStatus {
     func stop() {
         wantsMonitoring = false; generation += 1
         let expected = generation
-        Task { await driver.stop(generation: expected) }
+        let stopped = finishSound(reason: "microphone_stop")
+        Task {
+            await driver.stop(generation: expected)
+            if generation == expected { logStop(stopped, phase: "stopped", reason: "microphone_stop") }
+        }
         onStatus?(.stopped)
+    }
+    func setNurserySound(_ request: NurserySoundRequest, commandID: UUID? = nil) async throws {
+        try await applyNurserySound(request, commandID: commandID, stopReason: "user_stop")
+    }
+    private func applyNurserySound(_ request: NurserySoundRequest, commandID: UUID?, stopReason: String) async throws {
+        try Task.checkCancellation()
+        guard request.settings.isValid else { throw AudioError.unavailable }
+        generation += 1; let expected = generation
+        var next = playback
+        next.apply(request, at: currentTime())
+        let started = ContinuousClock.now
+        let previous = PlaybackLogContext(state: nurseryState, playbackID: playbackID, commandID: commandID ?? playbackCommandID)
+        let newPlayback = next.state.playing && (request.action == .play || !nurseryState.playing)
+        let nextPlaybackID = newPlayback ? UUID() : playbackID
+        logSound(phase: "audio_applying", request: request, commandID: commandID, state: next.state, playbackID: nextPlaybackID)
+        var reconfiguringCapture = wantsMonitoring && next.state.playing != nurseryState.playing
+        if reconfiguringCapture { onStatus?(.recovering("Updating nursery speaker and microphone…")) }
+        do {
+            guard expected == generation else { throw CancellationError() }
+            try await driver.setSound(next.state, capture: wantsMonitoring, generation: expected)
+            guard expected == generation else { throw CancellationError() }
+            try Task.checkCancellation()
+            // A settings edit may expire while synthesis or graph setup is in flight.
+            if next.expired(at: currentTime()) {
+                if wantsMonitoring, !reconfiguringCapture {
+                    reconfiguringCapture = true
+                    onStatus?(.recovering("Restoring microphone after nursery sound…"))
+                    guard expected == generation else { throw CancellationError() }
+                }
+                next.update(at: currentTime())
+                try await driver.setSound(next.state, capture: wantsMonitoring, generation: expected)
+                guard expected == generation else { throw CancellationError() }
+            }
+            playback = next; armSoundTimer(generation: expected)
+            if reconfiguringCapture, wantsMonitoring { onStatus?(.active) }
+            guard expected == generation else { throw CancellationError() }
+            if newPlayback, next.state.playing {
+                if previous.state.playing { logStop(previous, phase: "stopped", reason: "replaced") }
+                playbackID = nextPlaybackID; playbackCommandID = commandID
+                logSound(phase: "started", request: request, commandID: commandID)
+            }
+            logSound(phase: "audio_applied", request: request, commandID: commandID, elapsedMS: DiagnosticTiming.elapsedMS(since: started))
+            if previous.state.playing, !next.state.playing {
+                let reason = request.action == .stop ? stopReason : "timer_expired"
+                logStop(previous, phase: "stopped", reason: reason)
+                playbackID = nil; playbackCommandID = nil
+            }
+            if reconfiguringCapture, wantsMonitoring, !next.state.playing {
+                logSound(phase: "capture_restored", commandID: commandID, elapsedMS: DiagnosticTiming.elapsedMS(since: started))
+            }
+            publishSound()
+        } catch {
+            guard expected == generation else { throw error }
+            logSound(phase: "audio_failed", request: request, commandID: commandID, playbackID: nextPlaybackID,
+                     reason: error is CancellationError ? "superseded" : "playback_failed", elapsedMS: DiagnosticTiming.elapsedMS(since: started), error: error)
+            let stopped = finishSound(reason: "playback_failed")
+            do {
+                // Cleanup also runs for a cancelled request. A newer operation
+                // supersedes this restoration at both sides of the actor boundary.
+                try await driver.setSound(nurseryState, capture: wantsMonitoring, generation: expected)
+                if expected == generation {
+                    logStop(stopped, phase: "stopped", reason: "playback_failed")
+                    if wantsMonitoring { logSound(phase: "capture_restored", commandID: commandID); onStatus?(.active) }
+                }
+            } catch {
+                if expected == generation, wantsMonitoring {
+                    logSound(phase: "capture_restore_failed", commandID: commandID, error: error)
+                    onStatus?(.failed("Microphone unavailable. Open the app to restart monitoring."))
+                }
+            }
+            throw error
+        }
+    }
+    private func armSoundTimer(generation expected: Int) {
+        soundTask?.cancel(); soundTask = nil
+        guard nurseryState.playing else { return }
+        soundTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(0.25)) } catch { return }
+                guard let self, self.generation == expected else { return }
+                let now = self.currentTime()
+                if self.playback.expired(at: now) {
+                    try? await self.applyNurserySound(.init(settings: self.nurseryState.settings, action: .stop), commandID: nil, stopReason: "timer_expired")
+                    return
+                }
+                self.playback.update(at: now); self.publishSound()
+            }
+        }
+    }
+    private func publishSound() {
+        onNurserySoundChange?(nurseryState)
+    }
+    @discardableResult private func finishSound(reason: String) -> PlaybackLogContext? {
+        let context = nurseryState.playing ? PlaybackLogContext(state: nurseryState, playbackID: playbackID, commandID: playbackCommandID) : nil
+        logStop(context, phase: "stop_requested", reason: reason)
+        soundTask?.cancel(); soundTask = nil
+        playback.stop()
+        playbackID = nil; playbackCommandID = nil
+        onNurserySoundChange?(nurseryState)
+        return context
+    }
+    private func logSound(phase: String, request: NurserySoundRequest? = nil, commandID: UUID? = nil,
+                          state: NurserySoundState? = nil, playbackID: UUID? = nil, reason: String? = nil,
+                          elapsedMS: Int? = nil, error: (any Error)? = nil) {
+        let state = state ?? nurseryState
+        let mode = wantsMonitoring ? (state.playing ? "voiceChat" : "measurement") : (state.playing ? "playback" : "inactive")
+        log?.nurserySound(phase: phase, role: "listener", commandID: commandID ?? playbackCommandID,
+            playbackID: playbackID ?? self.playbackID, action: request?.action.rawValue, sound: state.settings.sound.rawValue,
+            timerMinutes: state.settings.timerMinutes, volume: state.settings.volume, playing: state.playing,
+            remainingSeconds: state.remainingSeconds, reason: reason, elapsedMS: elapsedMS, captureMode: mode, error: error)
+    }
+    private func logStop(_ context: PlaybackLogContext?, phase: String, reason: String) {
+        guard var context else { return }
+        if phase == "stopped" { context.state.playing = false; context.state.remainingSeconds = 0 }
+        logSound(phase: phase, commandID: context.commandID, state: context.state, playbackID: context.playbackID, reason: reason)
     }
     private func observe(_ name: Notification.Name) {
         observers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] notification in
@@ -65,34 +233,59 @@ enum AudioCaptureStatus {
         })
     }
     private func handle(name: Notification.Name, type: UInt?, options: UInt, reason: UInt?) async {
-        guard wantsMonitoring else { return }
-        // Codes: began → AVAudioSession.InterruptionReason, ended → InterruptionOptions
-        // (1 = shouldResume; without it one restart is still tried), route → RouteChangeReason.
+        // Graph/category notifications from our own successful configuration are
+        // not an external route change and must not stop a newly started sound.
+        let observedGeneration = generation
+        let running = await driver.isRunning
+        guard observedGeneration == generation else { return }
+        if name == .AVAudioEngineConfigurationChange, running { return }
+        if name == AVAudioSession.routeChangeNotification,
+           reason == AVAudioSession.RouteChangeReason.categoryChange.rawValue, running { return }
+        // Never resume a lullaby automatically after a call or route change.
+        // Its timer cannot be extended by an interruption or a device reconnect.
+        let stopReason = name == AVAudioSession.interruptionNotification ? "interruption" :
+            name == AVAudioSession.routeChangeNotification ? "route_change" :
+            name == AVAudioSession.mediaServicesWereResetNotification ? "media_services_reset" : "engine_configuration_changed"
+        generation += 1; let expected = generation
+        let stopped = finishSound(reason: stopReason)
+        // Playback-only sessions need the same interruption evidence as capture.
         if name == AVAudioSession.interruptionNotification {
             let began = type == AVAudioSession.InterruptionType.began.rawValue
             log?.record(began ? "audio_interruption_began" : "audio_interruption_ended", code: began ? reason.map { Int($0) } : Int(options))
-        }
-        else if name == AVAudioSession.routeChangeNotification { log?.record("audio_route_changed", code: reason.map { Int($0) }) }
+        } else if name == AVAudioSession.routeChangeNotification { log?.record("audio_route_changed", code: reason.map { Int($0) }) }
         else if name == AVAudioSession.mediaServicesWereResetNotification { log?.record("audio_services_reset") }
         else if name == .AVAudioEngineConfigurationChange { log?.record("audio_engine_changed") }
-        if name == .AVAudioEngineConfigurationChange, await driver.isRunning { return }
-        guard wantsMonitoring else { return }
+        guard wantsMonitoring else {
+            do {
+                try await driver.setSound(nurseryState, capture: false, generation: expected)
+                if expected == generation { logStop(stopped, phase: "stopped", reason: stopReason) }
+            } catch {
+                if expected == generation { logSound(phase: "audio_failed", reason: stopReason, error: error) }
+            }
+            return
+        }
+        // Codes: began → AVAudioSession.InterruptionReason, ended → InterruptionOptions
+        // (1 = shouldResume; without it one restart is still tried), route → RouteChangeReason.
         if name == AVAudioSession.interruptionNotification, type == AVAudioSession.InterruptionType.began.rawValue {
-            generation += 1; let expected = generation
             onStatus?(.recovering("Audio interrupted. Waiting for microphone…"))
-            await driver.pause(generation: expected); return
+            guard expected == generation else { return }
+            await driver.pause(generation: expected)
+            if generation == expected { logStop(stopped, phase: "stopped", reason: stopReason) }
+            return
         }
         // Without shouldResume the system makes no promise, but a background
         // record session can often reactivate anyway. Try once; an activation
         // error reports the failure, and a silent engine trips the stall check.
         let unprompted = name == AVAudioSession.interruptionNotification
             && !AVAudioSession.InterruptionOptions(rawValue: options).contains(.shouldResume)
-        generation += 1; let expected = generation
         // End the last observed episode before restarting; no interruption counts as crying.
         onStatus?(.recovering("Audio route changed. Recovering microphone…"))
+        guard expected == generation else { return }
         do {
-            try await driver.activate(generation: expected)
+            try await driver.activate(generation: expected, clearSound: true)
             guard generation == expected, wantsMonitoring else { return }
+            logStop(stopped, phase: "stopped", reason: stopReason)
+            logSound(phase: "capture_restored")
             onStatus?(.active)
         } catch {
             guard generation == expected, wantsMonitoring else { return }
@@ -104,38 +297,115 @@ enum AudioCaptureStatus {
 }
 /// Audio session activation is blocking on older iOS releases; actor isolation keeps
 /// acquisition, reconfiguration, and teardown off the main UI executor.
-private actor AudioCaptureDriver {
+private actor AudioCaptureDriver: AudioCaptureDriving {
     private var engine = AVAudioEngine()
     private var tapInstalled = false
     private var sessionActive = false
     private var generation = 0
+    private var captureEnabled = false
+    private var sound: NurserySoundSettings?
+    private var player: AVAudioPlayerNode?
+    private var buffers: [NurserySound: AVAudioPCMBuffer] = [:]
     private let continuation: AsyncStream<AudioLevelSample>.Continuation
     init(continuation: AsyncStream<AudioLevelSample>.Continuation) { self.continuation = continuation }
     var isRunning: Bool { engine.isRunning }
-    func activate(generation requested: Int) throws {
+    func activate(generation requested: Int, clearSound: Bool) throws {
+        try Task.checkCancellation()
         guard requested >= generation else { throw CancellationError() }; generation = requested
+        if clearSound { sound = nil }
+        captureEnabled = true
+        try rebuild()
+    }
+    private func rebuild(cancellable: Bool = true) throws {
         tearDown()
         let session = AVAudioSession.sharedInstance()
+        var stage = NurseryAudioFailure.Stage.session
         do {
-            try session.setCategory(.record, mode: .measurement, options: [])
+            if captureEnabled {
+                try session.setCategory(.playAndRecord, mode: sound == nil ? .measurement : .voiceChat, options: [.defaultToSpeaker])
+            } else { try session.setCategory(.playback, mode: .default, options: []) }
             try session.setPreferredIOBufferDuration(0.02)
             try session.setActive(true); sessionActive = true
             engine = AVAudioEngine()
-            let input = engine.inputNode; let format = input.outputFormat(forBus: 0)
-            guard format.sampleRate > 0, format.channelCount > 0 else { throw AudioError.unavailable }
-            let reducer = RMSReducer(sampleRate: format.sampleRate, continuation: continuation)
-            input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in reducer.consume(buffer) }
-            tapInstalled = true; engine.prepare(); try engine.start()
-        } catch { tearDown(); deactivateSession(); throw error }
+            if captureEnabled {
+                let input = engine.inputNode
+                // Playback goes through this engine's output so Voice Processing
+                // receives its echo reference. Never connect the mic to the mixer.
+                stage = .voiceProcessing
+                if sound != nil { try input.setVoiceProcessingEnabled(true); input.isVoiceProcessingAGCEnabled = false }
+                stage = .input
+                let format = input.outputFormat(forBus: 0)
+                guard format.sampleRate > 0, format.channelCount > 0 else { throw AudioError.unavailable }
+                let reducer = RMSReducer(sampleRate: format.sampleRate, continuation: continuation)
+                input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in reducer.consume(buffer) }
+                tapInstalled = true
+            }
+            stage = .player
+            if let sound { try preparePlayer(sound) }
+            if cancellable { try Task.checkCancellation() }
+            stage = .engine
+            engine.prepare(); try engine.start(); player?.play()
+        } catch {
+            tearDown(); deactivateSession()
+            if error is CancellationError || error is NurseryAudioFailure { throw error }
+            throw NurseryAudioFailure(stage: stage, underlying: error)
+        }
+    }
+    func setSound(_ state: NurserySoundState, capture: Bool, generation requested: Int) throws {
+        guard requested >= generation else { throw CancellationError() }; generation = requested
+        if state.playing { try Task.checkCancellation() }
+        guard state.isValid else { throw AudioError.unavailable }
+        let previous = sound
+        let captureChanged = captureEnabled != capture
+        captureEnabled = capture
+        sound = state.playing ? state.settings : nil
+        do {
+            if !state.playing {
+                player?.stop()
+                if capture {
+                    if captureChanged || previous != nil || !engine.isRunning || AVAudioSession.sharedInstance().mode != .measurement || engine.inputNode.isVoiceProcessingEnabled {
+                        try rebuild(cancellable: false)
+                    }
+                } else { tearDown(); deactivateSession() }
+            } else if !captureChanged, previous != nil, engine.isRunning, let player {
+                if previous?.sound != sound?.sound {
+                    player.stop()
+                    let buffer = try buffer(for: state.settings.sound)
+                    try Task.checkCancellation()
+                    player.scheduleBuffer(buffer, at: nil, options: .loops); player.play()
+                }
+                player.volume = Float(state.settings.volume)
+            } else { try rebuild() }
+        } catch { sound = nil; throw error }
+    }
+    private func buffer(for sound: NurserySound) throws -> AVAudioPCMBuffer {
+        if let buffer = buffers[sound] { return buffer }
+        let samples = sound.samples()
+        guard let format = AVAudioFormat(standardFormatWithSampleRate: 22_050, channels: 1),
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count)),
+              let channel = buffer.floatChannelData?[0] else { throw NurseryAudioFailure(stage: .synthesis, underlying: AudioError.unavailable) }
+        buffer.frameLength = buffer.frameCapacity
+        samples.withUnsafeBufferPointer { source in if let base = source.baseAddress { channel.update(from: base, count: samples.count) } }
+        buffers[sound] = buffer; return buffer
+    }
+    private func preparePlayer(_ settings: NurserySoundSettings) throws {
+        let buffer = try buffer(for: settings.sound)
+        let player = AVAudioPlayerNode(); engine.attach(player)
+        engine.connect(player, to: engine.mainMixerNode, format: buffer.format)
+        player.volume = Float(settings.volume); player.scheduleBuffer(buffer, at: nil, options: .loops)
+        self.player = player
     }
     func pause(generation requested: Int) {
         guard requested >= generation else { return }; generation = requested; tearDown()
+        sound = nil
     }
     func stop(generation requested: Int) {
         guard requested >= generation else { return }; generation = requested
+        captureEnabled = false; sound = nil
         tearDown(); deactivateSession()
     }
     private func tearDown() {
+        player?.stop(); player = nil
         if tapInstalled { engine.inputNode.removeTap(onBus: 0); tapInstalled = false }
         engine.stop()
     }

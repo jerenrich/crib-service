@@ -1,5 +1,19 @@
 # Readiness release checks
 
+## Nursery sound playback — physical checks before release
+
+Automated validation after the review fixes on 31 October 2026: iPhone simulator build, 377 iPhone unit tests (including actual muted playback and interruption handling), 366 Worker tests, TypeScript checks, and two targeted UI tests passed. The compact Monitor layout and sound-sheet screenshots were reviewed. Regression tests cover cancelled remote Play after local Stop, edits arriving after expiry, restoration before confirmation, restoration failure, expired settings during driver work, old-expiry/new-Play races, a tick crossing its deadline, and keeping the locked-nursery connection through Play/Stop reconfiguration. The follow-up code review also tightened command field types. No further actionable findings remained in the reviewed paths. The earlier shared macOS run passed 195 of 196 tests; the unchanged `AlarmSharedTests.testSnapshotReadReportsWhyItIsUnavailable` fails because its protected lock-probe file is not written on this host. That test passes in the current iOS suite. Physical audio/echo and locked-device checks below remain to be performed.
+
+The later diagnostics audit added command/playback correlation, safe audio error stages and codes, automatic stop reasons, sampled socket recovery, and bounded relay journal metadata. It also corrected backend-outage close codes. Validation passed 383 iPhone unit tests, 371 Worker tests, TypeScript checks, and both targeted UI tests. The earlier empty-log fixture assertion now expects the deliberate sound-diagnostics startup/version marker. See [sound diagnostics](diagnostics-review.md#nursery-sound-diagnostics--31-october-2026) for investigation steps and evidence limits. These changes are local and have not been deployed.
+
+- Deploy the updated Worker first, then install the updated iPhone app on both devices; no D1 migration is needed.
+- With the nursery phone charging, start monitoring and play each sound. Lock it, then change sound, volume, timer, and Stop from Parent. Confirm the speaker output, parent acknowledgement, and uninterrupted microphone readings. Repeat while monitoring is in Standby, then resume monitoring.
+- Test all five durations (5, 10, 20, 30, and 60 minutes). Disconnect the Parent and confirm playback still stops on time. Changing sound/volume must preserve the deadline; choosing a duration must restart it. Repeat a five-minute timer while the nursery phone is locked and temporarily offline.
+- At the intended placement and volume, play test crying-like sound alongside each nursery sound. Verify detection and alert delivery, and check that nursery playback alone does not trigger alerts. Repeat after stopping playback; voice processing changes the input path, so simulator results do not establish detection performance.
+- Interrupt with a call, change the audio route, stop the microphone, terminate/relaunch the nursery app, and unpair. Playback must stop and stay stopped. Merely pausing monitoring must leave sound and its timer running. Calibration must stop sound before sampling.
+- Disconnect/reconnect either phone during a Parent request. Parent must show a timeout or unconfirmed change, disable stale controls, and never replay a Play request after reconnecting. If the nursery microphone is fully stopped and the phone is locked without playback, reopen its app to restore remote control availability.
+- Check small iPhone screens and accessibility text: the compact player must remain reachable, the sheet must scroll when needed, and all timer buttons must have accessible minute labels.
+
 ## First device comparison and follow-up fixes — 29 October 2026
 
 Two real cries on J17, unplugged at 50% and locked:

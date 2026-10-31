@@ -1,5 +1,21 @@
 import XCTest
 final class OnboardingUITests: XCTestCase {
+    @MainActor func testNurserySoundSheetHasBothSoundsAndAllTimersOnParent() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound"]
+        app.launch()
+        let controls = app.buttons["nurserySoundControls"]
+        XCTAssertTrue(controls.waitForExistence(timeout: 5)); XCTAssertTrue(controls.isHittable)
+        controls.tap()
+        XCTAssertTrue(app.buttons["nurserySound_whiteNoise"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["nurserySound_twinkleTwinkle"].exists)
+        for minutes in [5, 10, 20, 30, 60] { XCTAssertTrue(app.buttons["nurserySoundTimer_\(minutes)"].exists) }
+        XCTAssertTrue(app.sliders["nurserySoundVolume"].exists)
+        XCTAssertFalse(app.buttons["nurserySoundPlayback"].isEnabled, "An offline Parent cannot claim it started playback")
+        let shot = XCTAttachment(screenshot: app.screenshot()); shot.name = "Parent nursery sound sheet"; shot.lifetime = .keepAlways; add(shot)
+        app.buttons["Done"].tap()
+        XCTAssertTrue(controls.isHittable)
+    }
     @MainActor func testTestAlertOpensConfigurationWithoutSending() {
         let app = XCUIApplication()
         app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound"]

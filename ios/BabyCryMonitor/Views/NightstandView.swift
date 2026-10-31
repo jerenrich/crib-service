@@ -16,9 +16,10 @@ struct NightstandView: View {
     @State private var detailsTestConfigurationPresented = false
     @State private var confirmStopMicrophone = false
     @State private var nightDimmed = false
+    @State private var soundsPresented = false
     @State private var lastInteraction = Date()
     @ScaledMetric(relativeTo: .caption) private var chartHeader: CGFloat = 40
-    private let ringSize: CGFloat = 228
+    private let ringSize: CGFloat = 200
 
     private var listener: Bool { role == .listener }
     private var soundLive: Bool { listener ? model.monitoring : model.parentHasLiveMonitoring }
@@ -194,7 +195,7 @@ struct NightstandView: View {
     /// With Keep screen awake on, the Parent dims after a minute untouched. Alerts and problems brighten it.
     private var parentCanDim: Bool {
         !listener && model.keepScreenAwake && (hero.tone == .calm || hero.tone == .inactive) && model.activeAlert == nil
-            && !pairing && !settingsPresented && !detailsPresented && !timing && !testConfigurationPresented
+            && !pairing && !settingsPresented && !detailsPresented && !timing && !testConfigurationPresented && !soundsPresented
     }
 
     private func setNightDimmed(_ value: Bool) {
@@ -275,6 +276,7 @@ struct NightstandView: View {
                         activitySummary
                         chips
                         soundPanel.frame(height: 100 + chartHeader)
+                        NurserySoundButton { soundsPresented = true }
                         actions
                         disclaimer
                     }
@@ -288,6 +290,7 @@ struct NightstandView: View {
                     activitySummary.padding(.top, -10)
                     chips
                     soundPanel.frame(minHeight: 60, maxHeight: .infinity)
+                    NurserySoundButton { soundsPresented = true }
                     actions
                     disclaimer
                 }
@@ -327,6 +330,11 @@ struct NightstandView: View {
         .sheet(isPresented: $timing) { AlertTimingView() }
         .sheet(isPresented: $pairing) { PairingView() }
         .sheet(isPresented: $settingsPresented) { SettingsView() }
+        .sheet(isPresented: $soundsPresented) {
+            NurserySoundsView()
+                .presentationDetents(typeSize.isAccessibilitySize ? [.large] : [.height(620), .large])
+                .presentationDragIndicator(.visible)
+        }
         .sheet(isPresented: $detailsPresented) { detailsSheet }
     }
 

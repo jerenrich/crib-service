@@ -2,6 +2,7 @@
 import Foundation
 import XCTest
 import UserNotifications
+import AVFoundation
 @testable import BabyCryMonitor
 
 actor RequestGate {
@@ -19,6 +20,365 @@ actor RequestGate {
 }
 
 final class AppModelTests: XCTestCase {
+    @MainActor func testSoundCommandLogsCorrelateBothPhonesWithoutControlTokens() async throws {
+        let parent = try Fixture(); parent.model.selectRole(.parent); await parent.model.refreshParent()
+        let nursery = try Fixture()
+        nursery.liveSound.onNurserySoundRequest?()
+        let update = try XCTUnwrap(nursery.liveSound.soundUpdates.last)
+        parent.liveSound.onConnectionChange?(true); parent.liveSound.onNurserySoundUpdate?(update)
+        await parent.model.changeNurserySound(.init(settings: .init(timerMinutes: 5), action: .play))
+        let command = try XCTUnwrap(parent.liveSound.soundCommands.last)
+        nursery.liveSound.onNurserySoundCommand?(command)
+        let applied = await eventually { nursery.liveSound.soundUpdates.last?.commandID == command.id }; XCTAssertTrue(applied)
+        parent.liveSound.onNurserySoundUpdate?(try XCTUnwrap(nursery.liveSound.soundUpdates.last))
+        let id = command.id.uuidString.lowercased()
+        for phase in ["requested", "sent", "confirmed"] {
+            XCTAssertTrue(parent.model.log.lines.contains { $0.contains("nursery_sound phase=\(phase)") && $0.contains("command_id=\(id)") }, phase)
+        }
+        for phase in ["received", "applying", "applied"] {
+            XCTAssertTrue(nursery.model.log.lines.contains { $0.contains("nursery_sound phase=\(phase)") && $0.contains("command_id=\(id)") }, phase)
+        }
+        for fixture in [parent, nursery] {
+            let text = fixture.model.log.export.lowercased()
+            XCTAssertFalse(text.contains(command.controlToken.uuidString.lowercased()))
+            XCTAssertFalse(text.contains(fixture.listener.secret)); XCTAssertFalse(text.contains(fixture.listener.deviceId.uuidString.lowercased()))
+        }
+        nursery.model.stop()
+    }
+    @MainActor func testParentSoundTimeoutAndSendFailureAreLoggedWithSafeErrorDetails() async throws {
+        let fixture = try Fixture(); fixture.model.selectRole(.parent); await fixture.model.refreshParent()
+        fixture.liveSound.onConnectionChange?(true)
+        fixture.liveSound.onNurserySoundUpdate?(.init(state: .init(), controlToken: UUID()))
+        await fixture.model.changeNurserySound(.init(settings: .init(), action: .play))
+        let timed = try XCTUnwrap(fixture.liveSound.soundCommands.last?.id)
+        let finished = await eventually(timeout: .seconds(9)) { !fixture.model.changingNurserySound }; XCTAssertTrue(finished)
+        XCTAssertTrue(fixture.model.log.lines.contains { $0.contains("phase=timed_out") && $0.contains("command_id=\(timed.uuidString.lowercased())") && $0.contains("reason=confirmation_timeout") })
+        fixture.liveSound.commandError = URLError(.timedOut, userInfo: [NSURLErrorFailingURLStringErrorKey: "https://private-host/private-token"])
+        fixture.liveSound.onNurserySoundUpdate?(.init(state: .init(), controlToken: UUID()))
+        await fixture.model.changeNurserySound(.init(settings: .init(), action: .play))
+        XCTAssertTrue(fixture.model.log.lines.contains { $0.contains("nursery_sound phase=failed") && $0.contains("reason=transport") && $0.contains("code=-1001") })
+        XCTAssertFalse(fixture.model.log.export.contains("private-token"))
+    }
+    @MainActor func testTimerAndPlaybackOnlyInterruptionHaveDistinctPersistentStopReasonsWithoutTickLogs() async throws {
+        let driver = AudioDriver()
+        var clock = ContinuousClock.now
+        let audio = AudioLevelMonitor(driver: driver, currentTime: { clock })
+        let fixture = try Fixture(audioService: audio)
+        await fixture.model.changeNurserySound(.init(settings: .init(timerMinutes: 5), action: .play))
+        let initial = fixture.model.log.lines.filter { $0.contains("nursery_sound") }.count
+        try await Task.sleep(for: .milliseconds(550))
+        XCTAssertEqual(fixture.model.log.lines.filter { $0.contains("nursery_sound") }.count, initial)
+        clock = clock.advanced(by: .seconds(301))
+        let timed = await eventually { !fixture.model.nurserySound.playing }; XCTAssertTrue(timed)
+        XCTAssertTrue(fixture.model.log.lines.contains { $0.contains("phase=stopped") && $0.contains("reason=timer_expired") && $0.contains("playback_id=") })
+        await fixture.model.changeNurserySound(.init(settings: .init(), action: .play))
+        NotificationCenter.default.post(name: AVAudioSession.interruptionNotification, object: nil,
+            userInfo: [AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.began.rawValue])
+        let interrupted = await eventually { !fixture.model.nurserySound.playing }; XCTAssertTrue(interrupted)
+        // The state changes before the asynchronous driver acknowledges Stop.
+        let logged = await eventually { fixture.model.log.lines.contains { $0.contains("phase=stopped") && $0.contains("reason=interruption") } }; XCTAssertTrue(logged)
+        XCTAssertTrue(fixture.model.log.export.contains("audio_interruption_began"))
+        fixture.model.stop()
+    }
+    @MainActor func testPlaybackAndCaptureRestorationErrorsRetainDomainAndCode() async throws {
+        let driver = AudioDriver(), audio = AudioLevelMonitor(driver: driver)
+        let fixture = try Fixture(audioService: audio)
+        try await audio.start()
+        await fixture.model.changeNurserySound(.init(settings: .init(), action: .play))
+        await driver.configure(failRestoration: true)
+        await fixture.model.changeNurserySound(.init(settings: .init(), action: .stop))
+        for phase in ["audio_failed", "capture_restore_failed", "failed"] {
+            XCTAssertTrue(fixture.model.log.lines.contains { $0.contains("nursery_sound phase=\(phase)") && $0.contains("domain=NSURLErrorDomain") && $0.contains("code=\(URLError.cannotOpenFile.rawValue)") }, phase)
+        }
+        fixture.model.stop()
+    }
+    @MainActor func testLockedNurseryKeepsItsConnectionWhileStartingAndStoppingSound() async throws {
+        let driver = AudioDriver()
+        let audio = AudioLevelMonitor(driver: driver)
+        let fixture = try Fixture(audioService: audio)
+        try await audio.start()
+        fixture.model.setAppActive(false)
+        for action in [NurserySoundRequest.Action.play, .stop] {
+            fixture.liveSound.onNurserySoundRequest?()
+            let token = try XCTUnwrap(fixture.liveSound.soundUpdates.last?.controlToken)
+            let command = NurserySoundCommand(id: UUID(), controlToken: token, request: .init(settings: .init(), action: action))
+            fixture.liveSound.onNurserySoundCommand?(command)
+            let confirmed = await eventually { fixture.liveSound.soundUpdates.last?.commandID == command.id && !fixture.model.changingNurserySound }
+            XCTAssertTrue(confirmed)
+            XCTAssertNil(fixture.liveSound.soundUpdates.last?.failure)
+            XCTAssertTrue(fixture.model.monitoring)
+            XCTAssertEqual(fixture.model.nurserySound.playing, action == .play)
+            XCTAssertEqual(fixture.liveSound.connectedDevice, fixture.listener.deviceId)
+        }
+        fixture.model.stop()
+    }
+    @MainActor func testOneClockSamplePerTickPreventsOrphanedPlaybackAtTheDeadline() async throws {
+        let driver = AudioDriver()
+        let now = ContinuousClock.now
+        var ticking = false, reads = 0
+        let audio = AudioLevelMonitor(driver: driver, currentTime: {
+            guard ticking else { return now }
+            reads += 1
+            return now.advanced(by: reads == 1 ? .milliseconds(299_999) : .seconds(301))
+        })
+        try await audio.setNurserySound(.init(settings: .init(timerMinutes: 5), action: .play))
+        ticking = true
+        let stopped = await eventually { let current = await driver.current; return !current.state.playing }
+        XCTAssertTrue(stopped, "Crossing the deadline must stop the driver, not just the displayed state")
+        audio.stop()
+    }
+    @MainActor func testSettingsExpiryDuringDriverWorkRestoresCaptureBeforeReturning() async throws {
+        let driver = AudioDriver(), gate = RequestGate()
+        var clock = ContinuousClock.now
+        let audio = AudioLevelMonitor(driver: driver, currentTime: { clock })
+        var state = NurserySoundState(), activeCount = 0
+        audio.onNurserySoundChange = { state = $0 }
+        audio.onStatus = { if case .active = $0 { activeCount += 1 } }
+        try await audio.start()
+        try await audio.setNurserySound(.init(settings: .init(timerMinutes: 5), action: .play))
+        await driver.configure(gate: gate)
+        let editing = Task { try await audio.setNurserySound(.init(settings: .init(volume: 0.7, timerMinutes: 5), action: .updateSettings)) }
+        let entered = await eventually { await driver.setAttempts == 2 }; XCTAssertTrue(entered)
+        clock = clock.advanced(by: .seconds(301)); await gate.open(); try await editing.value
+        XCTAssertFalse(state.playing); XCTAssertEqual(activeCount, 3)
+        let current = await driver.current; XCTAssertTrue(current.capture); XCTAssertFalse(current.state.playing)
+        audio.stop()
+    }
+    actor AudioDriver: AudioCaptureDriving {
+        struct Operation: Sendable { var capture: Bool; var state: NurserySoundState }
+        var isRunning = false
+        var generation = 0
+        var current = Operation(capture: false, state: .init())
+        var operations: [Operation] = []
+        var setAttempts = 0
+        var nextSetGate: RequestGate?
+        var failRestoration = false
+        func configure(gate: RequestGate? = nil, failRestoration: Bool = false) {
+            nextSetGate = gate; self.failRestoration = failRestoration
+        }
+        func activate(generation requested: Int, clearSound: Bool) throws {
+            guard requested >= generation else { throw CancellationError() }; generation = requested
+            current.capture = true
+            if clearSound { current.state.playing = false; current.state.remainingSeconds = 0 }
+            operations.append(current); isRunning = true
+        }
+        func setSound(_ state: NurserySoundState, capture: Bool, generation requested: Int) async throws {
+            setAttempts += 1
+            let gate = nextSetGate; nextSetGate = nil
+            await gate?.wait()
+            guard requested >= generation else { throw CancellationError() }; generation = requested
+            if state.playing { try Task.checkCancellation() }
+            if capture, !state.playing, failRestoration { isRunning = false; throw URLError(.cannotOpenFile) }
+            current = Operation(capture: capture, state: state); operations.append(current)
+            isRunning = capture || state.playing
+        }
+        func pause(generation requested: Int) {
+            guard requested >= generation else { return }; generation = requested
+            current.state.playing = false; current.state.remainingSeconds = 0; isRunning = false
+        }
+        func stop(generation requested: Int) {
+            guard requested >= generation else { return }; generation = requested
+            current = Operation(capture: false, state: .init()); operations.append(current); isRunning = false
+        }
+    }
+    @MainActor func testQueuedRemotePlayCannotRunAfterLocalStopAndOldTokensAreRevoked() async throws {
+        let fixture = try Fixture()
+        fixture.liveSound.onNurserySoundRequest?()
+        let token = try XCTUnwrap(fixture.liveSound.soundUpdates.last?.controlToken)
+        let command = NurserySoundCommand(id: UUID(), controlToken: token, request: .init(settings: .init(), action: .play))
+        fixture.liveSound.onNurserySoundCommand?(command)
+        fixture.model.stop()
+        for _ in 0..<100 { await Task.yield() }
+        XCTAssertTrue(fixture.audio.soundRequests.isEmpty)
+        XCTAssertFalse(fixture.model.nurserySound.playing)
+        fixture.liveSound.onNurserySoundCommand?(.init(id: UUID(), controlToken: token, request: command.request))
+        XCTAssertTrue(fixture.audio.soundRequests.isEmpty)
+        XCTAssertEqual(fixture.liveSound.soundUpdates.last?.failure, "expired")
+    }
+    @MainActor func testAudioStopSupersedesAnInFlightPlayWithoutRestartingCapture() async throws {
+        let driver = AudioDriver(), gate = RequestGate()
+        let audio = AudioLevelMonitor(driver: driver)
+        var state = NurserySoundState(); audio.onNurserySoundChange = { state = $0 }
+        await driver.configure(gate: gate)
+        let play = Task { try await audio.setNurserySound(.init(settings: .init(), action: .play)) }
+        let started = await eventually { await driver.setAttempts == 1 }; XCTAssertTrue(started)
+        audio.stop(); await gate.open()
+        if case .success = await play.result { XCTFail("Superseded Play must fail") }
+        XCTAssertFalse(state.playing)
+        let current = await driver.current
+        XCTAssertFalse(current.state.playing); XCTAssertFalse(current.capture)
+    }
+    @MainActor func testStoppingAndExpiringSoundRestoreCaptureAndAcknowledgeAfterRestoration() async throws {
+        for timed in [false, true] {
+            let driver = AudioDriver(), gate = RequestGate()
+            var clock = ContinuousClock.now
+            let audio = AudioLevelMonitor(driver: driver, currentTime: { clock })
+            var state = NurserySoundState(), activeCount = 0
+            audio.onNurserySoundChange = { state = $0 }
+            audio.onStatus = { if case .active = $0 { activeCount += 1 } }
+            try await audio.start()
+            try await audio.setNurserySound(.init(settings: .init(timerMinutes: 5), action: .play))
+            await driver.configure(gate: gate)
+            var stopping: Task<Void, Error>?
+            if timed { clock = clock.advanced(by: .seconds(301)) }
+            else { stopping = Task { try await audio.setNurserySound(.init(settings: state.settings, action: .stop)) } }
+            let restoring = await eventually { await driver.setAttempts == 2 }; XCTAssertTrue(restoring)
+            XCTAssertTrue(state.playing, "Do not confirm Stop before restoration completes")
+            XCTAssertEqual(activeCount, 2)
+            await gate.open()
+            try await stopping?.value
+            let finished = await eventually { !state.playing }; XCTAssertTrue(finished)
+            let current = await driver.current
+            XCTAssertTrue(current.capture); XCTAssertFalse(current.state.playing)
+            XCTAssertEqual(activeCount, 3)
+            audio.stop()
+        }
+    }
+    @MainActor func testExpiredSoundEditDoesNotPlayAndRestorationFailureIsReported() async throws {
+        let driver = AudioDriver()
+        var clock = ContinuousClock.now
+        let audio = AudioLevelMonitor(driver: driver, currentTime: { clock })
+        var state = NurserySoundState(), failed = false
+        audio.onNurserySoundChange = { state = $0 }
+        audio.onStatus = { if case .failed = $0 { failed = true } }
+        try await audio.start()
+        try await audio.setNurserySound(.init(settings: .init(timerMinutes: 5), action: .play))
+        clock = clock.advanced(by: .seconds(301))
+        try await audio.setNurserySound(.init(settings: .init(volume: 0.7), action: .updateSettings))
+        XCTAssertFalse(state.playing)
+        let current = await driver.current; XCTAssertFalse(current.state.playing); XCTAssertTrue(current.capture)
+        try await audio.setNurserySound(.init(settings: .init(), action: .play))
+        await driver.configure(failRestoration: true)
+        do { try await audio.setNurserySound(.init(settings: .init(), action: .stop)); XCTFail("Restoration should fail") } catch {}
+        XCTAssertTrue(failed); XCTAssertFalse(state.playing)
+        audio.stop()
+    }
+    @MainActor func testAnOldExpiryCannotStopOrCancelTheTimerOfANewerPlay() async throws {
+        let driver = AudioDriver(), gate = RequestGate()
+        var clock = ContinuousClock.now
+        let audio = AudioLevelMonitor(driver: driver, currentTime: { clock })
+        var state = NurserySoundState(); audio.onNurserySoundChange = { state = $0 }
+        try await audio.setNurserySound(.init(settings: .init(timerMinutes: 5), action: .play))
+        await driver.configure(gate: gate)
+        clock = clock.advanced(by: .seconds(301))
+        let stopping = await eventually { await driver.setAttempts == 2 }; XCTAssertTrue(stopping)
+        try await audio.setNurserySound(.init(settings: .init(timerMinutes: 10), action: .play))
+        await gate.open()
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertTrue(state.playing); XCTAssertEqual(state.settings.timerMinutes, 10)
+        clock = clock.advanced(by: .seconds(601))
+        let expired = await eventually { !state.playing }; XCTAssertTrue(expired, "The newer Play must still have its own timer")
+        let current = await driver.current; XCTAssertFalse(current.state.playing)
+        audio.stop()
+    }
+    @MainActor func testConcreteSoundPlaybackSurvivesItsOwnCategoryChangeAndStopsOnInterruption() async throws {
+        let audio = AudioLevelMonitor()
+        var state = NurserySoundState()
+        audio.onNurserySoundChange = { state = $0 }
+        defer { audio.stop() }
+        // Exercise the actual engine without audible output from the test host.
+        try await audio.setNurserySound(.init(settings: .init(volume: 0, timerMinutes: 5), action: .play))
+        XCTAssertTrue(state.playing)
+        NotificationCenter.default.post(name: AVAudioSession.routeChangeNotification, object: nil,
+            userInfo: [AVAudioSessionRouteChangeReasonKey: AVAudioSession.RouteChangeReason.categoryChange.rawValue])
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertTrue(state.playing, "Our own category change must not stop the newly started sound")
+        try await audio.setNurserySound(.init(settings: .init(sound: .twinkleTwinkle, volume: 0, timerMinutes: 5), action: .updateSettings))
+        XCTAssertEqual(state.settings.sound, .twinkleTwinkle)
+        XCTAssertLessThan(state.remainingSeconds, 300, "Switching sound preserves the original countdown")
+        NotificationCenter.default.post(name: AVAudioSession.interruptionNotification, object: nil,
+            userInfo: [AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.began.rawValue])
+        let stopped = await eventually { !state.playing }
+        XCTAssertTrue(stopped)
+        NotificationCenter.default.post(name: AVAudioSession.interruptionNotification, object: nil,
+            userInfo: [AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.ended.rawValue,
+                       AVAudioSessionInterruptionOptionKey: AVAudioSession.InterruptionOptions.shouldResume.rawValue])
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertFalse(state.playing, "An interruption must not automatically restart nursery sound")
+    }
+    @MainActor func testNurserySoundWorksInStandbyAndDuplicateRemotePlayDoesNotRestartTimer() async throws {
+        let fixture = try Fixture()
+        await fixture.model.start(); fixture.model.pauseMonitoring()
+        fixture.liveSound.onNurserySoundRequest?()
+        let token = try XCTUnwrap(fixture.liveSound.soundUpdates.last?.controlToken)
+        let request = NurserySoundRequest(settings: .init(sound: .twinkleTwinkle, timerMinutes: 5), action: .play)
+        let command = NurserySoundCommand(id: UUID(), controlToken: token, request: request)
+        fixture.liveSound.onNurserySoundCommand?(command)
+        let applied = await eventually { fixture.liveSound.soundUpdates.last?.commandID == command.id }
+        XCTAssertTrue(applied)
+        XCTAssertTrue(fixture.model.nurserySound.playing)
+        XCTAssertTrue(fixture.model.standby)
+        XCTAssertEqual(fixture.audio.stops, 0)
+        fixture.liveSound.onNurserySoundCommand?(command)
+        XCTAssertEqual(fixture.audio.soundRequests.count, 1)
+        fixture.model.stop()
+        XCTAssertFalse(fixture.model.nurserySound.playing)
+    }
+    @MainActor func testExpiredAndLocallySupersededCommandsCannotStartSound() async throws {
+        let fixture = try Fixture()
+        fixture.liveSound.onNurserySoundRequest?()
+        let token = try XCTUnwrap(fixture.liveSound.soundUpdates.last?.controlToken)
+        fixture.time.now = fixture.time.now.addingTimeInterval(6)
+        let request = NurserySoundRequest(settings: .init(), action: .play)
+        fixture.liveSound.onNurserySoundCommand?(.init(id: UUID(), controlToken: token, request: request))
+        XCTAssertTrue(fixture.audio.soundRequests.isEmpty)
+        XCTAssertEqual(fixture.liveSound.soundUpdates.last?.failure, "expired")
+        fixture.liveSound.onNurserySoundRequest?()
+        let newer = try XCTUnwrap(fixture.liveSound.soundUpdates.last?.controlToken)
+        await fixture.model.changeNurserySound(.init(settings: .init(timerMinutes: 10), action: .stop))
+        fixture.liveSound.onNurserySoundCommand?(.init(id: UUID(), controlToken: newer, request: request))
+        XCTAssertEqual(fixture.audio.soundRequests.count, 1)
+        XCTAssertFalse(fixture.model.nurserySound.playing)
+    }
+    @MainActor func testParentWaitsForMatchingNurseryConfirmationAndDisablesStaleControls() async throws {
+        let fixture = try Fixture(); fixture.model.selectRole(.parent)
+        await fixture.model.refreshParent()
+        fixture.liveSound.onConnectionChange?(true)
+        let stopped = NurserySoundUpdate(state: .init(), controlToken: UUID())
+        fixture.liveSound.onNurserySoundUpdate?(stopped)
+        XCTAssertTrue(fixture.model.canControlNurserySound)
+        await fixture.model.changeNurserySound(.init(settings: .init(timerMinutes: 30), action: .play))
+        let command = try XCTUnwrap(fixture.liveSound.soundCommands.last)
+        XCTAssertTrue(fixture.model.changingNurserySound)
+        XCTAssertFalse(fixture.model.displayedNurserySound.playing, "Sending is not confirmation")
+        var confirmed = NurserySoundUpdate(state: .init(settings: command.request.settings, playing: true, remainingSeconds: 1800), controlToken: UUID(), commandID: UUID())
+        fixture.liveSound.onNurserySoundUpdate?(confirmed)
+        XCTAssertTrue(fixture.model.changingNurserySound, "A different command cannot confirm this request")
+        confirmed.commandID = command.id; fixture.liveSound.onNurserySoundUpdate?(confirmed)
+        XCTAssertFalse(fixture.model.changingNurserySound)
+        XCTAssertNil(fixture.model.nurserySoundError)
+        XCTAssertTrue(fixture.model.displayedNurserySound.playing)
+        fixture.time.now = fixture.time.now.addingTimeInterval(4)
+        XCTAssertFalse(fixture.model.canControlNurserySound)
+        await fixture.model.changeNurserySound(.init(settings: .init(), action: .stop))
+        XCTAssertEqual(fixture.liveSound.soundCommands.count, 1)
+    }
+    @MainActor func testParentDisconnectDoesNotConfirmOrReplayAPlayCommand() async throws {
+        let fixture = try Fixture(); fixture.model.selectRole(.parent); await fixture.model.refreshParent()
+        fixture.liveSound.onConnectionChange?(true)
+        fixture.liveSound.onNurserySoundUpdate?(.init(state: .init(), controlToken: UUID()))
+        await fixture.model.changeNurserySound(.init(settings: .init(), action: .play))
+        fixture.liveSound.onConnectionChange?(false)
+        XCTAssertFalse(fixture.model.changingNurserySound)
+        XCTAssertNotNil(fixture.model.nurserySoundError)
+        fixture.liveSound.onConnectionChange?(true)
+        XCTAssertEqual(fixture.liveSound.soundCommands.count, 1)
+        XCTAssertFalse(fixture.model.canControlNurserySound)
+    }
+    @MainActor func testNurseryReportsPlaybackFailureWithoutStoppingMonitoring() async throws {
+        let fixture = try Fixture(); await fixture.model.start()
+        fixture.audio.soundFailure = true
+        fixture.liveSound.onNurserySoundRequest?()
+        let token = try XCTUnwrap(fixture.liveSound.soundUpdates.last?.controlToken)
+        let command = NurserySoundCommand(id: UUID(), controlToken: token, request: .init(settings: .init(), action: .play))
+        fixture.liveSound.onNurserySoundCommand?(command)
+        let failed = await eventually { fixture.liveSound.soundUpdates.last?.failure == "playbackFailed" }
+        XCTAssertTrue(failed)
+        XCTAssertEqual(fixture.liveSound.soundUpdates.last?.commandID, command.id)
+        XCTAssertTrue(fixture.model.monitoring)
+        XCTAssertFalse(fixture.model.nurserySound.playing)
+        fixture.model.stop()
+    }
     @MainActor func testGeneratedAlertUploadsWithoutNetworkTickAfterDurableSave() async throws {
         let fixture = try Fixture()
         let gate = RequestGate()
@@ -203,6 +563,15 @@ final class AppModelTests: XCTestCase {
         let levels: AsyncStream<AudioLevelSample>
         private let continuation: AsyncStream<AudioLevelSample>.Continuation
         var onStatus: ((AudioCaptureStatus) -> Void)?
+        var onNurserySoundChange: ((NurserySoundState) -> Void)?
+        var soundRequests: [NurserySoundRequest] = []
+        var soundFailure = false
+        var soundPlayback = NurserySoundPlayback()
+        func setNurserySound(_ request: NurserySoundRequest, commandID: UUID? = nil) async throws {
+            soundRequests.append(request)
+            if soundFailure { throw URLError(.cannotOpenFile) }
+            soundPlayback.apply(request, at: .now); onNurserySoundChange?(soundPlayback.state)
+        }
         var permissionGranted = true
         var recoveryGate: RequestGate?
         var startFailure: Error?
@@ -227,7 +596,7 @@ final class AppModelTests: XCTestCase {
             }
             onStatus?(.active)
         }
-        func stop() { stops += 1; onStatus?(.stopped) }
+        func stop() { stops += 1; soundPlayback.stop(); onNurserySoundChange?(soundPlayback.state); onStatus?(.stopped) }
     }
     @MainActor final class Connectivity: ConnectivityProviding {
         var available = true
@@ -236,6 +605,17 @@ final class AppModelTests: XCTestCase {
     @MainActor final class LiveSound: LiveSoundStreaming {
         var onFrame: ((SoundLevelFrame) -> Void)?
         var onConnectionChange: ((Bool) -> Void)?
+        var onNurserySoundCommand: ((NurserySoundCommand) -> Void)?
+        var onNurserySoundUpdate: ((NurserySoundUpdate) -> Void)?
+        var onNurserySoundRequest: (() -> Void)?
+        var soundUpdates: [NurserySoundUpdate] = []
+        var soundCommands: [NurserySoundCommand] = []
+        var commandError: (any Error)?
+        func sendNurserySoundCommand(_ command: NurserySoundCommand) async throws {
+            soundCommands.append(command)
+            if let commandError { throw commandError }
+        }
+        func publishNurserySound(_ update: NurserySoundUpdate) { soundUpdates.append(update) }
         var connectedDevice: UUID?
         var frames: [SoundLevelFrame] = []
         func connect(baseURL: URL, credential: DeviceCredential) { connectedDevice = credential.deviceId }
@@ -390,7 +770,7 @@ final class AppModelTests: XCTestCase {
         let parent: DeviceCredential
         final class Time { var now = Date() }
         let time: Time
-        init(pending: Bool = false, automaticallyStart: Bool = false, logEvents: [String] = [], snapshotData: Data? = nil, heartbeatJitter: @escaping () -> Double = { 1 }, localWarnings: Bool = false, configureDefaults: (UserDefaults, DeviceCredential) -> Void = { _, _ in }) throws {
+        init(pending: Bool = false, automaticallyStart: Bool = false, logEvents: [String] = [], snapshotData: Data? = nil, heartbeatJitter: @escaping () -> Double = { 1 }, localWarnings: Bool = false, audioService: (any AudioLevelProviding)? = nil, configureDefaults: (UserDefaults, DeviceCredential) -> Void = { _, _ in }) throws {
             suite = "AppModelTests.\(UUID())"
             defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
             directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -415,7 +795,7 @@ final class AppModelTests: XCTestCase {
             let time = Time(); self.time = time
             let log = DiagnosticLog(directory: directory)
             for event in logEvents { log.record(event) }
-            model = AppModel(defaults: defaults, metadataStore: store, log: log, audio: audio, liveSound: liveSound, connectivity: connectivity,
+            model = AppModel(defaults: defaults, metadataStore: store, log: log, audio: audioService ?? audio, liveSound: liveSound, connectivity: connectivity,
                              notifications: notifications, keychain: Credentials(listener: listener, parent: parent),
                              makeClient: { _, _ in backend }, currentTime: { time.now }, heartbeatJitter: heartbeatJitter, automaticallyStart: automaticallyStart)
         }
@@ -440,7 +820,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(frame.state, fixture.model.state)
         XCTAssertTrue(frame.isValid)
         fixture.model.stop()
-        XCTAssertNil(fixture.liveSound.connectedDevice)
+        XCTAssertEqual(fixture.liveSound.connectedDevice, fixture.listener.deviceId, "Foreground sound controls stay reachable with the microphone off")
     }
     @MainActor func testParentSoundStaysCurrentWithoutMonitorVisibilityAndClearsOnUnpairing() async throws {
         let fixture = try Fixture()
@@ -738,7 +1118,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(fixture.model.standby); XCTAssertFalse(fixture.model.monitoring)
         XCTAssertTrue(fixture.model.microphoneActive); XCTAssertEqual(fixture.audio.stops, 0)
         XCTAssertEqual(fixture.model.state, .quiet); XCTAssertNil(fixture.model.snapshot.current)
-        XCTAssertNil(fixture.liveSound.connectedDevice)
+        XCTAssertEqual(fixture.liveSound.connectedDevice, fixture.listener.deviceId, "Standby keeps remote sound controls available")
         let history = fixture.model.snapshot.history.count
         let frames = fixture.liveSound.frames.count
         let pending = fixture.model.snapshot.pending.count
@@ -1919,7 +2299,8 @@ final class AppModelTests: XCTestCase {
     @MainActor func testFixtureLogsAreIsolatedAndExistingHistoryStillLoads() async throws {
         let first = try Fixture(logEvents: ["alert_apns_accepted"])
         let second = try Fixture()
-        XCTAssertTrue(second.model.log.lines.isEmpty)
+        XCTAssertEqual(second.model.log.lines.count, 1)
+        XCTAssertTrue(second.model.log.lines[0].contains("nursery_sound_pipeline_ready code=1"))
         second.model.log.record("monitoring_started")
         XCTAssertFalse(first.model.log.export.contains("monitoring_started"))
         let restored = DiagnosticLog(directory: first.directory)

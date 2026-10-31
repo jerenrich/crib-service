@@ -40,7 +40,10 @@ public struct LiveSoundRequests: Sendable {
         return id
     }
     public func accepts(_ frame: SoundLevelFrame, at now: Date) -> Bool {
-        guard let id = frame.requestID, let sent = issued[id] else { return false }
+        accepts(requestID: frame.requestID, at: now)
+    }
+    public func accepts(requestID: String?, at now: Date) -> Bool {
+        guard let id = requestID, let sent = issued[id] else { return false }
         return (0..<3).contains(now.timeIntervalSince(sent))
     }
 }
