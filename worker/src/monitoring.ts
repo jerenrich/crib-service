@@ -58,8 +58,11 @@ export const monitoringResumedSQL=`json_extract(events.payload,'$.type')='monito
  AND julianday(json_extract(h.metadata,'$.timestamp'))>julianday(json_extract(events.payload,'$.cryStartedAt')))`;
 // A pending Stop suppresses late uploads; an applied Stop remains in force until
 // either phone starts again. Never claim that this proves the microphone stopped.
-export const stoppedMonitoringSQL=`EXISTS(SELECT 1 FROM monitoring_commands m JOIN pairs p
+export function stoppedMonitoringForSQL(parentID:string,listenerID:string) {
+ return `EXISTS(SELECT 1 FROM monitoring_commands m JOIN pairs p
  ON p.parent_id=m.parent_id AND p.listener_id=m.listener_id AND p.created_at=m.pair_created_at
- WHERE m.parent_id=events.parent_id AND m.listener_id=events.listener_id AND m.enabled=0
+ WHERE m.parent_id=${parentID} AND m.listener_id=${listenerID} AND m.enabled=0
  AND (m.status='applied' OR (m.status='pending' AND m.expires_at>?))
  AND m.sequence=(SELECT MAX(sequence) FROM monitoring_commands WHERE parent_id=m.parent_id AND listener_id=m.listener_id AND pair_created_at=m.pair_created_at))`;
+}
+export const stoppedMonitoringSQL=stoppedMonitoringForSQL('events.parent_id','events.listener_id');

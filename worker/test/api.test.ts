@@ -184,6 +184,57 @@ describe('connection alerts, readiness and replacement',()=>{
   await call('listener/heartbeat',listener,beat(listener,false));mockPush();await flushConnections(testEnv);await flushConnections(testEnv);
   expect(pushRequests).toHaveLength(1);expect(JSON.parse(String(pushRequests[0].init?.body)).connectionState).toBe('stopped');
  });
+ it.each(['parent','listener'] as const)('keeps a deliberate Stop/Pause from the %s quiet and warns again after a new Start',async(role)=>{
+  const pair=await paired(),{parent,listener}=pair;
+  await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
+  await call('listener/heartbeat',listener,beat(listener));
+  expect((await call('monitoring',pair[role],{id:crypto.randomUUID(),enabled:false})).status).toBe(200);
+  // Even a stale active heartbeat must not generate an outage after Stop.
+  await stale();await flushConnections(testEnv);
+  await call('listener/heartbeat',listener,beat(listener,false));
+  await flushConnections(testEnv);await flushConnections(testEnv);
+  expect(pushRequests).toHaveLength(0);
+  expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM connection_notices').first()).toEqual({n:0});
+  expect(await runReminder(testEnv,parent.deviceId)).toBe(false);
+  // A later Start supersedes the Stop; an unexpected stop must still warn.
+  await call('monitoring',listener,{id:crypto.randomUUID(),enabled:true});
+  await call('listener/heartbeat',listener,beat(listener));await flushConnections(testEnv);
+  await call('listener/heartbeat',listener,beat(listener,false));
+  mockPush(200,2);await flushConnections(testEnv);
+  expect(pushRequests).toHaveLength(2);
+  expect(JSON.parse(String(pushRequests[0].init?.body)).connectionState).toBe('stopped');
+ });
+ it.each(['parent','listener'] as const)('cancels queued stopped notices after a deliberate Stop/Pause from the %s',async(role)=>{
+  const pair=await paired(),{parent,listener}=pair;
+  await call('listener/heartbeat',listener,beat(listener));
+  await call('listener/heartbeat',listener,beat(listener,false));
+  await flushConnections(testEnv);
+  expect(await env.DB.prepare('SELECT status FROM connection_notices').first()).toEqual({status:'blocked'});
+  await call('monitoring',pair[role],{id:crypto.randomUUID(),enabled:false});
+  await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
+  // Cancel even if the old notice's retry is not due yet.
+  await env.DB.prepare('UPDATE connection_notices SET next_attempt=?').bind(Date.now()+60000).run();
+  await flushConnections(testEnv);
+  expect(await env.DB.prepare('SELECT status FROM connection_notices').first()).toEqual({status:'cancelled'});
+  expect(pushRequests).toHaveLength(0);
+ });
+ it('rechecks a deliberate Stop before sending a previously selected stopped notice',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  await call('listener/heartbeat',listener,beat(listener));
+  await call('listener/heartbeat',listener,beat(listener,false));
+  const db=interceptDB(async(sql,_args,method,execute)=>{
+   const result=await execute();
+   if(sql.startsWith('SELECT n.id FROM connection_notices')&&method==='all'){
+    expect((await call('monitoring',listener,{id:crypto.randomUUID(),enabled:false})).status).toBe(200);
+   }
+   return result;
+  });
+  await flushConnections({...testEnv,DB:db});
+  expect(await env.DB.prepare('SELECT status FROM connection_notices').first()).toEqual({status:'cancelled'});
+  expect(pushRequests).toHaveLength(0);
+ });
  it('uses scheduled checks to warn both devices after three minutes and shares the crying snooze',async()=>{
   const {parent,listener}=await paired();
   await call('device/push-token',parent,{token:'ab'.repeat(32)});
