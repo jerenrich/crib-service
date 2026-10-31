@@ -41,6 +41,8 @@ struct AlarmSnapshot: Codable, Equatable, Sendable {
     var evidence: SilentCryAlarmRequest.ServerEvidence?
     var snoozeDuration: Double
     var publishedAt: Date
+    /// Consumed journal Stops are governed by the app snapshot, including early Resume.
+    var handledExtensionStopKeys: [String]? = nil
 
     /// Why the extension had no snapshot, recorded with its `no_snapshot` rejection.
     enum Issue: String, Error { case appGroupUnavailable = "app_group_unavailable", missing, unreadable, undecodable }
@@ -64,7 +66,7 @@ struct AlarmSnapshot: Codable, Equatable, Sendable {
     /// A Stop executed in the extension must suppress subsequent pushes even
     /// before the main app consumes its journal and publishes a new snapshot.
     func stopRejection(for request: SilentCryAlarmRequest, attempts: [AlarmAttempt], now: Date) -> SilentCryAlarmRequest.Rejection? {
-        for stop in attempts where stop.outcome == .stopped {
+        for stop in attempts where stop.outcome == .stopped && !(handledExtensionStopKeys ?? []).contains(stop.key) {
             if stop.isTest {
                 if request.isTest, request.eventID == stop.eventID { return .irrelevant }
             } else if !request.isTest {
