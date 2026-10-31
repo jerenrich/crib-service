@@ -212,7 +212,7 @@ struct AlertTimingView: View {
                     }.accessibilityIdentifier("quickSnoozeDuration")
                 }
                 Section {
-                    Text("Tap the orange circle on Monitor to snooze an active alert. While snoozed, tap Resume in the circle to end the snooze early. The nursery keeps listening.")
+                    Text("Tap the orange circle on Monitor to snooze an active alert. Snooze clears current alert notifications and silences alerts for your chosen duration. While snoozed, tap Resume in the circle to end the snooze early. The nursery keeps listening.")
                     Text(model.settingsSyncStatus)
                 }
             }.navigationTitle("Alert timing")

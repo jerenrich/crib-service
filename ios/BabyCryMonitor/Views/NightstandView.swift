@@ -297,7 +297,6 @@ struct NightstandView: View {
                         soundPanel.frame(height: 100 + chartHeader)
                         NurserySoundButton { soundsPresented = true }
                         actions
-                        stopAlertsControl
                         disclaimer
                     }
                     .padding(.horizontal, 20)
@@ -312,7 +311,6 @@ struct NightstandView: View {
                     soundPanel.frame(minHeight: 60, maxHeight: .infinity)
                     NurserySoundButton { soundsPresented = true }
                     actions
-                    stopAlertsControl
                     disclaimer
                 }
                 .padding(.horizontal, 20)
@@ -365,7 +363,6 @@ struct NightstandView: View {
         VStack(spacing: 8) {
             header
             timedHero
-            stopAlertsControl
             soundPanel.frame(height: hasTwoCaregivers ? 80 : 84)
             if hasTwoCaregivers { CaregiverDutyCard() }
             timingSummary
@@ -722,20 +719,6 @@ struct NightstandView: View {
         .frame(minHeight: 54)
         .foregroundStyle(style == .secondary ? Palette.lavender : Palette.background)
         .background(style == .primary ? Palette.mint : style == .alert ? Palette.amber : Palette.panel, in: RoundedRectangle(cornerRadius: 18))
-    }
-
-    @ViewBuilder private var stopAlertsControl: some View {
-        if model.paired, !model.stoppableAlertIDs.isEmpty {
-            Button { Task { await model.stopAlerts() } } label: {
-                Label(model.stoppingAlerts ? "Stopping alerts…" : "Stop alerts", systemImage: "bell.slash.fill")
-                    .font(.subheadline.weight(.semibold)).frame(maxWidth: .infinity, minHeight: 44)
-            }
-            .buttonStyle(.bordered)
-            .tint(Palette.amber)
-            .disabled(model.stoppingAlerts || model.acknowledgingAlert || model.resumingAlerts || model.managingDevice)
-            .accessibilityHint("Ends current alert episodes. Monitoring keeps its current setting.")
-            .accessibilityIdentifier("nightstandStopAlerts")
-        }
     }
 
     /// The contextual primary action, paired with the monitoring control when it still applies.

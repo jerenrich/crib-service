@@ -91,18 +91,25 @@ final class OnboardingUITests: XCTestCase {
         XCTAssertTrue(app.buttons["nightstandMonitoringControl"].isHittable)
         XCTAssertTrue(app.staticTexts["Microphone inactive"].firstMatch.exists)
         XCTAssertFalse(app.staticTexts["Nursery keeps listening"].exists)
-        XCTAssertTrue(app.buttons["nightstandStopAlerts"].exists)
-        XCTAssertTrue(app.buttons["nightstandStopAlerts"].isHittable)
+        XCTAssertFalse(app.buttons["nightstandStopAlerts"].exists)
     }
 
-    @MainActor func testStoppedParentOffersStopAlerts() {
+    @MainActor func testParentAndNurseryUseSnoozeWithoutASeparateStopAlertsButton() {
         let app = XCUIApplication()
-        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", "--uitesting-active-alert", "--uitesting-microphone-off", "--uitesting-caregivers"]
-        app.launch()
-        let stop = app.buttons["nightstandStopAlerts"]
-        XCTAssertTrue(stop.waitForExistence(timeout: 5))
-        XCTAssertTrue(stop.isHittable)
-        XCTAssertTrue(app.windows.firstMatch.frame.contains(stop.frame))
+        for role in [[], ["--uitesting-listener"]] {
+            for scenario in [["--uitesting-active-alert"], ["--uitesting-active-alert", "--uitesting-snoozed"],
+                             ["--uitesting-active-alert", "--uitesting-microphone-off"]] {
+                app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound"] + role + scenario
+                app.launch()
+                let actionID = scenario.contains("--uitesting-snoozed") ? "nightstandResumeAlerts" : "nightstandSnooze"
+                let action = app.buttons[actionID]
+                XCTAssertTrue(action.waitForExistence(timeout: 5))
+                XCTAssertTrue(action.isHittable)
+                XCTAssertTrue(app.windows.firstMatch.frame.contains(action.frame))
+                XCTAssertFalse(app.buttons["nightstandStopAlerts"].exists)
+                app.terminate()
+            }
+        }
     }
 
     @MainActor func testNurserySnoozedCircleShowsResumeAndCountdown() {
@@ -256,8 +263,6 @@ final class OnboardingUITests: XCTestCase {
             if let baseline {
                 for (actual, expected) in zip(frames, baseline) {
                     XCTAssertEqual(actual.minX, expected.minX, accuracy: 1)
-                    // The contextual Stop alerts row deliberately shifts lower
-                    // controls during an active alert; their widths stay stable.
                     XCTAssertEqual(actual.width, expected.width, accuracy: 1)
                     XCTAssertEqual(actual.height, expected.height, accuracy: 1)
                 }
