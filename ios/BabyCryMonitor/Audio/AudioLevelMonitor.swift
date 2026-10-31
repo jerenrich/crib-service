@@ -44,6 +44,7 @@ extension AudioLevelProviding {
     private var observers: [NSObjectProtocol] = []
     private var wantsMonitoring = false
     private var generation = 0
+    private var configuringGeneration: Int?
     var onStatus: ((AudioCaptureStatus) -> Void)?
     var onNurserySoundChange: ((NurserySoundState) -> Void)?
     private var playback = NurserySoundPlayback()
@@ -72,6 +73,8 @@ extension AudioLevelProviding {
         try Task.checkCancellation()
         wantsMonitoring = true; generation += 1
         let expected = generation
+        configuringGeneration = expected
+        defer { if configuringGeneration == expected { configuringGeneration = nil } }
         do {
             try await driver.activate(generation: expected, clearSound: false)
             guard generation == expected, wantsMonitoring else { throw CancellationError() }
@@ -115,6 +118,8 @@ extension AudioLevelProviding {
         try Task.checkCancellation()
         guard request.settings.isValid else { throw AudioError.unavailable }
         generation += 1; let expected = generation
+        configuringGeneration = expected
+        defer { if configuringGeneration == expected { configuringGeneration = nil } }
         var next = playback
         next.apply(request, at: currentTime())
         let started = ContinuousClock.now
@@ -233,6 +238,13 @@ extension AudioLevelProviding {
         })
     }
     private func handle(name: Notification.Name, type: UInt?, options: UInt, reason: UInt?) async {
+        // Notifications can arrive while a rebuild is still awaiting its actor.
+        // Let that operation publish its state before deciding what to recover.
+        let notificationGeneration = generation
+        while configuringGeneration == notificationGeneration {
+            try? await Task.sleep(for: .milliseconds(20))
+            guard generation == notificationGeneration else { return }
+        }
         // Graph/category notifications from our own successful configuration are
         // not an external route change and must not stop a newly started sound.
         let observedGeneration = generation
@@ -241,7 +253,35 @@ extension AudioLevelProviding {
         if name == .AVAudioEngineConfigurationChange, running { return }
         if name == AVAudioSession.routeChangeNotification, running,
            (reason == AVAudioSession.RouteChangeReason.categoryChange.rawValue ||
-            reason == AVAudioSession.RouteChangeReason.override.rawValue) { return }
+            reason == AVAudioSession.RouteChangeReason.override.rawValue ||
+            reason == AVAudioSession.RouteChangeReason.routeConfigurationChange.rawValue) { return }
+        // Changing between measurement and voice processing can itself cause a
+        // category or route-configuration notification and stop the engine. In
+        // that case restore the existing graph, including sound, rather than
+        // treating our own transition as a disconnected audio device.
+        if name == AVAudioSession.routeChangeNotification,
+           (reason == AVAudioSession.RouteChangeReason.categoryChange.rawValue ||
+            reason == AVAudioSession.RouteChangeReason.routeConfigurationChange.rawValue) {
+            guard wantsMonitoring || nurseryState.playing else { return }
+            generation += 1; let expected = generation
+            if wantsMonitoring { onStatus?(.recovering("Recovering speaker and microphone…")) }
+            do {
+                if wantsMonitoring { try await driver.activate(generation: expected, clearSound: false) }
+                else { try await driver.setSound(nurseryState, capture: false, generation: expected) }
+                guard generation == expected else { return }
+                armSoundTimer(generation: expected)
+                if wantsMonitoring { onStatus?(.active) }
+            } catch {
+                guard generation == expected else { return }
+                log?.record("audio_interrupted", error: error)
+                let stopped = finishSound(reason: "route_change")
+                await driver.stop(generation: expected)
+                guard generation == expected else { return }
+                logStop(stopped, phase: "stopped", reason: "route_change")
+                if wantsMonitoring { onStatus?(.failed("Microphone unavailable. Open the app to restart monitoring.")) }
+            }
+            return
+        }
         // Never resume a lullaby automatically after a call or route change.
         // Its timer cannot be extended by an interruption or a device reconnect.
         let stopReason = name == AVAudioSession.interruptionNotification ? "interruption" :

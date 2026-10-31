@@ -156,6 +156,7 @@ final class AppModelTests: XCTestCase {
         func configure(gate: RequestGate? = nil, failRestoration: Bool = false) {
             nextSetGate = gate; self.failRestoration = failRestoration
         }
+        func simulateEngineStopped() { isRunning = false }
         func activate(generation requested: Int, clearSound: Bool) throws {
             guard requested >= generation else { throw CancellationError() }; generation = requested
             current.capture = true
@@ -319,6 +320,48 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(stopped)
         let current = await driver.current
         XCTAssertTrue(current.capture)
+    }
+    @MainActor func testConfigurationRouteChangesRecoverStoppedEngineWithoutStoppingSound() async throws {
+        for capture in [false, true] {
+            for reason in [AVAudioSession.RouteChangeReason.categoryChange, .routeConfigurationChange] {
+                let driver = AudioDriver(), audio = AudioLevelMonitor(driver: driver)
+                var state = NurserySoundState()
+                audio.onNurserySoundChange = { state = $0 }
+                if capture { try await audio.start() }
+                try await audio.setNurserySound(.init(settings: .init(), action: .play))
+                await driver.simulateEngineStopped()
+                NotificationCenter.default.post(name: AVAudioSession.routeChangeNotification, object: nil,
+                    userInfo: [AVAudioSessionRouteChangeReasonKey: reason.rawValue])
+                let recovered = await eventually { await driver.isRunning }
+                XCTAssertTrue(recovered)
+                XCTAssertTrue(state.playing)
+                let current = await driver.current
+                XCTAssertEqual(current.capture, capture)
+                XCTAssertTrue(current.state.playing)
+                audio.stop()
+            }
+        }
+    }
+    @MainActor func testRouteNotificationDuringPlayWaitsForPublishedSoundState() async throws {
+        let driver = AudioDriver(), gate = RequestGate(), audio = AudioLevelMonitor(driver: driver)
+        var state = NurserySoundState()
+        audio.onNurserySoundChange = { state = $0 }
+        try await audio.start()
+        await driver.configure(gate: gate)
+        let play = Task { try await audio.setNurserySound(.init(settings: .init(), action: .play)) }
+        let entered = await eventually { await driver.setAttempts == 1 }
+        XCTAssertTrue(entered)
+        NotificationCenter.default.post(name: AVAudioSession.routeChangeNotification, object: nil,
+            userInfo: [AVAudioSessionRouteChangeReasonKey: AVAudioSession.RouteChangeReason.routeConfigurationChange.rawValue])
+        try await Task.sleep(for: .milliseconds(50))
+        await gate.open()
+        try await play.value
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertTrue(state.playing)
+        let current = await driver.current
+        XCTAssertTrue(current.capture)
+        XCTAssertTrue(current.state.playing)
+        audio.stop()
     }
     @MainActor func testOtherCaregiverCannotUndoTimerChangeWithAStaleVolumeCommand() async throws {
         let fixture = try Fixture()
