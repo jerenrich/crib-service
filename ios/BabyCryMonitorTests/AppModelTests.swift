@@ -296,6 +296,30 @@ final class AppModelTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(100))
         XCTAssertFalse(state.playing, "An interruption must not automatically restart nursery sound")
     }
+    @MainActor func testSpeakerOverrideKeepsSoundAndMonitoringButDeviceRemovalStopsSound() async throws {
+        let driver = AudioDriver()
+        let audio = AudioLevelMonitor(driver: driver)
+        var state = NurserySoundState()
+        audio.onNurserySoundChange = { state = $0 }
+        defer { audio.stop() }
+        try await audio.start()
+        for sound in [NurserySound.whiteNoise, .twinkleTwinkle] {
+            try await audio.setNurserySound(.init(settings: .init(sound: sound), action: .play))
+            NotificationCenter.default.post(name: AVAudioSession.routeChangeNotification, object: nil,
+                userInfo: [AVAudioSessionRouteChangeReasonKey: AVAudioSession.RouteChangeReason.override.rawValue])
+            try await Task.sleep(for: .milliseconds(100))
+            let current = await driver.current
+            XCTAssertTrue(state.playing)
+            XCTAssertTrue(current.capture)
+            XCTAssertEqual(current.state.settings.sound, sound)
+        }
+        NotificationCenter.default.post(name: AVAudioSession.routeChangeNotification, object: nil,
+            userInfo: [AVAudioSessionRouteChangeReasonKey: AVAudioSession.RouteChangeReason.oldDeviceUnavailable.rawValue])
+        let stopped = await eventually { !state.playing }
+        XCTAssertTrue(stopped)
+        let current = await driver.current
+        XCTAssertTrue(current.capture)
+    }
     @MainActor func testOtherCaregiverCannotUndoTimerChangeWithAStaleVolumeCommand() async throws {
         let fixture = try Fixture()
         await fixture.model.changeNurserySound(.init(settings: .init(timerMinutes: 60), action: .play))
@@ -375,6 +399,22 @@ final class AppModelTests: XCTestCase {
         fixture.liveSound.onNurserySoundCommand?(.init(id: UUID(), controlToken: newer, request: request))
         XCTAssertEqual(fixture.audio.soundRequests.count, 1)
         XCTAssertFalse(fixture.model.nurserySound.playing)
+    }
+    @MainActor func testNurserySoundAvailabilityUsesCurrentTimeAfterAnUpdateBetweenClockTicks() async throws {
+        let fixture = try Fixture(); fixture.model.selectRole(.parent); await fixture.model.refreshParent()
+        fixture.liveSound.onConnectionChange?(true)
+        fixture.model.now = fixture.time.now
+        fixture.time.now = fixture.time.now.addingTimeInterval(0.5)
+        fixture.liveSound.onNurserySoundUpdate?(.init(state: .init(), controlToken: UUID()))
+        XCTAssertTrue(fixture.model.nurserySoundIsLive)
+        XCTAssertTrue(fixture.model.canControlNurserySound)
+        XCTAssertEqual(fixture.model.nurserySoundConnectionText, "Plays on the nursery iPhone · Confirmed")
+        fixture.time.now = fixture.time.now.addingTimeInterval(3)
+        XCTAssertFalse(fixture.model.nurserySoundIsLive)
+        XCTAssertFalse(fixture.model.canControlNurserySound)
+        fixture.liveSound.onNurserySoundUpdate?(.init(state: .init(), controlToken: UUID()))
+        fixture.liveSound.onConnectionChange?(false)
+        XCTAssertFalse(fixture.model.nurserySoundIsLive)
     }
     @MainActor func testParentWaitsForMatchingNurseryConfirmationAndDisablesStaleControls() async throws {
         let fixture = try Fixture(); fixture.model.selectRole(.parent)

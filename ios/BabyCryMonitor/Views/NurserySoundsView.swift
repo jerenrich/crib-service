@@ -12,7 +12,7 @@ struct NurserySoundButton: View {
                     .frame(width: 36, height: 36).background(Palette.mint.opacity(0.1), in: RoundedRectangle(cornerRadius: 12))
                 VStack(alignment: .leading, spacing: 3) {
                     Text(state.playing ? state.settings.sound.title : "Nursery sounds").font(.subheadline.weight(.semibold))
-                    if model.role == .parent, !model.remoteNurserySound.isLive(at: model.now) {
+                    if model.role == .parent, !model.nurserySoundIsLive {
                         Text("Nursery unavailable · Sound controls").font(.caption).foregroundStyle(Palette.muted)
                     } else if model.changingNurserySound {
                         Text("Waiting for confirmation…").font(.caption).foregroundStyle(Palette.muted)
@@ -124,7 +124,7 @@ struct NurserySoundsView: View {
                         }.font(.headline).frame(maxWidth: .infinity, minHeight: 52)
                             .background(Palette.mint, in: RoundedRectangle(cornerRadius: 16)).foregroundStyle(Palette.background)
                     }.buttonStyle(.plain).disabled(!model.canControlNurserySound).accessibilityIdentifier("nurserySoundPlayback")
-                    if state.playing, model.role == .listener || model.remoteNurserySound.isLive(at: model.now) {
+                    if state.playing, model.role == .listener || model.nurserySoundIsLive {
                         Text("Stops in \(durationText(ceil(state.remainingSeconds))) · \(state.settings.timerMinutes) min timer")
                             .font(.footnote).monospacedDigit().foregroundStyle(Palette.mint).accessibilityIdentifier("nurserySoundCountdown")
                     }

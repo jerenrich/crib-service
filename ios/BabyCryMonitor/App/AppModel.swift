@@ -1109,16 +1109,22 @@ import UIKit
         _ = now
         return role == .parent ? remoteNurserySound.state(at: currentTime()) ?? NurserySoundState() : nurserySound
     }
+    var nurserySoundIsLive: Bool {
+        // Observe the periodic clock for expiry, but compare against the actual
+        // current time: an update may arrive after the last clock tick.
+        _ = now
+        return remoteNurserySound.isLive(at: currentTime())
+    }
     var canControlNurserySound: Bool {
         _ = now
         return !changingNurserySound && !managingDevice && !starting && !calibrationActive &&
-        (role == .listener ? !recoveringAudio : paired && liveSoundConnected && remoteNurserySound.isLive(at: currentTime()))
+        (role == .listener ? !recoveringAudio : paired && liveSoundConnected && nurserySoundIsLive)
     }
     var nurserySoundConnectionText: String {
         _ = now
         if changingNurserySound { return role == .parent ? "Waiting for nursery confirmation…" : "Updating nursery sound…" }
         if role == .listener { return "Plays on this nursery iPhone" }
-        return remoteNurserySound.isLive(at: currentTime()) ? "Plays on the nursery iPhone · Confirmed" : "Nursery unavailable · Open its app to connect"
+        return nurserySoundIsLive ? "Plays on the nursery iPhone · Confirmed" : "Nursery unavailable · Open its app to connect"
     }
     func changeNurserySound(_ request: NurserySoundRequest) async {
         guard !Task.isCancelled, canControlNurserySound, request.settings.isValid else { return }

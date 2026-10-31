@@ -239,8 +239,9 @@ extension AudioLevelProviding {
         let running = await driver.isRunning
         guard observedGeneration == generation else { return }
         if name == .AVAudioEngineConfigurationChange, running { return }
-        if name == AVAudioSession.routeChangeNotification,
-           reason == AVAudioSession.RouteChangeReason.categoryChange.rawValue, running { return }
+        if name == AVAudioSession.routeChangeNotification, running,
+           (reason == AVAudioSession.RouteChangeReason.categoryChange.rawValue ||
+            reason == AVAudioSession.RouteChangeReason.override.rawValue) { return }
         // Never resume a lullaby automatically after a call or route change.
         // Its timer cannot be extended by an interruption or a device reconnect.
         let stopReason = name == AVAudioSession.interruptionNotification ? "interruption" :
@@ -318,6 +319,9 @@ private actor AudioCaptureDriver: AudioCaptureDriving {
     }
     private func rebuild(cancellable: Bool = true) throws {
         tearDown()
+        // Release the old input/output graph before changing the session or
+        // enabling voice processing on a new engine.
+        engine = AVAudioEngine()
         let session = AVAudioSession.sharedInstance()
         var stage = NurseryAudioFailure.Stage.session
         do {
@@ -326,7 +330,6 @@ private actor AudioCaptureDriver: AudioCaptureDriving {
             } else { try session.setCategory(.playback, mode: .default, options: []) }
             try session.setPreferredIOBufferDuration(0.02)
             try session.setActive(true); sessionActive = true
-            engine = AVAudioEngine()
             if captureEnabled {
                 let input = engine.inputNode
                 // Playback goes through this engine's output so Voice Processing
