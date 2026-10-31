@@ -36,7 +36,10 @@ export async function inviteCaregiver(env:Env,device:Device,value:Record<string,
  const hash=await sha256(`${env.PAIRING_PEPPER}|caregiver|${code}`),expires=Date.now()+600000;
  await env.DB.batch([
   env.DB.prepare('UPDATE devices SET caregiver_name=? WHERE id=?').bind(displayName,device.id),
-  env.DB.prepare(`INSERT INTO caregiver_families(owner_id,pair_created_at,primary_id) SELECT parent_id,created_at,parent_id FROM pairs WHERE parent_id=? ON CONFLICT(owner_id) DO NOTHING`).bind(device.id),
+  env.DB.prepare(`INSERT INTO caregiver_families(owner_id,pair_created_at,primary_id) SELECT parent_id,created_at,parent_id FROM pairs WHERE parent_id=?
+   ON CONFLICT(owner_id) DO UPDATE SET pair_created_at=excluded.pair_created_at,primary_id=excluded.primary_id,
+    partner_id=NULL,escalation_seconds=120,mutation_id=NULL,revision=caregiver_families.revision+1
+   WHERE caregiver_families.pair_created_at!=excluded.pair_created_at`).bind(device.id),
   env.DB.prepare('DELETE FROM caregiver_invites WHERE owner_id=? OR expires_at<=?').bind(device.id,Date.now()),
   env.DB.prepare('INSERT INTO caregiver_invites(code_hash,owner_id,pair_created_at,expires_at) VALUES(?,?,?,?)').bind(hash,device.id,pair.created_at,expires)
  ]);
@@ -90,7 +93,12 @@ export async function detachCaregiver(env:Env,device:Device,f:Family,deleteDevic
   env.DB.prepare('UPDATE devices SET silent_watch_alarms=0 WHERE id=?').bind(device.id),
   ...(deleteDevice?[env.DB.prepare('DELETE FROM devices WHERE id=?').bind(device.id)]:[])
  ]);
- const pair=await env.DB.prepare('SELECT * FROM pairs WHERE parent_id=?').bind(f.owner_id).first<{parent_id:string;listener_id:string;created_at:number}>();if(pair)await revokeLiveSound(env,pair);await scheduleReminders(env,f.owner_id);return true;
+ const pair=await env.DB.prepare('SELECT * FROM pairs WHERE parent_id=?').bind(f.owner_id).first<{parent_id:string;listener_id:string;created_at:number}>();
+ // The relationship is already revoked. Auxiliary service failures must not
+ // make the phone retain its local pairing or credential after deletion.
+ if(pair)try{await revokeLiveSound(env,pair);}catch{/* Sockets also recheck membership. */}
+ try{await scheduleReminders(env,f.owner_id);}catch{/* Maintenance repairs scheduling. */}
+ return true;
 }
 
 export function planRecipients(plan:Plan,now:number):string[] {return [plan.primary,...(plan.secondary&&now>=plan.started+plan.after*1000?[plan.secondary]:[])];}
@@ -114,8 +122,9 @@ export async function dispatchFamilyEvent(env:Env,eventId:string):Promise<boolea
  const claimed=await env.DB.prepare(`UPDATE events SET status='sending',claim_id=?,lease_until=?,attempts=attempts+1 WHERE event_id=?
   AND status IN ('pending','blocked') AND acknowledged_at IS NULL AND resolved_at IS NULL AND next_attempt<=?
   AND EXISTS(SELECT 1 FROM pairs p JOIN devices d ON d.id=p.parent_id WHERE p.parent_id=events.parent_id AND p.listener_id=events.listener_id AND d.alerts_muted_until<=?)
-  AND NOT (${stoppedMonitoringSQL}) RETURNING *`).bind(claim,now+30000,eventId,now,now,now).first();
+  AND NOT (${stoppedMonitoringSQL}) RETURNING *`).bind(claim,now+30000,eventId,now,now,now).first<StoredEvent>();
  if(!claimed)return true;
+ if((claimed.lease_until??0)<=Date.now())return true;
  const f=await env.DB.prepare('SELECT * FROM caregiver_families WHERE owner_id=?').bind(event.parent_id).first<Family>();
  if(!f)return true;
  const caregivers=(await env.DB.prepare('SELECT * FROM devices WHERE id=? OR id=?').bind(f.owner_id,f.partner_id).all<Caregiver>()).results;
@@ -136,7 +145,7 @@ export async function dispatchFamilyEvent(env:Env,eventId:string):Promise<boolea
    const receipt=await env.DB.prepare(`UPDATE caregiver_deliveries SET state='sending',claim_id=?,lease_until=? WHERE event_id=? AND device_id=? AND target=? AND state IN ('pending','blocked') RETURNING *`).bind(claim,now+30000,eventId,id,target).first();
    if(!receipt){const old=await env.DB.prepare('SELECT state FROM caregiver_deliveries WHERE event_id=? AND device_id=? AND target=?').bind(eventId,id,target).first<{state:string}>();accepted ||= old?.state==='sent';uncertain ||= old?.state==='uncertain';continue;}
    // Recheck revocation, episode resolution, mute and Stop immediately before APNs.
-   const eligible=await env.DB.prepare(`SELECT 1 FROM events e JOIN pairs p ON p.parent_id=e.parent_id AND p.listener_id=e.listener_id JOIN caregiver_families f ON f.owner_id=p.parent_id AND f.pair_created_at=p.created_at JOIN devices d ON d.id=f.owner_id WHERE e.event_id=? AND e.claim_id=? AND e.acknowledged_at IS NULL AND e.resolved_at IS NULL AND d.alerts_muted_until<=? AND (f.owner_id=? OR f.partner_id=?) AND NOT (${stoppedMonitoringSQL.replaceAll('events.','e.')})`).bind(eventId,claim,Date.now(),id,id,Date.now()).first();
+   const eligible=await env.DB.prepare(`SELECT 1 FROM events e JOIN pairs p ON p.parent_id=e.parent_id AND p.listener_id=e.listener_id JOIN caregiver_families f ON f.owner_id=p.parent_id AND f.pair_created_at=p.created_at JOIN devices d ON d.id=f.owner_id JOIN devices recipient ON recipient.id=? WHERE e.event_id=? AND e.claim_id=? AND e.status='sending' AND e.lease_until>? AND e.acknowledged_at IS NULL AND e.resolved_at IS NULL AND d.alerts_muted_until<=? AND (f.owner_id=? OR f.partner_id=?) AND (?=0 OR recipient.secondary_enabled=1) AND NOT (${stoppedMonitoringSQL.replaceAll('events.','e.')})`).bind(id,eventId,claim,Date.now(),Date.now(),id,id,Number(id===plan.secondary),Date.now()).first();
    if(!eligible){await env.DB.prepare("UPDATE caregiver_deliveries SET state='cancelled' WHERE event_id=? AND device_id=? AND target=? AND claim_id=?").bind(eventId,id,target,claim).run();continue;}
    const cycle=target==='phone'?await reserveFamilyAlarm(env,event,recipient,claim):undefined;
    const requestAlarm=recipient.silent_watch_alarms===1&&recipient.alarm_app_wake!==0&&(recipient.alarm_receipts_version!==1||!!cycle);

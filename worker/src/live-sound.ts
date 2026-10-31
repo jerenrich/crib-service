@@ -3,18 +3,19 @@ import {pairFor} from './devices';
 import {uuid} from './security';
 
 type Pair = {parent_id:string;listener_id:string;created_at:number};
-type Peer = {pair:Pair;role:Device['role'];lastMessage:number;lastPing?:number;lastSample?:number};
+type Peer = {pair:Pair;role:Device['role'];deviceId?:string;lastMessage:number;lastPing?:number;lastSample?:number};
 export interface SoundFrame {
  type:'levels';sampledAt:number;levels:number[];threshold:number;
  state:'quiet'|'possibleCry'|'crying';episodeStartedAt?:number|null;alertDuration:number;
  requestID?:string;
+ requestIDs?:string[];
  notificationTimes?:number[];
 }
 
 export function soundFrame(value:unknown):SoundFrame {
  if(!value||typeof value!=='object'||Array.isArray(value))throw new APIError(400,'Invalid sound levels.');
  const v=value as Record<string,unknown>;
- if(Object.keys(v).some(k=>!['type','sampledAt','levels','threshold','state','episodeStartedAt','alertDuration','requestID','notificationTimes'].includes(k))
+ if(Object.keys(v).some(k=>!['type','sampledAt','levels','threshold','state','episodeStartedAt','alertDuration','requestID','requestIDs','notificationTimes'].includes(k))
   ||v.type!=='levels'||typeof v.sampledAt!=='number'||!Number.isFinite(v.sampledAt)||v.sampledAt<0||v.sampledAt>32503680000
   ||!Array.isArray(v.levels)||![32,120].includes(v.levels.length)||v.levels.some(n=>typeof n!=='number'||!Number.isFinite(n)||n < -100||n > 0)
   ||typeof v.threshold!=='number'||!Number.isFinite(v.threshold)||v.threshold < -60||v.threshold > -10
@@ -26,6 +27,10 @@ export function soundFrame(value:unknown):SoundFrame {
   ||v.notificationTimes.some(n=>typeof n!=='number'||!Number.isFinite(n)||n < (v.sampledAt as number)-30||n > (v.sampledAt as number))))
   throw new APIError(400,'Invalid notification markers.');
  if(v.requestID!==undefined)uuid(v.requestID);
+ if(v.requestIDs!==undefined){
+  if(!Array.isArray(v.requestIDs)||v.requestIDs.length>16)throw new APIError(400,'Invalid sound challenges.');
+  for(const id of v.requestIDs)uuid(id);
+ }
  return v as unknown as SoundFrame;
 }
 
@@ -38,7 +43,7 @@ export async function openLiveSound(env:Env,device:Device,request:Request):Promi
  if(!pair)throw new APIError(409,'Pair a device first.');
  // Construct fresh internal headers; never trust a caller's role or room headers.
  return room(env,pair).fetch(new Request('https://live-sound/connect',{headers:{upgrade:'websocket',
-  'x-live-peer':JSON.stringify({pair,role:device.role})}}));
+  'x-live-peer':JSON.stringify({pair,role:device.role,deviceId:device.familyAuthorization?.memberId??device.id})}}));
 }
 export async function revokeLiveSound(env:Env,pair:Pair):Promise<void> {
  await room(env,pair).fetch(new Request('https://live-sound/revoke',{method:'POST'}));
@@ -49,9 +54,17 @@ export async function revokeLiveSound(env:Env,pair:Pair):Promise<void> {
 export class LiveSound {
  private verifiedAt=0;
  constructor(private ctx:DurableObjectState,private env:Env) {}
- private async valid(pair:Pair):Promise<boolean> {
-  return !!await this.env.DB.prepare('SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?')
-   .bind(pair.parent_id,pair.listener_id,pair.created_at).first();
+ private identity(peer:Peer):string {return peer.deviceId??(peer.role==='parent'?peer.pair.parent_id:peer.pair.listener_id);}
+ private async members(pair:Pair):Promise<Set<string>|null> {
+  const row=await this.env.DB.prepare(`SELECT f.partner_id FROM pairs p LEFT JOIN caregiver_families f
+   ON f.owner_id=p.parent_id AND f.pair_created_at=p.created_at
+   WHERE p.parent_id=? AND p.listener_id=? AND p.created_at=?`)
+   .bind(pair.parent_id,pair.listener_id,pair.created_at).first<{partner_id:string|null}>();
+  if(!row)return null;
+  return new Set([pair.parent_id,pair.listener_id,...(row.partner_id?[row.partner_id]:[])]);
+ }
+ private revokeDeparted(members:Set<string>|null) {
+  for(const socket of this.ctx.getWebSockets())if(!members?.has(this.identity(socket.deserializeAttachment() as Peer)))socket.close(1008,'Pairing ended.');
  }
  private send(ws:WebSocket,value:unknown) {
   try{ws.send(JSON.stringify(value));}catch{ws.close(1011,'Connection unavailable.');}
@@ -64,9 +77,10 @@ export class LiveSound {
  async fetch(request:Request):Promise<Response> {
   if(new URL(request.url).pathname==='/revoke'){this.verifiedAt=0;this.closeAll();return new Response(null,{status:204});}
   const peer=JSON.parse(request.headers.get('x-live-peer')!) as Peer;
-  if(!await this.valid(peer.pair))return new Response(null,{status:403});
+  const members=await this.members(peer.pair);this.revokeDeparted(members);
+  if(!members?.has(this.identity(peer)))return new Response(null,{status:403});
   // One connection per paired device; a reconnect replaces the previous socket.
-  for(const old of this.ctx.getWebSockets(peer.role))old.close(1000,'Reconnected.');
+  for(const old of this.ctx.getWebSockets(peer.role))if(this.identity(old.deserializeAttachment() as Peer)===this.identity(peer))old.close(1000,'Reconnected.');
   const [client,server]=Object.values(new WebSocketPair());
   this.ctx.acceptWebSocket(server,[peer.role]);
   server.serializeAttachment({...peer,lastMessage:0});
@@ -81,7 +95,8 @@ export class LiveSound {
    if(typeof message!=='string'||message.length>4096)throw new Error();
    const peer=ws.deserializeAttachment() as Peer;
    if(Date.now()-this.verifiedAt>=15000){
-    if(!await this.valid(peer.pair)){this.closeAll();return;}
+    const members=await this.members(peer.pair);this.revokeDeparted(members);
+    if(!members?.has(this.identity(peer)))return;
     this.verifiedAt=Date.now();
    }
    const value=JSON.parse(message) as Record<string,unknown>;

@@ -81,6 +81,15 @@ export async function savePushToken(env:Env,device:Device,value:Record<string,un
  ]);
  return {ok:true};
 }
+// Include in the actual read/write transaction, not only an earlier pair lookup:
+// a partner may be removed while a request is waiting for D1.
+export function familyAccess(device:Device):{sql:string;args:(string|number)[]} {
+ const authorization=device.familyAuthorization;
+ return authorization?{sql:`EXISTS(SELECT 1 FROM caregiver_families access_family JOIN pairs access_pair
+  ON access_pair.parent_id=access_family.owner_id AND access_pair.created_at=access_family.pair_created_at
+  WHERE access_family.owner_id=? AND access_family.partner_id=? AND access_family.pair_created_at=?)`,
+  args:[device.id,authorization.memberId,authorization.pairCreatedAt]}:{sql:'1',args:[]};
+}
 export async function pairFor(env:Env,device:Device):Promise<{parent_id:string;listener_id:string;created_at:number}|null> {
  if(device.familyAuthorization)return env.DB.prepare(`SELECT p.* FROM pairs p JOIN caregiver_families f ON f.owner_id=p.parent_id AND f.pair_created_at=p.created_at WHERE p.parent_id=? AND p.created_at=? AND f.partner_id=?`).bind(device.id,device.familyAuthorization.pairCreatedAt,device.familyAuthorization.memberId).first();
  const own=await env.DB.prepare(`SELECT * FROM pairs WHERE ${device.role==='parent'?'parent_id':'listener_id'}=?`).bind(device.id).first<{parent_id:string;listener_id:string;created_at:number}>();
@@ -94,6 +103,8 @@ export async function removeDeviceData(env:Env,device:Device,deleteDevice=false)
  const pair=await pairFor(env,device);
  const listener=pair?.listener_id??device.id, parent=pair?.parent_id??device.id;
  await env.DB.batch([
+  env.DB.prepare('DELETE FROM caregiver_invites WHERE owner_id=?').bind(parent),
+  env.DB.prepare('DELETE FROM caregiver_families WHERE owner_id=?').bind(parent),
   env.DB.prepare('UPDATE devices SET alerts_muted_until=0,alerts_muted_at=0,silent_watch_alarms=0 WHERE id=?').bind(parent),
   env.DB.prepare('DELETE FROM monitoring_commands WHERE listener_id=? OR parent_id=?').bind(listener,parent),
   env.DB.prepare('DELETE FROM resolved_episodes WHERE listener_id=? OR parent_id=?').bind(listener,parent),

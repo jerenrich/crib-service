@@ -22,7 +22,6 @@ import Foundation
     private var viewing = false
     private var lastSentAt = Date.distantPast
     private var lastMessageAt = Date.distantPast
-    private var requestID: String?
     private var requests = LiveSoundRequests()
 
     init(enabled: Bool = true) { self.enabled = enabled }
@@ -47,7 +46,7 @@ import Foundation
                 guard self?.generation == generation else { return }
                 let socket = URLSession.shared.webSocketTask(with: request)
                 self?.socket = socket; self?.viewing = false; self?.lastSentAt = .distantPast
-                self?.requestID = nil; self?.requests = LiveSoundRequests()
+                self?.requests = LiveSoundRequests()
                 self?.lastMessageAt = Date()
                 socket.resume()
                 let keepalive = Task { [weak self, weak socket] in
@@ -83,7 +82,8 @@ import Foundation
                         case "sourceChanged": self?.onConnectionChange?(true)
                         case "viewing":
                             self?.viewing = control.active == true
-                            self?.requestID = control.requestID
+                            if control.active != true { self?.requests = LiveSoundRequests() }
+                            if let id = control.requestID { self?.requests.include(id, at: Date()) }
                         case "levels":
                             let frame = try JSONDecoder().decode(SoundLevelFrame.self, from: data)
                             guard frame.isValid else { throw URLError(.cannotParseResponse) }
@@ -105,16 +105,17 @@ import Foundation
     }
     func disconnect() {
         guard scope != nil || socket != nil else { return }
-        generation = UUID(); scope = nil; viewing = false; requestID = nil; requests = LiveSoundRequests()
+        generation = UUID(); scope = nil; viewing = false; requests = LiveSoundRequests()
         connectionTask?.cancel(); connectionTask = nil
         sendTask?.cancel(); sendTask = nil
         socket?.cancel(with: .goingAway, reason: nil); socket = nil
         onConnectionChange?(false)
     }
     func publish(_ frame: SoundLevelFrame) {
-        guard viewing, let requestID, let socket, sendTask == nil, frame.isValid,
+        let ids = requests.activeIDs(at: Date())
+        guard viewing, !ids.isEmpty, let socket, sendTask == nil, frame.isValid,
               Date().timeIntervalSince(lastSentAt) >= 1 else { return }
-        var frame = frame; frame.requestID = requestID
+        var frame = frame; frame.requestID = ids.last; frame.requestIDs = ids
         guard let data = try? JSONEncoder().encode(frame), let text = String(data: data, encoding: .utf8) else { return }
         lastSentAt = Date()
         sendTask = Task { [weak self] in
