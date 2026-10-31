@@ -7,6 +7,16 @@ function deferred<T>() {
 }
 const result=(id:number)=>({success:true,results:[{id}],meta:{duration:2,rows_read:3,rows_written:0,total_attempts:2}} as unknown as D1Result<{id:number}>);
 
+describe('caregiver diagnostic privacy',()=>{
+ it('keeps only fixed role/decision labels and bounded values',()=>{
+  const value={caregiver:{phase:'plan_repaired',reason:'primary_departed',member:'owner',duty:'primary',primary:'owner',revision:3,repaired_events:2,escalation_seconds:120,secondary_enabled:false,
+   name:'private-name',deviceId:'private-id',token:'private-token',invitation:'private-code'}} as unknown as TimingDetails;
+  expect(JSON.parse(safeTimingDetails(value)!)).toEqual({caregiver:{phase:'plan_repaired',reason:'primary_departed',member:'owner',duty:'primary',primary:'owner',revision:3,repaired_events:2,escalation_seconds:120,secondary_enabled:false}});
+  expect(safeTimingDetails({caregiver:{phase:'private-phase'}} as unknown as TimingDetails)).toBeNull();
+  expect(JSON.parse(safeTimingDetails({caregiver:{phase:'skipped',reason:'private-reason',member:'private-name',duty:'private-role',primary:'private-person',revision:Infinity,repaired_events:-1,escalation_seconds:12,secondary_enabled:'private-flag'}} as unknown as TimingDetails)!)).toEqual({caregiver:{phase:'skipped'}});
+ });
+});
+
 describe('bounded read fallback and database metrics',()=>{
  it('keeps local spans stable across a wall-clock adjustment',async()=>{
   const latency=new Latency(),wall=Date.now();

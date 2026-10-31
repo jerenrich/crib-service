@@ -296,6 +296,52 @@ final class AppModelTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(100))
         XCTAssertFalse(state.playing, "An interruption must not automatically restart nursery sound")
     }
+    @MainActor func testOtherCaregiverCannotUndoTimerChangeWithAStaleVolumeCommand() async throws {
+        let fixture = try Fixture()
+        await fixture.model.changeNurserySound(.init(settings: .init(timerMinutes: 60), action: .play))
+        fixture.liveSound.onNurserySoundRequest?()
+        let staleToken = try XCTUnwrap(fixture.liveSound.soundUpdates.last?.controlToken)
+        let timerCommand = NurserySoundCommand(id: UUID(), controlToken: staleToken,
+            request: .init(settings: .init(timerMinutes: 5), action: .updateSettings, restartTimer: true))
+        fixture.liveSound.onNurserySoundCommand?(timerCommand)
+        let changed = await eventually { fixture.liveSound.soundUpdates.last?.commandID == timerCommand.id && !fixture.model.changingNurserySound }
+        XCTAssertTrue(changed)
+        let staleVolume = NurserySoundCommand(id: UUID(), controlToken: staleToken,
+            request: .init(settings: .init(volume: 0.7, timerMinutes: 60), action: .updateSettings))
+        fixture.liveSound.onNurserySoundCommand?(staleVolume)
+        XCTAssertEqual(fixture.liveSound.soundUpdates.last?.failure, "expired")
+        XCTAssertEqual(fixture.model.nurserySound.settings.timerMinutes, 5)
+        XCTAssertEqual(fixture.audio.soundRequests.count, 2)
+        let fresh = try XCTUnwrap(fixture.liveSound.soundUpdates.last)
+        var settings = fresh.state.settings; settings.volume = 0.7
+        let retry = NurserySoundCommand(id: UUID(), controlToken: fresh.controlToken,
+            request: .init(settings: settings, action: .updateSettings))
+        fixture.liveSound.onNurserySoundCommand?(retry)
+        let confirmed = await eventually { fixture.liveSound.soundUpdates.last?.commandID == retry.id && !fixture.model.changingNurserySound }
+        XCTAssertTrue(confirmed)
+        XCTAssertNil(fixture.liveSound.soundUpdates.last?.failure)
+        XCTAssertEqual(fixture.model.nurserySound.settings.volume, 0.7)
+        XCTAssertEqual(fixture.model.nurserySound.settings.timerMinutes, 5)
+        XCTAssertLessThanOrEqual(fixture.model.nurserySound.remainingSeconds, 300)
+        fixture.model.stop()
+    }
+    @MainActor func testRestartingSameTimerRevokesOlderSoundCommands() async throws {
+        let fixture = try Fixture()
+        await fixture.model.changeNurserySound(.init(settings: .init(timerMinutes: 5), action: .play))
+        fixture.liveSound.onNurserySoundRequest?()
+        let token = try XCTUnwrap(fixture.liveSound.soundUpdates.last?.controlToken)
+        let reset = NurserySoundCommand(id: UUID(), controlToken: token,
+            request: .init(settings: fixture.model.nurserySound.settings, action: .updateSettings, restartTimer: true))
+        fixture.liveSound.onNurserySoundCommand?(reset)
+        let confirmed = await eventually { fixture.liveSound.soundUpdates.last?.commandID == reset.id && !fixture.model.changingNurserySound }
+        XCTAssertTrue(confirmed)
+        fixture.liveSound.onNurserySoundCommand?(.init(id: UUID(), controlToken: token,
+            request: .init(settings: .init(sound: .twinkleTwinkle, timerMinutes: 60), action: .play)))
+        XCTAssertEqual(fixture.liveSound.soundUpdates.last?.failure, "expired")
+        XCTAssertEqual(fixture.audio.soundRequests.count, 2)
+        XCTAssertEqual(fixture.model.nurserySound.settings.timerMinutes, 5)
+        fixture.model.stop()
+    }
     @MainActor func testNurserySoundWorksInStandbyAndDuplicateRemotePlayDoesNotRestartTimer() async throws {
         let fixture = try Fixture()
         await fixture.model.start(); fixture.model.pauseMonitoring()

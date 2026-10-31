@@ -64,7 +64,7 @@ export async function recordAlarmAttempts(env:Env,device:Device,value:Record<str
  requireRole(device,'parent');
  if(!Array.isArray(value.attempts)||value.attempts.length>maximumAlarmAttempts)throw new APIError(400,'Invalid alarm attempts.');
  const attempts=value.attempts.map(item=>alarmAttempt(item)).filter(item=>item!==null);
- // One storage round trip: each row keeps its event reference only for this Parent's own events.
+ // One storage round trip; the insert rechecks ownership or current family access.
  const references=await eventReferences(env,attempts.map(item=>item.eventId??''));
  const recorded=await recordDiagnostics(env,attempts.map(({eventId,started,details},index)=>({requestId,operation:'alarm_attempt' as const,stage:'handler' as const,
   outcome:'ok' as const,started,details:{alarm_attempt:details},...(eventId?{eventRef:references[index],owner:{eventId,parentId:device.id}}:{})})));

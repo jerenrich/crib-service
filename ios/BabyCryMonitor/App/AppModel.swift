@@ -254,7 +254,7 @@ import UIKit
                 state.settings = self.nurserySound.settings
             }
             let changed = state.playing != self.nurserySound.playing || state.settings != self.nurserySound.settings
-            if self.nurserySound.playing, !state.playing { self.soundControlTokens = NurserySoundControlTokens() }
+            if changed { self.soundControlTokens = NurserySoundControlTokens() }
             self.nurserySound = state
             if changed { self.publishNurserySoundState(); self.synchronizeLiveSound() }
         }
@@ -1178,6 +1178,9 @@ import UIKit
         }
         changingNurserySound = false; soundOperationID = nil; activeRemoteSoundCommand = nil
         activeSoundDiagnosticID = nil; activeSoundRequest = nil; activeSoundStartedAt = nil
+        // A capability authorizes edits to the state it accompanied. Revoke
+        // earlier snapshots after every operation, including same-duration resets.
+        soundControlTokens = NurserySoundControlTokens()
         soundAcknowledgement = origin == "remote" ? (commandID, failure) : nil
         publishNurserySoundState(); synchronizeLiveSound()
     }

@@ -8,7 +8,7 @@ import {ProviderTokenCache,providerTokens} from '../src/provider-token';
 import {deliverToBoth} from '../src/dual-delivery';
 import {encryptToken,decryptToken,sha256} from '../src/security';
 import {flushPending,dispatchEvent} from '../src/alerts';
-import {eventReference,recordDiagnostic} from '../src/diagnostics';
+import {eventReference,recordDiagnostic,operationFor} from '../src/diagnostics';
 import {flushConnections} from '../src/connections';
 import {soundFrame} from '../src/live-sound';
 import {reserveAlarmRequest} from '../src/alarm-scheduling';
@@ -3625,6 +3625,201 @@ describe('late Snooze delivery',()=>{
 });
 
 describe('two caregiver families',()=>{
+ it('starts the family claim lease after optional correlation hashing',async()=>{
+  const {parent,listener}=await family();const event=alert(listener);await call('listener/event',listener,event);await tokens(parent,'a');
+  await env.DB.prepare("UPDATE events SET status='pending',next_attempt=0 WHERE event_id=?").bind(event.eventId).run();
+  const sign=crypto.subtle.sign.bind(crypto.subtle),start=Date.now();let delayed=false;
+  vi.spyOn(Date,'now').mockReturnValue(start);
+  vi.spyOn(crypto.subtle,'sign').mockImplementation((algorithm,key,data)=>{
+   if(algorithm==='HMAC'&&!delayed){delayed=true;vi.mocked(Date.now).mockReturnValue(start+31000);}
+   return sign(algorithm,key,data);
+  });
+  mockPush(200,2);await dispatchEvent(testEnv,event.eventId);expect(delayed).toBe(true);expect(pushRequests).toHaveLength(2);
+ });
+ it('retains the known push result when the family delivery receipt write fails',async()=>{
+  const {parent,listener}=await family();await tokens(parent,'a');
+  const db=interceptDB(async(sql,_args,method,execute)=>{
+   if(method==='run'&&sql.startsWith('UPDATE caregiver_deliveries SET state=?,lease_until=NULL'))throw new Error('D1_ERROR: private-receipt-write-error');
+   return execute();
+  });
+  mockPush(200);const response=await worker.fetch(new Request('https://monitor.test/v1/listener/event',{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${listener.deviceId}.${listener.secret}`},body:JSON.stringify(alert(listener))}),{...testEnv,DB:db});
+  expect(response.status).toBe(503);expect(pushRequests).toHaveLength(1);
+  const row=await env.DB.prepare("SELECT stage,outcome,details FROM diagnostics WHERE operation='dispatch' ORDER BY sequence DESC LIMIT 1").first<{stage:string;outcome:string;details:string}>();
+  expect(row).toMatchObject({stage:'storage',outcome:'internal_error'});
+  expect(JSON.parse(row!.details)).toMatchObject({push_outcome:'sent',error_kind:'d1_error',caregiver:{phase:'destination',member:'owner',duty:'primary'}});
+  expect(row!.details).not.toContain('private-receipt-write-error');
+ });
+
+ it('delivers both destinations when diagnostic HMAC signing fails',async()=>{
+  const {parent,listener}=await family();await tokens(parent,'a');
+  const sign=crypto.subtle.sign.bind(crypto.subtle);
+  vi.spyOn(crypto.subtle,'sign').mockImplementation((algorithm,key,data)=>algorithm==='HMAC'?Promise.reject(new Error('private-diagnostic-signing-failure')):sign(algorithm,key,data));
+  const event=alert(listener);mockPush(200,2);
+  expect((await call('listener/event',listener,event)).status).toBe(200);expect(pushRequests).toHaveLength(2);
+  for(const push of pushRequests)expect(JSON.parse(String(push.init?.body)).diagnosticRef).toBeUndefined();
+  const rows=await env.DB.prepare("SELECT * FROM diagnostics WHERE operation='dispatch'").all();
+  expect(rows.results).toHaveLength(2);expect(JSON.stringify(rows.results)).not.toContain('private-diagnostic-signing-failure');
+ });
+ it('finishes delivery and commits receipts before a slow journal can consume the lease',async()=>{
+  const {parent,listener}=await family();await tokens(parent,'a');
+  const event=alert(listener),start=Date.now();let held=false;
+  const db=interceptDB(async(sql,args,method,execute)=>{
+   if(!held&&method==='batch'&&sql.startsWith('INSERT INTO diagnostics')&&['dispatch','caregiver_routing'].includes(String(args[2]))){
+    held=true;expect(pushRequests).toHaveLength(2);
+    expect((await env.DB.prepare('SELECT status FROM events WHERE event_id=?').bind(event.eventId).first<{status:string}>())?.status).toBe('sent');
+    vi.spyOn(Date,'now').mockReturnValue(start+31000);
+   }
+   return execute();
+  });
+  mockPush(200,2);
+  const response=await worker.fetch(new Request('https://monitor.test/v1/listener/event',{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${listener.deviceId}.${listener.secret}`},body:JSON.stringify(event)}),{...testEnv,DB:db});
+  expect(response.status).toBe(200);expect(held).toBe(true);expect(pushRequests).toHaveLength(2);
+  const rows=(await env.DB.prepare("SELECT elapsed_ms FROM diagnostics WHERE operation='dispatch'").all<{elapsed_ms:number}>()).results;
+  expect(rows).toHaveLength(2);expect(rows.every(row=>row.elapsed_ms<1000)).toBe(true);
+ });
+ it('keeps a failed diagnostic batch from changing family delivery',async()=>{
+  const {parent,listener}=await family();await tokens(parent,'a');let failed=false;
+  const db=interceptDB(async(sql,args,method,execute)=>{
+   if(method==='batch'&&sql.startsWith('INSERT INTO diagnostics')&&['dispatch','caregiver_routing'].includes(String(args[2]))){failed=true;throw new Error('private-journal-write-failure');}
+   return execute();
+  });
+  const event=alert(listener);mockPush(200,2);
+  const response=await worker.fetch(new Request('https://monitor.test/v1/listener/event',{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${listener.deviceId}.${listener.secret}`},body:JSON.stringify(event)}),{...testEnv,DB:db});
+  expect(response.status).toBe(200);expect(failed).toBe(true);expect(pushRequests).toHaveLength(2);
+  expect((await env.DB.prepare('SELECT status FROM events WHERE event_id=?').bind(event.eventId).first<{status:string}>())?.status).toBe('sent');
+ });
+ it.each(['upload','reminder'] as const)('attaches slow family journals to the %s background lifetime',async(source)=>{
+  const {parent,listener}=await family();await tokens(parent,'a');
+  const event=alert(listener);
+  if(source==='reminder'){mockPush(200,2);await call('listener/event',listener,event);vi.spyOn(Date,'now').mockReturnValue(Date.now()+6000);}
+  const baseline=pushRequests.length,jobs:Promise<unknown>[]=[];
+  let entered!:()=>void,release!:()=>void,held=false;
+  const ready=new Promise<void>(r=>entered=r),gate=new Promise<void>(r=>release=r);
+  const db=interceptDB(async(sql,args,method,execute)=>{
+   if(!held&&method==='batch'&&sql.startsWith('INSERT INTO diagnostics')&&['dispatch','caregiver_routing'].includes(String(args[2]))){held=true;entered();await gate;}
+   return execute();
+  });
+  mockPush(200,2);const background={waitUntil:(job:Promise<unknown>)=>{jobs.push(job);}};
+  const running=source==='upload'?worker.fetch(new Request('https://monitor.test/v1/listener/event',{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${listener.deviceId}.${listener.secret}`},body:JSON.stringify(event)}),{...testEnv,DB:db},background as unknown as ExecutionContext):runReminder({...testEnv,DB:db},parent.deviceId,undefined,undefined,{background});
+  try{
+   await ready;
+   const finished=await Promise.race([running.then(()=>true),new Promise<boolean>(r=>setTimeout(()=>r(false),1000))]);
+   expect(finished).toBe(true);expect(pushRequests).toHaveLength(baseline+2);expect(jobs.length).toBeGreaterThan(0);
+  }finally{release();await running;for(const job of jobs)await job;}
+ });
+ it('correlates both family destinations and retries with the claimed attempt',async()=>{
+  const {parent,listener}=await family();await tokens(parent,'a');const event=alert(listener);
+  mockPush(503,2);await call('listener/event',listener,event);
+  const {Latency}=await import('../src/latency');const trace=new Latency();
+  vi.spyOn(Date,'now').mockReturnValue(Date.now()+6000);mockPush(200,2);await dispatchEvent(testEnv,event.eventId,undefined,trace);
+  const ref=await eventReference(env,event.eventId);
+  expect(trace.eventRef).toBe(ref);expect(trace.deliveryAttempt).toBe(2);
+  expect(pushRequests.map(p=>{const body=JSON.parse(String(p.init?.body));return {ref:body.diagnosticRef,attempt:body.deliveryAttempt};}))
+   .toEqual([{ref,attempt:1},{ref,attempt:1},{ref,attempt:2},{ref,attempt:2}]);
+  const rows=(await env.DB.prepare("SELECT target,attempt,details FROM diagnostics WHERE operation='dispatch' ORDER BY sequence").all<{target:string;attempt:number;details:string}>()).results;
+  expect(rows.map(row=>row.attempt)).toEqual([1,1,2,2]);
+  for(const row of rows)expect(JSON.parse(row.details).caregiver).toMatchObject({phase:'destination',member:'owner',duty:'primary'});
+ });
+ it('records caregiver mutations with fixed route labels and private-input-free details',async()=>{
+  const {parent,partner,listener}=await family();const duty=(await status(parent)).caregiverDuty;
+  for(const route of ['invite','join','duty'])expect(operationFor('POST','/v1/caregivers/'+route)).toBe('caregiver_'+route);
+  await call('caregivers/duty',parent,{revision:duty.revision,primaryId:partner.deviceId,caregiverId:parent.deviceId,secondaryEnabled:false,escalationSeconds:60});
+  await call('listener/event',listener,alert(listener));
+  await call('pairing/remove',partner);
+  const rows=(await env.DB.prepare("SELECT operation,details FROM diagnostics WHERE operation IN ('caregiver_invite','caregiver_join','caregiver_duty','unpair') ORDER BY sequence").all<{operation:string;details:string|null}>()).results;
+  expect(rows.map(row=>row.operation)).toEqual(['caregiver_invite','caregiver_join','caregiver_duty','unpair']);
+  expect(JSON.parse(rows[2].details!).caregiver).toMatchObject({phase:'duty_changed',member:'owner',primary:'partner',secondary_enabled:false,escalation_seconds:60});
+  expect(JSON.parse(rows[3].details!).caregiver).toMatchObject({phase:'member_removed',member:'partner',repaired_events:1});
+  for(const row of rows){const text=JSON.stringify(row);for(const value of ['Jordan','Alex',parent.deviceId,partner.deviceId,listener.deviceId,parent.secret])expect(text).not.toContain(value);}
+ });
+
+ it.each(['same phone','replacement phone','deleted phone'] as const)('keeps ongoing alerts on the owner after the primary leaves and rejoins with %s',async(mode)=>{
+  const {parent,partner,listener}=await family();await tokens(parent,'a');await tokens(partner,'c');
+  const duty=(await status(parent)).caregiverDuty;
+  expect((await call('caregivers/duty',parent,{revision:duty.revision,primaryId:partner.deviceId,caregiverId:parent.deviceId,secondaryEnabled:false})).status).toBe(200);
+  const event=alert(listener);mockPush(200,2);expect((await call('listener/event',listener,event)).status).toBe(200);
+  expect((await call(mode==='deleted phone'?'device/delete':'pairing/remove',partner)).status).toBe(200);
+  const next=mode==='same phone'?partner:device('parent');if(next!==partner)await register(next);
+  await tokens(next,'c');
+  const invitation=await(await call('caregivers/invite',parent,{name:'Jordan'})).json() as {code:string};
+  expect((await call('caregivers/join',next,{code:invitation.code,name:'Alex'})).status).toBe(200);
+  expect((await status(parent)).caregiverDuty.primaryId).toBe(parent.deviceId);
+  expect((await status(parent)).notificationRelevance.cryEpisodeIDs).toContain(event.episodeId);
+  expect((await status(next)).notificationRelevance.cryEpisodeIDs).not.toContain(event.episodeId);
+  const now=Date.now();vi.spyOn(Date,'now');
+  for(const offset of [6000,12000,180000]){
+   vi.mocked(Date.now).mockReturnValue(now+offset);mockPush(200,2);
+   expect(await runReminder(testEnv,parent.deviceId)).toBe(true);
+  }
+  expect(pushRequests).toHaveLength(8);
+  expect(pushRequests.slice(2).every(p=>p.url.includes('a'.repeat(64))||p.url.includes('b'.repeat(64)))).toBe(true);
+ });
+ it('does not restore a departed primary from an in-flight episode-plan read',async()=>{
+  const {parent,partner,listener}=await family();await tokens(parent,'a');await tokens(partner,'c');
+  const duty=(await status(parent)).caregiverDuty;
+  await call('caregivers/duty',parent,{revision:duty.revision,primaryId:partner.deviceId,caregiverId:parent.deviceId,secondaryEnabled:false});
+  mockPush(200,2);const event=alert(listener);await call('listener/event',listener,event);
+  const now=Date.now();vi.spyOn(Date,'now').mockReturnValue(now+6000);
+  let replaced=false;
+  const db=interceptDB(async(sql,_args,method,execute)=>{
+   const result=await execute();
+   if(!replaced&&sql.startsWith('SELECT caregiver_plan,created_at FROM events')&&method==='first'){
+    replaced=true;expect((await call('pairing/remove',partner)).status).toBe(200);
+    const invitation=await(await call('caregivers/invite',parent,{name:'Jordan'})).json() as {code:string};
+    expect((await call('caregivers/join',partner,{code:invitation.code,name:'Alex'})).status).toBe(200);
+   }
+   return result;
+  });
+  await runReminder({...testEnv,DB:db},parent.deviceId);expect(replaced).toBe(true);expect(pushRequests).toHaveLength(2);
+  expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM diagnostics WHERE operation='caregiver_routing' AND json_extract(details,'$.caregiver.reason')='family_changed'").first('n')).toBe(1);
+  expect((await env.DB.prepare('SELECT status FROM events ORDER BY created_at DESC LIMIT 1').first<{status:string}>())?.status).toBe('pending');
+  vi.mocked(Date.now).mockReturnValue(now+12000);mockPush(200,2);await runReminder(testEnv,parent.deviceId);
+  expect(pushRequests).toHaveLength(4);
+  expect(pushRequests.slice(2).every(p=>p.url.includes('a'.repeat(64))||p.url.includes('b'.repeat(64)))).toBe(true);
+ });
+ it('repairs an old saved plan whose primary no longer belongs to the family',async()=>{
+  const {parent,listener}=await family();await tokens(parent,'a');
+  const event=alert(listener);mockPush(200,2);await call('listener/event',listener,event);
+  await env.DB.prepare("UPDATE events SET caregiver_plan=json_set(caregiver_plan,'$.primary',?,'$.secondary',NULL) WHERE event_id=?").bind(crypto.randomUUID(),event.eventId).run();
+  expect((await status(parent)).notificationRelevance.cryEpisodeIDs).toContain(event.episodeId);
+  vi.spyOn(Date,'now').mockReturnValue(Date.now()+6000);mockPush(200,2);
+  await runReminder(testEnv,parent.deviceId);expect(pushRequests).toHaveLength(4);
+  expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM diagnostics WHERE operation='caregiver_routing' AND json_extract(details,'$.caregiver.reason')='primary_departed'").first('n')).toBe(1);
+ });
+ it('keeps an ongoing episode on its original primary after an ordinary duty swap',async()=>{
+  const {parent,partner,listener}=await family();await tokens(parent,'a');await tokens(partner,'c');
+  mockPush(200,2);await call('listener/event',listener,alert(listener));
+  const duty=(await status(parent)).caregiverDuty;
+  expect((await call('caregivers/duty',parent,{revision:duty.revision,primaryId:partner.deviceId})).status).toBe(200);
+  vi.spyOn(Date,'now').mockReturnValue(Date.now()+6000);mockPush(200,2);
+  await runReminder(testEnv,parent.deviceId);
+  expect(pushRequests.slice(2).every(p=>p.url.includes('a'.repeat(64))||p.url.includes('b'.repeat(64)))).toBe(true);
+ });
+ it.each(['cry','own test','other caregiver test','revoked caregiver'] as const)('authorizes partner alarm diagnostic references for %s',async(kind)=>{
+  const {parent,partner,listener}=await family();
+  const event={...alert(listener),...(kind.includes('test')?{isTest:true,targetCaregiverId:kind==='own test'?partner.deviceId:parent.deviceId}:{})};
+  await env.DB.prepare('INSERT INTO events(event_id,episode_id,listener_id,parent_id,is_repeat,payload,created_at) VALUES(?,?,?,?,0,?,?)')
+   .bind(event.eventId,event.episodeId,listener.deviceId,parent.deviceId,JSON.stringify(event),Date.now()).run();
+  if(kind==='revoked caregiver')expect((await call('pairing/remove',partner)).status).toBe(200);
+  expect((await call('alarm/attempts',partner,{attempts:[{eventId:event.eventId,method:'extension',outcome:'scheduled',startedAtMs:Date.now()}]})).status).toBe(200);
+  const row=await env.DB.prepare("SELECT event_ref FROM diagnostics WHERE operation='alarm_attempt' ORDER BY sequence DESC LIMIT 1").first<{event_ref:string|null}>();
+  expect(row?.event_ref).toBe(kind==='cry'||kind==='own test'?await eventReference(env,event.eventId):null);
+ });
+ it('rechecks caregiver membership inside the alarm diagnostic insert',async()=>{
+  const {parent,partner,listener}=await family();const event=alert(listener);await call('listener/event',listener,event);
+  let revoked=false;
+  const db=interceptDB(async(sql,_args,method,execute)=>{
+   if(!revoked&&sql.startsWith('INSERT INTO diagnostics')&&sql.includes('CASE WHEN EXISTS')){
+    revoked=true;expect((await call('pairing/remove',partner)).status).toBe(200);
+   }
+   return execute();
+  });
+  const response=await worker.fetch(new Request('https://monitor.test/v1/alarm/attempts',{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${partner.deviceId}.${partner.secret}`},
+   body:JSON.stringify({attempts:[{eventId:event.eventId,method:'app',outcome:'scheduled'}]})}),{...testEnv,DB:db});
+  expect(response.status).toBe(200);expect(revoked).toBe(true);
+  expect((await env.DB.prepare("SELECT event_ref FROM diagnostics WHERE operation='alarm_attempt' ORDER BY sequence DESC LIMIT 1").first<{event_ref:string|null}>())?.event_ref).toBeNull();
+ });
+
  async function family(){
   const {parent,listener}=await paired(),partner=device('parent');await register(partner);
   const invitation=await(await call('caregivers/invite',parent,{name:'Jordan'})).json() as {code:string};
@@ -3666,6 +3861,12 @@ describe('two caregiver families',()=>{
   const advanced=Date.now()+121000;vi.spyOn(Date,'now').mockReturnValue(advanced);mockPush(200,4);
   expect(await runReminder(testEnv,parent.deviceId)).toBe(true);
   expect(pushRequests).toHaveLength(6);
+  const deliveries=(await env.DB.prepare("SELECT details FROM diagnostics WHERE operation='dispatch' ORDER BY sequence").all<{details:string}>()).results;
+  expect(deliveries.slice(2).map(row=>JSON.parse(row.details).caregiver)).toEqual([
+   expect.objectContaining({member:'owner',duty:'primary'}),expect.objectContaining({member:'owner',duty:'primary'}),
+   expect.objectContaining({member:'partner',duty:'secondary'}),expect.objectContaining({member:'partner',duty:'secondary'})]);
+  for(const push of pushRequests){const payload=JSON.parse(String(push.init?.body));expect(payload.diagnosticRef).toBe(await eventReference(env,payload.eventId));expect(payload.deliveryAttempt).toBe(1);}
+  expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM diagnostics WHERE operation='caregiver_routing' AND json_extract(details,'$.caregiver.phase')='plan_created'").first('n')).toBe(1);
   expect((await status(partner)).alerts.length).toBeGreaterThan(0);
   const latest=(await status(partner)).alerts[0].eventId;
   expect((await call('alert/acknowledge',partner,{eventId:latest})).status).toBe(200);
