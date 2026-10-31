@@ -5,6 +5,7 @@ struct PairingView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var code = ""
     @State private var busy = false
+    @State private var joinFamily = false
     var body: some View {
         NavigationStack {
             Form {
@@ -25,10 +26,14 @@ struct PairingView: View {
                     if let error = model.pairingError { Text(error).foregroundStyle(.orange) }
                     if model.paired { Label("Paired successfully", systemImage: "checkmark.circle").foregroundStyle(Palette.mint) }
                 }
+                if model.role == .parent && !model.paired {
+                    Section { Button("Join a family") { joinFamily = true } }
+                }
                 Section { Text("A code expires after 10 minutes and works once. Each iPhone has its own secret stored in Keychain.").font(.footnote) }
             }.navigationTitle("Pair iPhones").toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
                 .task { model.pairingError = nil; if model.role == .parent && !model.paired { run { await model.createPairing() } } }
         }.tint(Palette.mint)
+            .sheet(isPresented: $joinFamily) { CaregiverConnectionView() }
     }
     private func run(_ work: @escaping @MainActor () async -> Void) {
         busy = true; Task { await work(); busy = false }

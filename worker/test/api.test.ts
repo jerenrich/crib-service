@@ -3486,3 +3486,157 @@ describe('late Snooze delivery',()=>{
   expect(saved!.alerts_muted_until).toBeLessThanOrEqual(Date.now()+61000);
  });
 });
+
+describe('two caregiver families',()=>{
+ async function family(){
+  const {parent,listener}=await paired(),partner=device('parent');await register(partner);
+  const invitation=await(await call('caregivers/invite',parent,{name:'Jordan'})).json() as {code:string};
+  expect((await call('caregivers/join',partner,{code:invitation.code,name:'Alex'})).status).toBe(200);
+  return {parent,listener,partner,invitation};
+ }
+ async function status(d:TestDevice){return await(await call('listener/status',d,undefined,'GET')).json() as any;}
+ async function tokens(d:TestDevice,letter:string){
+  expect((await call('device/push-token',d,{token:letter.repeat(64)})).status).toBe(200);
+  expect((await call('device/watch-push-token',d,{token:(letter==='a'?'b':'d').repeat(64)})).status).toBe(200);
+ }
+ it('joins once, shares nursery configuration, and keeps per-person opt-outs through exclusive role swaps',async()=>{
+  const {parent,partner,listener,invitation}=await family();
+  const owner=await status(parent),member=await status(partner);
+  expect(member.paired).toBe(true);expect(member.listenerId).toBe(listener.deviceId);
+  expect(member.caregiverDuty.myId).toBe(partner.deviceId);
+  expect(owner.caregiverDuty.primaryId).toBe(parent.deviceId);
+  expect((await call('caregivers/join',partner,{code:invitation.code,name:'Alex'})).status).toBe(200);
+  let duty=owner.caregiverDuty;
+  const update=async(value:object)=>{const r=await call('caregivers/duty',partner,{revision:duty.revision,...value});expect(r.status).toBe(200);duty=await r.json() as any;};
+  await update({caregiverId:partner.deviceId,secondaryEnabled:false});
+  await update({primaryId:partner.deviceId});await update({primaryId:parent.deviceId});
+  expect(duty.caregivers.find((c:any)=>c.id===partner.deviceId).secondaryEnabled).toBe(false);
+  expect((await call('caregivers/duty',parent,{revision:owner.caregiverDuty.revision,primaryId:partner.deviceId})).status).toBe(409);
+  const outsider=device('parent');await register(outsider);
+  expect((await call('caregivers/duty',outsider,{revision:duty.revision,primaryId:outsider.deviceId})).status).toBe(409);
+  expect((await call('settings',partner,{...defaultConfiguration,alertDuration:120})).status).toBe(200);
+  expect((await status(parent)).configuration.alertDuration).toBe(120);
+ });
+ it('delivers primary phone and Watch first, then secondary after the delay; either person snoozes the family',async()=>{
+  const {parent,partner,listener}=await family();await tokens(parent,'a');await tokens(partner,'c');
+  const event=alert(listener);mockPush(200,2);
+  expect((await call('listener/event',listener,event)).status).toBe(200);
+  expect(pushRequests).toHaveLength(2);
+  expect(pushRequests.map(p=>p.url)).toEqual(expect.arrayContaining([expect.stringContaining('a'.repeat(64)),expect.stringContaining('b'.repeat(64))]));
+  expect((await status(partner)).alerts).toHaveLength(0);
+  const saved=await env.DB.prepare('SELECT caregiver_plan FROM events WHERE event_id=?').bind(event.eventId).first<{caregiver_plan:string}>();
+  const plan=JSON.parse(saved!.caregiver_plan);expect(plan.primary).toBe(parent.deviceId);
+  const advanced=Date.now()+121000;vi.spyOn(Date,'now').mockReturnValue(advanced);mockPush(200,4);
+  expect(await runReminder(testEnv,parent.deviceId)).toBe(true);
+  expect(pushRequests).toHaveLength(6);
+  expect((await status(partner)).alerts.length).toBeGreaterThan(0);
+  const latest=(await status(partner)).alerts[0].eventId;
+  expect((await call('alert/acknowledge',partner,{eventId:latest})).status).toBe(200);
+  expect(Date.parse((await status(parent)).alertsMutedUntil)).toBeGreaterThan(advanced);
+  expect(Date.parse((await status(partner)).alertsMutedUntil)).toBeGreaterThan(advanced);
+  expect((await status(parent)).snoozedBy).toBe(partner.deviceId);
+  const before=pushRequests.length;expect(await runReminder(testEnv,parent.deviceId)).toBe(true);expect(pushRequests).toHaveLength(before);
+ });
+ it('honors secondary opt-out immediately, allows a new primary, and revokes only the departing partner',async()=>{
+  const {parent,partner,listener}=await family();await tokens(parent,'a');await tokens(partner,'c');
+  let duty=(await status(parent)).caregiverDuty;
+  expect((await call('caregivers/duty',parent,{revision:duty.revision,primaryId:partner.deviceId,caregiverId:parent.deviceId,secondaryEnabled:false})).status).toBe(200);
+  mockPush(200,2);const event=alert(listener);expect((await call('listener/event',listener,event)).status).toBe(200);
+  expect(pushRequests.map(p=>p.url)).toEqual(expect.arrayContaining([expect.stringContaining('c'.repeat(64)),expect.stringContaining('d'.repeat(64))]));
+  expect((await status(parent)).alerts).toHaveLength(0);
+  const secondPartner=device('parent');await register(secondPartner);
+  expect((await call('caregivers/invite',parent,{name:'Jordan'})).status).toBe(409);
+  expect((await call('pairing/remove',partner)).status).toBe(200);
+  expect((await status(partner)).paired).toBe(false);expect((await status(parent)).paired).toBe(true);
+  expect((await status(parent)).caregiverDuty.primaryId).toBe(parent.deviceId);
+ });
+ it('rejects a used invitation for another device and rejects cross-family snooze',async()=>{
+  const {parent,partner,listener,invitation}=await family();const outsider=device('parent');await register(outsider);
+  expect((await call('caregivers/join',outsider,{code:invitation.code,name:'Third'})).status).toBe(409);
+  expect((await call('pairing/create',partner)).status).toBe(409);
+  const event=alert(listener);expect((await call('listener/event',listener,event)).status).toBe(200);
+  expect((await call('alert/acknowledge',outsider,{eventId:event.eventId})).status).toBe(404);
+  expect((await status(parent)).alertsMutedUntil).toBeNull();
+ });
+ it('commits only the winning preference in concurrent revision-qualified updates',async()=>{
+  const {parent,partner}=await family();const revision=(await status(parent)).caregiverDuty.revision;
+  const responses=await Promise.all([false,true].map(enabled=>call('caregivers/duty',parent,{revision,caregiverId:partner.deviceId,secondaryEnabled:enabled})));
+  expect(responses.map(r=>r.status).sort()).toEqual([200,409]);
+  const winner=responses.findIndex(r=>r.status===200),duty=(await status(parent)).caregiverDuty;
+  expect(duty.caregivers.find((c:any)=>c.id===partner.deviceId).secondaryEnabled).toBe([false,true][winner]);
+ });
+ it('does not send another destination after a caregiver snoozes during dispatch',async()=>{
+  const {parent,listener}=await family();await tokens(parent,'a');
+  const event=alert(listener);let sends=0;
+  vi.mocked(fetch).mockImplementationOnce(async()=>{
+   sends++;expect((await call('alert/acknowledge',parent,{eventId:event.eventId})).status).toBe(200);
+   return new Response(null,{status:200});
+  });
+  expect((await call('listener/event',listener,event)).status).toBe(200);
+  expect(sends).toBe(1);
+  expect((await status(parent)).alertsMutedUntil).not.toBeNull();
+  const sent=await env.DB.prepare("SELECT COUNT(*) AS count FROM caregiver_deliveries WHERE state='sent'").first<{count:number}>();expect(sent?.count).toBe(1);
+ });
+ it('suppresses a delayed family alert when the Listener already confirmed quiet',async()=>{
+  const {parent,listener}=await family();await tokens(parent,'a');const event=alert(listener);
+  const pair=await env.DB.prepare('SELECT created_at FROM pairs WHERE parent_id=?').bind(parent.deviceId).first<{created_at:number}>();
+  await env.DB.prepare('INSERT INTO resolved_episodes(parent_id,listener_id,pair_created_at,episode_id,resolved_at) VALUES(?,?,?,?,?)').bind(parent.deviceId,listener.deviceId,pair!.created_at,event.episodeId,new Date().toISOString()).run();
+  const response=await call('listener/event',listener,event);expect(response.status).toBe(200);expect((await response.json() as any).status).toBe('resolved');expect(pushRequests).toHaveLength(0);
+ });
+
+ it('tests the invited caregiver’s own phone and Watch rather than the original Parent’s devices',async()=>{
+  const {parent,partner,listener}=await family();await tokens(partner,'c');
+  expect((await call('silent-watch-alarms',partner,{enabled:true})).status).toBe(200);
+  mockPush(200);expect((await call('watch-test/push',partner)).status).toBe(200);expect(pushRequests[0].url).toContain('d'.repeat(64));
+  const configuration={alarmKit:false,phone:true,watch:true,repeatInterval:5,count:1,sharedCollapseIDs:false,distinctRequestIDs:false,coalesceRepeats:false,groupNotifications:false,phoneHeadStartMS:0};
+  expect((await call('alert-test',partner,{id:crypto.randomUUID(),configuration})).status).toBe(200);
+  const record=await env.DB.prepare('SELECT created_at FROM pairs WHERE parent_id=?').bind(parent.deviceId).first<{created_at:number}>();
+  const stub=env.ALERT_TESTS.get(env.ALERT_TESTS.idFromName(`${parent.deviceId}|${listener.deviceId}|${record!.created_at}|${partner.deviceId}`));
+  await runInDurableObject(stub,async(_instance,state)=>{
+   const session=await state.storage.get<{nextAt:string}>('session');session!.nextAt=new Date(Date.now()-1).toISOString();
+   await state.storage.put('session',session);await state.storage.setAlarm(Date.now()+60000);
+  });
+  mockPush(200,2);await runDurableObjectAlarm(stub);
+  expect(pushRequests.slice(1).map(r=>r.url)).toEqual(expect.arrayContaining([expect.stringContaining('c'.repeat(64)),expect.stringContaining('d'.repeat(64))]));
+  expect((await status(parent)).alerts).toHaveLength(0);expect((await status(partner)).alerts).toHaveLength(1);
+ });
+
+ it('starts escalation from server dispatch rather than a delayed upload’s client timestamp',async()=>{
+  const {parent,partner,listener}=await family();await tokens(parent,'a');await tokens(partner,'c');
+  const began=Date.now(),pairedAt=began-3600000;
+  await env.DB.batch([env.DB.prepare('UPDATE pairs SET created_at=? WHERE parent_id=?').bind(pairedAt,parent.deviceId),env.DB.prepare('UPDATE caregiver_families SET pair_created_at=? WHERE owner_id=?').bind(pairedAt,parent.deviceId)]);
+  const event={...alert(listener),createdAt:new Date(began-180000).toISOString(),cryStartedAt:new Date(began-480000).toISOString()};mockPush(200,2);
+  expect((await call('listener/event',listener,event)).status).toBe(200);expect(pushRequests).toHaveLength(2);
+  expect((await status(partner)).alerts).toHaveLength(0);
+  const row=await env.DB.prepare('SELECT caregiver_plan FROM events WHERE event_id=?').bind(event.eventId).first<{caregiver_plan:string}>();
+  expect(JSON.parse(row!.caregiver_plan).started).toBeGreaterThanOrEqual(began);
+ });
+
+ it('keeps silent-alarm recovery receipts separate for the invited caregiver',async()=>{
+  const {parent,partner,listener}=await family();await tokens(parent,'a');await tokens(partner,'c');
+  expect((await call('device/push-token',partner,{token:'c'.repeat(64),alarmReceiptsVersion:1})).status).toBe(200);
+  expect((await call('silent-watch-alarms',partner,{enabled:true})).status).toBe(200);
+  const duty=(await status(parent)).caregiverDuty;
+  expect((await call('caregivers/duty',partner,{revision:duty.revision,primaryId:partner.deviceId})).status).toBe(200);
+  const event=alert(listener);mockPush(200,2);expect((await call('listener/event',listener,event)).status).toBe(200);
+  const push=JSON.parse(pushRequests.find(p=>p.url.includes('c'.repeat(64)))!.init!.body as string);
+  expect(push.silentCryAlarm).toBe(true);expect(push.alarmCycleId).toBeDefined();
+  const receipt={episodeId:event.episodeId,eventId:event.eventId,cycleId:push.alarmCycleId};
+  expect((await call('alarm/scheduled',partner,receipt)).status).toBe(200);
+  expect((await call('alarm/scheduled',parent,receipt)).status).toBe(409);
+  vi.spyOn(Date,'now').mockReturnValue(Date.now()+6000);mockPush(200,2);await runReminder(testEnv,parent.deviceId);
+  const repeat=JSON.parse(pushRequests.slice(2).find(p=>p.url.includes('c'.repeat(64)))!.init!.body as string);
+  expect(repeat.silentCryAlarm).toBeUndefined();
+ });
+
+ it('invalidates an unused nursery pairing code when a caregiver joins a family',async()=>{
+  const {parent,listener}=await paired(),partner=device('parent');await register(partner);
+  const nurseryCode=await(await call('pairing/create',partner)).json() as {code:string};
+  const invitation=await(await call('caregivers/invite',parent,{name:'Jordan'})).json() as {code:string};
+  expect((await call('caregivers/join',partner,{code:invitation.code,name:'Alex'})).status).toBe(200);
+  const otherListener=device('listener');await register(otherListener);
+  expect((await call('pairing/claim',otherListener,{code:nurseryCode.code})).status).toBe(400);
+  expect((await status(partner)).listenerId).toBe(listener.deviceId);
+ });
+
+});

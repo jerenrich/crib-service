@@ -51,6 +51,44 @@ final class OnboardingUITests: XCTestCase {
         XCTAssertFalse(app.staticTexts["Test notification"].exists)
     }
 
+    @MainActor func testCompactCaregiverControlsFitWithoutScrolling() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", "--uitesting-active-alert", "--uitesting-caregivers"]
+        app.launch()
+        let swap = app.buttons["swapCaregiverRoles"]
+        XCTAssertTrue(swap.waitForExistence(timeout: 5))
+        let window = app.windows.firstMatch.frame
+        for element in [swap, app.buttons["nightstandSnooze"], app.buttons["editAlertTiming"],
+                        app.buttons["nightstandMonitoringControl"], app.switches["secondaryCaregiverEnabled"]] {
+            XCTAssertTrue(element.isHittable, "Caregiver control is not visible: \(element)")
+            XCTAssertTrue(window.contains(element.frame), "Caregiver control is outside the screen: \(element.frame)")
+        }
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = "Compact caregiver alert screen"; shot.lifetime = .keepAlways; add(shot)
+    }
+
+    @MainActor func testCompactParentControlsFitWithoutScrolling() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", "--uitesting-active-alert"]
+        app.launch()
+        let snooze = app.buttons["nightstandSnooze"]
+        XCTAssertTrue(snooze.waitForExistence(timeout: 5))
+        XCTAssertEqual(app.buttons.matching(identifier: "nightstandSnooze").count, 1)
+        XCTAssertFalse(app.buttons["I’m on it"].exists)
+        let window = app.windows.firstMatch.frame
+        XCTAssertLessThan(app.buttons["nightstandDetails"].frame.minY, window.minY + 110,
+                          "The compact screen should start near the top safe area")
+        for element in [snooze, app.buttons["editAlertTiming"], app.buttons["nightstandMonitoringControl"],
+                        app.descendants(matching: .any)["soundLevelChart"].firstMatch] {
+            XCTAssertTrue(element.isHittable, "Essential control is not visible: \(element)")
+            XCTAssertTrue(window.contains(element.frame), "Essential control extends beyond the screen: \(element.frame)")
+        }
+        XCTAssertGreaterThanOrEqual(snooze.frame.width, 44)
+        XCTAssertLessThan(snooze.frame.width, 180, "Snooze should be the compact status circle")
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = "Compact Parent layout"; shot.lifetime = .keepAlways; add(shot)
+    }
+
     @MainActor func testActiveAlertOffersOneTapSnoozeOnMonitor() {
         let app = XCUIApplication()
         app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", "--uitesting-active-alert"]

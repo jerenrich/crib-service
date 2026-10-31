@@ -6,7 +6,7 @@ import {PhoneHeadStart} from './notification-coordination';
 import {Latency} from './latency';
 import {eventReference,recordDiagnostic} from './diagnostics';
 
-type Pair={parent_id:string;listener_id:string;created_at:number};
+type Pair={parent_id:string;listener_id:string;created_at:number;recipient_id?:string};
 export interface AlertTestConfiguration {
  alarmKit:boolean;phone:boolean;watch:boolean;repeatInterval:number;count:number;
  sharedCollapseIDs:boolean;distinctRequestIDs:boolean;coalesceRepeats:boolean;groupNotifications:boolean;
@@ -28,11 +28,12 @@ export function alertTestConfiguration(value:Record<string,unknown>):AlertTestCo
  return Object.fromEntries(keys.map(key=>[key,value[key]])) as unknown as AlertTestConfiguration;
 }
 function room(env:Env,pair:Pair) {
- return env.ALERT_TESTS.get(env.ALERT_TESTS.idFromName(`${pair.parent_id}|${pair.listener_id}|${pair.created_at}`));
+ return env.ALERT_TESTS.get(env.ALERT_TESTS.idFromName(`${pair.parent_id}|${pair.listener_id}|${pair.created_at}${pair.recipient_id?`|${pair.recipient_id}`:''}`));
 }
 export async function configureAlertTest(env:Env,device:Device,operation:'status'|'start'|'stop',value:Record<string,unknown>={}) {
- const pair=await pairFor(env,device);
+ const pair:Pair|null=await pairFor(env,device);
  if(!pair)throw new APIError(409,'Pair both iPhones before testing.');
+ if(device.role==='parent'&&device.id!==pair.parent_id)pair.recipient_id=device.id;
  let input:Record<string,unknown>={pair};
  if(operation==='start'){
   const id=uuid(value.id);
@@ -81,8 +82,8 @@ export class AlertTests {
   });
  }
  private tokens(pair:Pair) {
-  return this.env.DB.prepare(`SELECT d.push_token,d.watch_push_token,d.silent_watch_alarms,d.alarm_app_wake,d.alarm_extension FROM devices d JOIN pairs p ON p.parent_id=d.id
-   WHERE p.parent_id=? AND p.listener_id=? AND p.created_at=?`).bind(pair.parent_id,pair.listener_id,pair.created_at)
+  return this.env.DB.prepare(`SELECT d.push_token,d.watch_push_token,d.silent_watch_alarms,d.alarm_app_wake,d.alarm_extension FROM devices d JOIN pairs p ON p.parent_id=?
+   WHERE d.id=? AND p.listener_id=? AND p.created_at=? AND (d.id=p.parent_id OR EXISTS(SELECT 1 FROM caregiver_families f WHERE f.owner_id=p.parent_id AND f.partner_id=d.id AND f.pair_created_at=p.created_at))`).bind(pair.parent_id,pair.recipient_id??pair.parent_id,pair.listener_id,pair.created_at)
    .first<{push_token:string|null;watch_push_token:string|null;silent_watch_alarms:number;alarm_app_wake:number;alarm_extension:number}>();
  }
  async alarm():Promise<void> {
@@ -101,7 +102,7 @@ export class AlertTests {
    if(!tokens){await finish('stopped','Pairing changed; test stopped.');return;}
    const options=session.configuration,now=new Date().toISOString();
    const alert:Alert={eventId:crypto.randomUUID(),episodeId:session.id,listenerId:session.pair.listener_id,type:'sustained_cry',
-    cryStartedAt:now,createdAt:now,durationSeconds:0,isRepeat:session.completedCount>0,isTest:true};
+    cryStartedAt:now,createdAt:now,durationSeconds:0,isRepeat:session.completedCount>0,isTest:true,...(session.pair.recipient_id?{targetCaregiverId:session.pair.recipient_id}:{})};
    const nextRoundAt=Date.now()+options.repeatInterval*1000;
    session.completedCount++;
    session.state='running';session.dispatching=true;

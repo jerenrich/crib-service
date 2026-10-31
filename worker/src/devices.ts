@@ -82,7 +82,10 @@ export async function savePushToken(env:Env,device:Device,value:Record<string,un
  return {ok:true};
 }
 export async function pairFor(env:Env,device:Device):Promise<{parent_id:string;listener_id:string;created_at:number}|null> {
- return env.DB.prepare(`SELECT * FROM pairs WHERE ${device.role==='parent'?'parent_id':'listener_id'}=?`).bind(device.id).first();
+ if(device.familyAuthorization)return env.DB.prepare(`SELECT p.* FROM pairs p JOIN caregiver_families f ON f.owner_id=p.parent_id AND f.pair_created_at=p.created_at WHERE p.parent_id=? AND p.created_at=? AND f.partner_id=?`).bind(device.id,device.familyAuthorization.pairCreatedAt,device.familyAuthorization.memberId).first();
+ const own=await env.DB.prepare(`SELECT * FROM pairs WHERE ${device.role==='parent'?'parent_id':'listener_id'}=?`).bind(device.id).first<{parent_id:string;listener_id:string;created_at:number}>();
+ if(own||device.role!=='parent')return own;
+ return env.DB.prepare('SELECT p.* FROM pairs p JOIN caregiver_families f ON f.owner_id=p.parent_id AND f.pair_created_at=p.created_at WHERE f.partner_id=?').bind(device.id).first();
 }
 
 // A single D1 transaction cancels queued delivery and revokes the old relationship.

@@ -195,7 +195,7 @@ export async function runReminder(env:Env,parentId:string,latency=new Latency(),
  latency.details.dispatch_source='reminder';latency.details.preparation_started_at_ms=now;
  const preparation=()=>{latency.details.spans!.reminder_prepare_ms=Math.max(0,performance.now()-startedMono);latency.details.preparation_finished_at_ms=Date.now();};
  const stop=(reason:typeof latency.details.exit_reason)=>{stopped=true;latency.details.exit_reason=reason;return false;};
- const send=async(id:string,insert?:D1PreparedStatement)=>{eventId=id;preparation();handedOff=true;await dispatchEvent(env,id,undefined,latency,{insert,accepted:delivery.accepted,background:delivery.background});};
+ const send=async(id:string,insert?:D1PreparedStatement)=>{if(insert&&await env.DB.prepare('SELECT 1 FROM caregiver_families WHERE owner_id=? AND partner_id IS NOT NULL').bind(parentId).first()){await insert.run();insert=undefined;}eventId=id;preparation();handedOff=true;await dispatchEvent(env,id,undefined,latency,{insert,accepted:delivery.accepted,background:delivery.background});};
  try {
  const read=async<T>(name:Span,statement:D1PreparedStatement)=>{const [result]=await latency.readOnly<T>(name,()=>statement.all<T>());return result.results[0];};
  // One consistent read-only snapshot replaces three sequential round trips.

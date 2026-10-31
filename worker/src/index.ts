@@ -1,3 +1,4 @@
+import {familyFor,sharedDevice,decorateFamilyStatus,inviteCaregiver,joinCaregiver,updateDuty,detachCaregiver} from './caregivers';
 import {confirmAlarmScheduled,recordAlarmAttempts} from './alarm-scheduling';
 import {retiredWatchTest,sendWatchTest} from './watch-test';
 import {sendStandaloneProbe} from './watch-latency-probe';
@@ -75,7 +76,14 @@ export default {
     const requestLimit=alertTestControl?1200:watchTestPush?660:600;
     if(!alertUpload&&!heartbeatUpload&&!alertTestStart)await latency.measure('rate_limit_ms',()=>rateLimit(env,scope,device.id,requestLimit,600,latency,'device_rate_limit_ms'));
     stage='handler';
+    const family=device.role==='parent'?await familyFor(env,device):null;
+    const sharedRoutes=['GET /v1/listener/status','GET /v1/timeline','GET /v1/live-sound','POST /v1/monitoring','POST /v1/settings','POST /v1/alert/resume','POST /v1/alert/acknowledge','POST /v1/connection-alerts'];
+    const shared=sharedRoutes.includes(route)?await sharedDevice(env,device,family):device;
     const special=await latency.measure('handler_ms',async()=>{switch(route){
+     case 'POST /v1/caregivers/invite':result=await inviteCaregiver(env,device,await body(request));break;
+     case 'POST /v1/caregivers/join':result=await joinCaregiver(env,device,await body(request),ip);break;
+     case 'POST /v1/caregivers/duty':result=await updateDuty(env,device,await body(request));break;
+
      case 'POST /v1/pairing/create':result=await createPairing(env,device);break;
      case 'POST /v1/pairing/claim':result=await claimPairing(env,device,await body(request),ip);break;
      case 'POST /v1/device/push-token':result=await savePushToken(env,device,await body(request));break;
@@ -91,9 +99,9 @@ export default {
      case 'POST /v1/alarm/scheduled':result=await confirmAlarmScheduled(env,device,await body(request),latency);break;
      case 'POST /v1/alarm/attempts':result=await recordAlarmAttempts(env,device,await body(request),requestId);break;
      case 'POST /v1/silent-watch-alarms':result=await saveSilentWatchAlarms(env,device,await body(request));break;
-     case 'POST /v1/pairing/remove':result=await removeDeviceData(env,device);break;
-     case 'POST /v1/device/delete':result=await removeDeviceData(env,device,true);break;
-     case 'POST /v1/connection-alerts':result=await connectionPreferences(env,device,await body(request));break;
+     case 'POST /v1/pairing/remove':result=family&&await detachCaregiver(env,device,family)?{ok:true}:await removeDeviceData(env,device);break;
+     case 'POST /v1/device/delete':result=family&&await detachCaregiver(env,device,family,true)?{ok:true}:await removeDeviceData(env,device,true);break;
+     case 'POST /v1/connection-alerts':result=await connectionPreferences(env,shared,await body(request));break;
      case 'GET /v1/alert-test':result=await configureAlertTest(env,device,'status');break;
      case 'POST /v1/alert-test':
       // Interactive comparisons need more starts than the older one-shot tests.
@@ -126,14 +134,15 @@ export default {
      }
      case 'POST /v1/listener/heartbeat':result=await saveHeartbeat(env,device,await latency.measure('body_read_ms',()=>body(request)),latency);break;
      case 'POST /v1/listener/event':result=await receiveAlert(env,device,await latency.measure('body_read_ms',()=>body(request)),requestId,latency,ctx);break;
-     case 'GET /v1/timeline':result=await timeline(env,device);break;
-     case 'GET /v1/listener/status':result=await listenerStatus(env,device,latency);break;
-     case 'GET /v1/live-sound':return await openLiveSound(env,device,request);
-     case 'POST /v1/monitoring':result=await requestMonitoring(env,device,await body(request));break;
+     case 'GET /v1/timeline':result=await timeline(env,shared);break;
+     case 'GET /v1/listener/status':result=await listenerStatus(env,shared,latency);
+      if(family)result=await decorateFamilyStatus(env,device,family,result);break;
+     case 'GET /v1/live-sound':return await openLiveSound(env,shared,request);
+     case 'POST /v1/monitoring':result=await requestMonitoring(env,shared,await body(request));break;
      case 'POST /v1/monitoring/complete':result=await completeMonitoring(env,device,await body(request));break;
-     case 'POST /v1/settings':result=await saveSettings(env,device,await body(request));break;
-     case 'POST /v1/alert/resume':result=await resumeAlerts(env,device,await body(request));break;
-     case 'POST /v1/alert/acknowledge':result=await acknowledge(env,device,await body(request));break;
+     case 'POST /v1/settings':result=await saveSettings(env,shared,await body(request));break;
+     case 'POST /v1/alert/resume':result=await resumeAlerts(env,shared,await body(request));break;
+     case 'POST /v1/alert/acknowledge':result=await acknowledge(env,shared,await body(request),device.id);break;
      default:throw new APIError(404,'Endpoint not found.');
     }});
     if(special instanceof Response)return special;
