@@ -314,6 +314,7 @@ import UIKit
                 state: .quiet, configuration: configuration, microphoneActive: true)
             if ProcessInfo.processInfo.arguments.contains("--uitesting-microphone-off") {
                 status.monitoring = false; status.microphoneActive = false
+                if role == .listener { monitoring = false; microphoneActive = false }
             }
             if ProcessInfo.processInfo.arguments.contains("--uitesting-listener-stale") {
                 status.lastHeartbeat = now.addingTimeInterval(-180)

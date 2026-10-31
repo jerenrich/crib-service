@@ -517,7 +517,7 @@ struct NightstandView: View {
                     heroDetail(hero).font(.footnote).foregroundStyle(Palette.muted)
                 } else {
                     Text(spokenDuration(model.configuration.snoozeDuration)).font(.subheadline)
-                    Text(model.monitoring ? "Nursery keeps listening" : hero.title).font(.caption).foregroundStyle(Palette.muted)
+                    Text(model.monitoring ? "Nursery keeps listening" : model.microphoneActive ? "Detection paused" : "Microphone inactive").font(.caption).foregroundStyle(Palette.muted)
                 }
             }
             .foregroundStyle(Palette.amber).multilineTextAlignment(.center)
