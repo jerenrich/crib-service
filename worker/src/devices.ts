@@ -81,8 +81,33 @@ export async function savePushToken(env:Env,device:Device,value:Record<string,un
  ]);
  return {ok:true};
 }
+// Include in the actual read/write transaction, not only an earlier pair lookup:
+// a partner or nursery may be removed while a request is waiting for D1.
+export function sharedAccess(device:Device):{sql:string;args:(string|number)[]} {
+ if(device.listenerAuthorization)return {sql:'EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?)',args:[device.id,device.listenerAuthorization.listenerId,device.listenerAuthorization.pairCreatedAt]};
+ const authorization=device.familyAuthorization;
+ return authorization?{sql:`EXISTS(SELECT 1 FROM caregiver_families access_family JOIN pairs access_pair
+  ON access_pair.parent_id=access_family.owner_id AND access_pair.created_at=access_family.pair_created_at
+  WHERE access_family.owner_id=? AND access_family.partner_id=? AND access_family.pair_created_at=?)`,
+  args:[device.id,authorization.memberId,authorization.pairCreatedAt]}:{sql:'1',args:[]};
+}
 export async function pairFor(env:Env,device:Device):Promise<{parent_id:string;listener_id:string;created_at:number}|null> {
- return env.DB.prepare(`SELECT * FROM pairs WHERE ${device.role==='parent'?'parent_id':'listener_id'}=?`).bind(device.id).first();
+ if(device.listenerAuthorization)return env.DB.prepare('SELECT * FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?').bind(device.id,device.listenerAuthorization.listenerId,device.listenerAuthorization.pairCreatedAt).first();
+ if(device.familyAuthorization)return env.DB.prepare(`SELECT p.* FROM pairs p JOIN caregiver_families f ON f.owner_id=p.parent_id AND f.pair_created_at=p.created_at WHERE p.parent_id=? AND p.created_at=? AND f.partner_id=?`).bind(device.id,device.familyAuthorization.pairCreatedAt,device.familyAuthorization.memberId).first();
+ const own=await env.DB.prepare(`SELECT * FROM pairs WHERE ${device.role==='parent'?'parent_id':'listener_id'}=?`).bind(device.id).first<{parent_id:string;listener_id:string;created_at:number}>();
+ if(own||device.role!=='parent')return own;
+ return env.DB.prepare('SELECT p.* FROM pairs p JOIN caregiver_families f ON f.owner_id=p.parent_id AND f.pair_created_at=p.created_at WHERE f.partner_id=?').bind(device.id).first();
+}
+
+// Only Snooze/Resume routes use this household identity. It cannot authorize
+// tests, token registration, caregiver duty, or another nursery's events.
+export async function listenerSnoozeDevice(env:Env,device:Device):Promise<Device> {
+ requireRole(device,'listener');
+ const pair=await pairFor(env,device);if(!pair)throw new APIError(409,'Pair the nursery iPhone before snoozing alerts.');
+ const parent=await env.DB.prepare('SELECT d.* FROM devices d JOIN pairs p ON p.parent_id=d.id WHERE p.parent_id=? AND p.listener_id=? AND p.created_at=?')
+  .bind(pair.parent_id,device.id,pair.created_at).first<Device>();
+ if(!parent)throw new APIError(409,'Pairing changed. Refresh and try again.');
+ return {...parent,listenerAuthorization:{listenerId:device.id,pairCreatedAt:pair.created_at}};
 }
 
 // A single D1 transaction cancels queued delivery and revokes the old relationship.
@@ -91,6 +116,8 @@ export async function removeDeviceData(env:Env,device:Device,deleteDevice=false)
  const pair=await pairFor(env,device);
  const listener=pair?.listener_id??device.id, parent=pair?.parent_id??device.id;
  await env.DB.batch([
+  env.DB.prepare('DELETE FROM caregiver_invites WHERE owner_id=?').bind(parent),
+  env.DB.prepare('DELETE FROM caregiver_families WHERE owner_id=?').bind(parent),
   env.DB.prepare('UPDATE devices SET alerts_muted_until=0,alerts_muted_at=0,silent_watch_alarms=0 WHERE id=?').bind(parent),
   env.DB.prepare('DELETE FROM monitoring_commands WHERE listener_id=? OR parent_id=?').bind(listener,parent),
   env.DB.prepare('DELETE FROM resolved_episodes WHERE listener_id=? OR parent_id=?').bind(listener,parent),

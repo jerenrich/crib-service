@@ -49,7 +49,7 @@ import Observation
         "watch_snapshot_failed", "watch_snapshot_received", "watch_command_queued", "watch_command_failed", "watch_push_received",
         "monitoring_start_blocked_safety", "monitoring_start_blocked_storage", "test_push_failed",
         "acknowledgement_failed", "connection_preferences_failed", "device_removal_failed",
-        "calibration_failed", "listener_status_failed", "monitoring_control_failed", "resume_alerts_failed", "timeline_failed"
+        "calibration_failed", "listener_status_failed", "monitoring_control_failed", "resume_alerts_failed", "stop_alerts_failed", "timeline_failed"
     ]
     init(directory: URL? = nil) {
         let folder = directory ?? (try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true))
@@ -171,7 +171,7 @@ import Observation
     func network(operation: String, outcome: String, status: Int? = nil, requestID: UUID? = nil,
                  elapsedMS: Int, storageUnavailable: Bool = false, error: (any Error)? = nil, eventID: UUID? = nil, benchmarkAttempt: UUID? = nil, serverDiagnosticMS: Int? = nil, diagnosticState: String? = nil,
                  metrics: DiagnosticNetworkTiming? = nil, clock: DiagnosticClockSample? = nil, monotonic: Bool = false, clientRequestID: UUID? = nil) {
-        let operations: Set<String> = ["alarm_scheduled", "alarm_attempts", "alarm_settings", "alert_test_status", "register", "pairing_create", "pairing_claim", "push_token", "watch_token", "heartbeat", "alert", "status", "timeline", "monitoring", "monitoring_complete", "settings", "acknowledge", "test_push", "connection_preferences", "unpair", "delete_device", "resume_alerts"]
+        let operations: Set<String> = ["alarm_scheduled", "alarm_attempts", "alarm_settings", "alert_test_status", "register", "pairing_create", "pairing_claim", "push_token", "watch_token", "heartbeat", "alert", "status", "timeline", "monitoring", "monitoring_complete", "settings", "acknowledge", "test_push", "connection_preferences", "unpair", "delete_device", "resume_alerts", "stop_alerts"]
         guard operations.contains(operation), ["ok", "http_error", "transport_error", "decode_error", "encode_error", "cancelled", "invalid_response"].contains(outcome) else { return }
         if operation == "status" {
             benchmark.requestFinished(benchmarkAttempt, outcome: outcome, requestID: requestID, status: status, elapsedMS: elapsedMS)

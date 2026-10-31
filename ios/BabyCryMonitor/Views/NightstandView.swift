@@ -19,7 +19,9 @@ struct NightstandView: View {
     @State private var soundsPresented = false
     @State private var lastInteraction = Date()
     @ScaledMetric(relativeTo: .caption) private var chartHeader: CGFloat = 40
-    private let ringSize: CGFloat = 200
+    private var ringSize: CGFloat { listener ? 200 : hasTwoCaregivers ? 96 : 112 }
+    private var hasTwoCaregivers: Bool { model.caregiverDuty?.caregivers.count == 2 }
+
 
     private var listener: Bool { role == .listener }
     private var soundLive: Bool { listener ? model.monitoring : model.parentHasLiveMonitoring }
@@ -46,7 +48,7 @@ struct NightstandView: View {
         model.snapshot.current.map { model.snapshot.alertStatus(for: $0) == .failed } == true
     }
     private var snoozedUntil: Date? {
-        guard !listener, let until = model.parentStatus?.alertsMutedUntil, until > model.now else { return nil }
+        guard let until = model.alertStatus?.alertsMutedUntil, until > model.now else { return nil }
         return until
     }
 
@@ -112,7 +114,10 @@ struct NightstandView: View {
         }
         if let until = snoozedUntil {
             let remaining = max(0, until.timeIntervalSince(date)) / max(1, model.configuration.snoozeDuration)
-            return Hero(title: "Alerts snoozed", detail: "Resumes in", tone: .caution, ring: .progress(min(1, remaining)), icon: "bell.slash", resumesAt: until)
+            let actor = (model.alertStatus?.snoozedBy).flatMap { id in
+                id == model.alertStatus?.listenerId ? "Nursery iPhone" : model.caregiverDuty?.caregivers.first { $0.id == id }?.name
+            }
+            return Hero(title: "Alerts snoozed", detail: actor.map { "\($0) snoozed · Resumes in" } ?? "Resumes in", tone: .caution, ring: .progress(min(1, remaining)), icon: "bell.slash", resumesAt: until)
         }
         if standby {
             return Hero(title: "Standby", detail: "Microphone active · Detection paused", tone: .inactive, icon: "pause.circle")
@@ -146,6 +151,11 @@ struct NightstandView: View {
         if !model.paired && !model.monitoring {
             return Hero(title: "Not paired", detail: "Pair with the Parent iPhone to begin.", tone: .inactive, icon: "link")
         }
+        if let until = snoozedUntil {
+            let remaining = max(0, until.timeIntervalSince(date)) / max(1, model.configuration.snoozeDuration)
+            return Hero(title: "Alerts snoozed", detail: "Resumes in", tone: .caution,
+                        ring: .progress(min(1, remaining)), icon: "bell.slash", resumesAt: until)
+        }
         if standby {
             return Hero(title: "Standby", detail: "Microphone active · Detection paused", tone: .inactive, icon: "pause.circle")
         }
@@ -156,6 +166,9 @@ struct NightstandView: View {
         }
         if model.paired, model.connectivity.checked, !model.connectivity.available {
             return Hero(title: "Internet unavailable", detail: "Alerts can't be delivered right now.", tone: .caution, ring: .dashed, icon: "wifi.slash")
+        }
+        if model.activeAlert != nil {
+            return Hero(title: "Check on baby", detail: "Crying-like sound detected", tone: .alert, ring: .full, icon: "bell.fill")
         }
         return liveHero(alertSent: model.snapshot.current?.alertSentAt != nil, at: date)
     }
@@ -267,7 +280,13 @@ struct NightstandView: View {
 
     var body: some View {
         Group {
-            if typeSize.isAccessibilitySize {
+            if !listener {
+                ViewThatFits(in: .vertical) {
+                    compactParentContents
+                    ScrollView { compactParentContents }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            } else if typeSize.isAccessibilitySize {
                 // Large accessibility text needs its full reading height.
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
@@ -278,6 +297,7 @@ struct NightstandView: View {
                         soundPanel.frame(height: 100 + chartHeader)
                         NurserySoundButton { soundsPresented = true }
                         actions
+                        stopAlertsControl
                         disclaimer
                     }
                     .padding(.horizontal, 20)
@@ -292,6 +312,7 @@ struct NightstandView: View {
                     soundPanel.frame(minHeight: 60, maxHeight: .infinity)
                     NurserySoundButton { soundsPresented = true }
                     actions
+                    stopAlertsControl
                     disclaimer
                 }
                 .padding(.horizontal, 20)
@@ -338,11 +359,58 @@ struct NightstandView: View {
         .sheet(isPresented: $detailsPresented) { detailsSheet }
     }
 
+    /// Keep the Parent's essential controls near the top. On short screens and
+    /// with larger text, the same content can scroll rather than being clipped.
+    private var compactParentContents: some View {
+        VStack(spacing: 8) {
+            header
+            timedHero
+            stopAlertsControl
+            soundPanel.frame(height: hasTwoCaregivers ? 80 : 84)
+            if hasTwoCaregivers { CaregiverDutyCard() }
+            timingSummary
+            NurserySoundButton { soundsPresented = true }
+            if !hasTwoCaregivers || needsConnectionRecovery || parentStartUnavailable || !model.paired { actions }
+            if !hasTwoCaregivers { disclaimer }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .top)
+    }
+
+    private var timingSummary: some View {
+        Button { timing = true } label: {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Alert timing").font(.subheadline.weight(.semibold))
+                    Text("Cry \(spokenDuration(timingPending ? model.configuration.alertDuration : alertDuration)) · Snooze \(spokenDuration(model.configuration.snoozeDuration))")
+                        .font(.caption).foregroundStyle(Palette.muted)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if timingPending {
+                        Text("Waiting for nursery confirmation").font(.caption).foregroundStyle(Palette.amber)
+                    }
+                }
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.right").foregroundStyle(Palette.lavender)
+            }
+            .padding(12).frame(maxWidth: .infinity, minHeight: 56, alignment: .leading)
+            .background(Palette.panel, in: RoundedRectangle(cornerRadius: 16))
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("editAlertTiming")
+    }
+
     private var header: some View {
         HStack(spacing: 10) {
             Label(listener ? "Nursery iPhone" : "Parent iPhone", systemImage: listener ? "mic" : "bell")
                 .font(.subheadline).foregroundStyle(Palette.muted)
             Spacer(minLength: 8)
+            if !listener && hasTwoCaregivers && !parentStartUnavailable && model.paired {
+                Button(action: toggleMonitoring) {
+                    Image(systemName: monitoringActive ? "pause.fill" : "play.fill").frame(width: 44, height: 44)
+                }.disabled(busy || model.managingDevice)
+                    .accessibilityLabel(controlTitle).accessibilityIdentifier("nightstandMonitoringControl")
+            }
             Button { detailsPresented = true } label: {
                 Label("Details", systemImage: "info.circle").font(.subheadline)
                     .padding(.horizontal, 14).frame(minHeight: 44).background(Palette.panel, in: Capsule())
@@ -364,14 +432,115 @@ struct NightstandView: View {
         return SwiftUI.TimelineView(.animation(minimumInterval: 1.0 / 30, paused: !animating)) { context in
             let value = hero(at: animating ? max(context.date, model.now) : model.now)
             if typeSize.isAccessibilitySize {
-                heroText(value)
+                VStack(spacing: 10) {
+                    heroText(value)
+                    if !listener { parentHeroControl(value) }
+                    else if snoozedUntil != nil || model.activeAlert != nil { listenerHeroRing(value) }
+                }
             } else {
                 heroRing(value)
             }
         }
     }
 
-    private func heroRing(_ hero: Hero) -> some View {
+    @ViewBuilder private func heroRing(_ hero: Hero) -> some View {
+        if !listener {
+            VStack(spacing: 6) {
+                heroTitle(hero).font(.system(.title2, design: .rounded).weight(.semibold))
+                    .multilineTextAlignment(.center)
+                heroDetail(hero).font(.footnote).foregroundStyle(Palette.muted)
+                    .multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
+                parentHeroControl(hero)
+            }
+            .frame(maxWidth: .infinity)
+        } else {
+            listenerHeroRing(hero)
+        }
+    }
+
+    @ViewBuilder private func parentHeroControl(_ hero: Hero) -> some View {
+        if let until = snoozedUntil {
+            Button { Task { await model.resumeAlerts(until: until) } } label: {
+                parentCircle(hero, title: model.resumingAlerts ? "Resuming…" : "Resume", detail: "alerts", icon: "play.fill")
+            }
+            .buttonStyle(.plain)
+            .disabled(model.resumingAlerts || model.managingDevice)
+            .accessibilityLabel("Resume alerts")
+            .accessibilityIdentifier("nightstandResumeAlerts")
+        } else if let alert = model.activeAlert {
+            Button { Task { await model.acknowledge(alert.eventId) } } label: {
+                parentCircle(hero, title: model.acknowledgingAlert ? "Snoozing…" : "Snooze",
+                             detail: spokenDuration(model.configuration.snoozeDuration), icon: "bell.slash")
+            }
+            .buttonStyle(.plain)
+            .disabled(model.acknowledgingAlert || model.managingDevice)
+            .accessibilityLabel("Snooze alerts for \(spokenDuration(model.configuration.snoozeDuration))")
+            .accessibilityIdentifier("nightstandSnooze")
+        } else {
+            parentCircle(hero, title: hero.timer.map(clock) ?? "", detail: "", icon: hero.icon ?? "waveform")
+                .accessibilityHidden(true)
+        }
+    }
+
+    private func parentCircle(_ hero: Hero, title: String, detail: String, icon: String) -> some View {
+        ZStack {
+            StatusRing(fill: hero.ring, color: hero.tone.color, glow: hero.tone == .alert)
+            VStack(spacing: 4) {
+                Image(systemName: icon).font(.title3).foregroundStyle(hero.tone.color)
+                if !title.isEmpty { Text(title).font(.headline).foregroundStyle(hero.tone.color) }
+                if !detail.isEmpty { Text(detail).font(.caption).foregroundStyle(Palette.muted) }
+            }
+            .multilineTextAlignment(.center)
+            .padding(10)
+        }
+        .frame(width: ringSize, height: ringSize)
+        .contentShape(Circle())
+    }
+
+    @ViewBuilder private func listenerHeroRing(_ hero: Hero) -> some View {
+        if let until = snoozedUntil {
+            Button { Task { await model.resumeAlerts(until: until) } } label: {
+                listenerAlertCircle(hero, title: model.resumingAlerts ? "Resuming…" : "Resume", icon: "play.fill")
+            }
+            .buttonStyle(.plain)
+            .disabled(model.resumingAlerts || model.acknowledgingAlert || model.managingDevice)
+            .accessibilityLabel("Resume alerts")
+            .accessibilityIdentifier("nightstandResumeAlerts")
+        } else if let alert = model.activeAlert {
+            Button { Task { await model.acknowledge(alert.eventId) } } label: {
+                listenerAlertCircle(hero, title: model.acknowledgingAlert ? "Snoozing…" : "Snooze", icon: "bell.slash")
+            }
+            .buttonStyle(.plain)
+            .disabled(model.acknowledgingAlert || model.resumingAlerts || model.managingDevice)
+            .accessibilityLabel("Snooze alerts for \(spokenDuration(model.configuration.snoozeDuration))")
+            .accessibilityIdentifier("nightstandSnooze")
+        } else {
+            listenerStatusRing(hero)
+        }
+    }
+
+    private func listenerAlertCircle(_ hero: Hero, title: String, icon: String) -> some View {
+        ZStack {
+            StatusRing(fill: snoozedUntil == nil ? .full : hero.ring, color: Palette.amber, glow: snoozedUntil == nil)
+            VStack(spacing: 6) {
+                Image(systemName: icon).font(.title2).accessibilityHidden(true)
+                heroTitle(hero).font(.subheadline.weight(.medium))
+                Text(title).font(.system(.title, design: .rounded).weight(.semibold))
+                if snoozedUntil != nil {
+                    heroDetail(hero).font(.footnote).foregroundStyle(Palette.muted)
+                } else {
+                    Text(spokenDuration(model.configuration.snoozeDuration)).font(.subheadline)
+                    Text(model.monitoring ? "Nursery keeps listening" : model.microphoneActive ? "Detection paused" : "Microphone inactive").font(.caption).foregroundStyle(Palette.muted)
+                }
+            }
+            .foregroundStyle(Palette.amber).multilineTextAlignment(.center)
+            .frame(width: ringSize - 48)
+        }
+        .frame(width: ringSize, height: ringSize).contentShape(Circle())
+        .frame(maxWidth: .infinity)
+    }
+
+    private func listenerStatusRing(_ hero: Hero) -> some View {
         ZStack {
             StatusRing(fill: hero.ring, color: hero.tone.color, glow: hero.tone == .alert)
             VStack(spacing: 4) {
@@ -555,6 +724,20 @@ struct NightstandView: View {
         .background(style == .primary ? Palette.mint : style == .alert ? Palette.amber : Palette.panel, in: RoundedRectangle(cornerRadius: 18))
     }
 
+    @ViewBuilder private var stopAlertsControl: some View {
+        if model.paired, !model.stoppableAlertIDs.isEmpty {
+            Button { Task { await model.stopAlerts() } } label: {
+                Label(model.stoppingAlerts ? "Stopping alerts…" : "Stop alerts", systemImage: "bell.slash.fill")
+                    .font(.subheadline.weight(.semibold)).frame(maxWidth: .infinity, minHeight: 44)
+            }
+            .buttonStyle(.bordered)
+            .tint(Palette.amber)
+            .disabled(model.stoppingAlerts || model.acknowledgingAlert || model.resumingAlerts || model.managingDevice)
+            .accessibilityHint("Ends current alert episodes. Monitoring keeps its current setting.")
+            .accessibilityIdentifier("nightstandStopAlerts")
+        }
+    }
+
     /// The contextual primary action, paired with the monitoring control when it still applies.
     private var actions: some View {
         let layout = typeSize.isAccessibilitySize ? AnyLayout(VStackLayout(spacing: 10)) : AnyLayout(HStackLayout(spacing: 10))
@@ -562,20 +745,8 @@ struct NightstandView: View {
             if !model.paired {
                 Button { pairing = true } label: { actionLabel(listener ? "Pair with Parent" : "Pair iPhones", icon: "link", style: .primary) }
                     .disabled(model.managingDevice)
-            } else if !listener, let alert = model.activeAlert {
-                Button { Task { await model.acknowledge(alert.eventId) } } label: {
-                    actionLabel(model.acknowledgingAlert ? "Confirming…" : "Snooze alerts for \(spokenDuration(model.configuration.snoozeDuration))",
-                                icon: "bell.slash", style: .alert)
-                }
-                .disabled(model.acknowledgingAlert)
-                .accessibilityIdentifier("nightstandSnooze")
-                secondaryMonitoringControl
-            } else if let until = snoozedUntil {
-                Button { Task { await model.resumeAlerts(until: until) } } label: {
-                    actionLabel(model.resumingAlerts ? "Resuming…" : "Resume alerts", icon: "bell", style: .primary)
-                }
-                .disabled(model.resumingAlerts || model.managingDevice)
-                .accessibilityIdentifier("nightstandResumeAlerts")
+            } else if (model.activeAlert != nil || snoozedUntil != nil) && (!listener || monitoringActive || busy) {
+                // The status circle owns Snooze/Resume. Keep Pause available here.
                 secondaryMonitoringControl
             } else if !listener, [.connectionLost, .unavailable].contains(model.parentMonitoringDisplayState) {
                 Button { Task { await model.retryConnection() } } label: {
@@ -621,7 +792,7 @@ struct NightstandView: View {
 
     /// Pausing must stay available beside other actions, including in unknown states, to cancel repeating alerts.
     @ViewBuilder private var secondaryMonitoringControl: some View {
-        let compact = !typeSize.isAccessibilitySize
+        let compact = listener && !typeSize.isAccessibilitySize
         if parentStartUnavailable && !confirmedParentState && model.pendingMonitoringCommand == nil {
             Button { Task { await model.requestMonitoring(false) } } label: {
                 actionLabel("Pause Monitoring", icon: "pause.fill", style: .secondary, compact: compact)
@@ -681,8 +852,8 @@ struct NightstandView: View {
                         Text(hero.title).font(.title2)
                         heroDetail(hero).font(.subheadline).foregroundStyle(Palette.muted)
                     }
-                    if !listener, let alert = model.activeAlert { alertPanel(alert) }
-                    if !listener, let until = model.parentStatus?.alertsMutedUntil, until > model.now { snoozePanel(until: until) }
+                    if let alert = model.activeAlert { alertPanel(alert) }
+                    if let until = snoozedUntil { snoozePanel(until: until) }
                     if needsConnectionRecovery { connectionRecovery }
                     if !listener, let error = model.monitoringControlError {
                         VStack(alignment: .leading, spacing: 8) {
@@ -893,5 +1064,95 @@ private struct StatusRing: View {
         }
         .padding(lineWidth / 2)
         .accessibilityHidden(true)
+    }
+}
+
+struct CaregiverDutyCard: View {
+    @Environment(AppModel.self) private var model
+    var body: some View {
+        if let duty = model.caregiverDuty, let primary = duty.primary, let secondary = duty.secondary {
+            VStack(spacing: 0) {
+                HStack {
+                    Text(primary.name + (primary.id == duty.myId ? " · You" : "")).font(.subheadline.weight(.semibold))
+                    Spacer()
+                    Text("Primary").font(.caption).foregroundStyle(Palette.mint)
+                }.frame(minHeight: 34)
+                Button {
+                    Task { await model.updateCaregiverDuty(primaryId: secondary.id) }
+                } label: {
+                    Label("Swap roles", systemImage: "arrow.up.arrow.down")
+                        .font(.subheadline.weight(.medium)).frame(maxWidth: .infinity, minHeight: 44)
+                        .background(Palette.background.opacity(0.5), in: RoundedRectangle(cornerRadius: 12))
+                }.buttonStyle(.plain).tint(Palette.lavender).accessibilityIdentifier("swapCaregiverRoles")
+                Toggle(isOn: Binding(get: { secondary.secondaryEnabled }, set: { enabled in
+                    Task { await model.updateCaregiverDuty(caregiverId: secondary.id, secondaryEnabled: enabled) }
+                })) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(secondary.name + (secondary.id == duty.myId ? " · You" : "")).font(.subheadline.weight(.semibold))
+                        Text(secondary.secondaryEnabled ? "Secondary · After \(spokenDuration(Double(duty.escalationSeconds)))" : "Off duty · Secondary alerts off")
+                            .font(.caption).foregroundStyle(Palette.muted)
+                    }
+                }.tint(Palette.mint).frame(minHeight: 44)
+                    .accessibilityIdentifier("secondaryCaregiverEnabled")
+                if let error = model.caregiverError { Text(error).font(.caption).foregroundStyle(Palette.amber) }
+            }
+            .padding(10).background(Palette.panel, in: RoundedRectangle(cornerRadius: 18))
+            .disabled(model.changingCaregiverDuty || model.managingDevice)
+        }
+    }
+}
+
+struct CaregiverConnectionView: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = ""
+    @State private var code = ""
+    var body: some View {
+        NavigationStack {
+            Form {
+                if let duty = model.caregiverDuty, duty.caregivers.count == 2 {
+                    Section("Your caregivers") {
+                        ForEach(duty.caregivers) { caregiver in
+                            VStack(alignment: .leading, spacing: 5) {
+                                Text(caregiver.name + (caregiver.id == duty.myId ? " · You" : ""))
+                                Text(caregiver.id == duty.primaryId ? "Primary" : caregiver.secondaryEnabled ? "Secondary" : "Off duty")
+                                    .font(.subheadline).foregroundStyle(Palette.muted)
+                                Label(caregiver.phoneRegistered ? "iPhone alerts registered" : "iPhone alerts need setup", systemImage: "iphone")
+                                Label(caregiver.watchRegistered ? "Watch alerts registered" : "Watch alerts need setup", systemImage: "applewatch")
+                            }.font(.subheadline)
+                        }
+                    }
+                    Section { Text("Each caregiver uses their own Parent iPhone and its paired Apple Watch. Use Settings on this iPhone to enable notifications and wrist alarms.") }
+                } else {
+                    Section {
+                        TextField("Your name", text: $name).textContentType(.givenName)
+                            .onChange(of: name) { _, value in name = String(value.prefix(40)) }
+                        if model.paired {
+                            Text("On your partner’s iPhone, choose Parent Mode, then Join a family in Pair iPhones. Enter this invitation code.")
+                            if let invite = model.caregiverInvite, invite.expiresAt > model.now {
+                                Text(invite.code).font(.system(.largeTitle, design: .monospaced)).textSelection(.enabled)
+                                Text("Expires \(invite.expiresAt.formatted(.relative(presentation: .numeric)))").font(.caption)
+                            }
+                            Button("Create partner invitation") { Task { await model.inviteCaregiver(name: name) } }
+                                .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                                .accessibilityIdentifier("createCaregiverInvitation")
+                        } else {
+                            Text("Enter the invitation created in Caregivers on the already paired Parent iPhone.")
+                            TextField("Six-digit invitation code", text: $code).keyboardType(.numberPad).textContentType(.oneTimeCode)
+                                .onChange(of: code) { _, value in code = String(value.filter(\.isNumber).prefix(6)) }
+                            Button("Join family") {
+                                Task { await model.joinCaregiver(code: code, name: name); if model.paired { dismiss() } }
+                            }.disabled(code.count != 6 || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty).accessibilityIdentifier("joinCaregiverFamily")
+                        }
+                    }.disabled(model.changingCaregiverDuty)
+                    if model.changingCaregiverDuty { ProgressView() }
+                    if let error = model.caregiverError { Text(error).foregroundStyle(Palette.amber) }
+                    Section { Text("Invitations expire after 10 minutes and can be used once. A family has one primary and one optional secondary caregiver. Secondary availability stays with each person when roles swap.") }
+                }
+            }
+            .navigationTitle("Caregivers")
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+            .onAppear { model.caregiverError = nil }
+        }.tint(Palette.lavender).preferredColorScheme(.dark)
     }
 }

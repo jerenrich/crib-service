@@ -41,6 +41,8 @@ struct AlarmSnapshot: Codable, Equatable, Sendable {
     var evidence: SilentCryAlarmRequest.ServerEvidence?
     var snoozeDuration: Double
     var publishedAt: Date
+    /// Consumed journal Stops are governed by the app snapshot, including early Resume.
+    var handledExtensionStopKeys: [String]? = nil
 
     /// Why the extension had no snapshot, recorded with its `no_snapshot` rejection.
     enum Issue: String, Error { case appGroupUnavailable = "app_group_unavailable", missing, unreadable, undecodable }
@@ -59,6 +61,20 @@ struct AlarmSnapshot: Codable, Equatable, Sendable {
     /// The server state is applied only when observed after the push was created.
     func evidenceApplies(to request: SilentCryAlarmRequest) -> Bool {
         evidence.map { $0.observedAt >= request.createdAt } ?? false
+    }
+
+    /// A Stop executed in the extension must suppress subsequent pushes even
+    /// before the main app consumes its journal and publishes a new snapshot.
+    func stopRejection(for request: SilentCryAlarmRequest, attempts: [AlarmAttempt], now: Date) -> SilentCryAlarmRequest.Rejection? {
+        for stop in attempts where stop.outcome == .stopped && !(handledExtensionStopKeys ?? []).contains(stop.key) {
+            if stop.isTest {
+                if request.isTest, request.eventID == stop.eventID { return .irrelevant }
+            } else if !request.isTest {
+                if now < stop.startedAt.addingTimeInterval(snoozeDuration) { return .locallyMuted }
+                if request.createdAt <= stop.startedAt { return .stopped }
+            }
+        }
+        return nil
     }
 
     func save(to directory: URL? = AlarmShared.directory) throws {
@@ -165,5 +181,24 @@ struct AlarmJournal: Sendable {
             let lines = entries.compactMap { try? encoder.encode($0) }.compactMap { String(data: $0, encoding: .utf8) }
             try (lines.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
         }
+    }
+}
+
+/// The currently scheduled alarm's notification identity must advance when an
+/// episode re-arms after Snooze. Old journal entries cannot replace a newer alarm.
+struct SilentAlarmRecord: Codable, Equatable {
+    let episodeID: UUID
+    let eventID: UUID
+    let snoozeDuration: Double
+    let scheduledAt: Date
+    var isTest: Bool? = nil
+    var alarmAt: Date? = nil
+
+    static func merging(_ attempt: AlarmAttempt, into records: [Self], snoozeDuration: Double) -> [Self] {
+        guard attempt.outcome == .scheduled, let episodeID = attempt.episodeID, let eventID = attempt.eventID else { return records }
+        if let current = records.first(where: { $0.episodeID == episodeID }), current.scheduledAt > attempt.finishedAt { return records }
+        let record = Self(episodeID: episodeID, eventID: eventID, snoozeDuration: snoozeDuration,
+                          scheduledAt: attempt.finishedAt, isTest: attempt.isTest ? true : nil, alarmAt: attempt.alarmAt)
+        return Array((records.filter { $0.episodeID != episodeID } + [record]).suffix(64))
     }
 }

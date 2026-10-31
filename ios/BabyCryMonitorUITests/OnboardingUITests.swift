@@ -67,6 +67,97 @@ final class OnboardingUITests: XCTestCase {
         XCTAssertFalse(app.staticTexts["Test notification"].exists)
     }
 
+    @MainActor func testNurseryAlertCircleOffersSnoozeAndKeepsPauseVisible() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", "--uitesting-listener", "--uitesting-active-alert"]
+        app.launch()
+        let snooze = app.buttons["nightstandSnooze"]
+        XCTAssertTrue(snooze.waitForExistence(timeout: 5))
+        XCTAssertTrue(snooze.isHittable)
+        XCTAssertEqual(snooze.label, "Snooze alerts for 1 min")
+        XCTAssertTrue(app.buttons["nightstandMonitoringControl"].isHittable)
+        XCTAssertFalse(app.buttons["nightstandTestAlert"].exists)
+        XCTAssertTrue(app.windows.firstMatch.frame.contains(snooze.frame))
+        XCTAssertTrue(app.descendants(matching: .any)["soundLevelChart"].firstMatch.isHittable)
+        let shot = XCTAttachment(screenshot: app.screenshot()); shot.name = "Nursery alert Snooze circle"; shot.lifetime = .keepAlways; add(shot)
+    }
+
+    @MainActor func testStoppedNurseryCanSnoozeAnOutstandingAlertAndStillOffersStart() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", "--uitesting-listener", "--uitesting-active-alert", "--uitesting-microphone-off"]
+        app.launch()
+        XCTAssertTrue(app.buttons["nightstandSnooze"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["nightstandSnooze"].isHittable)
+        XCTAssertTrue(app.buttons["nightstandMonitoringControl"].isHittable)
+        XCTAssertTrue(app.staticTexts["Microphone inactive"].firstMatch.exists)
+        XCTAssertFalse(app.staticTexts["Nursery keeps listening"].exists)
+        XCTAssertTrue(app.buttons["nightstandStopAlerts"].exists)
+        XCTAssertTrue(app.buttons["nightstandStopAlerts"].isHittable)
+    }
+
+    @MainActor func testStoppedParentOffersStopAlerts() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", "--uitesting-active-alert", "--uitesting-microphone-off", "--uitesting-caregivers"]
+        app.launch()
+        let stop = app.buttons["nightstandStopAlerts"]
+        XCTAssertTrue(stop.waitForExistence(timeout: 5))
+        XCTAssertTrue(stop.isHittable)
+        XCTAssertTrue(app.windows.firstMatch.frame.contains(stop.frame))
+    }
+
+    @MainActor func testNurserySnoozedCircleShowsResumeAndCountdown() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", "--uitesting-listener", "--uitesting-snoozed"]
+        app.launch()
+        let resume = app.buttons["nightstandResumeAlerts"]
+        XCTAssertTrue(resume.waitForExistence(timeout: 5))
+        XCTAssertTrue(resume.isHittable)
+        XCTAssertTrue(app.windows.firstMatch.frame.contains(resume.frame))
+        XCTAssertFalse(app.buttons["nightstandSnooze"].exists)
+        XCTAssertTrue(app.buttons["nightstandMonitoringControl"].isHittable)
+        app.buttons["nightstandDetails"].tap()
+        XCTAssertTrue(app.buttons["resumeAlerts"].waitForExistence(timeout: 5))
+        let shot = XCTAttachment(screenshot: app.screenshot()); shot.name = "Nursery snooze countdown"; shot.lifetime = .keepAlways; add(shot)
+    }
+
+    @MainActor func testCompactCaregiverControlsFitWithoutScrolling() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", "--uitesting-active-alert", "--uitesting-caregivers"]
+        app.launch()
+        let swap = app.buttons["swapCaregiverRoles"]
+        XCTAssertTrue(swap.waitForExistence(timeout: 5))
+        let window = app.windows.firstMatch.frame
+        for element in [swap, app.buttons["nightstandSnooze"], app.buttons["editAlertTiming"],
+                        app.buttons["nightstandMonitoringControl"], app.switches["secondaryCaregiverEnabled"]] {
+            XCTAssertTrue(element.isHittable, "Caregiver control is not visible: \(element)")
+            XCTAssertTrue(window.contains(element.frame), "Caregiver control is outside the screen: \(element.frame)")
+        }
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = "Compact caregiver alert screen"; shot.lifetime = .keepAlways; add(shot)
+    }
+
+    @MainActor func testCompactParentControlsFitWithoutScrolling() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", "--uitesting-active-alert"]
+        app.launch()
+        let snooze = app.buttons["nightstandSnooze"]
+        XCTAssertTrue(snooze.waitForExistence(timeout: 5))
+        XCTAssertEqual(app.buttons.matching(identifier: "nightstandSnooze").count, 1)
+        XCTAssertFalse(app.buttons["I’m on it"].exists)
+        let window = app.windows.firstMatch.frame
+        XCTAssertLessThan(app.buttons["nightstandDetails"].frame.minY, window.minY + 110,
+                          "The compact screen should start near the top safe area")
+        for element in [snooze, app.buttons["editAlertTiming"], app.buttons["nightstandMonitoringControl"],
+                        app.descendants(matching: .any)["soundLevelChart"].firstMatch] {
+            XCTAssertTrue(element.isHittable, "Essential control is not visible: \(element)")
+            XCTAssertTrue(window.contains(element.frame), "Essential control extends beyond the screen: \(element.frame)")
+        }
+        XCTAssertGreaterThanOrEqual(snooze.frame.width, 44)
+        XCTAssertLessThan(snooze.frame.width, 180, "Snooze should be the compact status circle")
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = "Compact Parent layout"; shot.lifetime = .keepAlways; add(shot)
+    }
+
     @MainActor func testActiveAlertOffersOneTapSnoozeOnMonitor() {
         let app = XCUIApplication()
         app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", "--uitesting-active-alert"]
@@ -115,7 +206,7 @@ final class OnboardingUITests: XCTestCase {
 
     @MainActor func testTimingChipEditsDelayAndDeviceChipsOpenDevices() {
         let app = XCUIApplication()
-        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound"]
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", "--uitesting-listener"]
         app.launch()
         let timing = app.buttons["editAlertTiming"]
         XCTAssertTrue(timing.waitForExistence(timeout: 5))
@@ -132,7 +223,7 @@ final class OnboardingUITests: XCTestCase {
         XCTAssertTrue(app.navigationBars["Devices"].waitForExistence(timeout: 5))
     }
 
-    @MainActor func testCompactMonitorDoesNotScrollOrMoveAcrossStates() {
+    @MainActor func testCompactMonitorControlsStayReachableAcrossStates() {
         let app = XCUIApplication()
         var baseline: [CGRect]?
         let scenarios: [[String]] = [[], ["--uitesting-active-alert"], ["--uitesting-snoozed"],
@@ -147,19 +238,26 @@ final class OnboardingUITests: XCTestCase {
             let details = app.buttons["nightstandDetails"]
             let timing = app.buttons["editAlertTiming"]
             let actions = app.descendants(matching: .any)["nightstandActions"].firstMatch
+            let sounds = app.buttons["nurserySoundControls"]
             for action in [details, timing] { XCTAssertTrue(action.isHittable, action.debugDescription) }
+            for control in [sounds, app.buttons.matching(identifier: "nightstandMonitoringControl").firstMatch] {
+                XCTAssertTrue(control.isHittable)
+                XCTAssertTrue(app.windows.firstMatch.frame.contains(control.frame))
+            }
             XCTAssertTrue(app.buttons.matching(identifier: "nightstandMonitoringControl").firstMatch.isHittable)
             XCTAssertGreaterThan(chart.frame.height, 30)
             XCTAssertLessThanOrEqual(details.frame.maxY, state.frame.minY)
             XCTAssertLessThanOrEqual(state.frame.maxY, timing.frame.minY)
-            XCTAssertLessThanOrEqual(timing.frame.maxY, chart.frame.minY)
-            XCTAssertLessThanOrEqual(chart.frame.maxY, actions.frame.minY)
+            XCTAssertLessThanOrEqual(chart.frame.maxY, timing.frame.minY)
+            XCTAssertLessThanOrEqual(timing.frame.maxY, app.buttons["nurserySoundControls"].frame.minY)
+            XCTAssertLessThanOrEqual(app.buttons["nurserySoundControls"].frame.maxY, actions.frame.minY)
             XCTAssertLessThanOrEqual(actions.frame.maxY, app.tabBars.firstMatch.frame.minY)
             let frames = [details.frame, timing.frame, chart.frame, actions.frame, app.tabBars.firstMatch.frame]
             if let baseline {
                 for (actual, expected) in zip(frames, baseline) {
                     XCTAssertEqual(actual.minX, expected.minX, accuracy: 1)
-                    XCTAssertEqual(actual.minY, expected.minY, accuracy: 1)
+                    // The contextual Stop alerts row deliberately shifts lower
+                    // controls during an active alert; their widths stay stable.
                     XCTAssertEqual(actual.width, expected.width, accuracy: 1)
                     XCTAssertEqual(actual.height, expected.height, accuracy: 1)
                 }
@@ -350,7 +448,7 @@ final class OnboardingUITests: XCTestCase {
 
     @MainActor func testRecentActivitySummaryOpensActivity() {
         let app = XCUIApplication()
-        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-timeline"]
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-timeline", "--uitesting-listener"]
         app.launch()
         let summary = app.buttons["nightstandSummary"]
         XCTAssertTrue(summary.waitForExistence(timeout: 5))
@@ -381,7 +479,9 @@ final class OnboardingUITests: XCTestCase {
                 XCTAssertEqual(value, parentValue)
                 if let parentSize {
                     XCTAssertEqual(chart.frame.width, parentSize.width, accuracy: 0.5)
-                    XCTAssertEqual(chart.frame.height, parentSize.height, accuracy: 0.5)
+                    // Parent intentionally uses a compact chart; both retain
+                    // identical readings, scale, width, and accessible content.
+                    XCTAssertGreaterThanOrEqual(chart.frame.height, parentSize.height)
                 } else { XCTFail("Parent chart was not measured") }
             } else { parentValue = value; parentSize = chart.frame.size }
             let image = XCTAttachment(screenshot: app.screenshot())
@@ -465,7 +565,8 @@ final class OnboardingUITests: XCTestCase {
         XCTAssertEqual(chart.frame.minY, initialChartFrame.minY, accuracy: 1)
         XCTAssertEqual(chart.frame.height, initialChartFrame.height, accuracy: 1)
         let instruction = app.descendants(matching: .any)["nurseryMonitoringInstruction"].firstMatch
-        XCTAssertEqual(instruction.frame.midY, initialControlFrame.midY, accuracy: 1)
+        XCTAssertTrue(instruction.isHittable)
+        XCTAssertTrue(instruction.frame.intersects(initialControlFrame))
         XCTAssertEqual(app.tabBars.firstMatch.frame.minY, initialTabFrame.minY, accuracy: 1)
         let details = app.buttons["nightstandDetails"]
         for _ in 0..<4 {

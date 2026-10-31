@@ -1,6 +1,6 @@
 import {APIError,requireRole,type Device,type Env} from './types';
 import {onlyKeys,uuid} from './security';
-import {pairFor} from './devices';
+import {pairFor,sharedAccess} from './devices';
 import type {Latency} from './latency';
 
 type Pair={parent_id:string;listener_id:string;created_at:number};
@@ -19,13 +19,13 @@ export async function requestMonitoring(env:Env,device:Device,value:Record<strin
  onlyKeys(value,['id','enabled']);const id=uuid(value.id);
  if(typeof value.enabled!=='boolean')throw new APIError(400,'Monitoring must be true or false.');
  const pair=await pairFor(env,device);if(!pair)throw new APIError(409,'Pair before controlling monitoring.');
- const now=Date.now(),enabled=Number(value.enabled),claim=crypto.randomUUID();
+ const now=Date.now(),enabled=Number(value.enabled),claim=crypto.randomUUID(),access=sharedAccess(device);
  // Listener requests report a local action. Parent requests await actual microphone confirmation.
  const status=device.role==='listener'?'applied':'pending';
  await env.DB.batch([
   env.DB.prepare(`INSERT INTO monitoring_commands(id,claim_id,parent_id,listener_id,pair_created_at,enabled,status,created_at,expires_at)
-   SELECT ?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?) ON CONFLICT(id) DO NOTHING`)
-   .bind(id,claim,pair.parent_id,pair.listener_id,pair.created_at,enabled,status,now,now+30000,pair.parent_id,pair.listener_id,pair.created_at),
+   SELECT ?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?) AND ${access.sql} ON CONFLICT(id) DO NOTHING`)
+   .bind(id,claim,pair.parent_id,pair.listener_id,pair.created_at,enabled,status,now,now+30000,pair.parent_id,pair.listener_id,pair.created_at,...access.args),
   // Retire outstanding crying alerts as soon as Stop is requested. Test notifications stay independent.
   env.DB.prepare(`UPDATE events SET acknowledged_at=COALESCE(acknowledged_at,?) WHERE parent_id=? AND listener_id=?
    AND COALESCE(json_extract(payload,'$.isTest'),0)=0 AND ?=0
@@ -58,8 +58,11 @@ export const monitoringResumedSQL=`json_extract(events.payload,'$.type')='monito
  AND julianday(json_extract(h.metadata,'$.timestamp'))>julianday(json_extract(events.payload,'$.cryStartedAt')))`;
 // A pending Stop suppresses late uploads; an applied Stop remains in force until
 // either phone starts again. Never claim that this proves the microphone stopped.
-export const stoppedMonitoringSQL=`EXISTS(SELECT 1 FROM monitoring_commands m JOIN pairs p
+export function stoppedMonitoringForSQL(parentID:string,listenerID:string) {
+ return `EXISTS(SELECT 1 FROM monitoring_commands m JOIN pairs p
  ON p.parent_id=m.parent_id AND p.listener_id=m.listener_id AND p.created_at=m.pair_created_at
- WHERE m.parent_id=events.parent_id AND m.listener_id=events.listener_id AND m.enabled=0
+ WHERE m.parent_id=${parentID} AND m.listener_id=${listenerID} AND m.enabled=0
  AND (m.status='applied' OR (m.status='pending' AND m.expires_at>?))
  AND m.sequence=(SELECT MAX(sequence) FROM monitoring_commands WHERE parent_id=m.parent_id AND listener_id=m.listener_id AND pair_created_at=m.pair_created_at))`;
+}
+export const stoppedMonitoringSQL=stoppedMonitoringForSQL('events.parent_id','events.listener_id');

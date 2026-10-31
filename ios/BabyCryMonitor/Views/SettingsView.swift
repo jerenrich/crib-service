@@ -4,6 +4,7 @@ struct SettingsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     @State private var pairing = false
+    @State private var caregivers = false
     @State private var removal = Removal.unpair
     @State private var confirmRemoval = false
     private enum Removal { case unpair, delete }
@@ -72,6 +73,7 @@ struct SettingsView: View {
                 }
                 Section("This iPhone") {
                     Picker("Mode", selection: Binding(get: { model.role ?? .listener }, set: { model.selectRole($0) })) { Text("Listener").tag(DeviceRole.listener); Text("Parent").tag(DeviceRole.parent) }
+                    if model.role == .parent { Button("Caregivers & duty") { caregivers = true } }
                     Button(model.paired ? "Pairing details" : "Pair iPhones") { pairing = true }
                     if model.role == .parent { Button("Enable notifications") { Task { await model.notifications.register() } } }
                 }
@@ -133,6 +135,7 @@ struct SettingsView: View {
                 .onDisappear { model.stopWatchTest() }
                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
                 .sheet(isPresented: $pairing) { PairingView() }
+        .sheet(isPresented: $caregivers) { CaregiverConnectionView() }
                 .alert(removal == .delete ? "Delete device and shared history?" : "Unpair these phones?", isPresented: $confirmRemoval) {
                     Button(removal == .delete ? "Delete device & shared history" : "Unpair and clear shared history", role: .destructive) {
                         let deleteDevice = removal == .delete
@@ -184,9 +187,43 @@ struct AlertTimingView: View {
                 } footer: {
                     Text("The timer counts from the start of sustained loud sound, including the initial sound check. Brief noises are filtered out.")
                 }
-                Section { Text(model.settingsSyncStatus) }
+                if let duty = model.caregiverDuty, duty.secondary != nil {
+                    Section("Secondary caregiver") {
+                        Picker("Escalate after first alert", selection: Binding(get: { duty.escalationSeconds }, set: { delay in
+                            Task { await model.updateCaregiverDuty(escalationSeconds: delay) }
+                        })) {
+                            ForEach([60, 120, 180, 300], id: \.self) { Text(spokenDuration(Double($0))).tag($0) }
+                        }.disabled(model.changingCaregiverDuty || duty.secondary?.secondaryEnabled != true)
+                        Text("Duty changes apply to future cry alerts. Turning secondary alerts off also stops escalation to that person for an ongoing alert.").font(.footnote)
+                        if let error = model.caregiverError {
+                            Text(error).font(.footnote).foregroundStyle(Palette.amber)
+                        }
+                    }
+                }
+                Section("Reminders & snooze") {
+                    Picker("Repeat unanswered alerts", selection: setting(\.repeatInterval)) {
+                        Text("Every 5 seconds").tag(TimeInterval?.some(5))
+                        Text("Every 2 seconds").tag(TimeInterval?.some(2))
+                    }.accessibilityIdentifier("quickRepeatInterval")
+                    Picker("Snooze duration", selection: setting(\.snoozeDuration)) {
+                        ForEach(MonitoringConfiguration.snoozeDurations, id: \.self) { value in
+                            Text(spokenDuration(value)).tag(value)
+                        }
+                    }.accessibilityIdentifier("quickSnoozeDuration")
+                }
+                Section {
+                    Text("Tap the orange circle on Monitor to snooze an active alert. While snoozed, tap Resume in the circle to end the snooze early. The nursery keeps listening.")
+                    Text(model.settingsSyncStatus)
+                }
             }.navigationTitle("Alert timing")
                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
-        }.tint(Palette.lavender)
+        }.tint(Palette.lavender).preferredColorScheme(.dark)
+    }
+    private func setting<Value>(_ keyPath: WritableKeyPath<MonitoringConfiguration, Value>) -> Binding<Value> {
+        Binding(get: { model.configuration[keyPath: keyPath] }, set: { value in
+            var configuration = model.configuration
+            configuration[keyPath: keyPath] = value
+            model.saveSettings(configuration)
+        })
     }
 }

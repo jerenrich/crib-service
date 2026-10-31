@@ -56,6 +56,35 @@ final class LiveSoundTests: XCTestCase {
         XCTAssertFalse(requests.accepts(value, at: now))
     }
 
+    func testTwoCaregiversAcceptTheSameReadingWithTheirOwnFreshnessDeadlines() {
+        let now = Date(timeIntervalSince1970: 10_000)
+        var first = LiveSoundRequests(), second = LiveSoundRequests(), nursery = LiveSoundRequests()
+        let a = first.issue(at: now), b = second.issue(at: now.addingTimeInterval(1))
+        nursery.include(a, at: now); nursery.include(b, at: now.addingTimeInterval(1))
+        var value = frame()
+        value.requestID = b; value.requestIDs = nursery.activeIDs(at: now.addingTimeInterval(2))
+        XCTAssertTrue(value.isValid)
+        XCTAssertTrue(first.accepts(value, at: now.addingTimeInterval(2)))
+        XCTAssertTrue(second.accepts(value, at: now.addingTimeInterval(2)))
+        XCTAssertFalse(first.accepts(value, at: now.addingTimeInterval(3)))
+        XCTAssertTrue(second.accepts(value, at: now.addingTimeInterval(3)))
+        XCTAssertFalse(second.accepts(value, at: now.addingTimeInterval(4)))
+        XCTAssertFalse(LiveSoundRequests().accepts(value, at: now.addingTimeInterval(2)))
+    }
+
+    func testRepeatedChallengeDoesNotExtendItsLifetimeAndTheEchoListIsBounded() {
+        let now = Date(timeIntervalSince1970: 10_000), id = UUID().uuidString.lowercased()
+        var nursery = LiveSoundRequests()
+        nursery.include(id, at: now); nursery.include(id, at: now.addingTimeInterval(2))
+        XCTAssertTrue(nursery.activeIDs(at: now.addingTimeInterval(3)).isEmpty)
+        for _ in 0..<30 { nursery.include(UUID().uuidString, at: now) }
+        XCTAssertEqual(nursery.activeIDs(at: now).count, 16)
+        var value = frame(); value.requestIDs = Array(repeating: id, count: 17)
+        XCTAssertFalse(value.isValid)
+        value.requestIDs = ["invalid"]
+        XCTAssertFalse(value.isValid)
+    }
+
     func testEpisodeTimerAdvancesBetweenFramesUsingTheReceivingClock() throws {
         let now = Date(timeIntervalSince1970: 10_000)
         var state = RemoteSoundState()

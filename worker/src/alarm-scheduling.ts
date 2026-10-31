@@ -42,11 +42,12 @@ export async function confirmAlarmScheduled(env:Env,device:Device,value:Record<s
  if(latency)try{latency.eventRef=await eventReference(env,event);}catch{/* Best effort correlation. */}
  const result=await env.DB.prepare(`UPDATE silent_alarm_cycles SET confirmed_at=COALESCE(confirmed_at,?)
   WHERE parent_id=? AND episode_id=? AND cycle_id=?
-  AND EXISTS(SELECT 1 FROM pairs p JOIN devices d ON d.id=p.parent_id
-   WHERE p.parent_id=silent_alarm_cycles.parent_id AND p.listener_id=silent_alarm_cycles.listener_id
+  AND EXISTS(SELECT 1 FROM pairs p JOIN devices household ON household.id=p.parent_id JOIN devices d ON d.id=silent_alarm_cycles.parent_id
+   WHERE p.listener_id=silent_alarm_cycles.listener_id
+   AND (p.parent_id=d.id OR EXISTS(SELECT 1 FROM caregiver_families f WHERE f.owner_id=p.parent_id AND f.partner_id=d.id AND f.pair_created_at=p.created_at))
    AND p.created_at=silent_alarm_cycles.pair_created_at AND d.silent_watch_alarms=1
-   AND d.alerts_muted_until=silent_alarm_cycles.cycle_at AND d.alerts_muted_until<=?)
-  AND EXISTS(SELECT 1 FROM events e WHERE e.event_id=? AND e.parent_id=silent_alarm_cycles.parent_id
+   AND household.alerts_muted_until=silent_alarm_cycles.cycle_at AND household.alerts_muted_until<=?)
+  AND EXISTS(SELECT 1 FROM events e WHERE e.event_id=? AND (e.parent_id=silent_alarm_cycles.parent_id OR EXISTS(SELECT 1 FROM caregiver_families f WHERE f.owner_id=e.parent_id AND f.partner_id=silent_alarm_cycles.parent_id AND f.pair_created_at=silent_alarm_cycles.pair_created_at))
    AND e.listener_id=silent_alarm_cycles.listener_id AND e.episode_id=silent_alarm_cycles.episode_id
    AND e.event_id IN (SELECT value FROM json_each(silent_alarm_cycles.request_event_ids))
    AND e.acknowledged_at IS NULL AND e.resolved_at IS NULL AND COALESCE(json_extract(e.payload,'$.isTest'),0)=0)

@@ -1,3 +1,4 @@
+import {dispatchFamilyEvent} from './caregivers';
 import {reserveAlarmRequest} from './alarm-scheduling';
 import {phoneHeadStartFor} from './notification-coordination';
 import {deliverToBoth} from './dual-delivery';
@@ -7,7 +8,7 @@ import {scheduleReminders} from './reminders';
 import {Latency} from './latency';
 import {APIError,requireRole,type Alert,type Device,type Env,type StoredEvent} from './types';
 import {alert as validateAlert,uuid,configuration,date} from './security';
-import {pairFor} from './devices';
+import {pairFor,sharedAccess} from './devices';
 import {sendPush,sendSilentCryAlarmPush,type PushIdentityOptions,type PushResult} from './apns';
 import {eventReference,recordDiagnostic,observeLateWrites,PushPreparationError,type Outcome,type Stage} from './diagnostics';
 export async function receiveAlert(env:Env,device:Device,value:Record<string,unknown>,requestId=crypto.randomUUID(),latency=new Latency(),background?:Pick<ExecutionContext,'waitUntil'>) {
@@ -18,10 +19,10 @@ export async function receiveAlert(env:Env,device:Device,value:Record<string,unk
  try{latency.eventRef=await eventReference(env,alert.eventId);}catch{/* Best effort. */}
  // Both reads share one consistent snapshot and one remote call. The bounded
  // fallback is read-only; insertion and delivery claims are never hedged.
- type Pair={parent_id:string;listener_id:string;created_at:number};
+ type Pair={parent_id:string;listener_id:string;created_at:number;has_caregivers?:number};
  const snapshot=await latency.readOnly<StoredEvent|Pair>('alert_snapshot_ms',()=>env.DB.batch<StoredEvent|Pair>([
   env.DB.prepare('SELECT * FROM events WHERE event_id=?').bind(alert.eventId),
-  env.DB.prepare('SELECT * FROM pairs WHERE listener_id=?').bind(device.id)
+  env.DB.prepare('SELECT p.*,EXISTS(SELECT 1 FROM caregiver_families f WHERE f.owner_id=p.parent_id AND f.partner_id IS NOT NULL AND f.pair_created_at=p.created_at) AS has_caregivers FROM pairs p WHERE p.listener_id=?').bind(device.id)
  ]),250);
  const previous=snapshot[0].results[0] as StoredEvent|undefined;
  const pair=snapshot[1].results[0] as Pair|undefined;if(!pair)throw new APIError(409,'Listener is not paired.');
@@ -50,7 +51,7 @@ export async function receiveAlert(env:Env,device:Device,value:Record<string,unk
  // Start durable scheduling independently of push delivery. The minute recovery
  // job repairs an interrupted or failed scheduling request from stored events.
  try {await dispatchEvent(env,record.event_id,requestId,latency,
-  background&&!alert.isTest?{accepted:delivery=>queueAcceptedDelivery(env,delivery),background}:{});}
+  background&&!alert.isTest?{accepted:delivery=>queueAcceptedDelivery(env,delivery),background,family:pair.has_caregivers===1}:{family:pair.has_caregivers===1});}
  finally {
   if(!alert.isTest){
    const scheduling=scheduleRemindersSafely(env,pair.parent_id,requestId);
@@ -70,11 +71,13 @@ async function scheduleRemindersSafely(env:Env,parentId:string,requestId:string)
  catch {await recordDiagnostic(env,{requestId,started,operation:'reminder_schedule',stage:'handler',outcome:'internal_error',details:latency.details});}
 }
 export interface DispatchOptions {
+ family?:boolean;
  insert?:D1PreparedStatement;
  accepted?:(delivery:AcceptedDelivery)=>Promise<void>;
  background?:Pick<ExecutionContext,'waitUntil'>;
 }
 export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.randomUUID(),latency=new Latency(),options:DispatchOptions={}):Promise<void> {
+ if(options.family!==false&&!options.insert&&await dispatchFamilyEvent(env,eventId))return;
  const now=Date.now();
  observeLateWrites(env,latency,options.background,requestId,now);
  let stage:Stage='claim',eventRef:string|undefined,attempt:number|undefined,target:'phone'|'watch'|undefined;
@@ -258,15 +261,17 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
  } catch(error) { latency.failure(error);await record('internal_error',pushResult?.httpStatus);throw error; }
  finally {if(auxiliary)await auxiliary;}
 }
-export async function acknowledge(env:Env,device:Device,value:Record<string,unknown>) {
+export async function acknowledge(env:Env,device:Device,value:Record<string,unknown>,actorId=device.id) {
  requireRole(device,'parent');const id=uuid(value.eventId);
  const event=await env.DB.prepare('SELECT * FROM events WHERE event_id=? AND parent_id=?').bind(id,device.id).first<StoredEvent>();
  if(!event)throw new APIError(404,'Alert not found.');
+ const payload=JSON.parse(event.payload) as Alert;
+ if(payload.isTest&&(payload.targetCaregiverId??event.parent_id)!==actorId)throw new APIError(403,'This test belongs to another caregiver.');
  if(event.acknowledged_at){
   if(!(JSON.parse(event.payload) as Alert).isTest)await scheduleReminders(env,device.id);
   return {ok:true};
  }
- const now=Date.now(),timestamp=new Date(now).toISOString();
+ const now=Date.now(),timestamp=new Date(now).toISOString(),access=sharedAccess(device);
  const pair=await pairFor(env,device);if(!pair||pair.listener_id!==event.listener_id)throw new APIError(409,'Pairing changed.');
  const isTest=(JSON.parse(event.payload) as Alert).isTest===true;
  // A queued Snooze (Watch relay, offline AlarmKit Stop) can arrive long after the
@@ -277,27 +282,28 @@ export async function acknowledge(env:Env,device:Device,value:Record<string,unkn
   ...(isTest?{}:{endAt:new Date(until).toISOString()})};
  const journal=env.DB.prepare(`INSERT INTO timeline_events(id,parent_id,listener_id,pair_created_at,kind,occurred_at,payload)
   SELECT ?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?)
-  AND EXISTS(SELECT 1 FROM events WHERE event_id=? AND acknowledged_at IS NULL) ON CONFLICT DO NOTHING`)
-  .bind(journalEvent.id,pair.parent_id,pair.listener_id,pair.created_at,journalEvent.kind,actedAt,JSON.stringify(journalEvent),pair.parent_id,pair.listener_id,pair.created_at,id);
+  AND EXISTS(SELECT 1 FROM events WHERE event_id=? AND acknowledged_at IS NULL) AND ${access.sql} ON CONFLICT DO NOTHING`)
+  .bind(journalEvent.id,pair.parent_id,pair.listener_id,pair.created_at,journalEvent.kind,actedAt,JSON.stringify(journalEvent),pair.parent_id,pair.listener_id,pair.created_at,id,...access.args);
  if(isTest) {
-  // Tests never expire, so confirming one also confirms this pair's earlier unconfirmed tests.
-  // Otherwise repeated tests would each need a separate confirmation. Real alerts are untouched.
+  // Confirm this caregiver's earlier tests without clearing the other person's
+  // independent delivery check. Real alerts are untouched.
   await env.DB.batch([journal,env.DB.prepare(`UPDATE events SET acknowledged_at=COALESCE(acknowledged_at,?) WHERE parent_id=? AND listener_id=?
    AND acknowledged_at IS NULL AND COALESCE(json_extract(payload,'$.isTest'),0)=1 AND (event_id=? OR created_at<=?)
-   AND EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?)`)
-   .bind(timestamp,device.id,event.listener_id,id,event.created_at,pair.parent_id,pair.listener_id,pair.created_at)]);
+   AND COALESCE(json_extract(payload,'$.targetCaregiverId'),parent_id)=?
+   AND EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?) AND ${access.sql}`)
+   .bind(timestamp,device.id,event.listener_id,id,event.created_at,actorId,pair.parent_id,pair.listener_id,pair.created_at,...access.args)]);
  }else{
   const claim=crypto.randomUUID();
   // A unique request claim gates every side effect in the same D1 transaction.
   // A duplicate or a request overtaken by unpairing cannot affect newer alerts.
   await env.DB.batch([
    env.DB.prepare(`INSERT INTO alert_snoozes(event_id,claim_id,parent_id,listener_id,pair_created_at,started_at,until_at)
-    SELECT ?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?)
+    SELECT ?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?) AND ${access.sql}
     AND EXISTS(SELECT 1 FROM events WHERE event_id=? AND parent_id=? AND listener_id=? AND acknowledged_at IS NULL)
-    ON CONFLICT DO NOTHING`).bind(id,claim,device.id,pair.listener_id,pair.created_at,actedAt,until,pair.parent_id,pair.listener_id,pair.created_at,id,device.id,pair.listener_id),
+    ON CONFLICT DO NOTHING`).bind(id,claim,device.id,pair.listener_id,pair.created_at,actedAt,until,pair.parent_id,pair.listener_id,pair.created_at,...access.args,id,device.id,pair.listener_id),
    // Never shorten a longer snooze that is already running; an expired one mutes nothing.
-   env.DB.prepare(`UPDATE devices SET alerts_muted_until=?,alerts_muted_at=? WHERE id=? AND ?>? AND ?>alerts_muted_until
-    AND EXISTS(SELECT 1 FROM alert_snoozes WHERE event_id=? AND claim_id=?)`).bind(until,actedAt,device.id,until,now,until,id,claim),
+   env.DB.prepare(`UPDATE devices SET alerts_muted_until=?,alerts_muted_at=?,alerts_muted_by=? WHERE id=? AND ?>? AND ?>alerts_muted_until
+    AND EXISTS(SELECT 1 FROM alert_snoozes WHERE event_id=? AND claim_id=?)`).bind(until,actedAt,actorId,device.id,until,now,until,id,claim),
    journal,
    // Alerts created after the snooze window ended stay active.
    env.DB.prepare(`UPDATE events SET acknowledged_at=COALESCE(acknowledged_at,?) WHERE parent_id=? AND listener_id=?
@@ -308,16 +314,42 @@ export async function acknowledge(env:Env,device:Device,value:Record<string,unkn
  }
  return {ok:true};
 }
+// End only the episodes visible when Stop alerts was tapped. Persist resolution
+// tombstones so late outbox uploads and reminder retries cannot revive them.
+export async function stopAlerts(env:Env,device:Device,value:Record<string,unknown>) {
+ requireRole(device,'parent');
+ if(Object.keys(value).some(k=>k!=='eventIds')||!Array.isArray(value.eventIds)||!value.eventIds.length||value.eventIds.length>100)throw new APIError(400,'Choose the alerts to stop.');
+ const ids=[...new Set(value.eventIds.map(uuid))],pair=await pairFor(env,device);
+ if(!pair)throw new APIError(409,'Pair a Listener first.');
+ const access=sharedAccess(device),timestamp=new Date().toISOString(),selection=JSON.stringify(ids);
+ // Validate the whole selection before any write, including test/foreign alerts.
+ const selected=await env.DB.prepare(`SELECT event_id FROM events WHERE event_id IN (SELECT value FROM json_each(?)) AND parent_id=? AND listener_id=?
+  AND created_at>=? AND COALESCE(json_extract(payload,'$.isTest'),0)=0`).bind(selection,pair.parent_id,pair.listener_id,pair.created_at).all();
+ if(selected.results.length!==ids.length)throw new APIError(404,'Alert not found in this pairing.');
+ await env.DB.batch([
+  env.DB.prepare(`INSERT INTO resolved_episodes(parent_id,listener_id,pair_created_at,episode_id,resolved_at)
+   SELECT DISTINCT ?,?,?,e.episode_id,? FROM events e WHERE e.event_id IN (SELECT value FROM json_each(?)) AND e.parent_id=? AND e.listener_id=?
+   AND EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?) AND ${access.sql}
+   ON CONFLICT DO NOTHING`).bind(pair.parent_id,pair.listener_id,pair.created_at,timestamp,selection,pair.parent_id,pair.listener_id,pair.parent_id,pair.listener_id,pair.created_at,...access.args),
+  env.DB.prepare(`UPDATE events SET resolved_at=COALESCE(resolved_at,?) WHERE parent_id=? AND listener_id=?
+   AND COALESCE(json_extract(payload,'$.isTest'),0)=0 AND EXISTS(SELECT 1 FROM resolved_episodes r JOIN pairs p
+    ON p.parent_id=r.parent_id AND p.listener_id=r.listener_id AND p.created_at=r.pair_created_at
+    WHERE r.parent_id=events.parent_id AND r.listener_id=events.listener_id AND r.episode_id=events.episode_id) AND ${access.sql}`)
+   .bind(timestamp,pair.parent_id,pair.listener_id,...access.args)
+ ]);
+ await scheduleReminders(env,pair.parent_id);
+ return {ok:true};
+}
 // End only the snooze the user saw. A delayed retry must not cancel a newer snooze.
 export async function resumeAlerts(env:Env,device:Device,value:Record<string,unknown>) {
  requireRole(device,'parent');
  const expected=value.expectedUntil;
  if(typeof expected!=='number'||!Number.isSafeInteger(expected)||expected<=0)throw new APIError(400,'A valid snooze deadline is required.');
  const pair=await pairFor(env,device);if(!pair)throw new APIError(409,'Pair a Listener first.');
- const now=Date.now();
+ const now=Date.now(),access=sharedAccess(device);
  const guardSQL=`EXISTS(SELECT 1 FROM devices d JOIN pairs p ON p.parent_id=d.id
-  WHERE d.id=? AND d.alerts_muted_until=? AND p.listener_id=? AND p.created_at=?)`;
- const scope=[device.id,expected,pair.listener_id,pair.created_at];
+  WHERE d.id=? AND d.alerts_muted_until=? AND p.listener_id=? AND p.created_at=?) AND ${access.sql}`;
+ const scope=[device.id,expected,pair.listener_id,pair.created_at,...access.args];
  await env.DB.batch([
   // Retain the actual muted interval so delayed uploads from that interval stay silent.
   env.DB.prepare(`UPDATE timeline_events SET payload=json_set(payload,'$.endAt',?)

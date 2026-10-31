@@ -31,7 +31,6 @@ import Foundation
     private var viewing = false
     private var lastSentAt = Date.distantPast
     private var lastMessageAt = Date.distantPast
-    private var requestID: String?
     private var requests = LiveSoundRequests()
     weak var log: DiagnosticLog?
     private var diagnosticRole: String?
@@ -65,7 +64,7 @@ import Foundation
                 self?.connectionID = connectionID; self?.failureReason = nil
                 self?.log?.liveSound(phase: "connecting", role: credential.role.rawValue, connectionID: connectionID)
                 self?.socket = socket; self?.viewing = false; self?.lastSentAt = .distantPast
-                self?.requestID = nil; self?.requests = LiveSoundRequests()
+                self?.requests = LiveSoundRequests()
                 self?.lastMessageAt = Date()
                 socket.resume()
                 let keepalive = Task { [weak self, weak socket] in
@@ -110,7 +109,8 @@ import Foundation
                             self?.onConnectionChange?(true)
                         case "viewing":
                             self?.viewing = control.active == true
-                            self?.requestID = control.requestID
+                            if control.active != true { self?.requests = LiveSoundRequests() }
+                            if let id = control.requestID { self?.requests.include(id, at: Date()) }
                             if control.active == true, control.requestID != nil { self?.onNurserySoundRequest?() }
                         case "nurserySoundCommand":
                             guard credential.role == .listener else { throw URLError(.cannotParseResponse) }
@@ -121,7 +121,7 @@ import Foundation
                             guard credential.role == .parent else { throw URLError(.cannotParseResponse) }
                             let update = try JSONDecoder().decode(NurserySoundUpdate.self, from: data)
                             guard update.isValid else { throw URLError(.cannotParseResponse) }
-                            if self?.requests.accepts(requestID: update.requestID, at: Date()) == true { self?.onNurserySoundUpdate?(update) }
+                            if self?.requests.accepts(requestID: update.requestID, requestIDs: update.requestIDs, at: Date()) == true { self?.onNurserySoundUpdate?(update) }
                         case "levels":
                             let frame = try JSONDecoder().decode(SoundLevelFrame.self, from: data)
                             guard frame.isValid else { throw URLError(.cannotParseResponse) }
@@ -156,7 +156,7 @@ import Foundation
         if let diagnosticRole {
             log?.liveSound(phase: "disconnected", role: diagnosticRole, connectionID: connectionID, reason: "requested")
         }
-        generation = UUID(); scope = nil; viewing = false; requestID = nil; requests = LiveSoundRequests()
+        generation = UUID(); scope = nil; viewing = false; requests = LiveSoundRequests()
         connectionTask?.cancel(); connectionTask = nil
         sendTask?.cancel(); sendTask = nil
         soundStateSendTask?.cancel(); soundStateSendTask = nil
@@ -174,9 +174,10 @@ import Foundation
             closeCode: socket.closeCode.rawValue, httpStatus: (socket.response as? HTTPURLResponse)?.statusCode, error: error)
     }
     func publish(_ frame: SoundLevelFrame) {
-        guard viewing, let requestID, let socket, sendTask == nil, frame.isValid,
+        let ids = requests.activeIDs(at: Date())
+        guard viewing, !ids.isEmpty, let socket, sendTask == nil, frame.isValid,
               Date().timeIntervalSince(lastSentAt) >= 1 else { return }
-        var frame = frame; frame.requestID = requestID
+        var frame = frame; frame.requestID = ids.last; frame.requestIDs = ids
         guard let data = try? JSONEncoder().encode(frame), let text = String(data: data, encoding: .utf8) else { return }
         lastSentAt = Date()
         let connectionID = self.connectionID
@@ -214,8 +215,9 @@ import Foundation
         }
     }
     func publishNurserySound(_ value: NurserySoundUpdate) {
-        guard viewing, let requestID, let socket, soundStateSendTask == nil else { return }
-        var value = value; value.requestID = requestID
+        let ids = requests.activeIDs(at: Date())
+        guard viewing, !ids.isEmpty, let socket, soundStateSendTask == nil else { return }
+        var value = value; value.requestID = ids.last; value.requestIDs = ids
         guard let data = try? JSONEncoder().encode(value), let text = String(data: data, encoding: .utf8) else { return }
         let connectionID = self.connectionID
         soundStateSendTask = Task { [weak self] in

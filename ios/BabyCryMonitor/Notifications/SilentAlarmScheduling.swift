@@ -23,7 +23,7 @@ enum SilentAlarmScheduling {
             stopButton: AlarmButton(text: "Stop", textColor: .white, systemImageName: "stop.circle")
         )), metadata: Metadata(), tintColor: .mint)
         return .alarm(schedule: .fixed(date), attributes: attributes,
-                      stopIntent: SnoozeSilentCryAlarmIntent(episodeID: request.episodeID.uuidString),
+                      stopIntent: SnoozeSilentCryAlarmIntent(episodeID: request.episodeID.uuidString, eventID: request.eventID.uuidString, isTest: request.isTest),
                       sound: .named(soundName))
     }
 }
@@ -32,18 +32,22 @@ enum SilentAlarmScheduling {
 struct SnoozeSilentCryAlarmIntent: LiveActivityIntent {
     static var title: LocalizedStringResource { "Snooze alerts" }
     @Parameter(title: "Episode") var episodeID: String
+    @Parameter(title: "Alert") var eventID: String?
+    @Parameter(title: "Test alarm", default: false) var isTest: Bool
     init() {}
-    init(episodeID: String) { self.episodeID = episodeID }
+    init(episodeID: String, eventID: String, isTest: Bool) {
+        self.episodeID = episodeID; self.eventID = eventID; self.isTest = isTest
+    }
     func perform() async throws -> some IntentResult {
         guard let id = UUID(uuidString: episodeID) else { return .result() }
         #if ALARM_EXTENSION
         // If iOS ever runs Stop in the extension, leave a marker; the app applies
         // the snooze the next time it runs.
         try? AlarmJournal.forMethod(.extension)?.append(AlarmAttempt(method: .extension, outcome: .stopped, reason: nil,
-            eventID: nil, episodeID: id, isTest: false, flags: [], pushCreatedAt: nil, startedAt: Date(), finishedAt: Date(),
+            eventID: eventID.flatMap(UUID.init(uuidString:)), episodeID: id, isTest: isTest, flags: [], pushCreatedAt: nil, startedAt: Date(), finishedAt: Date(),
             alarmAt: nil, conditions: .init(lowPower: ProcessInfo.processInfo.isLowPowerModeEnabled)))
         #else
-        await SilentCryAlarmService.shared.snooze(episodeID: id)
+        await SilentCryAlarmService.shared.snooze(episodeID: id, eventID: eventID.flatMap(UUID.init(uuidString:)), isTest: eventID == nil ? nil : isTest)
         #endif
         return .result()
     }

@@ -107,12 +107,15 @@ struct NurserySoundUpdate: Codable, Equatable, Sendable {
     var type = "nurserySoundState"
     var state: NurserySoundState
     var requestID: String?
+    var requestIDs: [String]?
     var controlToken: UUID
     var commandID: UUID?
     var failure: String?
     var isValid: Bool {
         type == "nurserySoundState" && state.isValid
         && (requestID.map { UUID(uuidString: $0) != nil } ?? true)
+        && (requestIDs?.count ?? 0) <= 16
+        && (requestIDs ?? []).allSatisfy { UUID(uuidString: $0) != nil }
         && (failure.map { ["playbackFailed", "expired", "unavailable"].contains($0) } ?? true)
     }
 }

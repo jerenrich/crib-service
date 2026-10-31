@@ -18,6 +18,7 @@ import UIKit
     var error: String?
     var audioStatus = "Stopped"
     var deliveryStatus = "Not connected"
+    var stoppingAlerts = false
     var resumingAlerts = false
     var acknowledgingAlert = false
     var retryingConnection = false
@@ -51,6 +52,8 @@ import UIKit
     private var parentMonitoringPairingID: String?
     private(set) var listenerPairStatus: ParentStatus?
     private(set) var listenerPairStatusReceivedAt: Date?
+    @ObservationIgnored private var listenerAlertGeneration = 0
+    var alertStatus: ParentStatus? { role == .listener ? listenerPairStatus : parentStatus }
     var timeline: TimelineResponse?
     var timelineClockOffset: TimeInterval = 0
     var timelineError: String?
@@ -115,6 +118,9 @@ import UIKit
     @ObservationIgnored private let liveSound: any LiveSoundStreaming
     @ObservationIgnored private var appActive = true
     @ObservationIgnored private let alerts = AlertCoordinator()
+    var changingCaregiverDuty = false
+    var caregiverInvite: PairingCode?
+    var caregiverError: String?
     @ObservationIgnored private var credential: DeviceCredential?
     @ObservationIgnored private var loopTask: Task<Void, Never>?
     @ObservationIgnored private var audioTask: Task<Void, Never>?
@@ -393,19 +399,26 @@ import UIKit
                 state: .quiet, configuration: configuration, microphoneActive: true)
             if ProcessInfo.processInfo.arguments.contains("--uitesting-microphone-off") {
                 status.monitoring = false; status.microphoneActive = false
+                if role == .listener { monitoring = false; microphoneActive = false }
             }
             if ProcessInfo.processInfo.arguments.contains("--uitesting-listener-stale") {
                 status.lastHeartbeat = now.addingTimeInterval(-180)
             }
-            if role == .parent { parentStatus = status }
-            else { listenerPairStatus = status; listenerPairStatusReceivedAt = now }
-            seedLiveSoundFrameForUITest()
+            if ProcessInfo.processInfo.arguments.contains("--uitesting-caregivers") {
+                let me = UUID(), partner = UUID()
+                status.caregiverDuty = CaregiverDuty(myId: me, primaryId: me, revision: 1, escalationSeconds: 120,
+                    caregivers: [.init(id: me, name: "Jordan", secondaryEnabled: true, phoneRegistered: true, watchRegistered: true),
+                                 .init(id: partner, name: "Alex", secondaryEnabled: true, phoneRegistered: true, watchRegistered: true)])
+            }
             if ProcessInfo.processInfo.arguments.contains("--uitesting-active-alert") || ProcessInfo.processInfo.arguments.contains("--uitesting-test-alert") {
-                parentStatus?.alerts = [RemoteAlert(eventId: UUID(), episodeId: UUID(), cryStartedAt: now.addingTimeInterval(-60),
+                status.alerts = [RemoteAlert(eventId: UUID(), episodeId: UUID(), cryStartedAt: now.addingTimeInterval(-60),
                     durationSeconds: 60, createdAt: now, status: "sent", acknowledgedAt: nil,
                     isTest: ProcessInfo.processInfo.arguments.contains("--uitesting-test-alert"))]
             }
-            if ProcessInfo.processInfo.arguments.contains("--uitesting-snoozed") { parentStatus?.alertsMutedUntil = now.addingTimeInterval(60) }
+            if ProcessInfo.processInfo.arguments.contains("--uitesting-snoozed") { status.alertsMutedUntil = now.addingTimeInterval(60) }
+            if role == .parent { parentStatus = status }
+            else { listenerPairStatus = status; listenerPairStatusReceivedAt = now }
+            seedLiveSoundFrameForUITest()
             if ProcessInfo.processInfo.arguments.contains("--uitesting-chart-paused") { remoteSound.disconnected() }
             if ProcessInfo.processInfo.arguments.contains("--uitesting-keep-awake") { keepScreenAwake = true }
         }
@@ -487,9 +500,43 @@ import UIKit
             : "Monitoring is not confirmed. Check internet on both phones, then reopen Crib Service on the nursery iPhone."
     }
 
+    /// Includes snoozed episodes so Stop also prevents them resuming later.
+    var stoppableAlertIDs: [UUID] {
+        var episodes = Set<UUID>()
+        return (alertStatus?.alerts ?? []).filter {
+            $0.isTest != true && $0.resolvedAt == nil && episodes.insert($0.episodeId).inserted
+        }.map(\.eventId)
+    }
+
+    @discardableResult func stopAlerts() async -> Bool {
+        let ids = stoppableAlertIDs
+        guard role != nil, paired, !ids.isEmpty, !stoppingAlerts, !acknowledgingAlert, !resumingAlerts, !managingDevice else { return false }
+        stoppingAlerts = true; defer { stoppingAlerts = false }
+        let revision = environmentRevision
+        let episodes = Set((alertStatus?.alerts ?? []).filter { ids.contains($0.eventId) }.map(\.episodeId))
+        do {
+            let client = try await registeredClient()
+            guard revision == environmentRevision else { return false }
+            try await client.stopAlerts(eventIDs: ids)
+            guard revision == environmentRevision else { return false }
+            if #available(iOS 26.0, *), defaults === UserDefaults.standard {
+                SilentCryAlarmService.shared.cancelEpisodes(episodes)
+            }
+            await notifications.dismissCryingAlerts(testEventID: nil)
+            try await refreshAlertStatus(using: client)
+            guard revision == environmentRevision else { return false }
+            return true
+        } catch {
+            guard revision == environmentRevision else { return false }
+            self.error = "Could not confirm alerts stopped. Retry when connected. \(error.localizedDescription)"
+            log.record("stop_alerts_failed", error: error)
+            return false
+        }
+    }
+
     @discardableResult func resumeAlerts(until expected: Date? = nil) async -> Bool {
-        guard role == .parent, paired, !resumingAlerts, !managingDevice,
-              let until = expected ?? parentStatus?.alertsMutedUntil, until > currentTime() else { return false }
+        guard role != nil, paired, !resumingAlerts, !acknowledgingAlert, !stoppingAlerts, !managingDevice,
+              let until = expected ?? alertStatus?.alertsMutedUntil, until > currentTime() else { return false }
         resumingAlerts = true; defer { resumingAlerts = false }
         let revision = environmentRevision
         do {
@@ -497,8 +544,9 @@ import UIKit
             guard revision == environmentRevision else { return false }
             try await client.resumeAlerts(until: until)
             guard revision == environmentRevision else { return false }
-            await refreshParent()
-            return parentStatus != nil && (parentStatus?.alertsMutedUntil ?? .distantPast) <= currentTime()
+            try await refreshAlertStatus(using: client)
+            guard revision == environmentRevision else { return false }
+            return alertStatus != nil && (alertStatus?.alertsMutedUntil ?? .distantPast) <= currentTime()
         } catch {
             guard revision == environmentRevision else { return false }
             self.error = "Could not confirm alerts resumed. Retry when connected. \(error.localizedDescription)"
@@ -511,7 +559,7 @@ import UIKit
 
     /// Test delivery must not replace nursery status or monitoring controls.
     var activeAlert: RemoteAlert? {
-        parentStatus?.alerts?.first { $0.isTest != true && $0.acknowledgedAt == nil && $0.resolvedAt == nil }
+        alertStatus?.alerts?.first { $0.isTest != true && $0.acknowledgedAt == nil && $0.resolvedAt == nil }
     }
     /// Keep existing Watch test presentation independent of Monitor's real alerts.
     private var watchAlert: RemoteAlert? {
@@ -529,7 +577,7 @@ import UIKit
         stop(); environmentRevision += 1; role = value; defaults.set(value.rawValue, forKey: "role")
         resetMonitoringControl()
         timeline = nil; timelineError = nil
-        parentStatus = nil; pairingCode = nil; credential = nil; uploadedToken = nil; loadCredential()
+        parentStatus = nil; pairingCode = nil; caregiverInvite = nil; caregiverError = nil; credential = nil; uploadedToken = nil; loadCredential()
         nextParentRefreshAt = .distantPast
         testPushStatus = nil; latestTestEventID = nil
         stopWatchTest(); watchTestError = nil
@@ -551,7 +599,7 @@ import UIKit
         clearLiveSound()
         defaults.set(backendURL, forKey: "backendURL")
         timeline = nil; timelineError = nil
-        credential = nil; parentStatus = nil; pairingCode = nil; uploadedToken = nil
+        credential = nil; parentStatus = nil; pairingCode = nil; caregiverInvite = nil; caregiverError = nil; uploadedToken = nil
         nextParentRefreshAt = .distantPast
         testPushStatus = nil; latestTestEventID = nil
         stopWatchTest(); watchTestError = nil
@@ -1566,14 +1614,20 @@ import UIKit
         parentRefreshTask = nil
     }
     private func fetchParentStatus() async {
-        let revision = environmentRevision, generation = settingsGeneration
+        let revision = environmentRevision, generation = settingsGeneration, alerts = listenerAlertGeneration
         let checkedAt = currentTime()
         do {
-            let client = try await registeredClient(); let status = try await client.status()
-            guard revision == environmentRevision, role == .parent else { return }
+            let client = try await registeredClient(); var status = try await client.status()
+            guard revision == environmentRevision, alerts == listenerAlertGeneration, role == .parent else { return }
+            // A poll started before a confirmed swap must not undo that swap.
+            if status.pairingID == parentStatus?.pairingID,
+               let currentDuty = parentStatus?.caregiverDuty,
+               let incomingDuty = status.caregiverDuty, currentDuty.revision > incomingDuty.revision {
+                status.caregiverDuty = currentDuty
+            }
             if #available(iOS 26.0, *), defaults === UserDefaults.standard {
                 await SilentCryAlarmService.shared.synchronize(using: client, status: status, checkedAt: checkedAt)
-                guard revision == environmentRevision, role == .parent else { return }
+                guard revision == environmentRevision, alerts == listenerAlertGeneration, role == .parent else { return }
             }
             if !status.paired || (parentStatus?.pairingID != nil && parentStatus?.pairingID != status.pairingID) {
                 timeline = nil; timelineError = nil; clearLiveSound()
@@ -1630,20 +1684,39 @@ import UIKit
     private func refreshListenerPairing(using client: any BackendServing) {
         guard listenerStatusTask == nil, currentTime().timeIntervalSince(lastRefreshAt) >= 3 else { return }
         lastRefreshAt = currentTime()
-        let revision = environmentRevision, control = controlGeneration
+        let revision = environmentRevision, control = controlGeneration, alerts = listenerAlertGeneration
         listenerStatusTask = Task { [weak self] in
             defer { self?.listenerStatusTask = nil }
             do {
                 guard let self else { return }
                 let fetchedAt = self.currentTime()
                 let status = try await client.status()
-                guard revision == self.environmentRevision, control == self.controlGeneration, self.role == .listener else { return }
+                guard revision == self.environmentRevision, control == self.controlGeneration, alerts == self.listenerAlertGeneration, self.role == .listener else { return }
                 self.observePairing(status)
                 if status.paired { await self.applyMonitoringCommand(status.monitoringCommand, serverTime: status.serverTime, fetchedAt: fetchedAt, using: client) }
             } catch {
                 guard let self, revision == self.environmentRevision else { return }
                 self.log.record("listener_status_failed", error: error)
             }
+        }
+    }
+    private func refreshAlertStatus(using client: any BackendServing) async throws {
+        // A poll begun before this confirmed action cannot restore its alerts.
+        listenerAlertGeneration += 1
+        let revision = environmentRevision, generation = listenerAlertGeneration
+        let checkedAt = currentTime()
+        let status = try await client.status()
+        guard revision == environmentRevision, generation == listenerAlertGeneration else { return }
+        if role == .listener { observePairing(status) }
+        else if role == .parent {
+            if #available(iOS 26.0, *), defaults === UserDefaults.standard {
+                await SilentCryAlarmService.shared.synchronize(using: client, status: status, checkedAt: checkedAt)
+                guard revision == environmentRevision, generation == listenerAlertGeneration else { return }
+            }
+            parentStatus = status
+            paired = status.paired; defaults.set(paired, forKey: pairingKey)
+            notificationsCheckedAt = checkedAt
+            publishWatch()
         }
     }
     func refreshTimeline() async {
@@ -1685,7 +1758,7 @@ import UIKit
     }
     #endif
     @discardableResult func acknowledge(_ id: UUID) async -> Bool {
-        guard !acknowledgingAlert else { return false }
+        guard role != nil, paired, !acknowledgingAlert, !resumingAlerts, !stoppingAlerts, !managingDevice else { return false }
         acknowledgingAlert = true; defer { acknowledgingAlert = false }
         if let alert = parentStatus?.alerts?.first(where: { $0.eventId == id }) {
             if #available(iOS 26.0, *), defaults === UserDefaults.standard {
@@ -1700,8 +1773,9 @@ import UIKit
             guard revision == environmentRevision else { return false }
             try await client.acknowledge(id)
             guard revision == environmentRevision else { return false }
-            SilentCryAlarmSnooze(defaults: defaults).markHandled(id)
-            await refreshParent()
+            if role == .parent { SilentCryAlarmSnooze(defaults: defaults).markHandled(id) }
+            try await refreshAlertStatus(using: client)
+            guard revision == environmentRevision else { return false }
             return true
         } catch {
             guard revision == environmentRevision else { return false }
@@ -1837,7 +1911,7 @@ import UIKit
             paired = false; defaults.set(false, forKey: pairingKey)
             setParentConnectionDeadline(nil)
             timeline = nil; timelineError = nil
-            parentStatus = nil; pairingCode = nil; needsRestart = false
+            parentStatus = nil; pairingCode = nil; caregiverInvite = nil; caregiverError = nil; needsRestart = false
             listenerPairStatus = nil; listenerPairStatusReceivedAt = nil
             settingsDirty = false; defaults.set(false, forKey: "settingsDirty")
             engine = CrySessionManager(); configuration = engine.snapshot.configuration; persist()
@@ -2042,5 +2116,66 @@ import UIKit
     func end() {
         guard identifier != .invalid else { return }
         UIApplication.shared.endBackgroundTask(identifier); identifier = .invalid
+    }
+}
+
+
+extension AppModel {
+    var caregiverDuty: CaregiverDuty? { parentStatus?.caregiverDuty }
+
+    func inviteCaregiver(name: String) async {
+        guard !changingCaregiverDuty else { return }
+        changingCaregiverDuty = true; caregiverError = nil
+        defer { changingCaregiverDuty = false }
+        let revision = environmentRevision
+        do {
+            let client = try await registeredClient()
+            let invite = try await client.inviteCaregiver(name: name)
+            guard revision == environmentRevision else { return }
+            caregiverInvite = invite
+            await refreshParent()
+        } catch {
+            guard revision == environmentRevision else { return }
+            caregiverError = error.localizedDescription
+        }
+    }
+
+    func joinCaregiver(code: String, name: String) async {
+        guard !changingCaregiverDuty else { return }
+        changingCaregiverDuty = true; caregiverError = nil
+        defer { changingCaregiverDuty = false }
+        let revision = environmentRevision
+        do {
+            let client = try await registeredClient()
+            try await client.joinCaregiver(code: code, name: name)
+            guard revision == environmentRevision else { return }
+            environmentRevision += 1
+            parentRefreshTask?.cancel(); parentRefreshTask = nil
+            paired = true; defaults.set(true, forKey: pairingKey)
+            await refreshParent()
+        } catch {
+            guard revision == environmentRevision else { return }
+            caregiverError = error.localizedDescription
+        }
+    }
+
+    func updateCaregiverDuty(primaryId: UUID? = nil, caregiverId: UUID? = nil,
+                             secondaryEnabled: Bool? = nil, escalationSeconds: Int? = nil) async {
+        guard let duty = caregiverDuty, !changingCaregiverDuty else { return }
+        changingCaregiverDuty = true; caregiverError = nil
+        defer { changingCaregiverDuty = false }
+        let revision = environmentRevision
+        do {
+            let client = try await registeredClient()
+            let confirmed = try await client.updateDuty(DutyUpdate(revision: duty.revision, primaryId: primaryId,
+                caregiverId: caregiverId, secondaryEnabled: secondaryEnabled, escalationSeconds: escalationSeconds))
+            guard revision == environmentRevision else { return }
+            parentStatus?.caregiverDuty = confirmed
+            await refreshParent()
+        } catch {
+            guard revision == environmentRevision else { return }
+            await refreshParent()
+            caregiverError = error.localizedDescription
+        }
     }
 }

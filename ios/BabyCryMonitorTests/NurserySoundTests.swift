@@ -7,6 +7,21 @@ import XCTest
 #endif
 
 final class NurserySoundTests: XCTestCase {
+    func testBothCaregiversCanValidateTheirOwnFreshSoundChallenge() {
+        let now = Date()
+        var first = LiveSoundRequests(), second = LiveSoundRequests(), nursery = LiveSoundRequests()
+        let a = first.issue(at: now), b = second.issue(at: now)
+        nursery.include(a, at: now); nursery.include(b, at: now)
+        let state = NurserySoundUpdate(state: .init(), requestID: a, requestIDs: nursery.activeIDs(at: now), controlToken: UUID())
+        XCTAssertTrue(state.isValid)
+        XCTAssertTrue(first.accepts(requestID: state.requestID, requestIDs: state.requestIDs, at: now))
+        XCTAssertTrue(second.accepts(requestID: state.requestID, requestIDs: state.requestIDs, at: now))
+        XCTAssertFalse(first.accepts(requestID: state.requestID, requestIDs: state.requestIDs, at: now.addingTimeInterval(3)))
+        var invalid = state; invalid.requestIDs = ["invalid"]
+        XCTAssertFalse(invalid.isValid)
+        invalid.requestIDs = Array(repeating: a, count: 17)
+        XCTAssertFalse(invalid.isValid)
+    }
     func testLateSettingsChangesNeverRestartExpiredOrStoppedSound() {
         let now = ContinuousClock.now
         for restart in [false, true] {

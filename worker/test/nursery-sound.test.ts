@@ -28,10 +28,12 @@ describe('nursery sound controls',()=>{
  });
  it('accepts confirmed states and rejects impossible countdowns and arbitrary error text',()=>{
   const base=state();expect(nurserySoundState(base)).toEqual(base);
+  expect(nurserySoundState({...base,requestIDs:[crypto.randomUUID(),crypto.randomUUID()]})).toBeTruthy();
   expect(nurserySoundState({...base,state:{...base.state,playing:false,remainingSeconds:0}})).toBeTruthy();
   for(const value of [{...base,state:{...base.state,playing:false}},
    ...[-1,0,1201,Infinity,NaN].map(remainingSeconds=>({...base,state:{...base.state,remainingSeconds}})),
-   {...base,failure:'untrusted message'}, {...base,failure:['expired']}, {...base,commandID:'bad'}, {...base,requestID:'bad'}, {...base,state:{...base.state,recording:'audio'}}])
+   {...base,failure:'untrusted message'}, {...base,failure:['expired']}, {...base,commandID:'bad'}, {...base,requestID:'bad'},
+   {...base,requestIDs:['bad']},{...base,requestIDs:Array(17).fill(crypto.randomUUID())},{...base,state:{...base.state,recording:'audio'}}])
    expect(()=>nurserySoundState(value)).toThrow();
  });
 });

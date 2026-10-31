@@ -3,6 +3,8 @@ import Foundation
 struct ParentStatus: Codable, Sendable {
     var paired: Bool
     var pairingID: String?
+    var caregiverDuty: CaregiverDuty? = nil
+    var snoozedBy: UUID? = nil
     var watchPushRegistered: Bool?
     var phonePushRegistered: Bool?
     var silentWatchAlarmsEnabled: Bool? = nil
@@ -40,6 +42,29 @@ struct ParentStatus: Codable, Sendable {
         guard remaining.isFinite, remaining >= -15 else { return 15 }
         return min(15, max(1, remaining))
     }
+}
+struct CaregiverDuty: Codable, Sendable {
+    struct Caregiver: Codable, Sendable, Identifiable {
+        let id: UUID
+        let name: String
+        let secondaryEnabled: Bool
+        let phoneRegistered: Bool
+        let watchRegistered: Bool
+    }
+    let myId: UUID
+    let primaryId: UUID
+    let revision: Int
+    let escalationSeconds: Int
+    let caregivers: [Caregiver]
+    var primary: Caregiver? { caregivers.first { $0.id == primaryId } }
+    var secondary: Caregiver? { caregivers.first { $0.id != primaryId } }
+}
+struct DutyUpdate: Encodable, Sendable {
+    let revision: Int
+    var primaryId: UUID? = nil
+    var caregiverId: UUID? = nil
+    var secondaryEnabled: Bool? = nil
+    var escalationSeconds: Int? = nil
 }
 struct MonitoringCommand: Codable, Sendable, Equatable {
     let id: UUID
@@ -90,6 +115,9 @@ struct EmptyResponse: Codable, Sendable { var ok: Bool? }
 protocol BackendServing: AlertSending {
     var credential: DeviceCredential { get }
     func register() async throws
+    func inviteCaregiver(name: String) async throws -> PairingCode
+    func joinCaregiver(code: String, name: String) async throws
+    func updateDuty(_ update: DutyUpdate) async throws -> CaregiverDuty
     func createPairing() async throws -> PairingCode
     func claim(_ code: String) async throws
     func status() async throws -> ParentStatus
@@ -101,6 +129,7 @@ protocol BackendServing: AlertSending {
     /// `actedAt` is when the person tapped Snooze, for a queued/late delivery.
     func acknowledge(_ id: UUID, actedAt: Date?) async throws
     func resumeAlerts(until: Date) async throws
+    func stopAlerts(eventIDs: [UUID]) async throws
     func pushToken(_ token: String) async throws
     func watchPushToken(_ token: String?) async throws
     func connectionAlerts(_ enabled: Bool) async throws
@@ -116,6 +145,11 @@ protocol BackendServing: AlertSending {
     func deleteDevice() async throws
 }
 extension BackendServing {
+    func stopAlerts(eventIDs: [UUID]) async throws { throw BackendError.message("Stop alerts requires an updated connection service.") }
+    func inviteCaregiver(name: String) async throws -> PairingCode { throw BackendError.message("Caregiver sharing requires the updated connection service.") }
+    func joinCaregiver(code: String, name: String) async throws { throw BackendError.message("Caregiver sharing requires the updated connection service.") }
+    func updateDuty(_ update: DutyUpdate) async throws -> CaregiverDuty { throw BackendError.message("Caregiver sharing requires the updated connection service.") }
+
     func acknowledge(_ id: UUID) async throws { try await acknowledge(id, actedAt: nil) }
     func alertTest() async throws -> AlertTestResponse { throw BackendError.message("Configurable tests require an updated connection service.") }
     func startAlertTest(id: UUID, configuration: AlertTestConfiguration) async throws -> AlertTestResponse { throw BackendError.message("Configurable tests require an updated connection service.") }
@@ -143,6 +177,11 @@ struct BackendClient: BackendServing {
         struct Registration: Codable { let deviceId: UUID; let role: DeviceRole; let secret: String }
         let _: EmptyResponse = try await request("/v1/device/register", body: Registration(deviceId: credential.deviceId, role: credential.role, secret: credential.secret))
     }
+    func inviteCaregiver(name: String) async throws -> PairingCode { try await request("/v1/caregivers/invite", body: ["name": name]) }
+    func joinCaregiver(code: String, name: String) async throws {
+        let _: PairingResult = try await request("/v1/caregivers/join", body: ["code": code, "name": name])
+    }
+    func updateDuty(_ update: DutyUpdate) async throws -> CaregiverDuty { try await request("/v1/caregivers/duty", body: update) }
     func createPairing() async throws -> PairingCode { try await request("/v1/pairing/create", body: [String: String]()) }
     func claim(_ code: String) async throws { let _: PairingResult = try await request("/v1/pairing/claim", body: ["code": code]) }
     func status() async throws -> ParentStatus { try await request("/v1/listener/status", method: "GET", body: Optional<String>.none) }
@@ -162,6 +201,9 @@ struct BackendClient: BackendServing {
         var body = ["eventId": id.uuidString]
         if let actedAt { body["actedAt"] = actedAt.formatted(Date.ISO8601FormatStyle(includingFractionalSeconds: true)) }
         let _: EmptyResponse = try await request("/v1/alert/acknowledge", body: body)
+    }
+    func stopAlerts(eventIDs: [UUID]) async throws {
+        let _: EmptyResponse = try await request("/v1/alert/stop", body: ["eventIds": eventIDs.map(\.uuidString)])
     }
     func resumeAlerts(until: Date) async throws {
         let _: EmptyResponse = try await request("/v1/alert/resume", body: ["expectedUntil": Int64((until.timeIntervalSince1970 * 1000).rounded())])
@@ -232,7 +274,7 @@ struct BackendClient: BackendServing {
         let operation = ["/v1/device/register": "register", "/v1/pairing/create": "pairing_create", "/v1/pairing/claim": "pairing_claim",
                          "/v1/alarm/scheduled": "alarm_scheduled", "/v1/alarm/attempts": "alarm_attempts", "/v1/silent-watch-alarms": "alarm_settings", "/v1/device/push-token": "push_token", "/v1/device/watch-push-token": "watch_token",
                          "/v1/listener/heartbeat": "heartbeat", "/v1/listener/event": "alert", "/v1/listener/status": "status",
-                         "/v1/timeline": "timeline", "/v1/monitoring": "monitoring", "/v1/monitoring/complete": "monitoring_complete", "/v1/settings": "settings", "/v1/alert/acknowledge": "acknowledge", "/v1/test-push": "test_push", "/v1/alert-test": "test_push", "/v1/alert-test/stop": "test_push", "/v1/watch-test": "test_push", "/v1/watch-test/push": "test_push", "/v1/listener/silent-alarm-test": "test_push", "/v1/alert/resume": "resume_alerts",
+                         "/v1/timeline": "timeline", "/v1/monitoring": "monitoring", "/v1/monitoring/complete": "monitoring_complete", "/v1/settings": "settings", "/v1/alert/acknowledge": "acknowledge", "/v1/test-push": "test_push", "/v1/alert-test": "test_push", "/v1/alert-test/stop": "test_push", "/v1/watch-test": "test_push", "/v1/watch-test/push": "test_push", "/v1/listener/silent-alarm-test": "test_push", "/v1/alert/resume": "resume_alerts", "/v1/alert/stop": "stop_alerts",
                          "/v1/connection-alerts": "connection_preferences", "/v1/pairing/remove": "unpair", "/v1/device/delete": "delete_device"][path].map {
                              // Test status is polled every few seconds; starting a test is not.
                              method == "GET" && path == "/v1/alert-test" ? "alert_test_status" : $0 } ?? "unknown"

@@ -13,6 +13,8 @@ public struct SoundLevelFrame: Codable, Equatable, Sendable {
     public var episodeStartedAt: TimeInterval?
     public var alertDuration: TimeInterval
     public var requestID: String?
+    /// Recent challenges from both caregivers, echoed together in one reading.
+    public var requestIDs: [String]?
     /// Unix timestamps of alert notifications created within the visible chart window.
     public var notificationTimes: [TimeInterval]?
 
@@ -25,6 +27,8 @@ public struct SoundLevelFrame: Codable, Equatable, Sendable {
         && (notificationTimes ?? []).allSatisfy { $0.isFinite && $0 >= sampledAt - Self.windowDuration && $0 <= sampledAt }
         && (episodeStartedAt.map { $0.isFinite && $0 >= 0 && $0 <= sampledAt } ?? true)
         && (requestID.map { UUID(uuidString: $0) != nil } ?? true)
+        && (requestIDs?.count ?? 0) <= 16
+        && (requestIDs ?? []).allSatisfy { UUID(uuidString: $0) != nil }
     }
     public var episodeDuration: TimeInterval? { episodeStartedAt.map { max(0, sampledAt - $0) } }
 }
@@ -35,16 +39,25 @@ public struct LiveSoundRequests: Sendable {
     private var issued: [String: Date] = [:]
     public init() {}
     public mutating func issue(at now: Date) -> String {
-        issued = issued.filter { (0..<3).contains(now.timeIntervalSince($0.value)) }
-        let id = UUID().uuidString.lowercased(); issued[id] = now
+        let id = UUID().uuidString.lowercased(); include(id, at: now)
         return id
     }
-    public func accepts(_ frame: SoundLevelFrame, at now: Date) -> Bool {
-        accepts(requestID: frame.requestID, at: now)
+    public mutating func include(_ id: String, at now: Date) {
+        issued = issued.filter { (0..<3).contains(now.timeIntervalSince($0.value)) }
+        guard UUID(uuidString: id) != nil else { return }
+        // Receiving a duplicate never extends that challenge's lifetime.
+        issued[id] = issued[id] ?? now
+        if issued.count > 16, let oldest = issued.min(by: { $0.value < $1.value })?.key { issued.removeValue(forKey: oldest) }
     }
-    public func accepts(requestID: String?, at now: Date) -> Bool {
-        guard let id = requestID, let sent = issued[id] else { return false }
-        return (0..<3).contains(now.timeIntervalSince(sent))
+    public func activeIDs(at now: Date) -> [String] {
+        issued.filter { (0..<3).contains(now.timeIntervalSince($0.value)) }.keys.sorted()
+    }
+    public func accepts(_ frame: SoundLevelFrame, at now: Date) -> Bool {
+        accepts(requestID: frame.requestID, requestIDs: frame.requestIDs, at: now)
+    }
+    public func accepts(requestID: String?, requestIDs: [String]? = nil, at now: Date) -> Bool {
+        let ids = (requestID.map { [$0] } ?? []) + (requestIDs ?? [])
+        return ids.contains { id in issued[id].map { (0..<3).contains(now.timeIntervalSince($0)) } ?? false }
     }
 }
 

@@ -134,6 +134,7 @@ struct NightstandDevicesPanel: View {
 struct NightstandDevicesView: View {
     @Environment(AppModel.self) private var model
     @State private var pairing = false
+    @State private var caregivers = false
 
     var body: some View {
         ScrollView {
@@ -149,6 +150,8 @@ struct NightstandDevicesView: View {
                         .font(.footnote).foregroundStyle(Palette.muted)
                 }
                 if model.role == .parent {
+                    Button("Caregivers & duty") { caregivers = true }
+                        .frame(minHeight: 44).accessibilityIdentifier("manageCaregivers")
                     Panel {
                         Label("Apple Watch", systemImage: "applewatch").font(.headline)
                         Text(model.watch.status).font(.subheadline).foregroundStyle(Palette.muted)
@@ -165,5 +168,6 @@ struct NightstandDevicesView: View {
         .toolbar(.visible, for: .navigationBar)
         .toolbarBackground(Palette.background, for: .navigationBar)
         .sheet(isPresented: $pairing) { PairingView() }
+        .sheet(isPresented: $caregivers) { CaregiverConnectionView() }
     }
 }
