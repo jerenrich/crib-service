@@ -17,7 +17,7 @@ struct NurserySoundButton: View {
                     } else if model.changingNurserySound {
                         Text("Waiting for confirmation…").font(.caption).foregroundStyle(Palette.muted)
                     } else {
-                        Text(state.playing ? "Stops in \(durationText(ceil(state.remainingSeconds))) · \(Int(state.settings.volume * 100))% volume" : "White noise or a gentle lullaby")
+                        Text(state.playing ? "Stops in \(durationText(ceil(state.remainingSeconds)))" : "White noise or a gentle lullaby")
                             .font(.caption).monospacedDigit().foregroundStyle(Palette.muted)
                     }
                 }
@@ -35,9 +35,6 @@ struct NurserySoundButton: View {
 struct NurserySoundsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
-    @State private var volume = 0.3
-    @State private var editingVolume = false
-
     private var state: NurserySoundState { model.displayedNurserySound }
     private func change(settings: NurserySoundSettings, action: NurserySoundRequest.Action = .updateSettings, restartTimer: Bool = false) {
         let request = NurserySoundRequest(settings: settings, action: action, restartTimer: restartTimer)
@@ -100,20 +97,8 @@ struct NurserySoundsView: View {
                     }
                 }.disabled(!model.canControlNurserySound)
 
-                VStack(spacing: 8) {
-                    HStack { Text("Nursery volume"); Spacer(); Text("\(Int((volume * 100).rounded()))%").monospacedDigit() }.font(.subheadline)
-                    HStack(spacing: 12) {
-                        Image(systemName: "speaker.fill")
-                        Slider(value: $volume, in: 0...1, step: 0.01) { editing in
-                            editingVolume = editing
-                            if !editing {
-                                guard model.canControlNurserySound else { volume = state.settings.volume; return }
-                                var settings = state.settings; settings.volume = volume; change(settings: settings)
-                            }
-                        }.tint(Palette.mint).accessibilityLabel("Nursery volume").accessibilityIdentifier("nurserySoundVolume")
-                        Image(systemName: "speaker.wave.3.fill")
-                    }.foregroundStyle(Palette.muted)
-                }.disabled(!model.canControlNurserySound)
+                Text("Adjust the volume using the buttons on the nursery iPhone.")
+                    .font(.caption).foregroundStyle(Palette.muted)
 
                 VStack(spacing: 10) {
                     Button { change(settings: state.settings, action: state.playing ? .stop : .play) } label: {
@@ -132,15 +117,10 @@ struct NurserySoundsView: View {
                         Text(failure).font(.footnote).foregroundStyle(Palette.amber).accessibilityIdentifier("nurserySoundError")
                     }
                 }
-                Text("Changing sound or volume keeps the timer running. Choosing a timer starts a new countdown.")
+                Text("Changing sound keeps the timer running. Choosing a timer starts a new countdown.")
                     .font(.caption).foregroundStyle(Palette.muted)
             }.padding(22)
         }
         .background(Palette.background).foregroundStyle(.white).tint(Palette.lavender)
-        .onAppear { volume = state.settings.volume }
-        .onChange(of: state.settings.volume) { _, value in if !editingVolume { volume = value } }
-        .onChange(of: model.changingNurserySound) { _, changing in
-            if !changing, !editingVolume { volume = state.settings.volume }
-        }
     }
 }

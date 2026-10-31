@@ -377,7 +377,6 @@ private actor AudioCaptureDriver: AudioCaptureDriving {
                     try Task.checkCancellation()
                     player.scheduleBuffer(buffer, at: nil, options: .loops); player.play()
                 }
-                player.volume = Float(state.settings.volume)
             } else { try rebuild() }
         } catch { sound = nil; throw error }
     }
@@ -395,7 +394,8 @@ private actor AudioCaptureDriver: AudioCaptureDriving {
         let buffer = try buffer(for: settings.sound)
         let player = AVAudioPlayerNode(); engine.attach(player)
         engine.connect(player, to: engine.mainMixerNode, format: buffer.format)
-        player.volume = Float(settings.volume); player.scheduleBuffer(buffer, at: nil, options: .loops)
+        // The system volume is the only user-facing volume control.
+        player.volume = 1; player.scheduleBuffer(buffer, at: nil, options: .loops)
         self.player = player
     }
     func pause(generation requested: Int) {

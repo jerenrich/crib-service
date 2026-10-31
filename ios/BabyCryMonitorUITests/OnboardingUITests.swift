@@ -10,7 +10,7 @@ final class OnboardingUITests: XCTestCase {
         XCTAssertTrue(app.buttons["nurserySound_whiteNoise"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.buttons["nurserySound_twinkleTwinkle"].exists)
         for minutes in [5, 10, 20, 30, 60] { XCTAssertTrue(app.buttons["nurserySoundTimer_\(minutes)"].exists) }
-        XCTAssertTrue(app.sliders["nurserySoundVolume"].exists)
+        XCTAssertFalse(app.sliders["nurserySoundVolume"].exists)
         XCTAssertFalse(app.buttons["nurserySoundPlayback"].isEnabled, "An offline Parent cannot claim it started playback")
         let shot = XCTAttachment(screenshot: app.screenshot()); shot.name = "Parent nursery sound sheet"; shot.lifetime = .keepAlways; add(shot)
         app.buttons["Done"].tap()
