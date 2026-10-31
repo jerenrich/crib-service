@@ -66,6 +66,17 @@ final class OnboardingUITests: XCTestCase {
         let shot = XCTAttachment(screenshot: app.screenshot()); shot.name = "Nursery alert Snooze circle"; shot.lifetime = .keepAlways; add(shot)
     }
 
+    @MainActor func testStoppedNurseryCanSnoozeAnOutstandingAlertAndStillOffersStart() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", "--uitesting-listener", "--uitesting-active-alert", "--uitesting-microphone-off"]
+        app.launch()
+        XCTAssertTrue(app.buttons["nightstandSnooze"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["nightstandSnooze"].isHittable)
+        XCTAssertTrue(app.buttons["nightstandMonitoringControl"].isHittable)
+        XCTAssertTrue(app.staticTexts["Microphone inactive"].firstMatch.exists)
+        XCTAssertFalse(app.staticTexts["Nursery keeps listening"].exists)
+    }
+
     @MainActor func testNurserySnoozedCircleShowsResumeAndCountdown() {
         let app = XCUIApplication()
         app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", "--uitesting-listener", "--uitesting-snoozed"]
