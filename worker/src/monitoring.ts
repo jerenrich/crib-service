@@ -30,7 +30,21 @@ export async function requestMonitoring(env:Env,device:Device,value:Record<strin
   env.DB.prepare(`UPDATE events SET acknowledged_at=COALESCE(acknowledged_at,?) WHERE parent_id=? AND listener_id=?
    AND COALESCE(json_extract(payload,'$.isTest'),0)=0 AND ?=0
    AND EXISTS(SELECT 1 FROM monitoring_commands WHERE id=? AND claim_id=? AND parent_id=? AND listener_id=? AND enabled=0)`)
-   .bind(new Date(now).toISOString(),pair.parent_id,pair.listener_id,enabled,id,claim,pair.parent_id,pair.listener_id)
+   .bind(new Date(now).toISOString(),pair.parent_id,pair.listener_id,enabled,id,claim,pair.parent_id,pair.listener_id),
+  // End the current shared snooze with this new pause, retaining its actual
+  // interval so delayed uploads from that interval remain suppressed. The
+  // claim prevents retries of an old command from clearing a newer snooze.
+  env.DB.prepare(`UPDATE timeline_events SET payload=json_set(payload,'$.endAt',?)
+   WHERE parent_id=? AND listener_id=? AND pair_created_at=? AND kind='alert_acknowledged'
+   AND id IN (SELECT 'ack:'||event_id FROM alert_snoozes WHERE parent_id=? AND listener_id=? AND pair_created_at=? AND until_at>?)
+   AND EXISTS(SELECT 1 FROM monitoring_commands WHERE id=? AND claim_id=? AND enabled=0)`)
+   .bind(new Date(now).toISOString(),pair.parent_id,pair.listener_id,pair.created_at,pair.parent_id,pair.listener_id,pair.created_at,now,id,claim),
+  env.DB.prepare(`UPDATE alert_snoozes SET until_at=? WHERE parent_id=? AND listener_id=? AND pair_created_at=? AND until_at>?
+   AND EXISTS(SELECT 1 FROM monitoring_commands WHERE id=? AND claim_id=? AND enabled=0)`)
+   .bind(now,pair.parent_id,pair.listener_id,pair.created_at,now,id,claim),
+  env.DB.prepare(`UPDATE devices SET alerts_muted_until=? WHERE id=? AND alerts_muted_until>?
+   AND EXISTS(SELECT 1 FROM monitoring_commands WHERE id=? AND claim_id=? AND enabled=0)`)
+   .bind(now,pair.parent_id,now,id,claim)
  ]);
  const row=await env.DB.prepare('SELECT * FROM monitoring_commands WHERE id=? AND parent_id=? AND listener_id=? AND pair_created_at=?')
   .bind(id,pair.parent_id,pair.listener_id,pair.created_at).first<Command>();

@@ -1335,6 +1335,29 @@ describe('configurable reminders and acknowledgement mute',()=>{
   expect(await runReminder(testEnv,parent.deviceId)).toBe(false);
   expect(pushRequests).toHaveLength(1);
  });
+ it.each(['parent','listener'] as const)('clears the shared snooze on %s pause without clearing a later snooze on retry',async(role)=>{
+  const pair=await ready();const {parent,listener,event}=pair;
+  await call('alert/acknowledge',parent,{eventId:event.eventId});
+  advance(5);const pausedAt=Date.now(),id=crypto.randomUUID();
+  expect((await call('monitoring',pair[role],{id,enabled:false})).status).toBe(200);
+  const status=await (await call('listener/status',parent,undefined,'GET')).json() as {alertsMutedUntil:string|null};
+  expect(!status.alertsMutedUntil || Date.parse(status.alertsMutedUntil)<=pausedAt).toBe(true);
+  const window=await env.DB.prepare('SELECT until_at FROM alert_snoozes WHERE event_id=?').bind(event.eventId).first<{until_at:number}>();
+  expect(window?.until_at).toBe(pausedAt);
+  const entry=await env.DB.prepare('SELECT payload FROM timeline_events WHERE id=?').bind(`ack:${event.eventId}`).first<{payload:string}>();
+  expect(Date.parse(JSON.parse(entry!.payload).endAt)).toBe(pausedAt);
+  // A later, independent alert can still be snoozed, and a lost-response retry
+  // of the old pause must not undo it.
+  await call('monitoring',listener,{id:crypto.randomUUID(),enabled:true});
+  advance(10);const next={...alert(listener),createdAt:new Date(Date.now()).toISOString(),cryStartedAt:new Date(pausedAt+1000).toISOString(),durationSeconds:9};
+  expect((await call('listener/event',listener,next)).status).toBe(200);
+  expect((await call('alert/acknowledge',parent,{eventId:next.eventId})).status).toBe(200);
+  const later=await (await call('listener/status',parent,undefined,'GET')).json() as {alertsMutedUntil:string};
+  expect(Date.parse(later.alertsMutedUntil)).toBeGreaterThan(Date.now());
+  await call('monitoring',pair[role],{id,enabled:false});
+  const retried=await (await call('listener/status',parent,undefined,'GET')).json() as {alertsMutedUntil:string};
+  expect(retried.alertsMutedUntil).toBe(later.alertsMutedUntil);
+ });
  it('does not replay delayed offline alerts created during the mute after it expires',async()=>{
   const {parent,listener,event}=await ready();await call('alert/acknowledge',parent,{eventId:event.eventId});
   const created=Date.now()+30000;
