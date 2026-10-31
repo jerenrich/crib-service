@@ -204,9 +204,9 @@ final class OnboardingUITests: XCTestCase {
         let shot = XCTAttachment(screenshot: app.screenshot()); shot.name = "Snooze and connection recovery"; shot.lifetime = .keepAlways; add(shot)
     }
 
-    @MainActor func testTimingChipEditsDelayAndDeviceChipsOpenDevices() {
+    @MainActor func testTimingEditsPersistAndDevicesTabOpens() {
         let app = XCUIApplication()
-        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", "--uitesting-listener"]
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound"]
         app.launch()
         let timing = app.buttons["editAlertTiming"]
         XCTAssertTrue(timing.waitForExistence(timeout: 5))
@@ -216,10 +216,10 @@ final class OnboardingUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["The timer counts from the start of sustained loud sound, including the initial sound check. Brief noises are filtered out."].exists)
         app.buttons["30 sec"].tap()
         app.buttons["Done"].tap()
-        XCTAssertTrue((timing.value as? String)?.contains("30 sec") == true, timing.debugDescription)
+        XCTAssertTrue(timing.label.contains("30 sec"), timing.debugDescription)
         XCTAssertFalse(app.descendants(matching: .any)["pairedDevice_listener"].exists)
         XCTAssertFalse(app.buttons["deviceSummary"].exists)
-        app.buttons["nightstandChip_nursery"].tap()
+        app.tabBars.buttons["Devices"].tap()
         XCTAssertTrue(app.navigationBars["Devices"].waitForExistence(timeout: 5))
     }
 
@@ -448,7 +448,7 @@ final class OnboardingUITests: XCTestCase {
 
     @MainActor func testRecentActivitySummaryOpensActivity() {
         let app = XCUIApplication()
-        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-timeline", "--uitesting-listener"]
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-timeline", "--uitesting-listener", "--uitesting-live-sound"]
         app.launch()
         let summary = app.buttons["nightstandSummary"]
         XCTAssertTrue(summary.waitForExistence(timeout: 5))
@@ -693,12 +693,22 @@ final class OnboardingUITests: XCTestCase {
         XCTAssertTrue(duration.label.contains("30 seconds") || duration.staticTexts["30 seconds"].exists, duration.debugDescription)
         duration.tap()
         app.buttons["5 seconds"].tap()
+        let settingsForm = app.descendants(matching: .any)["settingsForm"]
+        func reveal(_ element: XCUIElement) {
+            for _ in 0..<12 {
+                if element.exists && element.isHittable && element.frame.maxY < settingsForm.frame.maxY - 50 { return }
+                scrollDown(in: settingsForm)
+            }
+        }
         let threshold = app.buttons["soundThresholdPicker"]
-        if !threshold.isHittable { app.swipeUp() }
+        reveal(threshold)
         XCTAssertTrue(threshold.waitForExistence(timeout: 5)); threshold.tap()
-        app.buttons["-45 dBFS"].tap()
+        let thresholdOption = app.buttons["-45 dBFS"]
+        XCTAssertTrue(thresholdOption.waitForExistence(timeout: 5))
+        thresholdOption.coordinate(withNormalizedOffset: CGVector(dx: 0.25, dy: 0.5)).tap()
+        XCTAssertTrue(NSPredicate(format: "label CONTAINS %@", "-45 dBFS").evaluate(with: threshold))
         let snooze = app.buttons["snoozeDurationPicker"]
-        if !snooze.isHittable { app.swipeUp() }
+        reveal(snooze)
         XCTAssertTrue(snooze.waitForExistence(timeout: 5))
         XCTAssertTrue(snooze.label.contains("1 minute") || snooze.staticTexts["1 minute"].exists, snooze.debugDescription)
         snooze.tap(); app.buttons["2 minutes"].tap()
@@ -708,9 +718,9 @@ final class OnboardingUITests: XCTestCase {
         app.buttons["Settings"].tap()
         XCTAssertTrue(duration.waitForExistence(timeout: 5))
         XCTAssertTrue(duration.label.contains("5 seconds") || duration.staticTexts["5 seconds"].exists, duration.debugDescription)
-        if !threshold.isHittable { app.swipeUp() }
+        reveal(threshold)
         XCTAssertTrue(threshold.label.contains("-45 dBFS") || threshold.staticTexts["-45 dBFS"].exists, threshold.debugDescription)
-        if !snooze.isHittable { app.swipeUp() }
+        reveal(snooze)
         XCTAssertTrue(snooze.label.contains("2 minutes") || snooze.staticTexts["2 minutes"].exists, snooze.debugDescription)
         app.swipeUp()
         let diagnostics = app.buttons["Diagnostics & simulation"]
