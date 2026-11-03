@@ -778,10 +778,10 @@ struct NightstandView: View {
         let compact = listener && !typeSize.isAccessibilitySize
         if parentStartUnavailable && !confirmedParentState && model.pendingMonitoringCommand == nil {
             Button { Task { await model.requestMonitoring(false) } } label: {
-                actionLabel("Pause Monitoring", icon: "pause.fill", style: .secondary, compact: compact)
+                actionLabel("Pause (unconfirmed)", icon: "pause.fill", style: .secondary, compact: compact)
             }
             .disabled(model.requestingMonitoring || model.managingDevice)
-            .accessibilityLabel("Pause Monitoring")
+            .accessibilityLabel("Pause monitoring; current status unconfirmed")
             .accessibilityIdentifier("nightstandPauseUnconfirmed")
         } else if !parentStartUnavailable && (monitoringActive || busy) {
             Button(action: toggleMonitoring) {

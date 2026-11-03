@@ -172,6 +172,8 @@ final class AppModelTests: XCTestCase {
         var setAttempts = 0
         var nextSetGate: RequestGate?
         var failRestoration = false
+        var canKeepCaptureOnStop = false
+        func keepCaptureOnStop(_ enabled: Bool) { canKeepCaptureOnStop = enabled }
         func configure(gate: RequestGate? = nil, failRestoration: Bool = false) {
             nextSetGate = gate; self.failRestoration = failRestoration
         }
@@ -200,6 +202,13 @@ final class AppModelTests: XCTestCase {
             if capture, !state.playing, failRestoration { running = false; throw URLError(.cannotOpenFile) }
             current = Operation(capture: capture, state: state); operations.append(current)
             running = capture || state.playing
+        }
+        func stopSoundKeepingCapture(generation requested: Int) throws -> Bool {
+            guard requested >= generation else { throw CancellationError() }; generation = requested
+            guard canKeepCaptureOnStop, running, current.capture, current.state.playing else { return false }
+            current.state.playing = false; current.state.remainingSeconds = 0
+            operations.append(current)
+            return true
         }
         func pause(generation requested: Int) {
             guard requested >= generation else { return }; generation = requested
@@ -262,6 +271,61 @@ final class AppModelTests: XCTestCase {
             XCTAssertEqual(activeCount, 3)
             audio.stop()
         }
+    }
+    @MainActor func testStoppingAndExpiringSoundKeepAnActiveCaptureWithoutRecovery() async throws {
+        for timed in [false, true] {
+            let driver = AudioDriver()
+            await driver.keepCaptureOnStop(true)
+            var clock = ContinuousClock.now
+            let audio = AudioLevelMonitor(driver: driver, currentTime: { clock })
+            var state = NurserySoundState(), transitions: [String] = []
+            audio.onNurserySoundChange = { state = $0 }
+            audio.onStatus = { status in
+                switch status {
+                case .active: transitions.append("active")
+                case .recovering: transitions.append("recovering")
+                case .stopped: transitions.append("stopped")
+                case .failed: transitions.append("failed")
+                }
+            }
+            try await audio.start()
+            try await audio.setNurserySound(.init(settings: .init(timerMinutes: 5), action: .play))
+            let before = transitions
+            if timed { clock = clock.advanced(by: .seconds(301)) }
+            else { try await audio.setNurserySound(.init(settings: state.settings, action: .stop)) }
+            let finished = await eventually { !state.playing }; XCTAssertTrue(finished)
+            XCTAssertEqual(transitions, before, "A running microphone must not be marked interrupted or restarted")
+            let current = await driver.current
+            XCTAssertTrue(current.capture); XCTAssertFalse(current.state.playing)
+            audio.stop()
+        }
+    }
+    @MainActor func testTimerExpiryKeepsCurrentDetectionEpisode() async throws {
+        let driver = AudioDriver()
+        await driver.keepCaptureOnStop(true)
+        let samples = AsyncStream<AudioLevelSample>.makeStream(bufferingPolicy: .bufferingNewest(64))
+        var clock = ContinuousClock.now
+        let audio = AudioLevelMonitor(driver: driver, currentTime: { clock }, sampleStream: samples.stream)
+        let fixture = try Fixture(audioService: audio)
+        await fixture.model.start()
+        await fixture.model.changeNurserySound(.init(settings: .init(timerMinutes: 5), action: .play))
+        for _ in 0..<24 {
+            fixture.time.now = fixture.time.now.addingTimeInterval(0.25)
+            samples.continuation.yield(AudioLevelSample(timestamp: fixture.time.now, dbFS: -10))
+        }
+        let started = await eventually { fixture.model.snapshot.current != nil }; XCTAssertTrue(started)
+        let episode = try XCTUnwrap(fixture.model.snapshot.current?.id)
+        let historyCount = fixture.model.snapshot.history.count
+        clock = clock.advanced(by: .seconds(301))
+        let expired = await eventually { !fixture.model.nurserySound.playing }; XCTAssertTrue(expired)
+        XCTAssertTrue(fixture.model.monitoring)
+        XCTAssertEqual(fixture.model.snapshot.current?.id, episode)
+        XCTAssertEqual(fixture.model.snapshot.history.count, historyCount)
+        fixture.time.now = fixture.time.now.addingTimeInterval(0.25)
+        samples.continuation.yield(AudioLevelSample(timestamp: fixture.time.now, dbFS: -10))
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertEqual(fixture.model.snapshot.current?.id, episode)
+        samples.continuation.finish(); fixture.model.stop()
     }
     @MainActor func testExpiredSoundEditDoesNotPlayAndRestorationFailureIsReported() async throws {
         let driver = AudioDriver()
@@ -462,6 +526,24 @@ final class AppModelTests: XCTestCase {
         let attempts = await driver.setAttempts
         XCTAssertEqual(attempts, 1, "The limit must not launch a fallback graph rebuild")
         XCTAssertFalse(current.state.playing)
+        audio.stop()
+    }
+    @MainActor func testIsolatedConfigurationRecoveriesDoNotExhaustALifetimeLimit() async throws {
+        let driver = AudioDriver()
+        var clock = ContinuousClock.now
+        let audio = AudioLevelMonitor(driver: driver, currentTime: { clock })
+        var failed = false
+        audio.onStatus = { if case .failed = $0 { failed = true } }
+        try await audio.start()
+        for attempt in 1...4 {
+            await driver.simulateEngineStopped()
+            NotificationCenter.default.post(name: .AVAudioEngineConfigurationChange, object: nil)
+            let recovered = await eventually { await driver.isRunning }; XCTAssertTrue(recovered)
+            let count = await driver.recoveryAttempts
+            XCTAssertEqual(count, attempt)
+            XCTAssertFalse(failed)
+            clock = clock.advanced(by: .seconds(61))
+        }
         audio.stop()
     }
     @MainActor func testExternalEventsAreNotLostWhileConfigurationReadsDriverStatus() async throws {
@@ -3083,6 +3165,16 @@ final class AudioGraphIntegrationTests: XCTestCase {
             // AVAudioMixerNode uses equal-power centre panning for a mono
             // player routed to stereo (each side receives -3 dB).
             let playbackPerChannel: Float = channels == 2 ? 0.05 / sqrt(2) : 0.05
+            XCTAssertEqual(try XCTUnwrap(output.floatChannelData)[0][100], amplitude + playbackPerChannel, accuracy: 0.005)
+            // The timer stops only the player: input must continue on the same
+            // running graph, and a later sound must be able to start again.
+            player.stop()
+            XCTAssertTrue(engine.isRunning)
+            XCTAssertEqual(ObjectIdentifier(engine), identity)
+            XCTAssertEqual(try engine.renderOffline(1024, to: output), .success)
+            XCTAssertEqual(try XCTUnwrap(output.floatChannelData)[0][100], amplitude, accuracy: 0.005)
+            player.scheduleBuffer(sound, at: nil, options: .loops, completionHandler: nil); player.play()
+            XCTAssertEqual(try engine.renderOffline(1024, to: output), .success)
             XCTAssertEqual(try XCTUnwrap(output.floatChannelData)[0][100], amplitude + playbackPerChannel, accuracy: 0.005)
             try await Task.sleep(for: .milliseconds(150))
             AudioGraphLifecycle.tearDown(engine: engine, captureTap: tap, player: player)

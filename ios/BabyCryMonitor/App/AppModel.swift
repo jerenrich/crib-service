@@ -1124,7 +1124,7 @@ import UIKit
         _ = now
         if changingNurserySound { return role == .parent ? "Waiting for nursery confirmation…" : "Updating nursery sound…" }
         if role == .listener { return "Plays on this nursery iPhone" }
-        return nurserySoundIsLive ? "Plays on the nursery iPhone · Confirmed" : "Nursery unavailable · Open its app to connect"
+        return nurserySoundIsLive ? "Plays on the nursery iPhone · Confirmed" : "Sound controls disconnected · Open the nursery app to reconnect"
     }
     func changeNurserySound(_ request: NurserySoundRequest) async {
         guard !Task.isCancelled, canControlNurserySound, request.settings.isValid else { return }
