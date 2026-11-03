@@ -7,7 +7,13 @@ import UIKit
     var safetyAccepted: Bool
     var configuration = MonitoringConfiguration()
     var backendURL: String
-    var monitoring = false
+    var monitoring = false {
+        didSet {
+            guard monitoring != oldValue else { return }
+            audio.setClassificationEnabled(monitoring)
+            log.soundAnalysis.monitoring(monitoring, at: currentTime())
+        }
+    }
     private(set) var microphoneActive = false
     private var detectionPaused = false
     @ObservationIgnored private var detectionStartedAt: Date?
@@ -219,6 +225,13 @@ import UIKit
         settingsDirty = defaults.bool(forKey: "settingsDirty")
         UIDevice.current.isBatteryMonitoringEnabled = true
         audio.onStatus = { [weak self] status in self?.audioChanged(status) }
+        audio.onClassification = { [weak self] event in
+            guard let self, self.monitoring else { return }
+            if case .result(let score) = event {
+                guard let start = self.detectionStartedAt, score.windowStart >= start else { return }
+            }
+            self.log.soundAnalysis.classification(event)
+        }
         self.liveSound.onFrame = { [weak self] frame in
             guard let self, self.role == .parent, self.paired, self.appActive else { return }
             // A frame already in flight must not undo a requested Pause.
@@ -1058,6 +1071,9 @@ import UIKit
             log.record(engine.detector.quietSince == nil ? "crying_resumed" : "quiet_gap_started")
         }
         if !events.isEmpty { log.record("alert_threshold_reached") }
+        log.soundAnalysis.level(sample, configuration: configuration, state: state,
+            alertQueued: !events.isEmpty, episode: snapshot.current,
+            nurserySound: nurserySound.playing ? nurserySound.settings.sound : nil, appActive: appActive)
         let persistenceStarted = ContinuousClock.now
         if !events.isEmpty || before != state || sample.timestamp.timeIntervalSince(lastSavedAt) >= 5 { persist(); lastSavedAt = sample.timestamp }
         if !events.isEmpty, storageHealthy, store != nil {

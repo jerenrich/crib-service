@@ -18,6 +18,9 @@ import Observation
     private var recordsSinceCheckpoint = 0
     private let url: URL?
     private let batteryDrain: BatteryDrainLog
+    #if os(iOS)
+    let soundAnalysis: SoundAnalysisLog
+    #endif
     let benchmark: BackgroundBenchmark
     private var recent: [String: Date] = [:]
     private var lastStates: [String: String] = [:]
@@ -55,6 +58,9 @@ import Observation
         let folder = directory ?? (try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true))
         url = folder?.appendingPathComponent("diagnostics.txt")
         batteryDrain = BatteryDrainLog(directory: folder)
+        #if os(iOS)
+        soundAnalysis = SoundAnalysisLog(directory: folder)
+        #endif
         benchmark = BackgroundBenchmark(directory: folder)
         do {
             guard let folder, let url else { persistenceAvailable = false; return }

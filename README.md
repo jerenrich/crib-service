@@ -44,7 +44,7 @@ To build and run it yourself, follow the [developer setup guide](docs/developer-
 
 ### A few important limits
 
-Crib Service currently detects sustained sound levels, so other loud noises can trigger it and quiet crying can be missed. Watch alerts depend on connectivity, notification permissions, and Focus settings; waking a sleeper is not guaranteed. It is not a medical monitor or a substitute for adult supervision.
+Crib Service currently detects sustained sound levels, so other loud noises can trigger it and quiet crying can be missed. Apple’s on-device baby-cry classifier also runs while monitoring to collect comparison data; it does not control alerts. Export its confidence scores and volume-trigger CSV from the nursery iPhone’s Diagnostics screen. Study data stays local for up to 42 days with a 2 GiB cap; [retention and analysis details](docs/diagnostics-review.md#continuous-cry-classifier-study--3-november-2026). Watch alerts depend on connectivity, notification permissions, and Focus settings; waking a sleeper is not guaranteed. It is not a medical monitor or a substitute for adult supervision.
 
 ---
 

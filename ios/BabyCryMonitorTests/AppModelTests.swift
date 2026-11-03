@@ -20,6 +20,44 @@ actor RequestGate {
 }
 
 final class AppModelTests: XCTestCase {
+    @MainActor func testClassifierIsObservationalAndStopsLoggingInStandby() async throws {
+        let fixture = try Fixture()
+        await fixture.model.start()
+        XCTAssertTrue(fixture.audio.classificationEnabled)
+        let start = fixture.time.now
+        let capture = UUID()
+        fixture.audio.onClassification?(.started(id: capture, at: start, sampleRate: 48_000, voiceProcessing: false))
+        fixture.audio.onClassification?(.result(.init(captureID: capture, windowStart: start,
+            windowEnd: start.addingTimeInterval(2), confidence: 1, observedAt: start.addingTimeInterval(3))))
+        XCTAssertEqual(fixture.model.state, .quiet, "Even confidence 1 cannot start a volume episode")
+        for _ in 0..<32 {
+            fixture.time.now = fixture.time.now.addingTimeInterval(0.25)
+            fixture.audio.emit(.init(timestamp: fixture.time.now, dbFS: -20))
+        }
+        let crying = await eventually { fixture.model.state == .crying }; XCTAssertTrue(crying)
+        fixture.audio.onClassification?(.result(.init(captureID: capture, windowStart: start.addingTimeInterval(5),
+            windowEnd: start.addingTimeInterval(7), confidence: 0, observedAt: fixture.time.now)))
+        XCTAssertEqual(fixture.model.state, .crying, "Confidence 0 cannot suppress volume detection")
+        XCTAssertTrue(fixture.model.log.lines.contains { $0.contains("alert_threshold_reached") })
+        fixture.model.pauseMonitoring()
+        XCTAssertFalse(fixture.audio.classificationEnabled)
+        fixture.audio.onClassification?(.result(.init(captureID: capture, windowStart: fixture.time.now,
+            windowEnd: fixture.time.now.addingTimeInterval(2), confidence: 0.5, observedAt: fixture.time.now)))
+        fixture.audio.emit(.init(timestamp: fixture.time.now.addingTimeInterval(0.25), dbFS: -10))
+        for _ in 0..<20 { await Task.yield() }
+        let export = try await fixture.model.log.soundAnalysis.prepareExport()
+        defer { try? FileManager.default.removeItem(at: export[0].deletingLastPathComponent()) }
+        let text = try String(contentsOf: export[0], encoding: .utf8)
+        XCTAssertEqual(text.components(separatedBy: ",classification,").count - 1, 2)
+        XCTAssertEqual(text.components(separatedBy: ",level,").count - 1, 32)
+        XCTAssertTrue(text.contains(",crying,1,"), "Local initial alert creation is retained")
+        XCTAssertNil(fixture.model.log.soundAnalysis.latestConfidence)
+        await fixture.model.start()
+        XCTAssertTrue(fixture.audio.classificationEnabled)
+        fixture.model.stop()
+        await fixture.model.log.soundAnalysis.flush()
+    }
+
     @MainActor func testSoundCommandLogsCorrelateBothPhonesWithoutControlTokens() async throws {
         let parent = try Fixture(); parent.model.selectRole(.parent); await parent.model.refreshParent()
         let nursery = try Fixture()
@@ -1099,6 +1137,9 @@ final class AppModelTests: XCTestCase {
     }
 
     @MainActor final class Audio: AudioLevelProviding {
+        var onClassification: ((SoundClassificationEvent) -> Void)?
+        private(set) var classificationEnabled = false
+        func setClassificationEnabled(_ enabled: Bool) { classificationEnabled = enabled }
         let levels: AsyncStream<AudioLevelSample>
         private let continuation: AsyncStream<AudioLevelSample>.Continuation
         var onStatus: ((AudioCaptureStatus) -> Void)?
