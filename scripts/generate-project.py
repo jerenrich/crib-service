@@ -19,13 +19,13 @@ for name in ['Debug', 'Release']:
 for name, folder, kind in [('BabyCryMonitor', 'BabyCryMonitor', 'application'), ('BabyCryMonitorTests', 'BabyCryMonitorTests', 'bundle.unit-test'), ('BabyCryMonitorUITests', 'BabyCryMonitorUITests', 'bundle.ui-testing')]:
     sourceRefs = []; sourceBuilds = []; resourceBuilds = []
     files = sorted((ios/folder).rglob('*.swift'))
-    if kind == 'application': files += [ios/folder/'Assets.xcassets', ios/folder/'PrivacyInfo.xcprivacy', ios/folder/'Info.plist', ios/folder/'BabyCryMonitor.entitlements'] + sorted((ios/folder/'Resources').glob('*.caf'))
+    if kind == 'application': files += [ios/folder/'Assets.xcassets', ios/folder/'PrivacyInfo.xcprivacy', ios/folder/'Info.plist', ios/folder/'BabyCryMonitor.entitlements'] + sorted((ios/folder/'Resources').glob('*.caf')) + sorted((ios/folder/'Resources').glob('*.mp3'))
     for path in files:
         rel = path.relative_to(ios).as_posix()
-        filetype = {'swift':'sourcecode.swift', 'xcassets':'folder.assetcatalog', 'xcprivacy':'text.xml', 'plist':'text.plist.xml', 'entitlements':'text.plist.entitlements', 'caf':'file'}[path.suffix[1:]]
+        filetype = {'swift':'sourcecode.swift', 'xcassets':'folder.assetcatalog', 'xcprivacy':'text.xml', 'plist':'text.plist.xml', 'entitlements':'text.plist.entitlements', 'caf':'file', 'mp3':'audio.mp3'}[path.suffix[1:]]
         ref = obj('file'+rel, fields(isa='PBXFileReference', lastKnownFileType=filetype, path=q(rel), sourceTree=q('<group>'))); sourceRefs.append(ref)
         if path.suffix == '.swift': sourceBuilds.append(obj('build'+rel, fields(isa='PBXBuildFile', fileRef=ref)))
-        elif path.suffix in ['.xcassets', '.xcprivacy', '.caf']: resourceBuilds.append(obj('build'+rel, fields(isa='PBXBuildFile', fileRef=ref)))
+        elif path.suffix in ['.xcassets', '.xcprivacy', '.caf', '.mp3']: resourceBuilds.append(obj('build'+rel, fields(isa='PBXBuildFile', fileRef=ref)))
     refs.append(obj('group'+name, fields(isa='PBXGroup', name=q(name), children=array(sourceRefs), sourceTree=q('<group>'))))
     product = obj('product'+name, fields(isa='PBXFileReference', explicitFileType='wrapper.application' if kind == 'application' else 'wrapper.cfbundle', includeInIndex='0', path=q(name+('.app' if kind == 'application' else '.xctest')), sourceTree='BUILT_PRODUCTS_DIR'))
     products.append(product)

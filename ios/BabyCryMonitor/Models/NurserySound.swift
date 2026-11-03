@@ -5,32 +5,14 @@ public enum NurserySound: String, Codable, CaseIterable, Sendable {
     public var title: String { self == .whiteNoise ? "White noise" : "Twinkle Twinkle" }
     public var symbol: String { self == .whiteNoise ? "waveform" : "sparkles" }
 
-    /// Original synthesized audio; no recordings, downloads, or licensed assets.
+    /// Generate the locally synthesized white-noise loop.
     public func samples(sampleRate: Double = 22_050) -> [Float] {
-        guard sampleRate.isFinite, (8_000...48_000).contains(sampleRate) else { return [] }
-        if self == .whiteNoise {
-            var random: UInt64 = 0xC81B5EED
-            return (0..<Int(sampleRate * 4)).map { _ in
-                random = random &* 6_364_136_223_846_793_005 &+ 1
-                return (Float(random >> 40) / Float(0xFFFFFF) * 2 - 1) * 0.18
-            }
+        guard self == .whiteNoise, sampleRate.isFinite, (8_000...48_000).contains(sampleRate) else { return [] }
+        var random: UInt64 = 0xC81B5EED
+        return (0..<Int(sampleRate * 4)).map { _ in
+            random = random &* 6_364_136_223_846_793_005 &+ 1
+            return (Float(random >> 40) / Float(0xFFFFFF) * 2 - 1) * 0.18
         }
-        // Public-domain melody, played as a gentle bell-like instrumental.
-        let phrase: [(Int, Int)] = [(0,1),(0,1),(7,1),(7,1),(9,1),(9,1),(7,2),
-            (5,1),(5,1),(4,1),(4,1),(2,1),(2,1),(0,2)]
-        let middle: [(Int, Int)] = [(7,1),(7,1),(5,1),(5,1),(4,1),(4,1),(2,2)]
-        var result: [Float] = []
-        for (note, beats) in phrase + middle + middle + phrase {
-            let duration = Double(beats) * 0.65
-            let frequency = 523.251 * pow(2, Double(note) / 12)
-            for i in 0..<Int(duration * sampleRate) {
-                let t = Double(i) / sampleRate
-                let envelope = min(1, t / 0.015) * min(1, (duration - t) / 0.08) * exp(-2.8 * t)
-                let phase = 2 * Double.pi * frequency * t
-                result.append(Float((sin(phase) + 0.22 * sin(2 * phase) + 0.06 * sin(3 * phase)) * envelope * 0.20))
-            }
-        }
-        return result
     }
 }
 

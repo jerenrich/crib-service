@@ -1,5 +1,8 @@
 import Foundation
 import XCTest
+#if canImport(BabyCryMonitor)
+import AVFoundation
+#endif
 #if canImport(MonitorCore)
 @testable import MonitorCore
 #else
@@ -110,20 +113,24 @@ final class NurserySoundTests: XCTestCase {
         XCTAssertFalse(remote.isLive(at: now))
         XCTAssertEqual(remote.state(at: now)?.settings.sound, .whiteNoise)
     }
-    func testSoundGenerationProducesBoundedDistinctNonSilentAudioAndCorrectMelodyLength() {
+    func testWhiteNoiseGenerationProducesBoundedNonSilentAudio() {
         let noise = NurserySound.whiteNoise.samples(sampleRate: 8_000)
-        let melody = NurserySound.twinkleTwinkle.samples(sampleRate: 8_000)
         XCTAssertEqual(noise.count, 32_000)
-        XCTAssertEqual(melody.count, 249_600) // 48 beats at 0.65 seconds.
-        for samples in [noise, melody] {
-            XCTAssertTrue(samples.allSatisfy { $0.isFinite && abs($0) < 0.3 })
-            let rms = sqrt(samples.reduce(0.0) { $0 + Double($1 * $1) } / Double(samples.count))
-            XCTAssertGreaterThan(rms, 0.01)
-        }
-        XCTAssertEqual(melody.first, 0)
-        XCTAssertLessThan(abs(melody.last ?? 1), 0.001)
+        XCTAssertTrue(noise.allSatisfy { $0.isFinite && abs($0) < 0.3 })
+        let rms = sqrt(noise.reduce(0.0) { $0 + Double($1 * $1) } / Double(noise.count))
+        XCTAssertGreaterThan(rms, 0.01)
         XCTAssertTrue(NurserySound.whiteNoise.samples(sampleRate: .infinity).isEmpty)
     }
+    #if canImport(BabyCryMonitor)
+    func testTwinkleRecordingIsBundledAndDecodable() throws {
+        let url = try XCTUnwrap(Bundle.main.url(forResource: "TwinkleTwinkleOtoLogic", withExtension: "mp3"))
+        let file = try AVAudioFile(forReading: url)
+        XCTAssertGreaterThan(Double(file.length) / file.processingFormat.sampleRate, 30)
+        let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: 4096))
+        try file.read(into: buffer)
+        XCTAssertGreaterThan(buffer.frameLength, 0)
+    }
+    #endif
     func testWireValidationRejectsImpossiblePlaybackAndNonFiniteCountdowns() throws {
         for state in [NurserySoundState(playing: true), .init(playing: true, remainingSeconds: .infinity),
                       .init(playing: true, remainingSeconds: 1201), .init(playing: false, remainingSeconds: 5)] {

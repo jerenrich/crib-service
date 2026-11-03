@@ -479,12 +479,33 @@ private actor AudioCaptureDriver: AudioCaptureDriving {
     }
     private func buffer(for sound: NurserySound) throws -> AVAudioPCMBuffer {
         if let buffer = buffers[sound] { return buffer }
-        let samples = sound.samples()
-        guard let format = AVAudioFormat(standardFormatWithSampleRate: 22_050, channels: 1),
+        if sound == .twinkleTwinkle {
+            guard let url = Bundle.main.url(forResource: "TwinkleTwinkleOtoLogic", withExtension: "mp3") else {
+                throw NurseryAudioFailure(stage: .synthesis, underlying: AudioError.unavailable)
+            }
+            let file = try AVAudioFile(forReading: url)
+            guard file.length > 0, file.length <= Int64(UInt32.max),
+                  let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length)) else {
+                throw NurseryAudioFailure(stage: .synthesis, underlying: AudioError.unavailable)
+            }
+            try file.read(into: buffer)
+            guard buffer.frameLength > 0 else { throw NurseryAudioFailure(stage: .synthesis, underlying: AudioError.unavailable) }
+            buffers[sound] = buffer
+            return buffer
+        }
+        // Match the bundled recording's stereo 44.1 kHz format so the player
+        // can switch sounds without rebuilding the active capture graph.
+        let samples = sound.samples(sampleRate: 44_100)
+        guard let format = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 2),
               let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count)),
-              let channel = buffer.floatChannelData?[0] else { throw NurseryAudioFailure(stage: .synthesis, underlying: AudioError.unavailable) }
+              let channels = buffer.floatChannelData else { throw NurseryAudioFailure(stage: .synthesis, underlying: AudioError.unavailable) }
         buffer.frameLength = buffer.frameCapacity
-        samples.withUnsafeBufferPointer { source in if let base = source.baseAddress { channel.update(from: base, count: samples.count) } }
+        samples.withUnsafeBufferPointer { source in
+            if let base = source.baseAddress {
+                channels[0].update(from: base, count: samples.count)
+                channels[1].update(from: base, count: samples.count)
+            }
+        }
         buffers[sound] = buffer; return buffer
     }
     private func preparePlayer(_ settings: NurserySoundSettings) throws {

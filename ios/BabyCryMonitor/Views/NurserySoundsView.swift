@@ -119,6 +119,8 @@ struct NurserySoundsView: View {
                 }
                 Text("Changing sound keeps the timer running. Choosing a timer starts a new countdown.")
                     .font(.caption).foregroundStyle(Palette.muted)
+                Text("Twinkle Twinkle Little Star Music Box 01-1 by [OtoLogic](https://otologic.jp/free/bgm/music_box-douyo-standard02.html), licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).")
+                    .font(.caption).foregroundStyle(Palette.muted)
             }.padding(22)
         }
         .background(Palette.background).foregroundStyle(.white).tint(Palette.lavender)
