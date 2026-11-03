@@ -21,6 +21,7 @@ protocol AudioCaptureDriving: Sendable {
     var engineID: ObjectIdentifier { get async }
     func activate(generation: Int, clearSound: Bool) async throws
     func recoverConfiguration(generation: Int) async throws
+    func stopSoundKeepingCapture(generation: Int) async throws -> Bool
     func setSound(_ state: NurserySoundState, capture: Bool, generation: Int) async throws
     func pause(generation: Int) async
     func stop(generation: Int) async
@@ -48,6 +49,7 @@ extension AudioLevelProviding {
     private var generation = 0
     private var configuringGeneration: Int?
     private var configurationRecoveryAttempts = 0
+    private var configurationRecoveryWindowStarted: ContinuousClock.Instant?
     private var interrupted = false
     var onStatus: ((AudioCaptureStatus) -> Void)?
     var onNurserySoundChange: ((NurserySoundState) -> Void)?
@@ -63,9 +65,10 @@ extension AudioLevelProviding {
     }
     weak var log: DiagnosticLog?
 
-    init(driver: (any AudioCaptureDriving)? = nil, currentTime: @escaping () -> ContinuousClock.Instant = { .now }) {
+    init(driver: (any AudioCaptureDriving)? = nil, currentTime: @escaping () -> ContinuousClock.Instant = { .now },
+         sampleStream: AsyncStream<AudioLevelSample>? = nil) {
         let pair = AsyncStream<AudioLevelSample>.makeStream(bufferingPolicy: .bufferingNewest(16))
-        levels = pair.stream; self.driver = driver ?? AudioCaptureDriver(continuation: pair.continuation)
+        levels = sampleStream ?? pair.stream; self.driver = driver ?? AudioCaptureDriver(continuation: pair.continuation)
         self.currentTime = currentTime
         observe(AVAudioSession.interruptionNotification)
         observe(AVAudioSession.routeChangeNotification)
@@ -134,23 +137,34 @@ extension AudioLevelProviding {
         let newPlayback = next.state.playing && (request.action == .play || !nurseryState.playing)
         let nextPlaybackID = newPlayback ? UUID() : playbackID
         logSound(phase: "audio_applying", request: request, commandID: commandID, state: next.state, playbackID: nextPlaybackID)
-        var reconfiguringCapture = wantsMonitoring && next.state.playing != nurseryState.playing
-        if reconfiguringCapture { onStatus?(.recovering("Updating nursery speaker and microphone…")) }
+        var reconfiguringCapture = false
         do {
             guard expected == generation else { throw CancellationError() }
-            if interrupted { await driver.pause(generation: expected) }
-            else { try await driver.setSound(next.state, capture: wantsMonitoring, generation: expected) }
+            let retainedCapture: Bool
+            if wantsMonitoring, nurseryState.playing, !next.state.playing, !interrupted {
+                retainedCapture = try await driver.stopSoundKeepingCapture(generation: expected)
+                guard expected == generation else { throw CancellationError() }
+            } else { retainedCapture = false }
+            if !retainedCapture {
+                reconfiguringCapture = wantsMonitoring && next.state.playing != nurseryState.playing
+                if reconfiguringCapture { onStatus?(.recovering("Updating nursery speaker and microphone…")) }
+                if interrupted { await driver.pause(generation: expected) }
+                else { try await driver.setSound(next.state, capture: wantsMonitoring, generation: expected) }
+            }
             guard expected == generation else { throw CancellationError() }
             try Task.checkCancellation()
             // A settings edit may expire while synthesis or graph setup is in flight.
             if next.expired(at: currentTime()) {
-                if wantsMonitoring, !reconfiguringCapture {
+                next.update(at: currentTime())
+                let keptCapture = wantsMonitoring && !interrupted
+                    ? try await driver.stopSoundKeepingCapture(generation: expected) : false
+                guard expected == generation else { throw CancellationError() }
+                if !keptCapture, wantsMonitoring, !reconfiguringCapture {
                     reconfiguringCapture = true
                     onStatus?(.recovering("Restoring microphone after nursery sound…"))
                     guard expected == generation else { throw CancellationError() }
                 }
-                next.update(at: currentTime())
-                try await driver.setSound(next.state, capture: wantsMonitoring, generation: expected)
+                if !keptCapture { try await driver.setSound(next.state, capture: wantsMonitoring, generation: expected) }
                 guard expected == generation else { throw CancellationError() }
             }
             playback = next; armSoundTimer(generation: expected)
@@ -167,7 +181,7 @@ extension AudioLevelProviding {
                 logStop(previous, phase: "stopped", reason: reason)
                 playbackID = nil; playbackCommandID = nil
             }
-            if reconfiguringCapture, wantsMonitoring, !next.state.playing {
+            if wantsMonitoring, previous.state.playing, !next.state.playing {
                 logSound(phase: "capture_restored", commandID: commandID, elapsedMS: DiagnosticTiming.elapsedMS(since: started))
             }
             publishSound()
@@ -226,7 +240,9 @@ extension AudioLevelProviding {
                           state: NurserySoundState? = nil, playbackID: UUID? = nil, reason: String? = nil,
                           elapsedMS: Int? = nil, error: (any Error)? = nil) {
         let state = state ?? nurseryState
-        let mode = wantsMonitoring ? (state.playing ? "voiceChat" : "measurement") : (state.playing ? "playback" : "inactive")
+        // With capture active the graph may retain voice processing after the
+        // player stops, so its mode cannot be inferred from playback state.
+        let mode: String? = wantsMonitoring ? (state.playing ? "voiceChat" : nil) : (state.playing ? "playback" : "inactive")
         log?.nurserySound(phase: phase, role: "listener", commandID: commandID ?? playbackCommandID,
             playbackID: playbackID ?? self.playbackID, action: request?.action.rawValue, sound: state.settings.sound.rawValue,
             timerMinutes: state.settings.timerMinutes, volume: state.settings.volume, playing: state.playing,
@@ -290,6 +306,11 @@ extension AudioLevelProviding {
             defer { if configuringGeneration == expected { configuringGeneration = nil } }
             log?.record(name == .AVAudioEngineConfigurationChange ? "audio_engine_changed" : "audio_route_changed",
                         code: reason.map { Int($0) })
+            let now = currentTime()
+            if let window = configurationRecoveryWindowStarted, window.duration(to: now) >= .seconds(60) {
+                configurationRecoveryAttempts = 0
+            }
+            if configurationRecoveryAttempts == 0 { configurationRecoveryWindowStarted = now }
             if configurationRecoveryAttempts >= 2 {
                 let stopped = finishSound(reason: "engine_configuration_changed")
                 log?.record("audio_recovery_limit", code: configurationRecoveryAttempts)
@@ -463,11 +484,15 @@ private actor AudioCaptureDriver: AudioCaptureDriving {
             if !state.playing {
                 player?.stop()
                 if capture {
-                    if captureChanged || previous != nil || !engine.isRunning || AVAudioSession.sharedInstance().mode != .measurement || engine.inputNode.isVoiceProcessingEnabled {
+                    // Keep the running capture graph and active session when a
+                    // sound ends. Rebuilding it in the background can lose the
+                    // audio assertion and iOS can refuse to reactivate it.
+                    // Voice processing remains enabled until the next rebuild.
+                    if captureChanged || !engine.isRunning {
                         try rebuild(cancellable: false)
                     }
                 } else { tearDown(); deactivateSession() }
-            } else if !captureChanged, previous != nil, engine.isRunning, let player {
+            } else if !captureChanged, engine.isRunning, let player {
                 if previous?.sound != sound?.sound {
                     player.stop()
                     let buffer = try buffer(for: state.settings.sound)
@@ -476,6 +501,14 @@ private actor AudioCaptureDriver: AudioCaptureDriving {
                 }
             } else { try rebuild() }
         } catch { sound = nil; throw error }
+    }
+    func stopSoundKeepingCapture(generation requested: Int) throws -> Bool {
+        guard requested >= generation else { throw CancellationError() }; generation = requested
+        // This check and stop share the driver's actor, so no newer operation
+        // can replace the graph between checking and stopping the player.
+        guard captureEnabled, sound != nil, engine.isRunning, let player else { return false }
+        player.stop(); sound = nil
+        return true
     }
     private func buffer(for sound: NurserySound) throws -> AVAudioPCMBuffer {
         if let buffer = buffers[sound] { return buffer }
