@@ -35,6 +35,8 @@ extension DiagnosticsTests {
         }
         XCTAssertEqual(log.lines.filter { $0.contains("live_sound phase=failed") }.count, 1)
         XCTAssertEqual(log.lines.filter { $0.contains("live_sound phase=retrying") }.count, 1)
+        log.liveSound(phase: "disconnected", role: "listener", reason: "connection_closed", elapsedMS: 5_800_000)
+        XCTAssertTrue(log.lines.last!.contains("elapsed_ms=5800000"), "Long-lived connections must not be reported as one hour")
         log.liveSound(phase: "recovered", role: "listener", connectionID: UUID(), elapsedMS: 100)
         log.liveSound(phase: "failed", role: "listener", connectionID: UUID(), reason: "transport", closeCode: 1011, httpStatus: 503, error: error)
         XCTAssertEqual(log.lines.filter { $0.contains("live_sound phase=failed") }.count, 2)

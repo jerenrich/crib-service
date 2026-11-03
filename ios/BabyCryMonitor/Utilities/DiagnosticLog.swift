@@ -153,7 +153,7 @@ import Observation
         if let closeCode, (1000...4999).contains(closeCode) { entry += " close_code=\(closeCode)" }
         if let httpStatus, (100...599).contains(httpStatus) { entry += " http_status=\(httpStatus)" }
         if let retrySeconds, (1...15).contains(retrySeconds) { entry += " retry_seconds=\(retrySeconds)" }
-        if let elapsedMS { entry += " elapsed_ms=\(min(3_600_000, max(0, elapsedMS))) elapsed_source=monotonic" }
+        if let elapsedMS { entry += " elapsed_ms=\(min(86_400_000, max(0, elapsedMS))) elapsed_source=monotonic" }
         let details = error.map { Self.errorDetails($0) } ?? ""
         if !details.isEmpty { entry += " " + details }
         let failureKey = "live_sound_failure_\(role)"

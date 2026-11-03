@@ -13,7 +13,7 @@ struct NurserySoundButton: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(state.playing ? state.settings.sound.title : "Nursery sounds").font(.subheadline.weight(.semibold))
                     if model.role == .parent, !model.nurserySoundIsLive {
-                        Text("Nursery unavailable · Sound controls").font(.caption).foregroundStyle(Palette.muted)
+                        Text("Sound controls disconnected").font(.caption).foregroundStyle(Palette.muted)
                     } else if model.changingNurserySound {
                         Text("Waiting for confirmation…").font(.caption).foregroundStyle(Palette.muted)
                     } else {
