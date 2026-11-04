@@ -1,5 +1,11 @@
 # Logging and diagnostics review
 
+## Classifier failure diagnostics — 4 November 2026
+
+Classifier failures now carry a bounded snapshot of allowlisted error domains/codes, setup/analysis stage, capture identity, explicit recognized failure category and event-handling activity context in the study CSV. Capture starts identify initial, monitoring restart, audio gap or failure restart. The normal diagnostic ring also records sampled `classifier_failure` rows and a `classifier_recovered` row after valid scores return. Repeated equivalent failures across capture IDs are sampled for 60 seconds with a suppressed count; the CSV retains the individual failure observations. No exception descriptions, paths, userInfo or audio are exported, and failure still means missing confidence rather than zero.
+
+On iOS 26+, run metadata records advertised background-GPU task support. This is a capability query, not a new entitlement, submitted background task or permission for built-in inference. The CSV columns and retention limits are unchanged. These source changes have not been installed on devices. See [the device diagnosis, fix research and validation limits](classifier-background-investigation.md).
+
 ## Continuous cry classifier study — 3 November 2026
 
 The Listener now runs Apple SoundAnalysis `version1` alongside the existing RMS volume detector, using the same microphone input. It logs every returned `baby_crying` score, including zero/low scores, without a confidence threshold or changes to alert decisions. Two-second audio windows overlap by 50%, producing roughly one score per second after startup. Model work uses a separate serial queue with at most 64 pending buffer copies; copies and model windows exist only in memory. Disabling monitoring invalidates queued results and releases the analysis session, including when Standby keeps the microphone running. Graph/format changes start a new capture segment. Classifier initialization/inference failure leaves volume detection running.

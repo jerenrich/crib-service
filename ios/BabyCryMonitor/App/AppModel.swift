@@ -230,7 +230,13 @@ import UIKit
             if case .result(let score) = event {
                 guard let start = self.detectionStartedAt, score.windowStart >= start else { return }
             }
-            self.log.soundAnalysis.classification(event)
+            let active = UIApplication.shared.applicationState == .active
+            self.log.soundAnalysis.classification(event, appActive: active)
+            if case .unavailable(let at, let failure?) = event {
+                self.log.classifierFailure(failure, appActive: active, at: at)
+            } else if case .result(let score) = event {
+                self.log.classifierRecovered(score, appActive: active)
+            }
         }
         self.liveSound.onFrame = { [weak self] frame in
             guard let self, self.role == .parent, self.paired, self.appActive else { return }

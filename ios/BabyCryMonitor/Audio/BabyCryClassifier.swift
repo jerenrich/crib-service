@@ -43,12 +43,17 @@ final class BabyCryClassifier: @unchecked Sendable {
     private var epoch: Int?
     private var failedEpoch: Int?
     private var expectedFrame: AVAudioFramePosition?
+    private var nextStartReason: SoundClassificationStartReason = .initial
 
     init(control: SoundClassificationControl, emit: @escaping @Sendable (SoundClassificationEvent) -> Void) {
         self.control = control; self.emit = emit
         control.registerReset { [weak self] in self?.reset() }
     }
-    private func reset() { queue.async { [self] in endSession(); epoch = nil; failedEpoch = nil } }
+    private func reset() {
+        queue.async { [self] in
+            endSession(); epoch = nil; failedEpoch = nil; nextStartReason = .monitoringRestart
+        }
+    }
     /// A copied buffer has one owner after transfer to the serial queue.
     private struct OwnedBuffer: @unchecked Sendable { let value: AVAudioPCMBuffer }
     func consume(_ buffer: AVAudioPCMBuffer, at time: AVAudioTime, voiceProcessing: Bool) {
@@ -79,6 +84,9 @@ final class BabyCryClassifier: @unchecked Sendable {
             // analysis segment so a window cannot silently bridge missing audio.
             let gap = lost > 0 || (frame != nil && expectedFrame != nil && frame != expectedFrame)
             if self.epoch != epoch || gap {
+                if failedEpoch == epoch { nextStartReason = .afterFailure }
+                else if gap { nextStartReason = .audioGap }
+                else if self.epoch != nil { nextStartReason = .monitoringRestart }
                 endSession()
                 self.epoch = epoch; failedEpoch = nil
             }
@@ -88,14 +96,15 @@ final class BabyCryClassifier: @unchecked Sendable {
                 if session == nil {
                     session = try Session(format: copy.format, origin: start, epoch: epoch,
                                           control: control, emit: emit)
-                    emit(.started(id: session!.id, at: start, sampleRate: copy.format.sampleRate, voiceProcessing: voiceProcessing))
+                    emit(.started(id: session!.id, at: start, sampleRate: copy.format.sampleRate,
+                                  voiceProcessing: voiceProcessing, reason: nextStartReason))
                 }
                 session?.analyze(copy)
                 if session?.hasFailed == true { endSession(); failedEpoch = epoch }
                 expectedFrame = frame.map { $0 + AVAudioFramePosition(copy.frameLength) }
             } catch {
                 endSession(); failedEpoch = epoch
-                emit(.unavailable(at: end))
+                emit(.unavailable(at: end, failure: .init(error: error, stage: .setup)))
             }
         }
     }
@@ -166,7 +175,9 @@ final class BabyCryClassifier: @unchecked Sendable {
         }
         func request(_ request: SNRequest, didFailWithError error: any Error) {
             failureLock.lock(); let first = !failed; failed = true; failureLock.unlock()
-            if first, control.currentEpoch == epoch { emit(.unavailable(at: Date())) }
+            if first, control.currentEpoch == epoch {
+                emit(.unavailable(at: Date(), failure: .init(error: error, stage: .analysis, captureID: id)))
+            }
         }
     }
     private enum ClassifierError: Error { case missingLabel }

@@ -27,10 +27,15 @@ import Observation
     private var watchTraceKeys: Set<String> = []
     private var phoneReceiptKeys: Set<String> = []
     private var persistedLineCount = 0
+    #if os(iOS)
+    private var lastClassifierFailure: (fingerprint: String, at: Date)?
+    private var latestClassifierFailureAt: Date?
+    private var suppressedClassifierFailures = 0
+    #endif
     private var storagePrepared = false
     private static let timestampStyle = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
     private static let events: Set<String> = [
-        "alert_pipeline_ready", "nursery_sound_pipeline_ready", "app_launched", "background_time_expired", "alarm_snapshot_failed", "alarm_snapshot_unavailable", "alarm_journal_failed", "alarm_attempts_upload_discarded", "monitoring_start_superseded", "foreground", "background", "monitoring_recovered_after_relaunch",
+        "alert_pipeline_ready", "nursery_sound_pipeline_ready", "app_launched", "background_time_expired", "alarm_snapshot_failed", "alarm_snapshot_unavailable", "alarm_lock_probe_failed", "alarm_journal_failed", "alarm_attempts_upload_discarded", "monitoring_start_superseded", "foreground", "background", "monitoring_recovered_after_relaunch",
         "paired_successfully", "pairing_created", "pairing_failed", "credential_failed", "metadata_load_failed",
         "monitoring_started", "monitoring_stopped", "monitoring_paused", "monitoring_start_failed", "microphone_permission_denied",
         "test_push_queued", "audio_active", "audio_recovering", "audio_interrupted", "audio_stalled", "audio_recovery_limit",
@@ -107,6 +112,26 @@ import Observation
     func alertRequestStarted(eventID: UUID, clientRequestID: UUID) {
         append("alert_upload phase=started event_id=\(eventID.uuidString.lowercased()) client_request_id=\(clientRequestID.uuidString.lowercased())")
     }
+    #if os(iOS)
+    func classifierFailure(_ failure: SoundClassificationFailure, appActive: Bool, at now: Date = Date()) {
+        latestClassifierFailureAt = max(latestClassifierFailureAt ?? now, now)
+        let fingerprint = failure.diagnosticDetails + ";app_active=\(appActive)"
+        if let last = lastClassifierFailure, last.fingerprint == fingerprint,
+           now.timeIntervalSince(last.at) >= 0, now.timeIntervalSince(last.at) < 60 {
+            suppressedClassifierFailures += 1; sampledRecords += 1; return
+        }
+        var entry = "classifier_failure " + failure.diagnosticDetails + " app_active=\(appActive)"
+        if let id = failure.captureID { entry += " capture_id=\(id.uuidString.lowercased())" }
+        entry += " suppressed_failures=\(suppressedClassifierFailures)"
+        append(entry)
+        lastClassifierFailure = (fingerprint, now); suppressedClassifierFailures = 0
+    }
+    func classifierRecovered(_ score: SoundClassificationObservation, appActive: Bool) {
+        guard let last = latestClassifierFailureAt, score.observedAt >= last, score.windowEnd >= last else { return }
+        append("classifier_recovered capture_id=\(score.captureID.uuidString.lowercased()) app_active=\(appActive) suppressed_failures=\(suppressedClassifierFailures)")
+        lastClassifierFailure = nil; latestClassifierFailureAt = nil; suppressedClassifierFailures = 0
+    }
+    #endif
     /// Fixed vocabulary and bounded values only. Never accept a control token,
     /// device identity, audio samples, raw socket message, or error description.
     func nurserySound(phase: String, role: String? = nil, origin: String? = nil,

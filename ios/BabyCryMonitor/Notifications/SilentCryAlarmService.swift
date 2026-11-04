@@ -601,7 +601,9 @@ import UIKit
         guard let directory = AlarmShared.directory else {
             (log ?? DiagnosticLog()).record("alarm_snapshot_unavailable"); return
         }
-        AlarmShared.writeLockProbe(to: directory)
+        do {
+            try AlarmShared.writeLockProbe(to: directory)
+        } catch { (log ?? DiagnosticLog()).record("alarm_lock_probe_failed", error: error) }
         // Remember only a saved state, so a failed write is retried on the next change or sync.
         do {
             try snapshot.save(to: directory); lastSnapshot = unstamped
