@@ -149,14 +149,15 @@ struct DebugView: View {
                         LabeledContent("Baby crying confidence", value: String(format: "%.4f", confidence))
                         Text("Last audio window ended \(at.formatted(date: .omitted, time: .standard))").font(.caption)
                     } else { Text("Waiting for a classification while monitoring") }
-                    Text(model.log.soundAnalysis.classifierStatus).font(.caption)
+                    SwiftUI.TimelineView(.periodic(from: .now, by: 1)) { context in
+                        Text(model.log.soundAnalysis.classifierStatus(at: context.date)).font(.caption)
+                    }
                     Text(model.log.soundAnalysis.status).font(.caption)
                     if !model.log.soundAnalysis.persistenceAvailable {
                         Text("Sound analysis data could not be saved. Check free space and export what remains.").foregroundStyle(.orange)
                     }
                     Button(preparingSoundAnalysis ? "Preparing export…" : "Prepare sound analysis export") {
                         preparingSoundAnalysis = true
-                        soundAnalysisExport = []
                         Task {
                             defer { preparingSoundAnalysis = false }
                             do { soundAnalysisExport = try await model.log.soundAnalysis.prepareExport() }
@@ -165,6 +166,7 @@ struct DebugView: View {
                     }.disabled(preparingSoundAnalysis)
                     if !soundAnalysisExport.isEmpty {
                         ShareLink(items: soundAnalysisExport) { Text("Share prepared sound analysis export") }
+                            .disabled(preparingSoundAnalysis)
                     }
                     Text("Logs sound levels and applied volume triggers about 4 times per second, plus Apple's baby-cry confidence about once per second while monitoring. Scores are observations only; volume detection still controls alerts. No audio is saved or uploaded.").font(.footnote)
                     Text("Stored separately on this nursery iPhone for up to 42 days, capped at 2 GiB. The oldest files expire sooner if the cap is reached. Export regularly; app removal or device loss removes the data. An export needs additional free space and includes a coverage report explaining gaps and retention. Sudden termination can lose the latest few seconds.").font(.footnote)

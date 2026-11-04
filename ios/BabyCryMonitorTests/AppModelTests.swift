@@ -35,6 +35,8 @@ final class AppModelTests: XCTestCase {
             fixture.audio.emit(.init(timestamp: fixture.time.now, dbFS: -20))
         }
         let crying = await eventually { fixture.model.state == .crying }; XCTAssertTrue(crying)
+        let allSamplesConsumed = await eventually { fixture.model.chartSampledAt == fixture.time.now }
+        XCTAssertTrue(allSamplesConsumed, "Pause only after the queued monitoring samples have been consumed")
         fixture.audio.onClassification?(.result(.init(captureID: capture, windowStart: start.addingTimeInterval(5),
             windowEnd: start.addingTimeInterval(7), confidence: 0, observedAt: fixture.time.now)))
         XCTAssertEqual(fixture.model.state, .crying, "Confidence 0 cannot suppress volume detection")

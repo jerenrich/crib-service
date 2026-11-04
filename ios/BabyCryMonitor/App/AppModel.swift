@@ -1095,6 +1095,7 @@ import UIKit
         }
     }
     func setAppActive(_ active: Bool) {
+        audio.setClassificationAppActive(active)
         appActive = active
         if !active { stopWatchTest() }
         synchronizeLiveSound()

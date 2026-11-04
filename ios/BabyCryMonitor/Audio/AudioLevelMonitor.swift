@@ -33,6 +33,7 @@ protocol AudioCaptureDriving: Sendable {
     var onNurserySoundChange: ((NurserySoundState) -> Void)? { get set }
     var onClassification: ((SoundClassificationEvent) -> Void)? { get set }
     func setClassificationEnabled(_ enabled: Bool)
+    func setClassificationAppActive(_ active: Bool)
     func requestPermission() async -> Bool
     func start() async throws
     func stop()
@@ -41,6 +42,7 @@ protocol AudioCaptureDriving: Sendable {
 extension AudioLevelProviding {
     var onClassification: ((SoundClassificationEvent) -> Void)? { get { nil } set {} }
     func setClassificationEnabled(_ enabled: Bool) {}
+    func setClassificationAppActive(_ active: Bool) {}
     func setNurserySound(_ request: NurserySoundRequest) async throws { try await setNurserySound(request, commandID: nil) }
 }
 /// RMS levels feed the existing detector. Bounded transient buffer copies feed
@@ -52,6 +54,7 @@ extension AudioLevelProviding {
     private var classificationTask: Task<Void, Never>?
     var onClassification: ((SoundClassificationEvent) -> Void)?
     func setClassificationEnabled(_ enabled: Bool) { classificationControl.setEnabled(enabled) }
+    func setClassificationAppActive(_ active: Bool) { classificationControl.setAppActive(active) }
     private let currentTime: () -> ContinuousClock.Instant
     private var observers: [NSObjectProtocol] = []
     private var wantsMonitoring = false
