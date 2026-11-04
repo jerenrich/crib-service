@@ -1,5 +1,8 @@
 import Foundation
 import Observation
+#if os(iOS) && !targetEnvironment(macCatalyst)
+import BackgroundTasks
+#endif
 
 /// Continuous research telemetry has its own retention budget, independent of
 /// the short operational diagnostic ring. No audio or device credentials enter it.
@@ -33,7 +36,13 @@ import Observation
                                         retentionDays: retentionDays, maximumBytes: maximumBytes)
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
-        append(kind: "run_start", at: Date(), detail: "schema=1;app=\(version);build=\(build);os=\(ProcessInfo.processInfo.operatingSystemVersionString)")
+        var capabilities = ""
+        #if os(iOS) && !targetEnvironment(macCatalyst)
+        if #available(iOS 26.0, *) {
+            capabilities = ";background_gpu_supported=\(BGTaskScheduler.supportedResources.contains(.gpu))"
+        }
+        #endif
+        append(kind: "run_start", at: Date(), detail: "schema=1;app=\(version);build=\(build);os=\(ProcessInfo.processInfo.operatingSystemVersionString)\(capabilities)")
     }
     func level(_ sample: AudioLevelSample, configuration: MonitoringConfiguration, state: CryState,
                alertQueued: Bool, episode: CryEpisode?, nurserySound: NurserySound?, appActive: Bool) {
@@ -54,16 +63,21 @@ import Observation
         row[16] = nurserySound?.rawValue ?? "off"; row[17] = appActive ? "1" : "0"
         enqueue(row)
     }
-    func classification(_ event: SoundClassificationEvent) {
+    func classification(_ event: SoundClassificationEvent, appActive: Bool? = nil) {
+        func context(_ row: [String]) -> [String] {
+            var row = row
+            if let appActive { row[17] = appActive ? "1" : "0" }
+            return row
+        }
         switch event {
-        case let .started(id, at, rate, voiceProcessing):
+        case let .started(id, at, rate, voiceProcessing, reason):
             if at >= liveCaptureStartedAt {
                 liveCaptureID = id; liveCaptureStartedAt = at; liveCaptureRunning = true
                 latestConfidence = nil; latestScoreAt = nil; classifierStatus = "Listening for classifications"
             }
             var row = emptyRow(kind: "capture_start", at: at); row[3] = id.uuidString.lowercased()
-            row[18] = "classifier=version1;window_s=2;overlap=0.5;sample_rate=\(number(rate, digits: 0));voice_processing=\(voiceProcessing)"
-            enqueue(row)
+            row[18] = "classifier=version1;window_s=2;overlap=0.5;sample_rate=\(number(rate, digits: 0));voice_processing=\(voiceProcessing);reason=\(reason.rawValue)"
+            enqueue(context(row))
         case .result(let score):
             guard score.confidence.isFinite, (0...1).contains(score.confidence), score.windowEnd >= score.windowStart else { return }
             if liveCaptureRunning, liveCaptureID == score.captureID,
@@ -74,22 +88,23 @@ import Observation
             var row = emptyRow(kind: "classification", at: score.observedAt)
             row[3] = score.captureID.uuidString.lowercased(); row[4] = Self.date(score.windowStart)
             row[5] = Self.date(score.windowEnd); row[6] = number(score.confidence, digits: 6)
-            enqueue(row)
+            enqueue(context(row))
         case let .stopped(id, at):
             if liveCaptureID == id {
                 liveCaptureRunning = false; latestConfidence = nil; latestScoreAt = nil
                 classifierStatus = "Waiting for classifier audio"
             }
-            var row = emptyRow(kind: "capture_stop", at: at); row[3] = id.uuidString.lowercased(); enqueue(row)
-        case let .unavailable(at, failure, captureID, retryAfterSeconds, appActive):
+            var row = emptyRow(kind: "capture_stop", at: at); row[3] = id.uuidString.lowercased(); enqueue(context(row))
+        case let .unavailable(at, failure, eventCaptureID, retryAfterSeconds, eventActive):
+            let captureID = eventCaptureID ?? failure?.captureID
             if captureID == liveCaptureID || (captureID == nil && !liveCaptureRunning) {
                 liveCaptureRunning = false; latestConfidence = nil; latestScoreAt = nil
                 classifierStatus = "Classifier unavailable; volume alerts continue"
             }
             var row = emptyRow(kind: "classifier_unavailable", at: at)
             row[3] = captureID?.uuidString.lowercased() ?? ""
-            row[17] = appActive.map { $0 ? "1" : "0" } ?? ""
-            row[18] = failure?.fields ?? ""
+            row[17] = (eventActive ?? appActive).map { $0 ? "1" : "0" } ?? ""
+            row[18] = failure?.diagnosticDetails ?? ""
             if let retryAfterSeconds { row[18] += ";retry_after_s=\(retryAfterSeconds)" }
             enqueue(row)
         case .droppedEvents(let at):

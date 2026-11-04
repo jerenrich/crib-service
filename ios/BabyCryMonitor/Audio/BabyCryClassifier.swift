@@ -77,6 +77,7 @@ final class BabyCryClassifier: @unchecked Sendable {
     private var epoch: Int?
     private var recovery = SoundClassifierRecovery()
     private var expectedFrame: AVAudioFramePosition?
+    private var nextStartReason: SoundClassificationStartReason = .initial
 
     init(control: SoundClassificationControl, emit: @escaping @Sendable (SoundClassificationEvent) -> Void,
          currentTime: @escaping @Sendable () -> ContinuousClock.Instant = { .now },
@@ -89,6 +90,7 @@ final class BabyCryClassifier: @unchecked Sendable {
             // A delayed Stop/foreground callback must not destroy a newer stream.
             guard let epoch, epoch < invalidation else { return }
             endSession(); self.epoch = nil; recovery = .init(); expectedFrame = nil
+            nextStartReason = .monitoringRestart
         }
     }
     /// A copied buffer has one owner after transfer to the serial queue.
@@ -116,13 +118,17 @@ final class BabyCryClassifier: @unchecked Sendable {
             lock.lock(); let isStopped = stopped; lock.unlock()
             guard !isStopped, control.currentEpoch == epoch else { return }
             if self.epoch != epoch {
+                if self.epoch != nil { nextStartReason = .monitoringRestart }
                 endSession(); self.epoch = epoch; recovery = .init(); expectedFrame = nil
             }
             let gap = lost > 0 || (frame != nil && expectedFrame != nil && frame != expectedFrame)
             // Observe EVERY input frame, including buffers skipped during backoff.
             // An input gap must never clear failure state or authorize an early retry.
             defer { expectedFrame = frame.map { $0 + AVAudioFramePosition(copy.frameLength) } }
-            if gap { endSession() }
+            if gap {
+                if recovery.consecutiveFailures == 0 { nextStartReason = .audioGap }
+                endSession()
+            }
             if lost > 0 { emit(.droppedBuffers(count: lost, at: end)) }
             guard recovery.canAttempt(at: currentTime()) else { return }
             do {
@@ -130,7 +136,8 @@ final class BabyCryClassifier: @unchecked Sendable {
                     let created = try makeSession(copy.format, start, epoch, control, emit)
                     guard isCurrent(epoch: epoch) else { created.stop(); return }
                     session = created
-                    emit(.started(id: created.id, at: start, sampleRate: copy.format.sampleRate, voiceProcessing: voiceProcessing))
+                    emit(.started(id: created.id, at: start, sampleRate: copy.format.sampleRate,
+                                  voiceProcessing: voiceProcessing, reason: nextStartReason))
                 }
                 session?.analyze(copy)
                 guard isCurrent(epoch: epoch) else { endSession(); return }
@@ -138,7 +145,7 @@ final class BabyCryClassifier: @unchecked Sendable {
                 else if session?.hasProducedResult == true { recovery.succeeded(); control.noteSuccess(epoch: epoch) }
             } catch {
                 guard isCurrent(epoch: epoch) else { endSession(); return }
-                fail(.init(error, stage: .initialization), at: Date())
+                fail(.init(error: error, stage: .setup), at: Date())
             }
         }
     }
@@ -151,6 +158,7 @@ final class BabyCryClassifier: @unchecked Sendable {
         if let epoch { control.noteFailure(epoch: epoch) }
         endSession()
         let delay = recovery.failed(at: currentTime())
+        nextStartReason = .afterFailure
         emit(.unavailable(at: date, failure: failure, captureID: id,
                           retryAfterSeconds: delay, appActive: control.appActive))
     }
@@ -231,6 +239,6 @@ private final class Session: NSObject, SoundClassifierStreaming, SNResultsObserv
     }
     func request(_ request: SNRequest, didFailWithError error: any Error) {
         lock.lock(); defer { lock.unlock() }
-        if recordedFailure == nil { recordedFailure = .init(error, stage: .inference) }
+        if recordedFailure == nil { recordedFailure = .init(error: error, stage: .analysis, captureID: id) }
     }
 }

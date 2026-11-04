@@ -26,21 +26,24 @@ final class SoundAnalysisLogTests: XCTestCase {
         let ml = NSError(domain: "com.apple.CoreML", code: 0,
             userInfo: [NSUnderlyingErrorKey: gpu, NSLocalizedDescriptionKey: "private-payload"])
         let error = NSError(domain: "com.apple.SoundAnalysis", code: 2, userInfo: [NSUnderlyingErrorKey: ml])
-        let failure = SoundClassificationFailure(error, stage: .inference)
-        XCTAssertTrue(failure.backgroundGPURestricted)
-        XCTAssertEqual(failure.codes.count, 3)
+        let failure = SoundClassificationFailure(error: error, stage: .analysis)
+        XCTAssertEqual(failure.reason, .backgroundGPUDenied)
+        XCTAssertEqual(failure.causes.count, 3)
         let log = SoundAnalysisLog(directory: directory), id = UUID()
-        log.classification(.unavailable(at: Date(), failure: failure, captureID: id, retryAfterSeconds: 30, appActive: false))
+        log.classification(.unavailable(at: Date(), failure: failure, captureID: id, retryAfterSeconds: 30, appActive: false),
+                           appActive: true)
         let export = try await log.prepareExport()
         defer { try? FileManager.default.removeItem(at: export[0].deletingLastPathComponent()) }
         let text = try String(contentsOf: export[0], encoding: .utf8)
-        XCTAssertTrue(text.contains("com.apple.SoundAnalysis:2|com.apple.CoreML:0|MTLCommandBufferErrorDomain:7"))
-        XCTAssertTrue(text.contains("background_gpu_restricted=true;retry_after_s=30"))
+        XCTAssertTrue(text.contains("com.apple.SoundAnalysis:2>com.apple.CoreML:0>MTLCommandBufferErrorDomain:7"))
+        XCTAssertTrue(text.contains("causes_truncated=false;retry_after_s=30"))
         XCTAssertTrue(text.contains(id.uuidString.lowercased()))
+        XCTAssertEqual(try XCTUnwrap(try rows(in: export).first { $0[2] == "classifier_unavailable" })[17], "0",
+                       "A failure's captured background state must survive later foreground handling")
         XCTAssertFalse(text.contains("private-recording-path")); XCTAssertFalse(text.contains("private-payload"))
-        let unknown = SoundClassificationFailure(NSError(domain: "private-domain", code: 9), stage: .initialization)
-        XCTAssertEqual(unknown.codes.first?.domain, "other")
-        XCTAssertFalse(unknown.backgroundGPURestricted)
+        let unknown = SoundClassificationFailure(error: NSError(domain: "private-domain", code: 9), stage: .setup)
+        XCTAssertEqual(unknown.causes.first?.domain, "other")
+        XCTAssertEqual(unknown.reason, .unknown)
     }
     @MainActor func testDelayedOldCaptureEventsCannotReplaceTheLiveScore() {
         let directory = folder(); defer { try? FileManager.default.removeItem(at: directory) }
@@ -169,6 +172,61 @@ final class SoundAnalysisLogTests: XCTestCase {
     private func rows(in urls: [URL]) throws -> [[String]] {
         try String(contentsOf: urls[0], encoding: .utf8).split(separator: "\n").dropFirst()
             .map { $0.components(separatedBy: ",") }
+    }
+    func testClassifierFailureRetainsSafeCauseChainAndOnlyRecognizesExplicitGPUEvidence() {
+        let secret = "private-token-device-name-path"
+        let gpu = NSError(domain: "MTLCommandBufferErrorDomain", code: 7, userInfo: [
+            NSLocalizedDescriptionKey: "Insufficient Permission (to submit GPU work from background) " + secret,
+            NSFilePathErrorKey: secret
+        ])
+        let core = NSError(domain: "com.apple.CoreML", code: 0, userInfo: [NSUnderlyingErrorKey: gpu])
+        let error = NSError(domain: "com.apple.SoundAnalysis", code: 2,
+                            userInfo: [NSUnderlyingErrorKey: core, NSLocalizedDescriptionKey: secret])
+        let capture = UUID(), failure = SoundClassificationFailure(error: error, stage: .analysis, captureID: capture)
+        XCTAssertEqual(failure.captureID, capture)
+        XCTAssertEqual(failure.reason, .backgroundGPUDenied)
+        XCTAssertEqual(failure.causes.map(\.domain), ["com.apple.SoundAnalysis", "com.apple.CoreML", "MTLCommandBufferErrorDomain"])
+        XCTAssertEqual(failure.causes.map(\.code), [2, 0, 7])
+        XCTAssertFalse(failure.truncated)
+        XCTAssertFalse(failure.diagnosticDetails.contains(secret))
+        let generic = SoundClassificationFailure(error: NSError(domain: "com.apple.SoundAnalysis", code: 2), stage: .analysis)
+        XCTAssertEqual(generic.reason, .operationFailed, "Background context alone must never invent a GPU cause")
+    }
+    func testClassifierFailureBoundsNestedCausesAndRedactsUnknownDomainsAndMessages() {
+        let secret = "private-domain-and-message"
+        var error = NSError(domain: secret, code: 0, userInfo: [NSLocalizedDescriptionKey: secret])
+        for code in 1...8 { error = NSError(domain: secret, code: code, userInfo: [NSUnderlyingErrorKey: error]) }
+        let failure = SoundClassificationFailure(error: error, stage: .setup)
+        XCTAssertEqual(failure.causes.count, 4)
+        XCTAssertEqual(failure.causes.map(\.code), [8, 7, 6, 5])
+        XCTAssertTrue(failure.truncated)
+        XCTAssertTrue(failure.causes.allSatisfy { $0.domain == "other" })
+        XCTAssertFalse(failure.diagnosticDetails.contains(secret))
+        XCTAssertEqual(failure.reason, .unknown)
+        let spoof = SoundClassificationFailure(error: NSError(domain: secret, code: 1, userInfo: [
+            NSLocalizedDescriptionKey: "Insufficient Permission (to submit GPU work from background)"
+        ]), stage: .setup)
+        XCTAssertEqual(spoof.reason, .unknown)
+    }
+    @MainActor func testFailureExportCorrelatesCaptureAndLifecycleWithoutTurningMissingScoresIntoZero() async throws {
+        let directory = folder(); defer { try? FileManager.default.removeItem(at: directory) }
+        let log = SoundAnalysisLog(directory: directory), now = Date(), capture = UUID()
+        let failure = SoundClassificationFailure(error: NSError(domain: "com.apple.SoundAnalysis", code: 2),
+                                                 stage: .analysis, captureID: capture)
+        log.classification(.started(id: capture, at: now, sampleRate: 48_000, voiceProcessing: false, reason: .afterFailure), appActive: false)
+        log.classification(.result(.init(captureID: capture, windowStart: now, windowEnd: now.addingTimeInterval(2),
+                                        confidence: 0.8, observedAt: now.addingTimeInterval(2))), appActive: true)
+        log.classification(.unavailable(at: now.addingTimeInterval(3), failure: failure), appActive: false)
+        let export = try await log.prepareExport()
+        defer { try? FileManager.default.removeItem(at: export[0].deletingLastPathComponent()) }
+        let data = try rows(in: export)
+        let row = try XCTUnwrap(data.first { $0[2] == "classifier_unavailable" })
+        XCTAssertEqual(row[3], capture.uuidString.lowercased())
+        XCTAssertEqual(row[6], "")
+        XCTAssertEqual(row[17], "0")
+        XCTAssertTrue(row[18].contains("stage=analysis;reason=operation_failed;errors=com.apple.SoundAnalysis:2"))
+        XCTAssertTrue(try XCTUnwrap(data.first { $0[2] == "capture_start" })[18].contains("reason=after_failure"))
+        XCTAssertNil(log.latestConfidence)
     }
     @MainActor func testExportPreservesQuietScoresAndVolumeTriggersWithoutChangingAlerts() async throws {
         let directory = folder(); defer { try? FileManager.default.removeItem(at: directory) }

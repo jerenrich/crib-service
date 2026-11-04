@@ -4,6 +4,56 @@ import XCTest
 @testable import BabyCryMonitor
 
 extension DiagnosticsTests {
+    @MainActor func testLockProbeFailureKeepsErrorCodeWithoutPrivatePaths() {
+        let log = DiagnosticLog(directory: URL(fileURLWithPath: "/dev/null"))
+        let secret = "/private/lock-probe-path"
+        let error = NSError(domain: NSCocoaErrorDomain, code: CocoaError.fileWriteNoPermission.rawValue,
+                            userInfo: [NSLocalizedDescriptionKey: secret, NSFilePathErrorKey: secret])
+        log.record("alarm_lock_probe_failed", error: error)
+        XCTAssertTrue(log.export.contains("alarm_lock_probe_failed"))
+        XCTAssertTrue(log.export.contains("domain=NSCocoaErrorDomain code=513"))
+        XCTAssertFalse(log.export.contains(secret))
+    }
+
+    @MainActor func testClassifierFailuresSampleRepeatedCapturesButPreserveContextChangesAndCounts() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let log = DiagnosticLog(directory: directory), now = Date()
+        let error = NSError(domain: "com.apple.SoundAnalysis", code: 2,
+                            userInfo: [NSLocalizedDescriptionKey: "private-exception-description"])
+        for index in 0..<10 {
+            log.classifierFailure(.init(error: error, stage: .analysis, captureID: UUID()), appActive: false,
+                                  at: now.addingTimeInterval(Double(index)))
+        }
+        XCTAssertEqual(log.lines.filter { $0.contains("classifier_failure") }.count, 1)
+        log.classifierRecovered(.init(captureID: UUID(), windowStart: now, windowEnd: now.addingTimeInterval(5),
+                                      confidence: 0.5, observedAt: now.addingTimeInterval(12)), appActive: true)
+        XCTAssertFalse(log.lines.contains { $0.contains("classifier_recovered") },
+                       "Even sampled failures must prevent an older audio window from declaring recovery")
+        log.classifierFailure(.init(error: error, stage: .analysis), appActive: false, at: now.addingTimeInterval(61))
+        XCTAssertEqual(log.lines.filter { $0.contains("classifier_failure") }.count, 2)
+        XCTAssertTrue(log.lines.last!.contains("suppressed_failures=9"))
+        log.classifierFailure(.init(error: error, stage: .analysis), appActive: true, at: now.addingTimeInterval(62))
+        XCTAssertEqual(log.lines.filter { $0.contains("classifier_failure") }.count, 3)
+        XCTAssertTrue(log.lines.last!.contains("app_active=true"))
+        log.classifierFailure(.init(error: error, stage: .setup), appActive: true, at: now.addingTimeInterval(63))
+        XCTAssertEqual(log.lines.filter { $0.contains("classifier_failure") }.count, 4)
+        XCTAssertFalse(log.export.contains("private-exception-description"))
+        XCTAssertTrue(DiagnosticLog(directory: directory).export.contains("stage=setup"))
+        let capture = UUID()
+        let stale = SoundClassificationObservation(captureID: capture, windowStart: now,
+            windowEnd: now.addingTimeInterval(2), confidence: 0.5, observedAt: now.addingTimeInterval(65))
+        log.classifierRecovered(stale, appActive: true)
+        XCTAssertFalse(log.lines.contains { $0.contains("classifier_recovered") }, "Late delivery of an old audio window is not recovery")
+        let recovered = SoundClassificationObservation(captureID: capture, windowStart: now.addingTimeInterval(63),
+            windowEnd: now.addingTimeInterval(65), confidence: 0.5, observedAt: now.addingTimeInterval(65))
+        log.classifierRecovered(recovered, appActive: true)
+        log.classifierRecovered(recovered, appActive: true)
+        XCTAssertEqual(log.lines.filter { $0.contains("classifier_recovered") }.count, 1)
+        log.classifierFailure(.init(error: error, stage: .setup), appActive: true, at: now.addingTimeInterval(66))
+        XCTAssertEqual(log.lines.filter { $0.contains("classifier_failure") }.count, 5,
+                       "A new failure after a real result must not be hidden by previous sampling")
+    }
     @MainActor func testNurseryDiagnosticsKeepCorrelationAndSafeErrorsButRejectPrivateFields() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

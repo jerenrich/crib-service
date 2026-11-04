@@ -28,6 +28,10 @@ final class BabyCryClassifierTests: XCTestCase {
             lock.lock(); defer { lock.unlock() }
             return events.contains { if case .unavailable = $0 { true } else { false } }
         }
+        var startReasons: [SoundClassificationStartReason] {
+            lock.lock(); defer { lock.unlock() }
+            return events.compactMap { if case .started(_, _, _, _, let reason) = $0 { reason } else { nil } }
+        }
     }
     private final class TestClock: @unchecked Sendable {
         private let lock = NSLock()
@@ -82,7 +86,7 @@ final class BabyCryClassifierTests: XCTestCase {
             }
             func analyze(_ buffer: AVAudioPCMBuffer) {
                 beforeAnalyze()
-                if failing { failure = .init(NSError(domain: "com.apple.SoundAnalysis", code: 2), stage: .inference) }
+                if failing { failure = .init(error: NSError(domain: "com.apple.SoundAnalysis", code: 2), stage: .analysis) }
                 else if control.currentEpoch == epoch {
                     hasProducedResult = true
                     emit(.result(.init(captureID: id, windowStart: origin, windowEnd: origin.addingTimeInterval(2),
@@ -205,6 +209,9 @@ final class BabyCryClassifierTests: XCTestCase {
         XCTAssertLessThanOrEqual(factory.count, 125, "A persistent failure must not create thousands of model sessions")
         XCTAssertEqual(factory.count, factory.stoppedCount)
         XCTAssertTrue(events.scores.isEmpty)
+        XCTAssertEqual(events.startReasons.first, .initial)
+        XCTAssertTrue(events.startReasons.dropFirst().allSatisfy { $0 == .afterFailure },
+                      "Audio gaps during backoff must preserve the logged failure-recovery reason")
         let count = factory.count
         factory.setHealthy()
         // Foregrounding must recover immediately, without waiting out a 30s retry.
@@ -213,6 +220,7 @@ final class BabyCryClassifierTests: XCTestCase {
         await classifier.waitUntilIdle()
         XCTAssertEqual(factory.count, count + 1)
         XCTAssertEqual(events.scores.count, 1)
+        XCTAssertEqual(events.startReasons.last, .monitoringRestart)
     }
     func testInitializationFailuresRemainBackedOffDespiteSkippedFrames() async throws {
         let clock = TestClock(), factory = Factory(), events = Events(), control = SoundClassificationControl()

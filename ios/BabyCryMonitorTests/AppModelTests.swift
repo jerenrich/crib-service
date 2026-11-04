@@ -30,6 +30,10 @@ final class AppModelTests: XCTestCase {
         fixture.audio.onClassification?(.result(.init(captureID: capture, windowStart: start,
             windowEnd: start.addingTimeInterval(2), confidence: 1, observedAt: start.addingTimeInterval(3))))
         XCTAssertEqual(fixture.model.state, .quiet, "Even confidence 1 cannot start a volume episode")
+        fixture.audio.onClassification?(.unavailable(at: start, failure: .init(
+            error: NSError(domain: "com.apple.SoundAnalysis", code: 2), stage: .analysis, captureID: capture)))
+        XCTAssertTrue(fixture.model.monitoring, "Classifier failure must not stop microphone monitoring")
+        XCTAssertTrue(fixture.model.log.lines.contains { $0.contains("classifier_failure") })
         for _ in 0..<32 {
             fixture.time.now = fixture.time.now.addingTimeInterval(0.25)
             fixture.audio.emit(.init(timestamp: fixture.time.now, dbFS: -20))
@@ -53,6 +57,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(text.components(separatedBy: ",classification,").count - 1, 2)
         XCTAssertEqual(text.components(separatedBy: ",level,").count - 1, 32)
         XCTAssertTrue(text.contains(",crying,1,"), "Local initial alert creation is retained")
+        XCTAssertTrue(text.contains("stage=analysis;reason=operation_failed"))
         XCTAssertNil(fixture.model.log.soundAnalysis.latestConfidence)
         await fixture.model.start()
         XCTAssertTrue(fixture.audio.classificationEnabled)

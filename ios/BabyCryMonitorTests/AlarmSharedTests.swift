@@ -129,11 +129,53 @@ final class AlarmSharedTests: XCTestCase {
         XCTAssertFalse(value.evidenceApplies(to: request))
         value.evidence = .init(observedAt: request.createdAt, paired: true, enabled: true, relevance: nil, mutedUntil: nil)
         XCTAssertTrue(value.evidenceApplies(to: request))
-
-        XCTAssertNil(AlarmShared.protectedDataAvailable(in: directory))
-        AlarmShared.writeLockProbe(to: directory)
-        XCTAssertEqual(AlarmShared.protectedDataAvailable(in: directory), true)
     }
+
+    func testLockProbeReportsAvailabilityAndPreservesAnExistingProbe() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        XCTAssertNil(AlarmShared.protectedDataAvailable(in: nil))
+        XCTAssertNil(AlarmShared.protectedDataAvailable(in: directory))
+
+        // Exercise the shared read contract without requiring the host's Data
+        // Protection keys. The iOS integration test below creates the real probe.
+        let probe = directory.appendingPathComponent("lock-probe")
+        let contents = Data([7])
+        try contents.write(to: probe, options: .atomic)
+        XCTAssertEqual(AlarmShared.protectedDataAvailable(in: directory), true)
+        try AlarmShared.writeLockProbe(to: directory)
+        XCTAssertEqual(try Data(contentsOf: probe), contents, "An existing probe must not be rewritten")
+
+        try FileManager.default.removeItem(at: probe)
+        try FileManager.default.createDirectory(at: probe, withIntermediateDirectories: false)
+        XCTAssertEqual(AlarmShared.protectedDataAvailable(in: directory), false, "An existing but unreadable probe is unavailable")
+    }
+
+    func testLockProbeReportsWriteFailure() throws {
+        let missingDirectory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        XCTAssertThrowsError(try AlarmShared.writeLockProbe(to: missingDirectory))
+        XCTAssertNil(AlarmShared.protectedDataAvailable(in: missingDirectory))
+        XCTAssertNoThrow(try AlarmShared.writeLockProbe(to: nil))
+    }
+
+    #if os(iOS)
+    func testLockProbeCreationUsesCompleteProtection() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        // Throw the actual filesystem error instead of reporting only nil != true.
+        try AlarmShared.writeLockProbe(to: directory)
+        XCTAssertEqual(AlarmShared.protectedDataAvailable(in: directory), true)
+        let probe = directory.appendingPathComponent("lock-probe")
+        XCTAssertEqual(try Data(contentsOf: probe), Data([1]))
+        #if !targetEnvironment(simulator)
+        // Simulator storage does not report iOS Data Protection classes.
+        let attributes = try FileManager.default.attributesOfItem(atPath: probe.path)
+        XCTAssertEqual(attributes[.protectionKey] as? FileProtectionType, .complete)
+        #endif
+    }
+    #endif
 
     /// Concurrent appends keep every entry, and an unreadable journal is never replaced.
     func testJournalAppendsAreSerializedAndNeverTruncateAnUnreadableJournal() throws {

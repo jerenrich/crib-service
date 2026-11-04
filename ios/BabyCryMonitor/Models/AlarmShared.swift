@@ -16,12 +16,14 @@ enum AlarmShared {
     /// A one-byte file with complete protection: readable only while the device is
     /// unlocked. The extension cannot ask UIKit, so it reads this to record lock state.
     private static let lockProbeName = "lock-probe"
-    static func writeLockProbe(to directory: URL? = directory) {
+    /// Preserve write errors so diagnostics can distinguish a failed write from a
+    /// probe that has not been created yet. Never fall back to an unprotected file.
+    static func writeLockProbe(to directory: URL? = directory) throws {
         guard let url = directory?.appendingPathComponent(lockProbeName),
               !FileManager.default.fileExists(atPath: url.path) else { return }
-        try? Data([1]).write(to: url, options: [.atomic, .completeFileProtection])
+        try Data([1]).write(to: url, options: [.atomic, .completeFileProtection])
     }
-    /// `nil` until the app has written the probe.
+    /// `nil` until the app has successfully written the probe.
     static func protectedDataAvailable(in directory: URL? = directory) -> Bool? {
         guard let url = directory?.appendingPathComponent(lockProbeName),
               FileManager.default.fileExists(atPath: url.path) else { return nil }
