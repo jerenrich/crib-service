@@ -405,6 +405,20 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild \
 
 Use `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` for `swift test` as well if the system default points to Command Line Tools without XCTest.
 
+The shared lock-probe tests use ordinary file fixtures to check missing, readable,
+and unreadable probes, preservation of existing files, and write-error reporting.
+Creation with `.completeFileProtection` is an iOS integration test; its protection
+attribute is checked only on physical iOS, since simulator storage does not report
+iOS Data Protection classes. Probe write failures record `alarm_lock_probe_failed`
+with safe error domains/codes and do not prevent publishing the alarm snapshot.
+The earlier macOS failure (`nil` after probe creation) was transient: both the
+unchanged test binary and the full 214-test suite passed on 4 November evening.
+The old writer discarded its error, so the precise historical OS failure cannot
+be recovered. Do not interpret it as proof that macOS never supports protected writes.
+After this separation and error reporting change, all 216 shared macOS tests and
+47 focused iOS simulator tests (alarm sharing and diagnostics) passed. Physical
+iOS protection-attribute verification has not been run in this follow-up.
+
 ## Tests and validation commands
 
 From repository root:
