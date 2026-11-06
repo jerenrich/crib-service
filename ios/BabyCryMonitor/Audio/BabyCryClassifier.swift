@@ -53,7 +53,8 @@ final class SoundClassificationControl: @unchecked Sendable {
 protocol SoundClassifierStreaming: AnyObject {
     var id: UUID { get }
     var failure: SoundClassificationFailure? { get }
-    var hasProducedResult: Bool { get }
+    /// End of the latest valid, input-mapped result in the session's audio clock.
+    var latestResultWindowEnd: TimeInterval? { get }
     func analyze(_ buffer: AVAudioPCMBuffer, capturedAt: Date)
     func stop()
 }
@@ -61,6 +62,9 @@ protocol SoundClassifierStreaming: AnyObject {
 final class BabyCryClassifier: @unchecked Sendable {
     static let windowSeconds = CryConfidenceDetector.windowDuration
     static let overlap = 0.5
+    /// Allows startup and transient inference delays without retaining a silent
+    /// analyzer indefinitely. Checked only when more microphone audio arrives.
+    static let resultTimeout: Duration = .seconds(10)
     typealias SessionFactory = @Sendable (AVAudioFormat, Date, Int, SoundClassificationControl,
         @escaping @Sendable (SoundClassificationEvent) -> Void) throws -> any SoundClassifierStreaming
     private let queue = DispatchQueue(label: "CribService.SoundAnalysis", qos: .utility)
@@ -78,6 +82,11 @@ final class BabyCryClassifier: @unchecked Sendable {
     private var recovery = SoundClassifierRecovery()
     private var expectedFrame: AVAudioFramePosition?
     private var nextStartReason: SoundClassificationStartReason = .initial
+    private var lastResultWindowEnd: TimeInterval?
+    private var lastProgressAt: ContinuousClock.Instant?
+    private var sessionStartedAt: ContinuousClock.Instant?
+    private var receivedAudio: TimeInterval = 0
+    private var inputBuffers = 0
 
     init(control: SoundClassificationControl, emit: @escaping @Sendable (SoundClassificationEvent) -> Void,
          currentTime: @escaping @Sendable () -> ContinuousClock.Instant = { .now },
@@ -136,13 +145,30 @@ final class BabyCryClassifier: @unchecked Sendable {
                     let created = try makeSession(copy.format, start, epoch, control, emit)
                     guard isCurrent(epoch: epoch) else { created.stop(); return }
                     session = created
+                    lastProgressAt = currentTime()
+                    sessionStartedAt = lastProgressAt
                     emit(.started(id: created.id, at: start, sampleRate: copy.format.sampleRate,
                                   voiceProcessing: voiceProcessing, reason: nextStartReason))
                 }
+                receivedAudio = min(86_400, receivedAudio + Double(copy.frameLength) / copy.format.sampleRate)
+                inputBuffers = min(1_000_000_000, inputBuffers + 1)
                 session?.analyze(copy, capturedAt: end)
                 guard isCurrent(epoch: epoch) else { endSession(); return }
                 if let failure = session?.failure { fail(failure, at: Date()) }
-                else if session?.hasProducedResult == true { recovery.succeeded(); control.noteSuccess(epoch: epoch) }
+                else {
+                    let now = currentTime()
+                    if let end = session?.latestResultWindowEnd, end.isFinite,
+                       lastResultWindowEnd.map({ end > $0 }) ?? true {
+                        lastResultWindowEnd = end; lastProgressAt = now
+                        recovery.succeeded(); control.noteSuccess(epoch: epoch)
+                    } else if let lastProgressAt, lastProgressAt.duration(to: now) >= Self.resultTimeout,
+                              let id = session?.id, let sessionStartedAt {
+                        let context = SoundClassificationFailure.StallContext(timeout: Self.resultTimeout,
+                            sessionAge: sessionStartedAt.duration(to: now), noProgress: lastProgressAt.duration(to: now),
+                            receivedAudio: receivedAudio, inputBuffers: inputBuffers, lastResultWindowEnd: lastResultWindowEnd)
+                        fail(.init(stalledCaptureID: id, context: context), at: Date())
+                    }
+                }
             } catch {
                 guard isCurrent(epoch: epoch) else { endSession(); return }
                 fail(.init(error: error, stage: .setup), at: Date())
@@ -179,6 +205,8 @@ final class BabyCryClassifier: @unchecked Sendable {
             emit(.stopped(id: session.id, at: Date()))
         }
         session = nil
+        lastResultWindowEnd = nil; lastProgressAt = nil
+        sessionStartedAt = nil; receivedAudio = 0; inputBuffers = 0
     }
     private static func copy(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
         guard buffer.frameLength > 0, let copy = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: buffer.frameLength) else { return nil }
@@ -206,9 +234,9 @@ private final class Session: NSObject, SoundClassifierStreaming, SNResultsObserv
     private var audioClock: SoundClassificationAudioClock
     private let lock = NSLock()
     private var recordedFailure: SoundClassificationFailure?
-    private var producedResult = false
+    private var resultWindowEnd: TimeInterval?
     var failure: SoundClassificationFailure? { lock.lock(); defer { lock.unlock() }; return recordedFailure }
-    var hasProducedResult: Bool { lock.lock(); defer { lock.unlock() }; return producedResult }
+    var latestResultWindowEnd: TimeInterval? { lock.lock(); defer { lock.unlock() }; return resultWindowEnd }
     init(format: AVAudioFormat, origin: Date, epoch: Int, control: SoundClassificationControl,
          emit: @escaping @Sendable (SoundClassificationEvent) -> Void) throws {
         self.origin = origin; self.epoch = epoch; self.control = control; self.emit = emit
@@ -238,8 +266,14 @@ private final class Session: NSObject, SoundClassifierStreaming, SNResultsObserv
               score.confidence.isFinite, (0...1).contains(score.confidence),
               result.timeRange.start.seconds.isFinite, result.timeRange.duration.seconds.isFinite else { return }
         lock.lock()
-        producedResult = true
-        let capturedEnd = audioClock.capturedWindowEnd(at: CMTimeRangeGetEnd(result.timeRange).seconds)
+        let end = CMTimeRangeGetEnd(result.timeRange).seconds
+        let capturedEnd = audioClock.capturedWindowEnd(at: end)
+        // Duplicate, invalid and unmapped windows cannot keep the watchdog alive.
+        // Confidence is deliberately irrelevant to classifier health.
+        if capturedEnd != nil, end.isFinite, (1.9...2.1).contains(result.timeRange.duration.seconds),
+           result.timeRange.start.seconds >= 0, resultWindowEnd.map({ end > $0 }) ?? true {
+            resultWindowEnd = end
+        }
         lock.unlock()
         guard let capturedEnd else {
             // Preserve capture/window scope: an obsolete callback cannot create

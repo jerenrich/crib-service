@@ -11,6 +11,7 @@ import UIKit
         didSet {
             guard monitoring != oldValue else { return }
             audio.setClassificationEnabled(monitoring)
+            if !monitoring { log.resetClassifierRecovery() }
             log.soundAnalysis.monitoring(monitoring, at: currentTime())
         }
     }
@@ -1090,12 +1091,8 @@ import UIKit
             }
         } else { events = [] }
         let active = UIApplication.shared.applicationState == .active
-        log.soundAnalysis.classification(event, appActive: active, alert: events.first)
-        if case .unavailable(let at, let failure?, _, _, _) = event {
-            log.classifierFailure(failure, appActive: active, at: at)
-        } else if case .result(let score) = event {
-            log.classifierRecovered(score, appActive: active)
-        }
+        log.soundAnalysis.classification(event, appActive: active, alert: events.first, handledAt: currentTime())
+        log.classifierEvent(event, appActive: active, at: currentTime())
         completeDetection(events, previousState: before, previousQuiet: quietBefore, at: currentTime())
         // Classifier-only alerts need the same current episode in the heartbeat
         // as in the durable outbox, so server reminders and quiet resolution work.

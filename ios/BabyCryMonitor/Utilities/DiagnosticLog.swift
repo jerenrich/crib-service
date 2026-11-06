@@ -29,7 +29,7 @@ import Observation
     private var persistedLineCount = 0
     #if os(iOS)
     private var lastClassifierFailure: (fingerprint: String, at: Date)?
-    private var latestClassifierFailureAt: Date?
+    private var classifierRecovery = SoundClassificationRecoveryLog()
     private var suppressedClassifierFailures = 0
     #endif
     private var storagePrepared = false
@@ -114,22 +114,45 @@ import Observation
     }
     #if os(iOS)
     func classifierFailure(_ failure: SoundClassificationFailure, appActive: Bool, at now: Date = Date()) {
-        latestClassifierFailureAt = max(latestClassifierFailureAt ?? now, now)
-        let fingerprint = failure.diagnosticDetails + ";app_active=\(appActive)"
+        classifierEvent(.unavailable(at: now, failure: failure, captureID: failure.captureID), appActive: appActive, at: now)
+    }
+    func classifierRecovered(_ score: SoundClassificationObservation, appActive: Bool) {
+        classifierEvent(.result(score), appActive: appActive, at: score.observedAt)
+    }
+    func resetClassifierRecovery() {
+        classifierRecovery = .init(); lastClassifierFailure = nil; suppressedClassifierFailures = 0
+    }
+    func classifierEvent(_ event: SoundClassificationEvent, appActive: Bool, at now: Date = Date()) {
+        // The CSV retains raw late events. A retired capture's failure must not
+        // reopen/suppress the current operational recovery episode.
+        if case let .unavailable(_, failure, id, _, _) = event,
+           !classifierRecovery.acceptsFailure(captureID: id ?? failure?.captureID) { return }
+        let recovery = classifierRecovery.consume(event, at: now)
+        if case let .unavailable(at, failure?, captureID, retry, eventActive) = event {
+            recordClassifierFailure(failure, captureID: captureID, retry: retry, appActive: eventActive ?? appActive, at: at)
+        } else if let recovery, case .result(let score) = event {
+            append("classifier_recovered capture_id=\(score.captureID.uuidString.lowercased()) app_active=\(appActive) "
+                   + recovery + " suppressed_failures=\(suppressedClassifierFailures)")
+            lastClassifierFailure = nil; suppressedClassifierFailures = 0
+        }
+    }
+    private func recordClassifierFailure(_ failure: SoundClassificationFailure, captureID: UUID?, retry: Int?,
+                                         appActive: Bool, at now: Date) {
+        // Timing/capture counters change on every attempt; exclude them from
+        // the sampling key so a persistent stall cannot flood the short log.
+        let fingerprint = failure.diagnosticFingerprint + ";app_active=\(appActive)"
         if let last = lastClassifierFailure, last.fingerprint == fingerprint,
            now.timeIntervalSince(last.at) >= 0, now.timeIntervalSince(last.at) < 60 {
             suppressedClassifierFailures += 1; sampledRecords += 1; return
         }
         var entry = "classifier_failure " + failure.diagnosticDetails + " app_active=\(appActive)"
-        if let id = failure.captureID { entry += " capture_id=\(id.uuidString.lowercased())" }
+        if let id = captureID ?? failure.captureID { entry += " capture_id=\(id.uuidString.lowercased())" }
+        entry += " failure_at=\(now.formatted(Self.timestampStyle))"
+        if let retry { entry += " retry_after_s=\(min(30, max(0, retry)))" }
+        if let pending = classifierRecovery.pendingDetails(at: now) { entry += " " + pending }
         entry += " suppressed_failures=\(suppressedClassifierFailures)"
         append(entry)
         lastClassifierFailure = (fingerprint, now); suppressedClassifierFailures = 0
-    }
-    func classifierRecovered(_ score: SoundClassificationObservation, appActive: Bool) {
-        guard let last = latestClassifierFailureAt, score.observedAt >= last, score.windowEnd >= last else { return }
-        append("classifier_recovered capture_id=\(score.captureID.uuidString.lowercased()) app_active=\(appActive) suppressed_failures=\(suppressedClassifierFailures)")
-        lastClassifierFailure = nil; latestClassifierFailureAt = nil; suppressedClassifierFailures = 0
     }
     #endif
     /// Fixed vocabulary and bounded values only. Never accept a control token,
@@ -534,11 +557,18 @@ import Observation
     private var exportHeader: String {
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
+        var classifierPending = ""
+        #if os(iOS)
+        if let pending = classifierRecovery.pendingDetails(at: Date()) {
+            classifierPending = "classifier_recovery_pending " + pending + " suppressed_failures=\(suppressedClassifierFailures)\n"
+        }
+        #endif
         return "Crib Service diagnostics · app=\(version) build=\(build) os=\(ProcessInfo.processInfo.operatingSystemVersionString)\npersistence=\(persistenceAvailable ? "available" : "unavailable")\n"
             + "retention_limit=\(Self.maximumLines) retained_lines=\(lines.count)\n"
             + "first_record_at=\(coverageDate(lines.first)) last_record_at=\(coverageDate(lines.last))\n"
             + "diagnostic_coverage " + coverageFields + "\n"
             + (latestClockSample?.fields(at: Date()) ?? "clock_sample=unavailable") + "\n"
+            + classifierPending
             + (persistenceFailure.map { "diagnostic_storage_error \($0)\n" } ?? "")
     }
     private func coverageDate(_ line: String?) -> String {

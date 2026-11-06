@@ -20,6 +20,7 @@ import BackgroundTasks
     private var liveCaptureID: UUID?
     private var liveCaptureStartedAt = Date.distantPast
     private var liveCaptureRunning = false
+    private var recovery = SoundClassificationRecoveryLog()
     private let runID = UUID()
     private let writer: SoundAnalysisLogWriter
     private var pending: [String] = []
@@ -63,7 +64,11 @@ import BackgroundTasks
         row[16] = nurserySound?.rawValue ?? "off"; row[17] = appActive ? "1" : "0"
         enqueue(row)
     }
-    func classification(_ event: SoundClassificationEvent, appActive: Bool? = nil, alert: CryAlert? = nil) {
+    func classification(_ event: SoundClassificationEvent, appActive: Bool? = nil, alert: CryAlert? = nil,
+                        handledAt: Date? = nil) {
+        let observationTime: Date
+        if case .result(let score) = event { observationTime = score.observedAt } else { observationTime = Date() }
+        let recovered = recovery.consume(event, at: handledAt ?? observationTime)
         func context(_ row: [String]) -> [String] {
             var row = row
             if let appActive { row[17] = appActive ? "1" : "0" }
@@ -90,6 +95,9 @@ import BackgroundTasks
             row[5] = Self.date(score.windowEnd); row[6] = number(score.confidence, digits: 6)
             if let captured = score.audioWindowEndAt, captured.timeIntervalSinceReferenceDate.isFinite {
                 row[18] = "audio_window_end_at=\(Self.date(captured))"
+            }
+            if let recovered {
+                row[18] += (row[18].isEmpty ? "" : ";") + "recovery=confirmed;" + recovered
             }
             if let alert {
                 row[11] = "1"; row[12] = alert.episodeId.uuidString.lowercased()
@@ -135,6 +143,7 @@ import BackgroundTasks
         return classifierStatus
     }
     func monitoring(_ enabled: Bool, at: Date) {
+        recovery = .init()
         latestConfidence = nil; latestScoreAt = nil; lastLevelAt = nil
         liveCaptureID = nil; liveCaptureRunning = false; liveCaptureStartedAt = .distantPast
         classifierStatus = enabled ? "Waiting for microphone audio" : "Monitoring paused or stopped"

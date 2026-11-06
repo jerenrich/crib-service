@@ -192,6 +192,113 @@ final class SoundAnalysisLogTests: XCTestCase {
         try String(contentsOf: urls[0], encoding: .utf8).split(separator: "\n").dropFirst()
             .map { $0.components(separatedBy: ",") }
     }
+    func testStallSnapshotBoundsCountersAndSeparatesChangingContextFromTheSamplingKey() {
+        let context = SoundClassificationFailure.StallContext(timeout: .seconds(10), sessionAge: .seconds(20),
+            noProgress: .seconds(11), receivedAudio: 19.5, inputBuffers: 914, lastResultWindowEnd: 8)
+        XCTAssertEqual(context.sessionAgeMS, 20_000)
+        XCTAssertEqual(context.receivedAudioMS, 19_500)
+        XCTAssertEqual(context.lastResultWindowEndMS, 8_000)
+        let bounded = SoundClassificationFailure.StallContext(timeout: .seconds(-1), sessionAge: .seconds(Int64.max),
+            noProgress: .seconds(10), receivedAudio: .infinity, inputBuffers: Int.max, lastResultWindowEnd: .nan)
+        XCTAssertEqual(bounded.timeoutMS, 0)
+        XCTAssertEqual(bounded.sessionAgeMS, 86_400_000)
+        XCTAssertEqual(bounded.receivedAudioMS, 0)
+        XCTAssertEqual(bounded.inputBuffers, 1_000_000_000)
+        XCTAssertNil(bounded.lastResultWindowEndMS)
+        let first = SoundClassificationFailure(stalledCaptureID: UUID(), context: context)
+        let second = SoundClassificationFailure(stalledCaptureID: UUID(), context: bounded)
+        XCTAssertEqual(first.diagnosticFingerprint, second.diagnosticFingerprint)
+        XCTAssertNotEqual(first.diagnosticDetails, second.diagnosticDetails)
+    }
+
+    func testRecoveryRequiresFreshCurrentCaptureAudioAndUsesTheMappedInputClock() throws {
+        var log = SoundClassificationRecoveryLog()
+        let origin = Date(timeIntervalSince1970: 1000), failed = UUID(), replacement = UUID()
+        func date(_ seconds: Double) -> Date { origin.addingTimeInterval(seconds) }
+        func event(_ id: UUID, end: Double, captured: Double, confidence: Double = 0) -> SoundClassificationEvent {
+            .result(.init(captureID: id, windowStart: date(end - 2), windowEnd: date(end), confidence: confidence,
+                          observedAt: date(end), audioWindowEndAt: date(captured)))
+        }
+        _ = log.consume(.started(id: failed, at: origin, sampleRate: 48_000, voiceProcessing: false), at: origin)
+        _ = log.consume(.unavailable(at: date(10), failure: .init(stalledCaptureID: failed)), at: date(10))
+        XCTAssertNil(log.consume(event(failed, end: 11, captured: 11), at: date(11)), "A failed capture cannot declare itself recovered")
+        _ = log.consume(.started(id: replacement, at: date(11), sampleRate: 48_000, voiceProcessing: false), at: date(11))
+        _ = log.consume(.started(id: failed, at: origin, sampleRate: 48_000, voiceProcessing: false), at: date(11))
+        XCTAssertNil(log.consume(event(failed, end: 13, captured: 13), at: date(13)), "Retired capture callbacks are not recovery")
+        XCTAssertNil(log.consume(event(replacement, end: 13, captured: 9), at: date(13)), "Sample-clock dates cannot make old input fresh")
+        XCTAssertNil(log.consume(event(replacement, end: 13, captured: 13, confidence: .nan), at: date(13)))
+        XCTAssertNil(log.consume(.result(.init(captureID: replacement, windowStart: date(11), windowEnd: date(13),
+                                               confidence: 0, observedAt: date(13))), at: date(13)), "Recovery needs an independent input timestamp")
+        XCTAssertNil(log.consume(event(replacement, end: 13, captured: 13), at: date(20)), "Delayed handling is not recovery")
+        let result = try XCTUnwrap(log.consume(event(replacement, end: 14, captured: 13.5), at: date(14)))
+        XCTAssertTrue(result.contains("outage_ms=4000"))
+        XCTAssertTrue(result.contains("failure_count=1;restart_count=1"))
+        XCTAssertTrue(result.contains(failed.uuidString.lowercased()))
+        XCTAssertNil(log.pendingDetails(at: date(14)))
+        XCTAssertNil(log.consume(event(replacement, end: 15, captured: 15), at: date(15)), "One summary per outage")
+    }
+
+    func testRecoveryDoesNotAdoptUnknownStoppedOrPreGapResults() {
+        var log = SoundClassificationRecoveryLog()
+        let now = Date(timeIntervalSince1970: 1000), capture = UUID()
+        func event(end: Double) -> SoundClassificationEvent {
+            .result(.init(captureID: capture, windowStart: now.addingTimeInterval(end - 2), windowEnd: now.addingTimeInterval(end),
+                          confidence: 0, observedAt: now.addingTimeInterval(end), audioWindowEndAt: now.addingTimeInterval(end)))
+        }
+        _ = log.consume(.unavailable(at: now), at: now)
+        XCTAssertNil(log.consume(event(end: 2), at: now.addingTimeInterval(2)))
+        _ = log.consume(.started(id: capture, at: now, sampleRate: 48_000, voiceProcessing: false), at: now)
+        _ = log.consume(.droppedEvents(at: now.addingTimeInterval(2)), at: now.addingTimeInterval(2))
+        XCTAssertNil(log.consume(event(end: 3), at: now.addingTimeInterval(3)), "Require a complete post-gap audio window")
+        _ = log.consume(.stopped(id: capture, at: now.addingTimeInterval(3)), at: now.addingTimeInterval(3))
+        XCTAssertNil(log.consume(event(end: 4), at: now.addingTimeInterval(4)))
+        log = .init()
+        _ = log.consume(.started(id: capture, at: now, sampleRate: 48_000, voiceProcessing: false), at: now)
+        XCTAssertNil(log.consume(event(end: 5), at: now.addingTimeInterval(5)), "A monitoring reset cancels pending recovery")
+    }
+
+    @MainActor func testCSVRecoveryAnnotatesOnlyTheFirstFreshReplacementScoreWithoutAddingRows() async throws {
+        let directory = folder(); defer { try? FileManager.default.removeItem(at: directory) }
+        let log = SoundAnalysisLog(directory: directory), now = Date(), old = UUID(), replacement = UUID()
+        log.classification(.started(id: old, at: now, sampleRate: 48_000, voiceProcessing: false))
+        let context = SoundClassificationFailure.StallContext(timeout: .seconds(10), sessionAge: .seconds(10),
+            noProgress: .seconds(10), receivedAudio: 10, inputBuffers: 469, lastResultWindowEnd: nil)
+        log.classification(.unavailable(at: now.addingTimeInterval(10), failure: .init(stalledCaptureID: old, context: context),
+                                        captureID: old, retryAfterSeconds: 1, appActive: false))
+        let start = now.addingTimeInterval(11)
+        log.classification(.started(id: replacement, at: start, sampleRate: 48_000, voiceProcessing: false, reason: .afterFailure))
+        for offset in 2...4 {
+            let end = start.addingTimeInterval(Double(offset))
+            log.classification(.result(.init(captureID: replacement, windowStart: end.addingTimeInterval(-2), windowEnd: end,
+                                            confidence: 0, observedAt: end, audioWindowEndAt: end)), handledAt: end)
+        }
+        let export = try await log.prepareExport()
+        defer { try? FileManager.default.removeItem(at: export[0].deletingLastPathComponent()) }
+        let data = try rows(in: export)
+        let failure = try XCTUnwrap(data.first { $0[2] == "classifier_unavailable" })
+        XCTAssertTrue(failure[18].contains("received_audio_ms=10000;input_buffers=469;last_result_end_ms=none"))
+        XCTAssertTrue(failure[18].contains("retry_after_s=1"))
+        XCTAssertEqual(failure[6], "", "Failure is not a zero-confidence observation")
+        XCTAssertEqual(data.filter { $0[2] == "classification" }.count, 3)
+        XCTAssertEqual(data.filter { $0[18].contains("recovery=confirmed") }.count, 1)
+        XCTAssertEqual(data.count, 7, "Annotate existing lifecycle/score rows without adding periodic telemetry")
+        let recovered = try XCTUnwrap(data.first { $0[18].contains("recovery=confirmed") })
+        XCTAssertTrue(recovered[18].contains("failure_count=1;restart_count=1"))
+        XCTAssertTrue(recovered[18].contains(old.uuidString.lowercased()))
+        XCTAssertLessThan(failure[18].utf8.count + recovered[18].utf8.count, 1024)
+    }
+
+    func testClassifierStallHasAnExplicitSafeFailureReasonWithoutInventingFrameworkErrors() {
+        let capture = UUID(), failure = SoundClassificationFailure(stalledCaptureID: capture)
+        XCTAssertEqual(failure.stage, .analysis)
+        XCTAssertEqual(failure.captureID, capture)
+        XCTAssertEqual(failure.reason, .resultTimeout)
+        XCTAssertTrue(failure.causes.isEmpty)
+        XCTAssertFalse(failure.truncated)
+        XCTAssertEqual(failure.diagnosticDetails, "stage=analysis;reason=result_timeout;errors=;causes_truncated=false")
+        XCTAssertFalse(failure.diagnosticDetails.contains(capture.uuidString))
+    }
+
     func testClassifierFailureRetainsSafeCauseChainAndOnlyRecognizesExplicitGPUEvidence() {
         let secret = "private-token-device-name-path"
         let gpu = NSError(domain: "MTLCommandBufferErrorDomain", code: 7, userInfo: [

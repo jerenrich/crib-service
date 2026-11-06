@@ -113,6 +113,63 @@ final class AppModelTests: XCTestCase {
         XCTAssertFalse(fixture.model.log.export.contains("audio_stalled"))
     }
 
+    @MainActor func testClassifierRecoveryLogsRequireTheCurrentCaptureAndReachBothExports() async throws {
+        let fixture = try Fixture()
+        await fixture.model.start()
+        defer { fixture.model.stop() }
+        let start = fixture.time.now, failed = UUID(), replacement = UUID()
+        fixture.audio.onClassification?(.started(id: failed, at: start, sampleRate: 48_000, voiceProcessing: false))
+        fixture.time.now = start.addingTimeInterval(10)
+        fixture.audio.onClassification?(.unavailable(at: fixture.time.now, failure: .init(stalledCaptureID: failed),
+                                                    captureID: failed, retryAfterSeconds: 1, appActive: false))
+        XCTAssertTrue(fixture.model.log.export.contains("classifier_recovery_pending"))
+        fixture.time.now = start.addingTimeInterval(11)
+        fixture.audio.onClassification?(.started(id: replacement, at: fixture.time.now, sampleRate: 48_000, voiceProcessing: false,
+                                                reason: .afterFailure))
+        fixture.time.now = start.addingTimeInterval(12)
+        fixture.audio.onClassification?(.unavailable(at: fixture.time.now, failure: .init(stalledCaptureID: failed), captureID: failed))
+        fixture.time.now = start.addingTimeInterval(13)
+        for capture in [failed, replacement] {
+            XCTAssertFalse(fixture.model.log.lines.contains { $0.contains("classifier_recovered") })
+            fixture.audio.onClassification?(.result(.init(captureID: capture, windowStart: start.addingTimeInterval(11),
+                windowEnd: fixture.time.now, confidence: 0, observedAt: fixture.time.now, audioWindowEndAt: fixture.time.now)))
+        }
+        XCTAssertEqual(fixture.model.log.lines.filter { $0.contains("classifier_recovered") }.count, 1)
+        XCTAssertTrue(fixture.model.log.lines.last!.contains("outage_ms=3000"))
+        XCTAssertTrue(fixture.model.log.lines.last!.contains("failure_count=1;restart_count=1"), "An obsolete failure must not extend the outage")
+        XCTAssertFalse(fixture.model.log.export.contains("classifier_recovery_pending"))
+        let files = try await fixture.model.log.soundAnalysis.prepareExport()
+        defer { try? FileManager.default.removeItem(at: files[0].deletingLastPathComponent()) }
+        let csv = try String(contentsOf: files[0], encoding: .utf8)
+        XCTAssertEqual(csv.components(separatedBy: "recovery=confirmed").count - 1, 1)
+        XCTAssertTrue(csv.contains("failed_capture_id=\(failed.uuidString.lowercased())"))
+    }
+
+    @MainActor func testClassifierTimeoutPreservesVolumeAlertTimingAndConfiguration() async throws {
+        let fixture = try Fixture()
+        await fixture.model.start()
+        defer { fixture.model.stop() }
+        let configuration = fixture.model.configuration, start = fixture.time.now, capture = UUID()
+        fixture.audio.onClassification?(.started(id: capture, at: start, sampleRate: 48_000, voiceProcessing: false))
+        fixture.audio.onClassification?(.unavailable(at: start, failure: .init(stalledCaptureID: capture), captureID: capture,
+                                                    retryAfterSeconds: 1, appActive: false))
+        XCTAssertTrue(fixture.model.monitoring)
+        XCTAssertEqual(fixture.model.configuration, configuration)
+        for quarter in 1...24 {
+            fixture.time.now = start.addingTimeInterval(Double(quarter) / 4)
+            fixture.audio.emit(.init(timestamp: fixture.time.now, dbFS: -20))
+            let consumed = await eventually { fixture.model.chartSampledAt == fixture.time.now }
+            XCTAssertTrue(consumed)
+        }
+        let sent = await eventually { await fixture.backend.sent.count == 1 }
+        XCTAssertTrue(sent)
+        let alerts = await fixture.backend.sent
+        XCTAssertEqual(alerts.count, 1)
+        XCTAssertEqual(alerts.first?.createdAt, start.addingTimeInterval(5.25))
+        XCTAssertEqual(fixture.model.configuration, configuration)
+        XCTAssertTrue(fixture.model.log.export.contains("reason=result_timeout"))
+    }
+
     @MainActor func testClassifierFailureLeavesVolumeAlertsRunningAndStopsLoggingInStandby() async throws {
         let fixture = try Fixture()
         await fixture.model.start()

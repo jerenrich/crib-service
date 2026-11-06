@@ -32,6 +32,14 @@ final class BabyCryClassifierTests: XCTestCase {
             lock.lock(); defer { lock.unlock() }
             return events.compactMap { if case .started(_, _, _, _, let reason) = $0 { reason } else { nil } }
         }
+        var failures: [SoundClassificationFailure] {
+            lock.lock(); defer { lock.unlock() }
+            return events.compactMap { if case .unavailable(_, let failure, _, _, _) = $0 { failure } else { nil } }
+        }
+        var retryDelays: [Int] {
+            lock.lock(); defer { lock.unlock() }
+            return events.compactMap { if case .unavailable(_, _, _, let delay, _) = $0 { delay } else { nil } }
+        }
     }
     private final class TestClock: @unchecked Sendable {
         private let lock = NSLock()
@@ -40,10 +48,12 @@ final class BabyCryClassifierTests: XCTestCase {
         func advance(_ duration: Duration) { lock.lock(); instant = instant.advanced(by: duration); lock.unlock() }
     }
     private final class Factory: @unchecked Sendable {
+        enum ResultMode { case advancing, silent, repeated }
         private let lock = NSLock()
         private var attempts = 0
         private var stopped = 0
         private var failing = true
+        private var resultMode = ResultMode.advancing
         private var analysisGate: DispatchSemaphore?
         private var gateClaimed = false
         private var enteredAnalysis = false
@@ -61,10 +71,12 @@ final class BabyCryClassifierTests: XCTestCase {
         var count: Int { lock.lock(); defer { lock.unlock() }; return attempts }
         var stoppedCount: Int { lock.lock(); defer { lock.unlock() }; return stopped }
         func setHealthy() { lock.lock(); failing = false; lock.unlock() }
+        func setResultMode(_ mode: ResultMode) { lock.lock(); resultMode = mode; lock.unlock() }
         func make(origin: Date, epoch: Int, control: SoundClassificationControl,
                   emit: @escaping @Sendable (SoundClassificationEvent) -> Void) -> any SoundClassifierStreaming {
             lock.lock(); attempts += 1; let fail = failing; lock.unlock()
             return Stream(origin: origin, epoch: epoch, control: control, emit: emit, failing: fail,
+                          resultMode: { [self] in lock.lock(); defer { lock.unlock() }; return resultMode },
                           beforeAnalyze: { [self] in beforeAnalysis() }) { [self] in
                 lock.lock(); stopped += 1; lock.unlock()
             }
@@ -72,29 +84,182 @@ final class BabyCryClassifierTests: XCTestCase {
         private final class Stream: SoundClassifierStreaming {
             let id = UUID()
             var failure: SoundClassificationFailure?
-            var hasProducedResult = false
+            var latestResultWindowEnd: TimeInterval?
             let origin: Date, epoch: Int, control: SoundClassificationControl
             let emit: @Sendable (SoundClassificationEvent) -> Void
             let failing: Bool
             let onStop: () -> Void
             let beforeAnalyze: () -> Void
+            let resultMode: () -> ResultMode
             init(origin: Date, epoch: Int, control: SoundClassificationControl,
                  emit: @escaping @Sendable (SoundClassificationEvent) -> Void, failing: Bool,
+                 resultMode: @escaping () -> ResultMode,
                  beforeAnalyze: @escaping () -> Void, onStop: @escaping () -> Void) {
                 self.origin = origin; self.epoch = epoch; self.control = control; self.emit = emit
                 self.failing = failing; self.onStop = onStop; self.beforeAnalyze = beforeAnalyze
+                self.resultMode = resultMode
             }
             func analyze(_ buffer: AVAudioPCMBuffer, capturedAt: Date) {
                 beforeAnalyze()
                 if failing { failure = .init(error: NSError(domain: "com.apple.SoundAnalysis", code: 2), stage: .analysis) }
                 else if control.currentEpoch == epoch {
-                    hasProducedResult = true
-                    emit(.result(.init(captureID: id, windowStart: origin, windowEnd: origin.addingTimeInterval(2),
+                    let mode = resultMode()
+                    guard mode != .silent else { return }
+                    if latestResultWindowEnd == nil || mode == .advancing {
+                        latestResultWindowEnd = (latestResultWindowEnd ?? 1) + 1
+                    }
+                    let end = latestResultWindowEnd!
+                    emit(.result(.init(captureID: id, windowStart: origin.addingTimeInterval(end - 2), windowEnd: origin.addingTimeInterval(end),
                                        confidence: 0.01, observedAt: Date(), audioWindowEndAt: capturedAt)))
                 }
             }
             func stop() { onStop() }
         }
+    }
+    private struct StallFixture {
+        let clock = TestClock(), factory = Factory(), events = Events(), control = SoundClassificationControl()
+        let classifier: BabyCryClassifier
+        let buffer: AVAudioPCMBuffer
+        private var frame: AVAudioFramePosition = 0
+        init() throws {
+            let format = try XCTUnwrap(AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1))
+            buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 1024))
+            buffer.frameLength = 1024; buffer.floatChannelData![0].initialize(repeating: 0, count: 1024)
+            factory.setHealthy(); control.setEnabled(true)
+            classifier = BabyCryClassifier(control: control, emit: events.append, currentTime: { [clock] in clock.now },
+                makeSession: { [factory] _, origin, epoch, control, emit in
+                    factory.make(origin: origin, epoch: epoch, control: control, emit: emit)
+                })
+        }
+        mutating func feed(after duration: Duration = .zero, gap: Bool = false) async {
+            clock.advance(duration)
+            if gap { frame += 1024 }
+            classifier.consume(buffer, at: .init(sampleTime: frame, atRate: 48_000), voiceProcessing: false)
+            frame += 1024
+            await classifier.waitUntilIdle()
+        }
+    }
+
+    func testMissingFirstResultTimesOutAndRepeatedStallsBackOffAcrossInputGaps() async throws {
+        var s = try StallFixture(); defer { s.classifier.stop() }
+        s.factory.setResultMode(.silent)
+        await s.feed()
+        await s.feed(after: .milliseconds(9_999))
+        XCTAssertFalse(s.events.unavailable, "Allow model startup before declaring a stall")
+        await s.feed(after: .milliseconds(1))
+        XCTAssertEqual(s.factory.stoppedCount, 1)
+        XCTAssertEqual(s.events.retryDelays, [1])
+        let startup = try XCTUnwrap(s.events.failures.last?.stallContext)
+        XCTAssertEqual(startup.timeoutMS, 10_000)
+        XCTAssertEqual(startup.sessionAgeMS, 10_000)
+        XCTAssertEqual(startup.noProgressMS, 10_000)
+        XCTAssertEqual(startup.inputBuffers, 3)
+        XCTAssertEqual(startup.receivedAudioMS, 64)
+        XCTAssertNil(startup.lastResultWindowEndMS)
+        await s.feed(after: .milliseconds(999), gap: true)
+        XCTAssertEqual(s.factory.count, 1, "A hardware gap must not bypass stall backoff")
+        await s.feed(after: .milliseconds(1))
+        XCTAssertEqual(s.factory.count, 2)
+        await s.feed(after: .seconds(10))
+        XCTAssertEqual(s.events.retryDelays, [1, 2])
+        await s.feed(after: .milliseconds(1_999), gap: true)
+        XCTAssertEqual(s.factory.count, 2)
+        await s.feed(after: .milliseconds(1))
+        XCTAssertEqual(s.factory.count, 3)
+        XCTAssertEqual(s.events.startReasons, [.initial, .afterFailure, .afterFailure])
+    }
+
+    func testPreviouslySuccessfulClassifierCannotStayHealthyWithoutNewResults() async throws {
+        var s = try StallFixture(); defer { s.classifier.stop() }
+        await s.feed()
+        let capture = try XCTUnwrap(s.events.scores.last?.captureID)
+        s.factory.setResultMode(.silent)
+        await s.feed(after: .milliseconds(9_999))
+        XCTAssertFalse(s.events.unavailable)
+        await s.feed(after: .milliseconds(1))
+        XCTAssertEqual(s.factory.stoppedCount, 1)
+        XCTAssertEqual(s.events.failures.last?.captureID, capture)
+        XCTAssertEqual(s.events.failures.last?.reason, .resultTimeout)
+        XCTAssertEqual(s.events.failures.last?.stallContext?.lastResultWindowEndMS, 2_000)
+        XCTAssertEqual(s.events.retryDelays, [1])
+        s.factory.setResultMode(.advancing)
+        await s.feed(after: .seconds(1))
+        XCTAssertEqual(s.factory.count, 2)
+        XCTAssertNotEqual(s.events.scores.last?.captureID, capture)
+        s.factory.setResultMode(.silent)
+        await s.feed(after: .seconds(10))
+        XCTAssertEqual(s.events.retryDelays, [1, 1], "Fresh results reset the failure streak")
+    }
+
+    func testRepeatedWindowCallbacksCannotKeepAStalledClassifierAlive() async throws {
+        var s = try StallFixture(); defer { s.classifier.stop() }
+        await s.feed()
+        s.factory.setResultMode(.repeated)
+        for _ in 0..<10 { await s.feed(after: .seconds(1)) }
+        XCTAssertEqual(s.events.scores.count, 11, "Callbacks alone do not prove advancing audio")
+        XCTAssertEqual(s.factory.stoppedCount, 1)
+        XCTAssertEqual(s.events.retryDelays, [1])
+    }
+
+    func testWatchdogDoesNotRunWithoutMoreMicrophoneInput() async throws {
+        var s = try StallFixture(); defer { s.classifier.stop() }
+        s.factory.setResultMode(.silent)
+        await s.feed()
+        s.clock.advance(.seconds(60))
+        await s.classifier.waitUntilIdle()
+        XCTAssertFalse(s.events.unavailable)
+        XCTAssertEqual(s.factory.count, 1)
+        XCTAssertEqual(s.factory.stoppedCount, 0)
+        await s.feed()
+        XCTAssertEqual(s.events.retryDelays, [1], "Check the expired deadline only when input resumes")
+    }
+
+    func testAdvancingQuietResultsKeepWatchdogHealthyAcrossForegroundTransitions() async throws {
+        var s = try StallFixture(); defer { s.classifier.stop() }
+        await s.feed()
+        for index in 0..<30 {
+            s.control.setAppActive(index.isMultiple(of: 2))
+            await s.feed(after: .seconds(1))
+        }
+        XCTAssertTrue(s.events.scores.allSatisfy { $0.confidence < CryConfidenceDetector.threshold })
+        XCTAssertFalse(s.events.unavailable)
+        XCTAssertEqual(s.factory.count, 1)
+        XCTAssertEqual(s.factory.stoppedCount, 0)
+    }
+
+    func testAudioGapAndMonitoringRestartGiveReplacementItsOwnStartupDeadline() async throws {
+        var s = try StallFixture(); defer { s.classifier.stop() }
+        s.factory.setResultMode(.silent)
+        await s.feed()
+        await s.feed(after: .seconds(9), gap: true)
+        await s.feed(after: .seconds(9))
+        XCTAssertFalse(s.events.unavailable)
+        s.control.setEnabled(false); await s.classifier.waitUntilIdle()
+        s.clock.advance(.seconds(60))
+        await s.feed()
+        XCTAssertEqual(s.factory.count, 2, "Disabled capture must not run a watchdog or retry")
+        s.control.setEnabled(true)
+        await s.feed()
+        await s.feed(after: .milliseconds(9_999))
+        XCTAssertFalse(s.events.unavailable)
+        await s.feed(after: .milliseconds(1))
+        XCTAssertEqual(s.events.retryDelays, [1])
+        XCTAssertEqual(s.events.startReasons, [.initial, .audioGap, .monitoringRestart])
+    }
+
+    func testForegroundCanRecoverAStallImmediatelyAndStopCannotRestartIt() async throws {
+        var s = try StallFixture(); defer { s.classifier.stop() }
+        s.control.setAppActive(false); s.factory.setResultMode(.silent)
+        await s.feed()
+        await s.feed(after: .seconds(10))
+        s.control.setAppActive(true); s.factory.setResultMode(.advancing)
+        await s.feed()
+        XCTAssertEqual(s.factory.count, 2, "Foreground recovery need not wait for the pending retry")
+        XCTAssertEqual(s.events.startReasons.last, .monitoringRestart)
+        s.classifier.stop(); await s.classifier.waitUntilIdle()
+        await s.feed(after: .seconds(60))
+        XCTAssertEqual(s.factory.count, 2)
+        XCTAssertEqual(s.events.retryDelays, [1])
     }
     func testQueuedInferenceKeepsItsOriginalAudioCaptureStamp() async throws {
         let factory = Factory(), events = Events(), control = SoundClassificationControl()

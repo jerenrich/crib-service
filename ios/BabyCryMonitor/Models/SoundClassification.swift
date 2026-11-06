@@ -125,9 +125,33 @@ enum SoundClassificationStartReason: String, Sendable {
 
 /// A Sendable snapshot, never a retained NSError/userInfo or arbitrary exception text.
 struct SoundClassificationFailure: Sendable, Equatable {
+    /// A single bounded snapshot at timeout, never per-buffer telemetry.
+    struct StallContext: Sendable, Equatable {
+        let timeoutMS: Int, sessionAgeMS: Int, noProgressMS: Int, receivedAudioMS: Int, inputBuffers: Int
+        let lastResultWindowEndMS: Int?
+        init(timeout: Duration, sessionAge: Duration, noProgress: Duration, receivedAudio: TimeInterval,
+             inputBuffers: Int, lastResultWindowEnd: TimeInterval?) {
+            func milliseconds(_ duration: Duration) -> Int {
+                let c = duration.components
+                return Self.bounded(Double(c.seconds) * 1000 + Double(c.attoseconds) / 1e15)
+            }
+            timeoutMS = milliseconds(timeout); sessionAgeMS = milliseconds(sessionAge); noProgressMS = milliseconds(noProgress)
+            receivedAudioMS = Self.bounded(receivedAudio * 1000)
+            self.inputBuffers = min(1_000_000_000, max(0, inputBuffers))
+            lastResultWindowEndMS = lastResultWindowEnd.flatMap { $0.isFinite ? Self.bounded($0 * 1000) : nil }
+        }
+        private static func bounded(_ value: Double) -> Int {
+            value.isFinite ? Int(min(86_400_000, max(0, value))) : 0
+        }
+        var diagnosticDetails: String {
+            "timeout_ms=\(timeoutMS);session_age_ms=\(sessionAgeMS);no_progress_ms=\(noProgressMS);elapsed_source=monotonic"
+                + ";received_audio_ms=\(receivedAudioMS);input_buffers=\(inputBuffers);last_result_end_ms=\(lastResultWindowEndMS.map(String.init) ?? "none")"
+        }
+    }
     enum Stage: String, Sendable { case setup, analysis }
     enum Reason: String, Sendable {
-        case backgroundGPUDenied = "background_gpu_denied", operationFailed = "operation_failed", unknown
+        case backgroundGPUDenied = "background_gpu_denied", operationFailed = "operation_failed"
+        case resultTimeout = "result_timeout", unknown
     }
     struct Cause: Sendable, Equatable {
         let domain: String
@@ -138,9 +162,15 @@ struct SoundClassificationFailure: Sendable, Equatable {
     let reason: Reason
     let causes: [Cause]
     let truncated: Bool
+    let stallContext: StallContext?
+
+    init(stalledCaptureID: UUID, context: StallContext? = nil) {
+        stage = .analysis; captureID = stalledCaptureID; reason = .resultTimeout
+        causes = []; truncated = false; stallContext = context
+    }
 
     init(error: any Error, stage: Stage, captureID: UUID? = nil) {
-        self.stage = stage; self.captureID = captureID
+        self.stage = stage; self.captureID = captureID; stallContext = nil
         let allowed: Set<String> = ["com.apple.SoundAnalysis", "com.apple.CoreML", "MTLCommandBufferErrorDomain",
                                    NSCocoaErrorDomain, NSPOSIXErrorDomain, NSOSStatusErrorDomain]
         var current: NSError? = error as NSError
@@ -163,9 +193,78 @@ struct SoundClassificationFailure: Sendable, Equatable {
     }
 
     /// Fixed keys and allowlisted domains make this safe for both CSV and the operational log.
-    var diagnosticDetails: String {
+    var diagnosticFingerprint: String {
         "stage=\(stage.rawValue);reason=\(reason.rawValue);errors="
             + causes.map { "\($0.domain):\($0.code)" }.joined(separator: ">")
             + ";causes_truncated=\(truncated)"
+    }
+    var diagnosticDetails: String {
+        diagnosticFingerprint + (stallContext.map { ";" + $0.diagnosticDetails } ?? "")
+    }
+}
+
+/// Shared by the CSV and operational log, so both require current, fresh audio
+/// before declaring recovery. State and summaries are scoped to this process/run.
+struct SoundClassificationRecoveryLog {
+    private var capture: (id: UUID, startedAt: Date, running: Bool)?
+    private var lastWindowEnd: Date?
+    private var audioAfter = Date.distantPast
+    private var firstFailureAt: Date?, lastFailureAt: Date?, failedCaptureID: UUID?
+    private var failures = 0, restarts = 0
+
+    func acceptsFailure(captureID: UUID?) -> Bool {
+        captureID == nil || capture == nil || captureID == capture?.id
+    }
+
+    mutating func consume(_ event: SoundClassificationEvent, at now: Date) -> String? {
+        switch event {
+        case let .started(id, at, _, _, _):
+            guard at.timeIntervalSinceReferenceDate.isFinite, id != capture?.id,
+                  at >= (capture?.startedAt ?? .distantPast) else { return nil }
+            capture = (id, at, true); lastWindowEnd = nil; audioAfter = .distantPast
+            if firstFailureAt != nil { restarts = min(1_000_000_000, restarts + 1) }
+        case let .stopped(id, _):
+            if capture?.id == id { capture?.running = false }
+        case let .unavailable(at, failure, id, _, _):
+            let failedID = id ?? failure?.captureID
+            guard at.timeIntervalSinceReferenceDate.isFinite,
+                  acceptsFailure(captureID: failedID) else { return nil }
+            firstFailureAt = min(firstFailureAt ?? at, at); lastFailureAt = max(lastFailureAt ?? at, at)
+            failedCaptureID = failedID; failures = min(1_000_000_000, failures + 1)
+            capture?.running = false
+        case let .droppedEvents(at), let .droppedBuffers(_, at):
+            if at.timeIntervalSinceReferenceDate.isFinite { audioAfter = max(audioAfter, at) }
+        case let .unmappedResult(id, end, at):
+            if capture?.id == id, lastWindowEnd.map({ end > $0 }) ?? true,
+               at.timeIntervalSinceReferenceDate.isFinite { audioAfter = max(audioAfter, at) }
+        case .result(let score):
+            // Sample-clock dates alone cannot prove that inference used fresh input.
+            guard let capturedEnd = score.audioWindowEndAt else { return nil }
+            let duration = score.windowEnd.timeIntervalSince(score.windowStart)
+            guard capture?.running == true, capture?.id == score.captureID,
+                  score.windowStart >= (capture?.startedAt ?? .distantFuture),
+                  score.confidence.isFinite, (0...1).contains(score.confidence), (1.9...2.1).contains(duration),
+                  score.windowEnd.timeIntervalSinceReferenceDate.isFinite,
+                  lastWindowEnd.map({ score.windowEnd > $0 }) ?? true,
+                  (-1...CryConfidenceDetector.maximumResultAge).contains(now.timeIntervalSince(score.observedAt)),
+                  (-1...CryConfidenceDetector.maximumResultAge).contains(now.timeIntervalSince(capturedEnd)),
+                  capturedEnd.addingTimeInterval(-duration) >= audioAfter else { return nil }
+            lastWindowEnd = score.windowEnd
+            guard let lastFailureAt, score.observedAt >= lastFailureAt, capturedEnd >= lastFailureAt,
+                  let details = pendingDetails(at: score.observedAt) else { return nil }
+            firstFailureAt = nil; self.lastFailureAt = nil; failedCaptureID = nil; failures = 0; restarts = 0
+            return details
+        }
+        return nil
+    }
+
+    func pendingDetails(at now: Date) -> String? {
+        guard let firstFailureAt, let lastFailureAt else { return nil }
+        let elapsed = now.timeIntervalSince(firstFailureAt) * 1000
+        let milliseconds = elapsed.isFinite ? Int(min(86_400_000, max(0, elapsed))) : 0
+        let style = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
+        return "first_failure_at=\(firstFailureAt.formatted(style));last_failure_at=\(lastFailureAt.formatted(style))"
+            + ";outage_ms=\(milliseconds);outage_time_source=wall;failure_count=\(failures);restart_count=\(restarts)"
+            + ";failed_capture_id=\(failedCaptureID?.uuidString.lowercased() ?? "none");scope=process"
     }
 }

@@ -41,12 +41,15 @@ extension DiagnosticsTests {
         XCTAssertFalse(log.export.contains("private-exception-description"))
         XCTAssertTrue(DiagnosticLog(directory: directory).export.contains("stage=setup"))
         let capture = UUID()
+        log.classifierEvent(.started(id: capture, at: now.addingTimeInterval(63), sampleRate: 48_000, voiceProcessing: false),
+                            appActive: true, at: now.addingTimeInterval(63))
         let stale = SoundClassificationObservation(captureID: capture, windowStart: now,
             windowEnd: now.addingTimeInterval(2), confidence: 0.5, observedAt: now.addingTimeInterval(65))
         log.classifierRecovered(stale, appActive: true)
         XCTAssertFalse(log.lines.contains { $0.contains("classifier_recovered") }, "Late delivery of an old audio window is not recovery")
         let recovered = SoundClassificationObservation(captureID: capture, windowStart: now.addingTimeInterval(63),
-            windowEnd: now.addingTimeInterval(65), confidence: 0.5, observedAt: now.addingTimeInterval(65))
+            windowEnd: now.addingTimeInterval(65), confidence: 0.5, observedAt: now.addingTimeInterval(65),
+            audioWindowEndAt: now.addingTimeInterval(65))
         log.classifierRecovered(recovered, appActive: true)
         log.classifierRecovered(recovered, appActive: true)
         XCTAssertEqual(log.lines.filter { $0.contains("classifier_recovered") }.count, 1)
@@ -54,6 +57,42 @@ extension DiagnosticsTests {
         XCTAssertEqual(log.lines.filter { $0.contains("classifier_failure") }.count, 5,
                        "A new failure after a real result must not be hidden by previous sampling")
     }
+    @MainActor func testStallSnapshotsStaySampledAndRecoveryReportsTheCompleteOutage() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let log = DiagnosticLog(directory: directory), now = Date()
+        for index in 0..<10 {
+            let capture = UUID(), at = now.addingTimeInterval(Double(index))
+            log.classifierEvent(.started(id: capture, at: at, sampleRate: 48_000, voiceProcessing: false), appActive: false, at: at)
+            let context = SoundClassificationFailure.StallContext(timeout: .seconds(10), sessionAge: .seconds(10 + index),
+                noProgress: .seconds(10), receivedAudio: Double(10 + index), inputBuffers: 400 + index, lastResultWindowEnd: nil)
+            log.classifierEvent(.unavailable(at: at, failure: .init(stalledCaptureID: capture, context: context), captureID: capture,
+                                             retryAfterSeconds: 30, appActive: false), appActive: false, at: at)
+        }
+        XCTAssertEqual(log.lines.filter { $0.contains("classifier_failure") }.count, 1,
+                       "Changing snapshot counters must not defeat 60-second sampling")
+        XCTAssertTrue(log.export.contains("classifier_recovery_pending"))
+        XCTAssertTrue(log.export.contains("failure_count=10;restart_count=9"))
+        XCTAssertTrue(log.lines.last!.contains("retry_after_s=30"))
+        XCTAssertTrue(log.lines.last!.contains("no_progress_ms=10000"))
+        let capture = UUID(), at = now.addingTimeInterval(10)
+        log.classifierEvent(.started(id: capture, at: at, sampleRate: 48_000, voiceProcessing: false), appActive: false, at: at)
+        let score = SoundClassificationObservation(captureID: capture, windowStart: at, windowEnd: at.addingTimeInterval(2),
+            confidence: 0, observedAt: at.addingTimeInterval(2), audioWindowEndAt: at.addingTimeInterval(2))
+        log.classifierEvent(.result(score), appActive: false, at: score.observedAt)
+        XCTAssertEqual(log.lines.filter { $0.contains("classifier_recovered") }.count, 1)
+        XCTAssertTrue(log.lines.last!.contains("failure_count=10;restart_count=10"))
+        XCTAssertTrue(log.lines.last!.contains("suppressed_failures=9"))
+        XCTAssertTrue(log.lines.last!.contains("outage_ms=12000"))
+        XCTAssertLessThan(log.lines.joined(separator: "\n").utf8.count, 1536,
+                          "One sampled failure and recovery must remain compact")
+        XCTAssertFalse(log.export.contains("classifier_recovery_pending"))
+        XCTAssertTrue(DiagnosticLog(directory: directory).export.contains("classifier_recovered"))
+        log.classifierFailure(.init(stalledCaptureID: capture), appActive: false, at: at.addingTimeInterval(3))
+        log.resetClassifierRecovery()
+        XCTAssertFalse(log.export.contains("classifier_recovery_pending"))
+    }
+
     @MainActor func testNurseryDiagnosticsKeepCorrelationAndSafeErrorsButRejectPrivateFields() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
