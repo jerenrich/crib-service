@@ -1,5 +1,27 @@
 # Logging and diagnostics review
 
+## Four-second cry analysis — 6 November 2026
+
+The classifier now analyzes four seconds per score with 75% overlap, retaining
+one new result per second. The 0.60 confidence threshold and the full configured
+observation window with 80% positive evidence are unchanged. The detector,
+classifier watchdog, recovery validation and CSV capture metadata use the same
+window-duration policy. Overlapping results still contribute only newly covered
+suffixes; the initial four-second result cannot alert before five seconds of
+covered history. Starts and stops may be less precise, and scores may remain
+positive after a cry ends while older cry audio remains inside an analysis window.
+Historical sections below describe the policy in effect at their stated dates.
+
+## Cry confidence trial at 0.60 — 6 November 2026
+
+The cry classifier now qualifies scores at or above 0.60, lowered from 0.80 for
+the next acoustic trial. The volume threshold and the 80% time-coverage rule over
+a full configured observation window and the latest five seconds are unchanged.
+The detector, Settings, diagnostics description, export guidance and alert rows
+use the same confidence threshold. New CSV run-start rows record
+`confidence_threshold=0.60` so historical recordings retain their policy context.
+This is a sensitivity trial, not a measured improvement in recognition accuracy.
+
 ## PCM timing correction — 6 November 2026
 
 Physical observations exposed a coverage bug in the first time-coverage build:

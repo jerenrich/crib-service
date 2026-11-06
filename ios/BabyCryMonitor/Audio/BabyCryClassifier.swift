@@ -61,7 +61,7 @@ protocol SoundClassifierStreaming: AnyObject {
 
 final class BabyCryClassifier: @unchecked Sendable {
     static let windowSeconds = CryConfidenceDetector.windowDuration
-    static let overlap = 0.5
+    static let overlap = CryConfidenceDetector.overlapFactor
     /// Allows startup and transient inference delays without retaining a silent
     /// analyzer indefinitely. Checked only when more microphone audio arrives.
     static let resultTimeout: Duration = .seconds(10)
@@ -249,6 +249,9 @@ private final class Session: NSObject, SoundClassifierStreaming, SNResultsObserv
         }
         request.windowDuration = CMTime(seconds: BabyCryClassifier.windowSeconds, preferredTimescale: 48_000)
         request.overlapFactor = BabyCryClassifier.overlap
+        guard CryConfidenceDetector.windowDurationRange.contains(request.windowDuration.seconds) else {
+            throw NSError(domain: "CribService.SoundClassifier", code: 2)
+        }
         try analyzer.add(request, withObserver: self)
     }
     func analyze(_ buffer: AVAudioPCMBuffer, capturedAt: Date) {
@@ -270,7 +273,7 @@ private final class Session: NSObject, SoundClassifierStreaming, SNResultsObserv
         let capturedEnd = audioClock.capturedWindowEnd(at: end)
         // Duplicate, invalid and unmapped windows cannot keep the watchdog alive.
         // Confidence is deliberately irrelevant to classifier health.
-        if capturedEnd != nil, end.isFinite, (1.9...2.1).contains(result.timeRange.duration.seconds),
+        if capturedEnd != nil, end.isFinite, CryConfidenceDetector.windowDurationRange.contains(result.timeRange.duration.seconds),
            result.timeRange.start.seconds >= 0, resultWindowEnd.map({ end > $0 }) ?? true {
             resultWindowEnd = end
         }

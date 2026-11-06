@@ -28,7 +28,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Alert timing")
                 } footer: {
-                    Text("Each detector observes the full selected window. An alert requires qualifying sound for at least 80% of that window and 80% of the latest 5 seconds, with a qualifying latest reading. Sound qualifies by reaching your volume threshold or, independently, an Apple baby-cry score of at least 0.80. The detectors share one alert episode.")
+                    Text("Each detector observes the full selected window. An alert requires qualifying sound for at least 80% of that window and 80% of the latest 5 seconds, with a qualifying latest reading. Sound qualifies by reaching your volume threshold or, independently, an Apple baby-cry score of at least \(CryConfidenceDetector.thresholdDescription). The detectors share one alert episode.")
                 }
                 Section {
                     Picker("Reset timer after quiet", selection: setting(\.quietResetDuration)) {

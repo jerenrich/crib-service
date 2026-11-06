@@ -243,7 +243,7 @@ struct SoundClassificationRecoveryLog {
             let duration = score.windowEnd.timeIntervalSince(score.windowStart)
             guard capture?.running == true, capture?.id == score.captureID,
                   score.windowStart >= (capture?.startedAt ?? .distantFuture),
-                  score.confidence.isFinite, (0...1).contains(score.confidence), (1.9...2.1).contains(duration),
+                  score.confidence.isFinite, (0...1).contains(score.confidence), CryConfidenceDetector.windowDurationRange.contains(duration),
                   score.windowEnd.timeIntervalSinceReferenceDate.isFinite,
                   lastWindowEnd.map({ score.windowEnd > $0 }) ?? true,
                   (-1...CryConfidenceDetector.maximumResultAge).contains(now.timeIntervalSince(score.observedAt)),

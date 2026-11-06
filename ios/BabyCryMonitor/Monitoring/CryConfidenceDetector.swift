@@ -5,9 +5,15 @@ import Foundation
 /// scores consume the tolerance; discontinuities clear evidence. Episode grace
 /// and alert qualification remain separate.
 struct CryConfidenceDetector: Sendable {
-    static let threshold = 0.8
-    static let windowDuration: TimeInterval = 2
-    static let maximumWindowStep: TimeInterval = 1.5
+    static let threshold = 0.6
+    static var thresholdDescription: String {
+        String(format: "%.2f", locale: Locale(identifier: "en_US_POSIX"), threshold)
+    }
+    static let windowDuration: TimeInterval = 4
+    static let resultStep: TimeInterval = 1
+    static let overlapFactor = 1 - resultStep / windowDuration
+    static let windowDurationRange = (windowDuration - 0.1)...(windowDuration + 0.1)
+    static let maximumWindowStep = resultStep + 0.5
     static let maximumResultAge: TimeInterval = 3
     private(set) var captureID: UUID?
     private(set) var observationStartedAt: Date?
@@ -53,7 +59,7 @@ struct CryConfidenceDetector: Sendable {
             // of inference completion. Bound total age, including both inference
             // and callback handling; never recalibrate old audio to a late reply.
             guard score.confidence.isFinite, (0...1).contains(score.confidence),
-                  (1.9...2.1).contains(windowDuration),
+                  Self.windowDurationRange.contains(windowDuration),
                   score.windowStart >= captureStartedAt,
                   capturedEnd.timeIntervalSinceReferenceDate.isFinite,
                   (-1...Self.maximumResultAge).contains(now.timeIntervalSince(score.observedAt)),
@@ -73,7 +79,7 @@ struct CryConfidenceDetector: Sendable {
                 || lastObservationAt.map({ score.observedAt.timeIntervalSince($0) > Self.maximumResultAge }) == true {
                 interrupt(at: lastCapturedWindowEndAt ?? now)
             }
-            // The first result covers its full two seconds; subsequent results
+            // The first result covers its full analysis window; subsequent results
             // contribute only the suffix after the preceding window endpoint.
             // Low results never get overwritten by a later overlapping high one.
             let evidenceStart = max(score.windowStart, evidence.endedAt ?? score.windowStart)

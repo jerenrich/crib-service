@@ -44,7 +44,7 @@ import BackgroundTasks
             capabilities = ";background_gpu_supported=\(BGTaskScheduler.supportedResources.contains(.gpu))"
         }
         #endif
-        append(kind: "run_start", at: Date(), detail: "schema=1;app=\(version);build=\(build);os=\(ProcessInfo.processInfo.operatingSystemVersionString)\(capabilities);alert_policy=time_coverage_v1;required_fraction=0.80;recent_window_s=5;volume_timing=pcm_frames_v1")
+        append(kind: "run_start", at: Date(), detail: "schema=1;app=\(version);build=\(build);os=\(ProcessInfo.processInfo.operatingSystemVersionString)\(capabilities);alert_policy=time_coverage_v1;required_fraction=0.80;recent_window_s=5;confidence_threshold=\(CryConfidenceDetector.thresholdDescription);volume_timing=pcm_frames_v1")
     }
     func level(_ sample: AudioLevelSample, configuration: MonitoringConfiguration, state: CryState,
                alertQueued: Bool, episode: CryEpisode?, nurserySound: NurserySound?, appActive: Bool) {
@@ -95,7 +95,7 @@ import BackgroundTasks
                 latestConfidence = nil; latestScoreAt = nil; classifierStatus = "Listening for classifications"
             }
             var row = emptyRow(kind: "capture_start", at: at); row[3] = id.uuidString.lowercased()
-            row[18] = "classifier=version1;window_s=2;overlap=0.5;sample_rate=\(number(rate, digits: 0));voice_processing=\(voiceProcessing);reason=\(reason.rawValue)"
+            row[18] = "classifier=version1;window_s=\(number(CryConfidenceDetector.windowDuration, digits: 0));overlap=\(number(CryConfidenceDetector.overlapFactor, digits: 2));sample_rate=\(number(rate, digits: 0));voice_processing=\(voiceProcessing);reason=\(reason.rawValue)"
             enqueue(context(row))
         case .result(let score):
             guard score.confidence.isFinite, (0...1).contains(score.confidence), score.windowEnd >= score.windowStart else { return }
@@ -116,7 +116,7 @@ import BackgroundTasks
             if let alert {
                 row[11] = "1"; row[12] = alert.episodeId.uuidString.lowercased()
                 row[13] = Self.date(alert.cryStartedAt)
-                row[18] += (row[18].isEmpty ? "" : ";") + "alert_trigger=classifier;confidence_threshold=0.80;alert_policy=time_coverage_v1;required_fraction=0.80;recent_window_s=5"
+                row[18] += (row[18].isEmpty ? "" : ";") + "alert_trigger=classifier;confidence_threshold=\(CryConfidenceDetector.thresholdDescription);alert_policy=time_coverage_v1;required_fraction=0.80;recent_window_s=5"
             }
             enqueue(context(row))
         case let .stopped(id, at):
@@ -458,7 +458,7 @@ actor SoundAnalysisLogWriter {
         write_failures=\(coverage.writeFailures) lost_rows=\(coverage.lostRows) memory_dropped_rows=\(coverage.memoryDroppedRows) memory_dropped_rows_this_run=\(droppedRows)
         Levels: approximately 4 Hz, only while monitoring, with applied threshold, trigger, detector state and initial alert creation.
         Native RMS rows marked volume_timing=pcm_frames_v1 carry audio_capture_id, audio_start_frame, audio_end_frame and audio_sample_rate in detail. Use these frame ranges for duration; callback-date jitter does not imply missing PCM. level_capture_gap marks frame/capture discontinuity, while level_delivery_delay denotes late delivery of contiguous PCM. Earlier rows without frame metadata cannot reconstruct exact covered audio time.
-        Classifier: version1 baby_crying, 2-second windows, 50% overlap, approximately 1 Hz. Builds marked alert_policy=time_coverage_v1 require >=80% qualifying time over a full configured observation window and the latest 5 seconds, plus a qualifying latest reading, independently on each detector. A classifier score qualifies at >=0.80; overlapping results label only newly covered suffixes, without overwriting earlier evidence. Missing time never qualifies. Earlier parallel-alert builds required consecutive high scores; historical observational-only builds did not use scores for alerts.
+        Classifier: version1 baby_crying, current build \(String(format: "%.0f", CryConfidenceDetector.windowDuration))-second windows, \(String(format: "%.0f", CryConfidenceDetector.overlapFactor * 100))% overlap, approximately one result per \(String(format: "%.0f", CryConfidenceDetector.resultStep)) second. Builds marked alert_policy=time_coverage_v1 require >=80% qualifying time over a full configured observation window and the latest 5 seconds, plus a qualifying latest reading, independently on each detector. The current build qualifies classifier scores at >=\(CryConfidenceDetector.thresholdDescription); overlapping results label only newly covered suffixes, without overwriting earlier evidence. Missing time never qualifies. For historical data use each capture_start's window_s and overlap, and each run's confidence_threshold marker when present; earlier time-coverage builds used two-second windows with 50% overlap and confidence 0.80. Earlier parallel-alert builds required consecutive high scores; historical observational-only builds did not use scores for alerts.
         Join classification window_start_at/window_end_at to level recorded_at within the same run_id. recorded_at on classification rows is result receipt time, not audio time. Rows may arrive out of time order; sort by audio timestamps for analysis.
         In updated builds detail.audio_window_end_at independently maps the window's final frame to input-buffer arrival time. Use it to check total audio age; sample-clock window dates may drift relative to wall time during long captures. Inference completion never moves this input-derived timestamp forward.
         Volume is dBFS, not calibrated sound pressure. Above-threshold is the instantaneous volume test; detector_state is the combined volume/classifier state in updated builds. alert_queued marks local initial alert creation on either a level row or a classification row, not delivery; snooze, reminders and Watch delivery require operational diagnostics.

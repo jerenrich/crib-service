@@ -106,10 +106,10 @@ final class BabyCryClassifierTests: XCTestCase {
                     let mode = resultMode()
                     guard mode != .silent else { return }
                     if latestResultWindowEnd == nil || mode == .advancing {
-                        latestResultWindowEnd = (latestResultWindowEnd ?? 1) + 1
+                        latestResultWindowEnd = (latestResultWindowEnd ?? 3) + 1
                     }
                     let end = latestResultWindowEnd!
-                    emit(.result(.init(captureID: id, windowStart: origin.addingTimeInterval(end - 2), windowEnd: origin.addingTimeInterval(end),
+                    emit(.result(.init(captureID: id, windowStart: origin.addingTimeInterval(end - 4), windowEnd: origin.addingTimeInterval(end),
                                        confidence: 0.01, observedAt: Date(), audioWindowEndAt: capturedAt)))
                 }
             }
@@ -180,7 +180,7 @@ final class BabyCryClassifierTests: XCTestCase {
         XCTAssertEqual(s.factory.stoppedCount, 1)
         XCTAssertEqual(s.events.failures.last?.captureID, capture)
         XCTAssertEqual(s.events.failures.last?.reason, .resultTimeout)
-        XCTAssertEqual(s.events.failures.last?.stallContext?.lastResultWindowEndMS, 2_000)
+        XCTAssertEqual(s.events.failures.last?.stallContext?.lastResultWindowEndMS, 4_000)
         XCTAssertEqual(s.events.retryDelays, [1])
         s.factory.setResultMode(.advancing)
         await s.feed(after: .seconds(1))
@@ -464,10 +464,13 @@ final class BabyCryClassifierTests: XCTestCase {
         for _ in 0..<100 where events.scores.isEmpty && !events.unavailable { try await Task.sleep(for: .milliseconds(50)) }
         XCTAssertFalse(events.unavailable, "The built-in model must accept live microphone-format buffers")
         let scores = events.scores
-        XCTAssertFalse(scores.isEmpty)
+        XCTAssertGreaterThanOrEqual(scores.count, 2, "Four-second windows must still produce one result per second")
+        for (previous, next) in zip(scores, scores.dropFirst()) {
+            XCTAssertEqual(next.windowEnd.timeIntervalSince(previous.windowEnd), 1, accuracy: 0.001)
+        }
         if let score = scores.first {
             XCTAssertTrue((0...1).contains(score.confidence))
-            XCTAssertEqual(score.windowEnd.timeIntervalSince(score.windowStart), 2, accuracy: 0.001)
+            XCTAssertEqual(score.windowEnd.timeIntervalSince(score.windowStart), 4, accuracy: 0.001)
             let captured = try XCTUnwrap(score.audioWindowEndAt)
             XCTAssertLessThanOrEqual(captured, score.observedAt)
         }
@@ -480,7 +483,7 @@ final class BabyCryClassifierTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(200))
         XCTAssertEqual(events.scores.count, count)
         control.setEnabled(true)
-        for index in 100..<140 {
+        for index in 100..<160 {
             classifier.consume(buffer, at: .init(sampleTime: AVAudioFramePosition(index * 1600), atRate: 16_000), voiceProcessing: true)
             try await Task.sleep(for: .milliseconds(50))
         }

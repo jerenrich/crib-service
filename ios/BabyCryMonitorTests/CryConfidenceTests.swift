@@ -30,18 +30,18 @@ final class CryConfidenceTests: XCTestCase {
             alerts += engine.consumeClassification(.started(id: capture, at: date(second), sampleRate: 48_000,
                 voiceProcessing: false), at: date(second), listenerId: listener)
         }
-        mutating func score(_ confidence: Double = 0.8, end: Double, volume: Double = -80,
+        mutating func score(_ confidence: Double = 0.6, end: Double, volume: Double = -80,
                             observed: Double? = nil, captureID: UUID? = nil, captured: Double? = nil) {
             let now = observed ?? end
             levels(to: now, dbfs: volume)
             alerts += engine.consumeClassification(.result(.init(captureID: captureID ?? capture,
-                windowStart: date(end - 2), windowEnd: date(end), confidence: confidence, observedAt: date(now),
+                windowStart: date(end - 4), windowEnd: date(end), confidence: confidence, observedAt: date(now),
                 audioWindowEndAt: captured.map(date))),
                 at: date(now), listenerId: listener)
         }
         mutating func classifierOnlyScore(_ confidence: Double, end: Double) {
             alerts += engine.consumeClassification(.result(.init(captureID: capture,
-                windowStart: date(end - 2), windowEnd: date(end), confidence: confidence,
+                windowStart: date(end - 4), windowEnd: date(end), confidence: confidence,
                 observedAt: date(end), audioWindowEndAt: date(end))), at: date(end), listenerId: listener)
         }
     }
@@ -93,7 +93,7 @@ final class CryConfidenceTests: XCTestCase {
         restored.recoverAfterRelaunch()
         s.engine.suspend()
         for snapshot in [restored.snapshot, s.engine.snapshot] {
-            XCTAssertEqual(snapshot.history.first?.startedAt, s.date(22))
+            XCTAssertEqual(snapshot.history.first?.startedAt, s.date(20))
             XCTAssertEqual(snapshot.history.first?.endedAt, s.date(27))
             XCTAssertEqual(snapshot.history.first?.quietConfirmed, false)
             XCTAssertEqual(snapshot.pending.count, 1)
@@ -108,7 +108,7 @@ final class CryConfidenceTests: XCTestCase {
 
     func testInvalidClassifierInputCannotMoveThePersistedEpisodeEnd() {
         var s = Simulation()
-        for end in 2...5 { s.classifierOnlyScore(0.95, end: Double(end)) }
+        for end in 4...5 { s.classifierOnlyScore(0.95, end: Double(end)) }
         _ = s.engine.consumeClassification(.result(.init(captureID: UUID(), windowStart: s.date(98),
             windowEnd: s.date(100), confidence: 1, observedAt: s.date(100), audioWindowEndAt: s.date(100))),
             at: s.date(100), listenerId: s.listener)
@@ -119,7 +119,7 @@ final class CryConfidenceTests: XCTestCase {
 
     func testEarlierClassifierConfirmationCorrectsAnAlreadyPublishedVolumeOnset() throws {
         var s = Simulation(duration: 30)
-        for end in 2...29 { s.score(0.95, end: Double(end), volume: end <= 20 ? -80 : -20, captured: Double(end)) }
+        for end in 4...29 { s.score(0.95, end: Double(end), volume: end <= 20 ? -80 : -20, captured: Double(end)) }
         let id = try XCTUnwrap(s.engine.snapshot.current?.id)
         let journalID = "cry:\(id.uuidString.lowercased())"
         XCTAssertEqual(s.engine.snapshot.current?.startedAt, s.date(20.25))
@@ -138,8 +138,8 @@ final class CryConfidenceTests: XCTestCase {
         let at = s.date(80)
         let delivery = SoundClassificationEventDelivery(pair.continuation, currentTime: { at })
         delivery.emit(.started(id: s.capture, at: s.origin, sampleRate: 48_000, voiceProcessing: false))
-        for end in 2...80 {
-            delivery.emit(.result(.init(captureID: s.capture, windowStart: s.date(Double(end - 2)),
+        for end in 4...80 {
+            delivery.emit(.result(.init(captureID: s.capture, windowStart: s.date(Double(end - 4)),
                 windowEnd: s.date(Double(end)), confidence: 1, observedAt: s.date(Double(end)), audioWindowEndAt: s.date(Double(end)))))
         }
         pair.continuation.finish()
@@ -153,12 +153,12 @@ final class CryConfidenceTests: XCTestCase {
         XCTAssertTrue(engine.snapshot.pending.isEmpty)
         for end in 81...84 {
             _ = engine.consumeClassification(.result(.init(captureID: s.capture,
-                windowStart: s.date(Double(end - 2)), windowEnd: s.date(Double(end)), confidence: 1,
+                windowStart: s.date(Double(end - 4)), windowEnd: s.date(Double(end)), confidence: 1,
                 observedAt: s.date(Double(end)), audioWindowEndAt: s.date(Double(end)))),
                 at: s.date(Double(end)), listenerId: s.listener)
             XCTAssertTrue(engine.snapshot.pending.isEmpty)
         }
-        _ = engine.consumeClassification(.result(.init(captureID: s.capture, windowStart: s.date(83),
+        _ = engine.consumeClassification(.result(.init(captureID: s.capture, windowStart: s.date(81),
             windowEnd: s.date(85), confidence: 1, observedAt: s.date(85), audioWindowEndAt: s.date(85))),
             at: s.date(85), listenerId: s.listener)
         XCTAssertEqual(engine.snapshot.pending.count, 1)
@@ -182,18 +182,18 @@ final class CryConfidenceTests: XCTestCase {
 
     func testOnlyFreshValidatedInputTimestampsProveMicrophoneLiveness() {
         var s = Simulation()
-        s.score(0, end: 2)
+        s.score(0, end: 4)
         XCTAssertNil(s.engine.latestClassifierInputAt, "An inferred sample-clock date is not input evidence")
-        s.score(0, end: 3, captured: 3)
-        XCTAssertEqual(s.engine.latestClassifierInputAt, s.date(3), "Quiet audio also proves capture is alive")
-        s.score(1, end: 4, captureID: UUID(), captured: 4)
-        s.score(.nan, end: 4, captured: 4)
-        s.score(1, end: 2, observed: 4, captured: 4)
-        s.score(1, end: 4, observed: 8, captured: 4)
-        s.score(1, end: 5, observed: 8, captured: 10)
-        XCTAssertEqual(s.engine.latestClassifierInputAt, s.date(3), "Foreign, invalid, reordered, stale and future input must not postpone a stall")
-        s.score(0, end: 8, captured: 8)
-        XCTAssertEqual(s.engine.latestClassifierInputAt, s.date(8))
+        s.score(0, end: 5, captured: 5)
+        XCTAssertEqual(s.engine.latestClassifierInputAt, s.date(5), "Quiet audio also proves capture is alive")
+        s.score(1, end: 6, captureID: UUID(), captured: 6)
+        s.score(.nan, end: 6, captured: 6)
+        s.score(1, end: 4, observed: 6, captured: 6)
+        s.score(1, end: 6, observed: 10, captured: 6)
+        s.score(1, end: 7, observed: 10, captured: 12)
+        XCTAssertEqual(s.engine.latestClassifierInputAt, s.date(5), "Foreign, invalid, reordered, stale and future input must not postpone a stall")
+        s.score(0, end: 10, captured: 10)
+        XCTAssertEqual(s.engine.latestClassifierInputAt, s.date(10))
     }
 
     func testGapRecoveryUsesMappedInputTimeWithEitherDirectionOfClockDrift() {
@@ -221,32 +221,34 @@ final class CryConfidenceTests: XCTestCase {
         for frame in 1...1200 { clock.receive(through: Int64(frame * 1024), at: Date(timeIntervalSince1970: Double(frame))) }
         XCTAssertNil(clock.capturedWindowEnd(at: 1), "Reproduce an old callback whose input anchor was evicted")
         var s = Simulation()
-        s.score(end: 24, captured: 24); s.score(end: 25, captured: 25)
-        for (id, end) in [(s.capture, 1.0), (s.capture, 25.0), (UUID(), 26.0)] {
-            _ = s.engine.consumeClassification(.unmappedResult(captureID: id, windowEnd: s.date(end), at: s.date(25)),
-                at: s.date(25), listenerId: s.listener)
+        s.score(end: 24, captured: 24)
+        for (id, end) in [(s.capture, 1.0), (s.capture, 24.0), (UUID(), 25.0)] {
+            _ = s.engine.consumeClassification(.unmappedResult(captureID: id, windowEnd: s.date(end), at: s.date(24)),
+                at: s.date(24), listenerId: s.listener)
         }
-        s.score(end: 26, captured: 26); s.score(end: 27, captured: 27)
+        s.score(end: 25, captured: 25)
         XCTAssertEqual(s.alerts.count, 1)
-        XCTAssertEqual(s.alerts.first?.cryStartedAt, s.date(22))
-        XCTAssertEqual(s.alerts.first?.createdAt, s.date(27))
+        XCTAssertEqual(s.alerts.first?.cryStartedAt, s.date(20))
+        XCTAssertEqual(s.alerts.first?.createdAt, s.date(25))
     }
 
     func testUnmappedNewWindowStillRequiresACompletePostGapStreak() {
         var s = Simulation()
-        s.score(end: 2, captured: 2); s.score(end: 3, captured: 3)
-        _ = s.engine.consumeClassification(.unmappedResult(captureID: s.capture, windowEnd: s.date(4), at: s.date(4)),
-            at: s.date(4), listenerId: s.listener)
+        s.score(end: 4, captured: 4)
+        _ = s.engine.consumeClassification(.unmappedResult(captureID: s.capture, windowEnd: s.date(5), at: s.date(5)),
+            at: s.date(5), listenerId: s.listener)
         XCTAssertNil(s.engine.confidenceDetector.observationStartedAt)
-        for end in 5...8 { s.score(end: Double(end), captured: Double(end)); XCTAssertTrue(s.alerts.isEmpty) }
-        s.score(end: 9, captured: 9)
+        for end in 6...9 { s.score(end: Double(end), captured: Double(end)); XCTAssertTrue(s.alerts.isEmpty) }
+        s.score(end: 10, captured: 10)
         XCTAssertEqual(s.alerts.count, 1)
-        XCTAssertEqual(s.alerts.first?.cryStartedAt, s.date(4))
+        XCTAssertEqual(s.alerts.first?.cryStartedAt, s.date(5))
     }
 
-    func testEightyPercentForFiveSecondsAlertsEvenBelowVolumeThreshold() throws {
+    func testSixtyPercentConfidenceRequiresFullWindowEvenBelowVolumeThreshold() throws {
         var s = Simulation()
-        for end in 2...4 { s.score(end: Double(end)); XCTAssertTrue(s.alerts.isEmpty) }
+        s.score(end: 4); XCTAssertTrue(s.alerts.isEmpty)
+        s.levels(to: 4.75)
+        XCTAssertTrue(s.alerts.isEmpty, "The first four-second result cannot complete a five-second observation")
         s.score(end: 5)
         let alert = try XCTUnwrap(s.alerts.first)
         XCTAssertEqual(alert.createdAt, s.date(5)); XCTAssertEqual(alert.cryStartedAt, s.origin)
@@ -257,9 +259,29 @@ final class CryConfidenceTests: XCTestCase {
         XCTAssertEqual(s.alerts.count, 1, "The server, rather than either detector, owns reminders")
     }
 
+    func testTwoSecondResultsCannotQualifyInAFourSecondCapture() {
+        var s = Simulation()
+        for end in 4...12 {
+            let now = s.date(Double(end))
+            let alerts = s.engine.consumeClassification(.result(.init(captureID: s.capture,
+                windowStart: now.addingTimeInterval(-2), windowEnd: now,
+                confidence: 1, observedAt: now, audioWindowEndAt: now)), at: now, listenerId: s.listener)
+            XCTAssertTrue(alerts.isEmpty)
+        }
+        XCTAssertNil(s.engine.latestClassifierInputAt, "Invalid window lengths cannot prove microphone liveness")
+        XCTAssertNil(s.engine.confidenceDetector.observationStartedAt)
+    }
+
+    func testScoresBelowSixtyPercentCannotTriggerClassifier() {
+        var s = Simulation()
+        for end in 4...30 { s.score(0.6.nextDown, end: Double(end)) }
+        XCTAssertTrue(s.alerts.isEmpty)
+        XCTAssertEqual(s.engine.state, .quiet)
+    }
+
     func testClassifierUsesConfiguredDurationAndDoesNotDoubleCountOverlappingWindows() {
         var s = Simulation(duration: 30)
-        for end in 2...29 { s.score(0.99, end: Double(end)) }
+        for end in 4...29 { s.score(0.99, end: Double(end)) }
         XCTAssertTrue(s.alerts.isEmpty)
         s.score(0.99, end: 30)
         XCTAssertEqual(s.alerts.count, 1)
@@ -268,26 +290,26 @@ final class CryConfidenceTests: XCTestCase {
 
     func testOneLowSecondUsesToleranceInsteadOfRestartingTheWindow() {
         var s = Simulation()
-        s.score(end: 2); s.score(end: 3); s.score(0.799999, end: 4)
+        s.score(end: 4); s.score(0.6.nextDown, end: 5)
         XCTAssertTrue(s.alerts.isEmpty)
-        s.score(end: 5)
+        s.score(end: 6)
         XCTAssertEqual(s.alerts.first?.cryStartedAt, s.origin)
-        XCTAssertEqual(s.alerts.first?.createdAt, s.date(5))
+        XCTAssertEqual(s.alerts.first?.createdAt, s.date(6))
     }
 
     func testTwoLowSecondsCannotQualifyAFiveSecondWindow() {
         var s = Simulation()
-        s.score(end: 2); s.score(0.79, end: 3); s.score(0.79, end: 4); s.score(end: 5)
+        s.score(end: 4); s.score(0.59, end: 5); s.score(0.59, end: 6); s.score(end: 7)
         XCTAssertTrue(s.alerts.isEmpty)
-        s.score(end: 6); s.score(end: 7)
+        s.score(end: 8); s.score(end: 9)
         XCTAssertTrue(s.alerts.isEmpty)
-        s.score(end: 8)
-        XCTAssertEqual(s.alerts.first?.createdAt, s.date(8))
+        s.score(end: 10)
+        XCTAssertEqual(s.alerts.first?.createdAt, s.date(10))
     }
 
     func testOccasionalDipsDoNotPreventALongerClassifierAlert() {
         var s = Simulation(duration: 30)
-        for end in 2...29 { s.score(end == 20 ? 0.79 : 0.95, end: Double(end)) }
+        for end in 4...29 { s.score(end == 20 ? 0.59 : 0.95, end: Double(end)) }
         XCTAssertTrue(s.alerts.isEmpty)
         s.score(0.95, end: 30)
         XCTAssertEqual(s.alerts.first?.createdAt, s.date(30))
@@ -295,7 +317,7 @@ final class CryConfidenceTests: XCTestCase {
 
     func testOldClassifierBurstNeedsRecentSustainedActivityAndAPositiveLatestResult() {
         var s = Simulation(duration: 30)
-        for end in 2...25 { s.score(end: Double(end)) }
+        for end in 4...25 { s.score(end: Double(end)) }
         for end in 26...30 { s.score(0, end: Double(end)) }
         XCTAssertTrue(s.alerts.isEmpty, "80% historical coverage is insufficient while settled")
         s.score(end: 31)
@@ -306,7 +328,7 @@ final class CryConfidenceTests: XCTestCase {
 
     func testSparseHighScoresCannotPreserveAnAlertedClassifierEpisode() {
         var s = Simulation()
-        for end in 2...6 { s.score(end: Double(end)) }
+        for end in 4...6 { s.score(end: Double(end)) }
         XCTAssertEqual(s.alerts.count, 1)
         for end in 7...90 { s.score(end % 15 == 6 ? 0.95 : 0, end: Double(end)) }
         XCTAssertNil(s.engine.snapshot.current)
@@ -317,18 +339,19 @@ final class CryConfidenceTests: XCTestCase {
 
     func testMissingResultDoesNotCountAsContinuousHighConfidence() {
         var s = Simulation()
-        s.score(end: 2); s.score(end: 3)
-        for end in 5...7 { s.score(end: Double(end)); XCTAssertTrue(s.alerts.isEmpty) }
-        s.score(end: 8)
-        XCTAssertEqual(s.alerts.first?.cryStartedAt, s.date(3))
+        s.score(end: 4)
+        // Skip the result ending at 5; the first replacement window spans 2...6.
+        s.score(end: 6); XCTAssertTrue(s.alerts.isEmpty)
+        s.score(end: 7)
+        XCTAssertEqual(s.alerts.first?.cryStartedAt, s.date(2))
     }
 
     func testResultSilenceExpiresProgressWithoutAnotherCallback() {
         var s = Simulation()
-        s.score(end: 2); s.score(end: 3)
+        s.score(end: 4)
         s.levels(to: 10)
         XCTAssertEqual(s.engine.state, .quiet)
-        for end in 12...14 { s.score(end: Double(end)); XCTAssertTrue(s.alerts.isEmpty) }
+        s.score(end: 14); XCTAssertTrue(s.alerts.isEmpty)
         s.score(end: 15)
         XCTAssertEqual(s.alerts.first?.cryStartedAt, s.date(10))
     }
@@ -336,32 +359,32 @@ final class CryConfidenceTests: XCTestCase {
     func testStaleFutureInvalidAndOldCaptureResultsCannotAlert() {
         for confidence in [Double.nan, .infinity, -0.1, 1.1] {
             var s = Simulation()
-            for end in 2...8 { s.score(confidence, end: Double(end)) }
+            for end in 4...8 { s.score(confidence, end: Double(end)) }
             XCTAssertTrue(s.alerts.isEmpty)
         }
         var stale = Simulation()
-        for end in 2...8 { stale.score(1, end: Double(end), observed: Double(end + 10)) }
+        for end in 4...8 { stale.score(1, end: Double(end), observed: Double(end + 10)) }
         XCTAssertTrue(stale.alerts.isEmpty)
         var future = Simulation()
-        for end in 2...8 { future.score(1, end: Double(end + 10), observed: Double(end)) }
+        for end in 4...8 { future.score(1, end: Double(end + 10), observed: Double(end)) }
         XCTAssertTrue(future.alerts.isEmpty)
         var foreign = Simulation()
-        for end in 2...8 { foreign.score(1, end: Double(end), captureID: UUID()) }
+        for end in 4...8 { foreign.score(1, end: Double(end), captureID: UUID()) }
         XCTAssertTrue(foreign.alerts.isEmpty)
     }
 
     func testDuplicateAndOutOfOrderWindowsDoNotAccumulateTimeOrResetNewEvidence() {
         var s = Simulation()
-        s.score(end: 2); s.score(end: 3)
-        for _ in 0..<10 { s.score(0, end: 2, observed: 3) }
+        s.score(end: 4)
+        for _ in 0..<10 { s.score(0, end: 4, observed: 4) }
         XCTAssertTrue(s.alerts.isEmpty)
-        s.score(end: 4); s.score(end: 5)
+        s.score(end: 5)
         XCTAssertEqual(s.alerts.count, 1)
     }
 
     func testLongCaptureAudioClockDriftDoesNotDisableFreshClassifierResults() {
         var s = Simulation()
-        for second in 2...40 {
+        for second in 4...40 {
             let now = Double(second), audioEnd = now + Double(second - 2) * 0.05
             s.score(0.9, end: audioEnd, observed: now, captured: now)
         }
@@ -373,10 +396,10 @@ final class CryConfidenceTests: XCTestCase {
 
     func testCallbackThatWaitedTooLongForHandlingCannotExtendAStreak() {
         var s = Simulation()
-        s.score(end: 2); s.score(end: 3)
+        s.score(end: 4)
         s.levels(to: 10)
-        let delayed = SoundClassificationObservation(captureID: s.capture, windowStart: s.date(2),
-            windowEnd: s.date(4), confidence: 1, observedAt: s.date(4))
+        let delayed = SoundClassificationObservation(captureID: s.capture, windowStart: s.date(1),
+            windowEnd: s.date(5), confidence: 1, observedAt: s.date(5))
         let events = s.engine.consumeClassification(.result(delayed), at: s.date(10), listenerId: s.listener)
         XCTAssertTrue(events.isEmpty)
         XCTAssertNil(s.engine.confidenceDetector.observationStartedAt)
@@ -397,23 +420,23 @@ final class CryConfidenceTests: XCTestCase {
 
     func testNewCaptureCannotCarryOverItsPredecessorsStreak() {
         var s = Simulation()
-        s.score(end: 2); s.score(end: 3)
+        s.score(end: 4)
         let old = s.capture
-        s.capture = UUID(); s.startCapture(at: 3)
+        s.capture = UUID(); s.startCapture(at: 4)
         s.score(1, end: 4, captureID: old)
         _ = s.engine.consumeClassification(.stopped(id: old, at: s.date(4)), at: s.date(4), listenerId: s.listener)
-        for end in 5...7 { s.score(end: Double(end)); XCTAssertTrue(s.alerts.isEmpty) }
-        s.score(end: 8)
-        XCTAssertEqual(s.alerts.first?.cryStartedAt, s.date(3))
+        s.score(end: 8); XCTAssertTrue(s.alerts.isEmpty)
+        s.score(end: 9)
+        XCTAssertEqual(s.alerts.first?.cryStartedAt, s.date(4))
     }
 
     func testClassifierFailureAndDroppedEventsBreakOnlyClassifierProgress() {
-        for event in [SoundClassificationEvent.unavailable(at: Date(timeIntervalSince1970: 1003)),
-                      .droppedEvents(at: Date(timeIntervalSince1970: 1003)),
-                      .droppedBuffers(count: 1, at: Date(timeIntervalSince1970: 1003))] {
+        for event in [SoundClassificationEvent.unavailable(at: Date(timeIntervalSince1970: 1004)),
+                      .droppedEvents(at: Date(timeIntervalSince1970: 1004)),
+                      .droppedBuffers(count: 1, at: Date(timeIntervalSince1970: 1004))] {
             var s = Simulation()
-            s.score(end: 2); s.score(end: 3)
-            _ = s.engine.consumeClassification(event, at: s.date(3), listenerId: s.listener)
+            s.score(end: 4)
+            _ = s.engine.consumeClassification(event, at: s.date(4), listenerId: s.listener)
             XCTAssertNil(s.engine.confidenceDetector.observationStartedAt)
             s.levels(to: 10, dbfs: -20)
             XCTAssertEqual(s.alerts.count, 1)
@@ -423,7 +446,7 @@ final class CryConfidenceTests: XCTestCase {
 
     func testLowConfidenceCannotSuppressVolumeAlerts() {
         var s = Simulation()
-        for end in 2...8 { s.score(0, end: Double(end), volume: -20) }
+        for end in 4...8 { s.score(0, end: Double(end), volume: -20) }
         XCTAssertEqual(s.alerts.count, 1)
         XCTAssertEqual(s.alerts.first?.createdAt, s.date(5.25))
         XCTAssertEqual(s.engine.lastAlertTrigger, .volume)
@@ -431,7 +454,7 @@ final class CryConfidenceTests: XCTestCase {
 
     func testClassifierThenVolumeShareOneEpisodeAndOneInitialAlert() throws {
         var s = Simulation()
-        for end in 2...6 { s.score(end: Double(end), volume: -20) }
+        for end in 4...6 { s.score(end: Double(end), volume: -20) }
         let id = try XCTUnwrap(s.engine.snapshot.current?.id)
         XCTAssertEqual(s.alerts.count, 1)
         XCTAssertEqual(s.engine.lastAlertTrigger, .classifier)
@@ -454,7 +477,7 @@ final class CryConfidenceTests: XCTestCase {
     func testDetectorsCannotCombinePartialTimersToCreateAnEarlyAlert() {
         var s = Simulation(duration: 10)
         s.levels(to: 6, dbfs: -20)
-        for end in 8...15 { s.score(end: Double(end)); XCTAssertTrue(s.alerts.isEmpty) }
+        for end in 10...15 { s.score(end: Double(end)); XCTAssertTrue(s.alerts.isEmpty) }
         s.score(end: 16)
         XCTAssertEqual(s.alerts.count, 1)
         XCTAssertEqual(s.alerts.first?.createdAt, s.date(16))
@@ -478,7 +501,7 @@ final class CryConfidenceTests: XCTestCase {
 
     func testQuietVolumeCannotResolveAClassifierEpisodeAndBothMustSettle() throws {
         var s = Simulation()
-        for end in 2...35 { s.score(end: Double(end)) }
+        for end in 4...35 { s.score(end: Double(end)) }
         let id = try XCTUnwrap(s.engine.snapshot.current?.id)
         XCTAssertEqual(s.engine.state, .crying)
         XCTAssertTrue(s.engine.snapshot.history.isEmpty)
@@ -495,13 +518,13 @@ final class CryConfidenceTests: XCTestCase {
 
     func testMissingClassifierEventuallyReleasesItsEpisodeButLoudVolumeKeepsIt() {
         var s = Simulation()
-        for end in 2...5 { s.score(end: Double(end)) }
+        for end in 4...5 { s.score(end: Double(end)) }
         s.levels(to: 24.75)
         XCTAssertNotNil(s.engine.snapshot.current)
         s.levels(to: 25)
         XCTAssertNil(s.engine.snapshot.current)
         var loud = Simulation()
-        for end in 2...5 { loud.score(end: Double(end), volume: -20) }
+        for end in 4...5 { loud.score(end: Double(end), volume: -20) }
         loud.levels(to: 35, dbfs: -20)
         XCTAssertEqual(loud.engine.state, .crying)
         XCTAssertNotNil(loud.engine.snapshot.current)
@@ -510,7 +533,7 @@ final class CryConfidenceTests: XCTestCase {
 
     func testSuspendAndRelaunchResetClassifierProgressAndPreserveOutbox() throws {
         var s = Simulation()
-        for end in 2...5 { s.score(end: Double(end)) }
+        for end in 4...5 { s.score(end: Double(end)) }
         let saved = try JSONDecoder().decode(SessionSnapshot.self, from: JSONEncoder().encode(s.engine.snapshot))
         var recovered = CrySessionManager(snapshot: saved)
         recovered.recoverAfterRelaunch()
@@ -525,11 +548,11 @@ final class CryConfidenceTests: XCTestCase {
 
     func testAudioLevelGapRetainsCaptureIdentityButRequiresNewClassifierAudio() {
         var s = Simulation()
-        s.score(end: 2); s.score(end: 3)
+        s.score(end: 4)
         s.elapsed = 10
         s.levels(to: 10.25)
         XCTAssertEqual(s.engine.confidenceDetector.captureID, s.capture)
-        for end in [12.25, 13.25, 14.25] { s.score(end: end); XCTAssertTrue(s.alerts.isEmpty) }
+        s.score(end: 14.25); XCTAssertTrue(s.alerts.isEmpty)
         s.score(end: 15.25)
         XCTAssertEqual(s.alerts.count, 1)
         XCTAssertEqual(s.alerts.first?.cryStartedAt, s.date(10.25))
@@ -537,11 +560,11 @@ final class CryConfidenceTests: XCTestCase {
 
     func testLevelDeliveryGapCannotSplitAHealthyClassifierEpisodeOrDuplicateItsAlert() throws {
         var s = Simulation()
-        for end in 2...4 { s.score(end: Double(end)) }
+        s.score(end: 4)
         s.levels(to: 4.5)
         for end in [5.0, 6.0] {
             s.alerts += s.engine.consumeClassification(.result(.init(captureID: s.capture,
-                windowStart: s.date(end - 2), windowEnd: s.date(end), confidence: 0.9, observedAt: s.date(end))),
+                windowStart: s.date(end - 4), windowEnd: s.date(end), confidence: 0.9, observedAt: s.date(end))),
                 at: s.date(end), listenerId: s.listener)
         }
         let id = try XCTUnwrap(s.engine.snapshot.current?.id)
@@ -557,11 +580,8 @@ final class CryConfidenceTests: XCTestCase {
 
     func testLevelGapPreservesAnUnfinishedClassifierTimer() {
         var s = Simulation()
-        s.score(end: 2); s.score(end: 3)
+        s.score(end: 4)
         s.elapsed = 5.0
-        s.alerts += s.engine.consumeClassification(.result(.init(captureID: s.capture,
-            windowStart: s.date(2), windowEnd: s.date(4), confidence: 0.9, observedAt: s.date(4))),
-            at: s.date(4), listenerId: s.listener)
         s.levels(to: 5.25)
         s.score(end: 5, observed: 5.25)
         XCTAssertEqual(s.alerts.count, 1)
@@ -570,12 +590,12 @@ final class CryConfidenceTests: XCTestCase {
 
     func testDriftedCaptureCanQualifyAgainAfterBothStreamsHaveBeenQuietOrMissing() {
         var s = Simulation()
-        for second in 2...20 {
+        for second in 4...20 {
             let now = Double(second)
             s.score(0, end: now + Double(second - 2) * 0.075, observed: now, captured: now)
         }
         s.elapsed = 25; s.levels(to: 25.25)
-        for second in 27...30 {
+        for second in 29...30 {
             let now = Double(second)
             s.score(0.9, end: now + 1.35, observed: now, captured: now)
         }
@@ -588,15 +608,15 @@ final class CryConfidenceTests: XCTestCase {
     func testGrowingInferenceBacklogDoesNotReanchorOldAudioOrTriggerAnAlert() {
         for anchored in [false, true] {
             var s = Simulation()
-            for (end, received, confidence) in [(2.0, 2.0, 0.0), (3, 4.5, 0.9), (4, 7, 0.9),
-                                                (5, 9.5, 0.9), (6, 12, 0.9)] {
+            for (end, received, confidence) in [(4.0, 4.0, 0.0), (5, 6.5, 0.9), (6, 9, 0.9),
+                                                (7, 11.5, 0.9), (8, 14, 0.9)] {
                 s.score(confidence, end: end, observed: received, captured: anchored ? end : nil)
             }
             XCTAssertTrue(s.alerts.isEmpty)
             XCTAssertNil(s.engine.confidenceDetector.observationStartedAt)
             // A caught-up stream must recover on a new full streak, with the
             // original audio onset rather than an onset shifted by old latency.
-            for end in 14...17 { s.score(end: Double(end), captured: anchored ? Double(end) : nil) }
+            for end in 16...17 { s.score(end: Double(end), captured: anchored ? Double(end) : nil) }
             XCTAssertEqual(s.alerts.count, 1)
             XCTAssertEqual(s.alerts.first?.cryStartedAt, s.date(12))
         }
@@ -604,9 +624,9 @@ final class CryConfidenceTests: XCTestCase {
 
     func testAudioAgeIncludesInferenceAndMainActorDelaysTogether() {
         var s = Simulation()
-        s.score(end: 2); s.score(end: 3); s.score(end: 4)
+        s.score(end: 4)
         s.levels(to: 8.5)
-        let result = SoundClassificationObservation(captureID: s.capture, windowStart: s.date(3), windowEnd: s.date(5),
+        let result = SoundClassificationObservation(captureID: s.capture, windowStart: s.date(1), windowEnd: s.date(5),
             confidence: 0.9, observedAt: s.date(7), audioWindowEndAt: s.date(5))
         let events = s.engine.consumeClassification(.result(result), at: s.date(8.5), listenerId: s.listener)
         XCTAssertTrue(events.isEmpty, "Neither individual delay exceeds three seconds, but the audio is 3.5 seconds old")

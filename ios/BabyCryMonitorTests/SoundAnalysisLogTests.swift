@@ -216,7 +216,7 @@ final class SoundAnalysisLogTests: XCTestCase {
         let origin = Date(timeIntervalSince1970: 1000), failed = UUID(), replacement = UUID()
         func date(_ seconds: Double) -> Date { origin.addingTimeInterval(seconds) }
         func event(_ id: UUID, end: Double, captured: Double, confidence: Double = 0) -> SoundClassificationEvent {
-            .result(.init(captureID: id, windowStart: date(end - 2), windowEnd: date(end), confidence: confidence,
+            .result(.init(captureID: id, windowStart: date(end - 4), windowEnd: date(end), confidence: confidence,
                           observedAt: date(end), audioWindowEndAt: date(captured)))
         }
         _ = log.consume(.started(id: failed, at: origin, sampleRate: 48_000, voiceProcessing: false), at: origin)
@@ -230,19 +230,19 @@ final class SoundAnalysisLogTests: XCTestCase {
         XCTAssertNil(log.consume(.result(.init(captureID: replacement, windowStart: date(11), windowEnd: date(13),
                                                confidence: 0, observedAt: date(13))), at: date(13)), "Recovery needs an independent input timestamp")
         XCTAssertNil(log.consume(event(replacement, end: 13, captured: 13), at: date(20)), "Delayed handling is not recovery")
-        let result = try XCTUnwrap(log.consume(event(replacement, end: 14, captured: 13.5), at: date(14)))
-        XCTAssertTrue(result.contains("outage_ms=4000"))
+        let result = try XCTUnwrap(log.consume(event(replacement, end: 15, captured: 14.5), at: date(15)))
+        XCTAssertTrue(result.contains("outage_ms=5000"))
         XCTAssertTrue(result.contains("failure_count=1;restart_count=1"))
         XCTAssertTrue(result.contains(failed.uuidString.lowercased()))
         XCTAssertNil(log.pendingDetails(at: date(14)))
-        XCTAssertNil(log.consume(event(replacement, end: 15, captured: 15), at: date(15)), "One summary per outage")
+        XCTAssertNil(log.consume(event(replacement, end: 16, captured: 16), at: date(16)), "One summary per outage")
     }
 
     func testRecoveryDoesNotAdoptUnknownStoppedOrPreGapResults() {
         var log = SoundClassificationRecoveryLog()
         let now = Date(timeIntervalSince1970: 1000), capture = UUID()
         func event(end: Double) -> SoundClassificationEvent {
-            .result(.init(captureID: capture, windowStart: now.addingTimeInterval(end - 2), windowEnd: now.addingTimeInterval(end),
+            .result(.init(captureID: capture, windowStart: now.addingTimeInterval(end - 4), windowEnd: now.addingTimeInterval(end),
                           confidence: 0, observedAt: now.addingTimeInterval(end), audioWindowEndAt: now.addingTimeInterval(end)))
         }
         _ = log.consume(.unavailable(at: now), at: now)
@@ -267,9 +267,9 @@ final class SoundAnalysisLogTests: XCTestCase {
                                         captureID: old, retryAfterSeconds: 1, appActive: false))
         let start = now.addingTimeInterval(11)
         log.classification(.started(id: replacement, at: start, sampleRate: 48_000, voiceProcessing: false, reason: .afterFailure))
-        for offset in 2...4 {
+        for offset in 4...6 {
             let end = start.addingTimeInterval(Double(offset))
-            log.classification(.result(.init(captureID: replacement, windowStart: end.addingTimeInterval(-2), windowEnd: end,
+            log.classification(.result(.init(captureID: replacement, windowStart: end.addingTimeInterval(-4), windowEnd: end,
                                             confidence: 0, observedAt: end, audioWindowEndAt: end)), handledAt: end)
         }
         let export = try await log.prepareExport()
@@ -371,11 +371,15 @@ final class SoundAnalysisLogTests: XCTestCase {
         log.classification(.result(.init(captureID: capture, windowStart: now, windowEnd: now.addingTimeInterval(2),
                                         confidence: 0, observedAt: now.addingTimeInterval(3))))
         log.classification(.result(.init(captureID: capture, windowStart: now.addingTimeInterval(1),
-            windowEnd: now.addingTimeInterval(3), confidence: 0.987654, observedAt: now.addingTimeInterval(4))))
+            windowEnd: now.addingTimeInterval(3), confidence: 0.987654, observedAt: now.addingTimeInterval(4))),
+            alert: .init(episodeId: episode.id, listenerId: UUID(), cryStartedAt: now,
+                         durationSeconds: 4, createdAt: now.addingTimeInterval(4), isRepeat: false))
         let export = try await log.prepareExport()
         defer { try? FileManager.default.removeItem(at: export[0].deletingLastPathComponent()) }
         let data = try rows(in: export)
         let levels = data.filter { $0[2] == "level" }
+        XCTAssertTrue(try XCTUnwrap(data.first { $0[2] == "capture_start" })[18]
+            .contains("window_s=4;overlap=0.75"))
         XCTAssertEqual(levels.count, 3)
         XCTAssertEqual(levels.map { $0[9] }, ["0", "1", "1"])
         XCTAssertEqual(levels.map { $0[10] }, ["quiet", "possibleCry", "crying"])
@@ -385,12 +389,16 @@ final class SoundAnalysisLogTests: XCTestCase {
         XCTAssertEqual(levels[1][16], "whiteNoise")
         let scores = data.filter { $0[2] == "classification" }
         XCTAssertEqual(scores.map { $0[6] }, ["0.000000", "0.987654"])
+        XCTAssertTrue(try XCTUnwrap(data.first { $0[2] == "run_start" })[18].contains("confidence_threshold=0.60"))
+        XCTAssertTrue(scores[1][18].contains("alert_trigger=classifier;confidence_threshold=0.60"))
         XCTAssertNotEqual(scores[0][0], scores[0][5], "Receipt time must remain distinct from audio time")
         XCTAssertEqual(scores[0][3], capture.uuidString.lowercased())
         XCTAssertEqual(log.latestConfidence, 0.987654)
         let coverage = try String(contentsOf: export[1], encoding: .utf8)
         XCTAssertTrue(coverage.contains("alert_policy=time_coverage_v1"))
         XCTAssertTrue(coverage.contains(">=80% qualifying time"))
+        XCTAssertTrue(coverage.contains("qualifies classifier scores at >=0.60"))
+        XCTAssertTrue(coverage.contains("4-second windows, 75% overlap"))
         XCTAssertTrue(coverage.contains("overlapping results label only newly covered suffixes"))
         XCTAssertTrue(coverage.contains("combined volume/classifier state"))
     }
