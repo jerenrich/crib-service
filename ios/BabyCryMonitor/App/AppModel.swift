@@ -118,6 +118,7 @@ import UIKit
     let notifications: any NotificationProviding
     let watch: PhoneWatchBridge
     let log: DiagnosticLog
+    var calibrationAudio: CalibrationAudioRecording? { audio.calibrationAudio }
     let refreshExperiment: BackgroundRefreshController?
     private var engine = CrySessionManager()
     @ObservationIgnored private var store: MetadataStore?

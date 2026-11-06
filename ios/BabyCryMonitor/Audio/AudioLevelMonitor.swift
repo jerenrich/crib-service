@@ -28,6 +28,7 @@ protocol AudioCaptureDriving: Sendable {
 }
 
 @MainActor protocol AudioLevelProviding: AnyObject {
+    var calibrationAudio: CalibrationAudioRecording? { get }
     var levels: AsyncStream<AudioLevelSample> { get }
     var onStatus: ((AudioCaptureStatus) -> Void)? { get set }
     var onNurserySoundChange: ((NurserySoundState) -> Void)? { get set }
@@ -40,15 +41,17 @@ protocol AudioCaptureDriving: Sendable {
     func setNurserySound(_ request: NurserySoundRequest, commandID: UUID?) async throws
 }
 extension AudioLevelProviding {
+    var calibrationAudio: CalibrationAudioRecording? { nil }
     var onClassification: ((SoundClassificationEvent) -> Void)? { get { nil } set {} }
     func setClassificationEnabled(_ enabled: Bool) {}
     func setClassificationAppActive(_ active: Bool) {}
     func setNurserySound(_ request: NurserySoundRequest) async throws { try await setNurserySound(request, commandID: nil) }
 }
 /// RMS levels feed the existing detector. Bounded transient buffer copies feed
-/// an independent classifier; neither audio path records or uploads audio.
+/// an independent classifier and optional, local calibration recorder.
 @MainActor final class AudioLevelMonitor: AudioLevelProviding {
     let levels: AsyncStream<AudioLevelSample>
+    let calibrationAudio: CalibrationAudioRecording?
     private let driver: any AudioCaptureDriving
     private let classificationControl = SoundClassificationControl()
     private var classificationTask: Task<Void, Never>?
@@ -82,8 +85,11 @@ extension AudioLevelProviding {
         let pair = AsyncStream<AudioLevelSample>.makeStream(bufferingPolicy: .bufferingNewest(16))
         let classifications = AsyncStream<SoundClassificationEvent>.makeStream(bufferingPolicy: .bufferingNewest(64))
         levels = sampleStream ?? pair.stream
+        let recording = CalibrationAudioRecording()
+        calibrationAudio = recording
         self.driver = driver ?? AudioCaptureDriver(continuation: pair.continuation,
-            classificationControl: classificationControl, classificationEvents: classifications.continuation)
+            classificationControl: classificationControl, classificationEvents: classifications.continuation,
+            recording: recording.writer)
         self.currentTime = currentTime
         classificationTask = Task { [weak self] in
             for await event in classifications.stream {
@@ -436,9 +442,10 @@ private actor AudioCaptureDriver: AudioCaptureDriving {
     private var buffers: [NurserySound: AVAudioPCMBuffer] = [:]
     init(continuation: AsyncStream<AudioLevelSample>.Continuation,
          classificationControl: SoundClassificationControl,
-         classificationEvents: AsyncStream<SoundClassificationEvent>.Continuation) {
+         classificationEvents: AsyncStream<SoundClassificationEvent>.Continuation,
+         recording: CalibrationAudioWriter) {
         captureTap = AudioCaptureTap(continuation: continuation, classificationControl: classificationControl,
-                                    classificationEvents: classificationEvents)
+                                    classificationEvents: classificationEvents, recording: recording)
     }
     var isRunning: Bool { engine.isRunning }
     var engineID: ObjectIdentifier { ObjectIdentifier(engine) }
@@ -608,11 +615,15 @@ final class AudioCaptureTap {
     private let classificationControl: SoundClassificationControl?
     private let classificationEvents: AsyncStream<SoundClassificationEvent>.Continuation?
     private var classifier: BabyCryClassifier?
+    private let recording: CalibrationAudioWriter?
+    private var recordingCaptureID: UUID?
     init(continuation: AsyncStream<AudioLevelSample>.Continuation,
          classificationControl: SoundClassificationControl? = nil,
-         classificationEvents: AsyncStream<SoundClassificationEvent>.Continuation? = nil) {
+         classificationEvents: AsyncStream<SoundClassificationEvent>.Continuation? = nil,
+         recording: CalibrationAudioWriter? = nil) {
         self.continuation = continuation; self.classificationControl = classificationControl
         self.classificationEvents = classificationEvents
+        self.recording = recording
     }
     func replace(on input: AVAudioInputNode) throws {
         remove()
@@ -629,13 +640,21 @@ final class AudioCaptureTap {
         } else { classifier = nil }
         self.classifier = classifier
         let voiceProcessing = input.isVoiceProcessingEnabled
+        let recording = self.recording
+        let recordingCaptureID = recording?.beginCapture()
+        self.recordingCaptureID = recordingCaptureID
         input.installTap(onBus: 0, bufferSize: 1024, format: nil) { buffer, time in
             reducer.consume(buffer, at: time)
             classifier?.consume(buffer, at: time, voiceProcessing: voiceProcessing)
+            if let recordingCaptureID {
+                recording?.consume(buffer, at: time, captureID: recordingCaptureID, voiceProcessing: voiceProcessing)
+            }
         }
         node = input
     }
     func remove() {
+        if let recordingCaptureID { recording?.endCapture(recordingCaptureID) }
+        recordingCaptureID = nil
         node?.removeTap(onBus: 0)
         classifier?.stop(); classifier = nil
         node = nil

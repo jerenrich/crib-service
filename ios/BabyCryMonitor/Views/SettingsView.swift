@@ -119,11 +119,14 @@ struct SettingsView: View {
                     Button("Unpair or replace a phone", role: .destructive) { removal = .unpair; confirmRemoval = true }.disabled(model.managingDevice)
                     Button("Delete device & shared history", role: .destructive) { removal = .delete; confirmRemoval = true }.disabled(model.managingDevice)
                 } header: { Text("Device management") } footer: {
-                    Text("Unpairing stops this iPhone's monitoring and removes the pair's server episode history, alerts, and connection history. Both phones can then pair with a replacement. Deleting also removes this device's server registration and resets its local history. The other phone's local data and restricted server diagnostic records are not erased remotely.")
+                    Text("Unpairing stops this iPhone's monitoring and removes the pair's server episode history, alerts, and connection history. Both phones can then pair with a replacement. Deleting also removes this device's server registration and resets its local history. Calibration audio is removed separately with Delete saved audio. The other phone's local data and restricted server diagnostic records are not erased remotely.")
                 }
                 Section("Privacy & supervision") {
-                    Text("Audio never leaves the Listener iPhone. Numeric sound-level readings are relayed to the paired Parent for the live chart and are not saved by the connection service. No recordings or audio streams are uploaded.")
+                    Text("Audio is processed on the Listener iPhone. Optional calibration recordings stay on that iPhone unless you explicitly export and share them. Numeric sound-level readings are relayed to the paired Parent for the live chart and are not saved by the connection service. No recordings or audio streams are automatically uploaded.")
                     Text("Sound detection only. Cannot detect breathing problems, movement problems, silent distress, medical emergencies, or unsafe sleep conditions. Adult supervision is required; this is not a medical monitor.").font(.footnote).foregroundStyle(.secondary)
+                }
+                if model.role == .listener, let recording = model.calibrationAudio {
+                    CalibrationAudioSection(recording: recording)
                 }
                 Section {
                     NavigationLink("Diagnostics & simulation") { DebugView() }
