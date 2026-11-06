@@ -46,6 +46,17 @@ final class NotificationCallbackJournalTests: XCTestCase {
         let text = try String(contentsOf: dir.appendingPathComponent("watch-callbacks.log"), encoding: .utf8)
         XCTAssertEqual(text.split(separator: "\n").count, 2);XCTAssertFalse(text.contains("phase=retained"))
     }
+    func testViewActiveAndInactiveTransitionsArePersistedInOrder() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let journal = NotificationCallbackJournal(directory: dir)
+        for phase in [WatchAlertTrace.Phase.viewActive, .viewInactive, .viewActive] { journal.record(trace(phase: phase)) }
+        let lines = try String(contentsOf: dir.appendingPathComponent("watch-callbacks.log"), encoding: .utf8).split(separator: "\n")
+        XCTAssertEqual(lines.count, 3)
+        XCTAssertTrue(lines[0].contains("phase=view_active"))
+        XCTAssertTrue(lines[1].contains("phase=view_inactive"))
+        XCTAssertTrue(lines[2].contains("phase=view_active"))
+    }
     func testRotationBoundsDiskAndRetainsRecentCompleteLines() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: dir) }

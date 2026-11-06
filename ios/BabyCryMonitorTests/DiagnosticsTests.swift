@@ -482,6 +482,22 @@ final class DiagnosticsTests: XCTestCase {
         XCTAssertTrue(log.previewExport.contains("Showing latest 200 retained lines"))
         XCTAssertTrue(log.recentExport.contains("retention_limit=10000 retained_lines=250"))
     }
+    @MainActor func testWatchHistoryPreservesBothCopiesButDeduplicatesRescansAcrossRelaunch() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let created = Date(timeIntervalSince1970: 1_800_000_000)
+        let alert = WatchCryAlert(eventId: UUID(), episodeId: UUID(), startedAt: created, createdAt: created, duration: 5, isTest: false)
+        let phone = WatchAlertTrace(alert: alert, phase: .retained, deliveredAt: created, collapseScope: .phoneEvent)
+        let watch = WatchAlertTrace(alert: alert, phase: .retained, deliveredAt: created.addingTimeInterval(0.007), collapseScope: .watchEvent)
+        let log = DiagnosticLog(directory: directory)
+        log.watchAlerts([phone, watch, phone, watch])
+        XCTAssertEqual(log.lines.count, 2)
+        let restored = DiagnosticLog(directory: directory)
+        restored.watchAlerts([phone, watch])
+        XCTAssertEqual(restored.lines.count, 2)
+        XCTAssertTrue(restored.lines.contains { $0.contains("collapse_scope=phone_event") })
+        XCTAssertTrue(restored.lines.contains { $0.contains("collapse_scope=watch_event") })
+    }
     @MainActor func testWatchTraceDeduplicatesAcrossCallbacksAndRelaunchButPreservesDistinctPhases() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

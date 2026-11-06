@@ -370,7 +370,7 @@ describe('connection alerts, readiness and replacement',()=>{
   const phone=JSON.parse(String(pushRequests.find(r=>r.url.includes('ab'.repeat(32)))!.init?.body));
   const watch=JSON.parse(String(pushRequests.find(r=>r.url.includes('cd'.repeat(32)))!.init?.body));
   expect(phone.type).toBe('listener_disconnected');expect(phone.silentCryAlarm).toBe(true);
-  expect(phone.aps['content-available']).toBe(1);expect(watch.silentCryAlarm).toBeUndefined();
+  expect(phone.aps['content-available']).toBe(1);expect(watch).toEqual(phone);
   expect(watch.eventId).toBe(phone.eventId);expect(phone.alarmCycleId).toEqual(expect.any(String));
   expect((await call('alarm/scheduled',parent,{episodeId:phone.episodeId,eventId:phone.eventId,cycleId:phone.alarmCycleId})).status).toBe(200);
   await call('connection-alerts',parent,{enabled:false});
@@ -700,8 +700,8 @@ describe('direct Apple Watch alerts',()=>{
   expect(phone.body.aps).toEqual(watch.body.aps);
   for(const key of ['apns-id','apns-priority','apns-push-type'])expect(phone.headers.get(key)).toBe(watch.headers.get(key));
   expect(phone.headers.get('apns-id')).toBe(event.eventId);
-  expect(phone.headers.get('apns-collapse-id')).toBe(isTest?event.eventId:`phone:${event.eventId}`);
-  expect(watch.headers.get('apns-collapse-id')).toBe(isTest?event.eventId:`watch:${event.eventId}`);
+  expect(phone.headers.get('apns-collapse-id')).toBe(event.eventId);
+  expect(watch.headers.get('apns-collapse-id')).toBe(event.eventId);
   const status=await (await call('listener/status',parent,undefined,'GET')).json() as {alerts:{deliveryTarget:string;deliveryState:unknown}[]};
   expect(status.alerts[0]).toMatchObject({deliveryTarget:'both',deliveryState:{phone:'sent',watch:'sent'}});
  });
@@ -727,8 +727,8 @@ describe('direct Apple Watch alerts',()=>{
   expect(pushRequests).toHaveLength(3);
   expect(pushRequests.filter(r=>r.url.includes((rejected==='phone'?'ab':'cd').repeat(32)))).toHaveLength(2);
   for(const request of pushRequests){
-   const headers=new Headers(request.init?.headers),target=headers.get('apns-topic')!.endsWith('.watchkitapp')?'watch':'phone';
-   expect(headers.get('apns-collapse-id')).toBe(`${target}:${event.eventId}`);
+   const headers=new Headers(request.init?.headers);
+   expect(headers.get('apns-collapse-id')).toBe(event.eventId);
    expect(headers.get('apns-id')).toBe(event.eventId);
   }
   expect(await env.DB.prepare('SELECT status,delivery_state FROM events WHERE event_id=?').bind(event.eventId).first()).toMatchObject({status:'sent',delivery_state:JSON.stringify({phone:'sent',watch:'sent'})});
@@ -814,8 +814,7 @@ describe('direct Apple Watch alerts',()=>{
   expect(repeat[0].aps).toEqual(repeat[1].aps);expect(repeat[0].aps.sound).toBe('default');
   for(const request of pushRequests.slice(2)){
    const headers=new Headers(request.init?.headers);
-   const target=headers.get('apns-topic')!.endsWith('.watchkitapp')?'watch':'phone';
-   expect(headers.get('apns-id')).toBe(repeat[0].eventId);expect(headers.get('apns-collapse-id')).toBe(`${target}:${repeat[0].eventId}`);
+   expect(headers.get('apns-id')).toBe(repeat[0].eventId);expect(headers.get('apns-collapse-id')).toBe(repeat[0].eventId);
    expect(repeat[0].aps['thread-id']).toBeUndefined();
   }
  });
@@ -1267,7 +1266,7 @@ describe('configurable reminders and acknowledgement mute',()=>{
   expect(reminder.aps.alert.title).toBe('Repeat alert · Check on baby');expect(reminder.aps.alert.body).toContain('Settings');
   const headers=pushRequests[1].init?.headers as Record<string,string>;
   expect(Number(headers['apns-expiration'])).toBe(Math.floor(Date.now()/1000)+15);
-  expect(headers['apns-collapse-id']).toBe(`phone:${reminder.eventId}`);
+  expect(headers['apns-collapse-id']).toBe(reminder.eventId);
   advance(5);mockPush();await runReminder(testEnv,parent.deviceId);expect(pushRequests).toHaveLength(3);
   const later=JSON.parse(String(pushRequests[2].init?.body));
   expect(later.episodeId).toBe(event.episodeId);expect(later.eventId).not.toBe(reminder.eventId);
@@ -2641,7 +2640,7 @@ describe('optional overnight silent Watch alarms',()=>{
   const bodies=pushRequests.map(r=>JSON.parse(String(r.init?.body)));
   expect(bodies.find(b=>b.silentCryAlarm)?.aps['content-available']).toBe(1);
   expect(bodies.find(b=>b.silentCryAlarm)?.aps.sound).toBe('default');
-  expect(bodies.find(b=>!b.silentCryAlarm)?.aps.sound).toBe('default');
+  expect(bodies[0]).toEqual(bodies[1]);
   expect(bodies[0].eventId).toBe(bodies[1].eventId);
  });
  it('retains Watch acceptance while retrying a rejected phone delivery with the optional alarm enabled',async()=>{
@@ -2693,7 +2692,7 @@ describe('optional overnight silent Watch alarms',()=>{
   }
   for(const request of pushRequests.filter(r=>new Headers(r.init?.headers).get('apns-topic')!.endsWith('.watchkitapp'))){
    const body=JSON.parse(String(request.init?.body));
-   expect(body.alarmExtension).toBeUndefined();expect(body.aps['mutable-content']).toBeUndefined();
+   expect(body.alarmExtension).toBe(true);expect(body.aps['mutable-content']).toBe(1);
   }
   expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM silent_alarm_cycles').first<{n:number}>()).toEqual({n:0});
  });
@@ -2705,6 +2704,25 @@ describe('optional overnight silent Watch alarms',()=>{
   await call('listener/event',listener,alert(listener));
   const [initial]=phoneBodies();
   expect(initial).toMatchObject({silentCryAlarm:true,alarmExtension:true,aps:{'content-available':1,'mutable-content':1,sound:'default'}});
+ });
+ it.each([{appWake:true,extension:false},{appWake:false,extension:true},{appWake:true,extension:true}])('coordinates identical phone and Watch payloads with AlarmKit methods %j',async methods=>{
+  const {parent,listener}=await receiptSetup(),base=Date.now(),clock=vi.spyOn(Date,'now').mockReturnValue(base);
+  await call('silent-watch-alarms',parent,{enabled:true,...methods});
+  await call('listener/event',listener,alert(listener));
+  clock.mockReturnValue(base+5000);await runReminder(testEnv,parent.deviceId);
+  expect(pushRequests).toHaveLength(4);
+  const ids=new Set<string>();
+  for(let i=0;i<4;i+=2){
+   const pair=pushRequests.slice(i,i+2),bodies=pair.map(r=>JSON.parse(String(r.init?.body)));
+   expect(bodies[0]).toEqual(bodies[1]);ids.add(bodies[0].eventId);
+   expect(bodies[0].alarmExtension).toBe(methods.extension?true:undefined);
+   for(const request of pair){
+    const headers=new Headers(request.init?.headers);
+    expect(headers.get('apns-collapse-id')).toBe(bodies[0].eventId);
+    expect(headers.get('apns-id')).toBe(bodies[0].eventId);
+   }
+  }
+  expect(ids.size).toBe(2); // Reminders are distinct; only sibling copies coalesce.
  });
  it('defaults to the app wake only',async()=>{
   const {parent,listener}=await receiptSetup();
@@ -2742,12 +2760,11 @@ describe('optional overnight silent Watch alarms',()=>{
    expect(requests).toHaveLength(2);
    for(const request of requests){
     const headers=new Headers(request.init?.headers),body=JSON.parse(String(request.init?.body));
-    const watch=headers.get('apns-topic')===testEnv.APNS_BUNDLE_ID+'.watchkitapp';
     expect(body).toMatchObject({eventId:id,episodeId:initial.episodeId,
      aps:{sound:'default',category:'BABY_CRY_ALERT','interruption-level':'time-sensitive'}});
-    expect(body.silentCryAlarm).toBe(watch?undefined:true);
-    expect(body.aps['content-available']).toBe(watch?undefined:1);
-    expect(headers.get('apns-collapse-id')).toBe(`${watch?'watch':'phone'}:${id}`);
+    expect(body.silentCryAlarm).toBe(true);
+    expect(body.aps['content-available']).toBe(1);
+    expect(headers.get('apns-collapse-id')).toBe(id);
     expect(body.aps['thread-id']).toBeUndefined();
    }
   }
@@ -2788,14 +2805,14 @@ describe('optional overnight silent Watch alarms',()=>{
   try {
    await Promise.race([running,new Promise<never>((_,reject)=>setTimeout(()=>reject(new Error('Owned claim fan-out stalled')),1000))]);
    expect(latency.details.claim_result_source).toBe('receipt');expect(pushRequests).toHaveLength(2);
-   expect(pushRequests.map(r=>JSON.parse(String(r.init?.body))).filter(b=>b.silentCryAlarm)).toHaveLength(1);
+   expect(pushRequests.map(r=>JSON.parse(String(r.init?.body))).filter(b=>b.silentCryAlarm)).toHaveLength(2);
   }finally{release();await running;}
  });
  it('preserves the Watch notification when the Parent has no phone token',async()=>{
   const {parent,listener}=await setup();await call('silent-watch-alarms',parent,{enabled:true});
   await env.DB.prepare('UPDATE devices SET push_token=NULL WHERE id=?').bind(parent.deviceId).run();
   fanout();await call('listener/event',listener,alert(listener));expect(pushRequests).toHaveLength(1);
-  expect(JSON.parse(String(pushRequests[0].init?.body)).silentCryAlarm).toBeUndefined();
+  expect(JSON.parse(String(pushRequests[0].init?.body))).toMatchObject({silentCryAlarm:true,aps:{sound:'default','content-available':1}});
  });
 });
 
@@ -3267,7 +3284,7 @@ describe('distinct APNs request ID marked-test control',()=>{
  });
 });
 
-describe('separate collapse IDs for crying alerts and scoped marked tests',()=>{
+describe('coordinated crying alerts and scoped separate-identity tests',()=>{
  async function setup(){
   const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
   await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
@@ -3275,14 +3292,14 @@ describe('separate collapse IDs for crying alerts and scoped marked tests',()=>{
  }
  const upload=(listener:TestDevice,event:Alert,configured:Env)=>worker.fetch(new Request('https://monitor.test/v1/listener/event',{method:'POST',
   headers:{'content-type':'application/json',authorization:`Bearer ${listener.deviceId}.${listener.secret}`},body:JSON.stringify(event)}),configured);
- it.each([{isTest:false,isRepeat:false},{isTest:false,isRepeat:true},{isTest:true,isRepeat:false},{isTest:true,isRepeat:true}])('separates notification IDs while retaining one logical event and transport-ID policy (test=$isTest, repeat=$isRepeat)',async({isTest,isRepeat})=>{
+ it.each([{isTest:false,isRepeat:false},{isTest:false,isRepeat:true},{isTest:true,isRepeat:false},{isTest:true,isRepeat:true}])('coordinates real alerts while retaining the scoped separate-identity test (test=$isTest, repeat=$isRepeat)',async({isTest,isRepeat})=>{
   const {listener,configured}=await setup(),event={...alert(listener),...(isTest?{isTest:true}:{}),isRepeat};mockPush(200,2);
-  expect(await (await upload(listener,event,isTest?configured:testEnv)).json()).toEqual({status:'sent'});
+  expect(await (await upload(listener,event,configured)).json()).toEqual({status:'sent'});
   const requests=pushRequests.map(r=>({headers:new Headers(r.init?.headers),body:JSON.parse(String(r.init?.body))}));expect(requests).toHaveLength(2);
   const base=event.eventId;
   for(const r of requests){
    const target=r.headers.get('apns-topic')!.endsWith('.watchkitapp')?'watch':'phone';
-   expect(r.headers.get('apns-collapse-id')).toBe(`${target}:${base}`);
+   expect(r.headers.get('apns-collapse-id')).toBe(isTest?`${target}:${base}`:base);
    expect(new TextEncoder().encode(r.headers.get('apns-collapse-id')!).length).toBeLessThanOrEqual(64);
    expect(r.headers.get('apns-id')).toBe(event.eventId);
    expect(r.body.isTest).toBe(isTest?true:undefined);
@@ -3293,7 +3310,10 @@ describe('separate collapse IDs for crying alerts and scoped marked tests',()=>{
   expect(requests[0].body).toEqual(requests[1].body);
   const rows=await env.DB.prepare("SELECT details FROM diagnostics WHERE operation='dispatch' AND target IS NOT NULL").all<{details:string}>();
   expect(rows.results).toHaveLength(2);
-  for(const row of rows.results)expect(JSON.parse(row.details)).toMatchObject({apns_collapse_mode:'target_scoped',apns_collapse_basis:'event'});
+  for(const row of rows.results){
+   if(isTest)expect(JSON.parse(row.details)).toMatchObject({apns_collapse_mode:'target_scoped',apns_collapse_basis:'event'});
+   else expect(JSON.parse(row.details).apns_collapse_mode).toBeUndefined();
+  }
  });
  it.each(['other_parent','disabled'] as const)('preserves matching collapse IDs for marked tests (%s)',async mode=>{
   const {listener,configured}=await setup(),event={...alert(listener),isTest:true};mockPush(200,2);
@@ -3314,7 +3334,7 @@ describe('separate collapse IDs for crying alerts and scoped marked tests',()=>{
   const {listener}=await setup(),event={...alert(listener),isRepeat:true};mockPush();mockPush(503);
   await upload(listener,event,testEnv);
   const first=pushRequests.map(r=>new Headers(r.init?.headers));
-  expect(first.map(h=>h.get('apns-collapse-id'))).toEqual([`phone:${event.eventId}`,`watch:${event.eventId}`]);
+  expect(first.map(h=>h.get('apns-collapse-id'))).toEqual([event.eventId,event.eventId]);
   await env.DB.prepare('UPDATE events SET next_attempt=0 WHERE event_id=?').bind(event.eventId).run();mockPush();
   await dispatchEvent(testEnv,event.eventId);expect(pushRequests).toHaveLength(3);
   const retry=new Headers(pushRequests[2].init?.headers);
@@ -3328,7 +3348,7 @@ describe('separate collapse IDs for crying alerts and scoped marked tests',()=>{
   await dispatchEvent(configured,event.eventId);await dispatchEvent(testEnv,event.eventId);expect(pushRequests).toHaveLength(2);
  });
  it.each([false,true])('acknowledges both notification copies once and only snoozes real crying alerts (test=%s)',async isTest=>{
-  const {parent,listener,configured}=await setup(),event={...alert(listener),...(isTest?{isTest:true}:{})};mockPush(200,2);await upload(listener,event,isTest?configured:testEnv);
+  const {parent,listener,configured}=await setup(),event={...alert(listener),...(isTest?{isTest:true}:{})};mockPush(200,2);await upload(listener,event,configured);
   let mutedUntil:number|undefined;
   for(const request of pushRequests){
    const body=JSON.parse(String(request.init?.body));expect((await call('alert/acknowledge',parent,{eventId:body.eventId})).status).toBe(200);

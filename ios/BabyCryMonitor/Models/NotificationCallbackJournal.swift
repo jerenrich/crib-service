@@ -29,7 +29,7 @@ final class NotificationCallbackJournal: @unchecked Sendable {
 
     @discardableResult func record(_ trace: WatchAlertTrace) -> Int {
         switch trace.phase {
-        case .foreground, .controllerReceived, .controllerActivated, .controllerDeactivated, .viewAppeared, .opened, .acknowledged: break
+        case .foreground, .controllerReceived, .controllerActivated, .controllerDeactivated, .viewAppeared, .viewActive, .viewInactive, .opened, .acknowledged: break
         default: return 0 // A history scan must never masquerade as callback entry.
         }
         guard trace.callbackID != nil, let entry = trace.entry else { return 0 }

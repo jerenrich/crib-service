@@ -6,6 +6,7 @@ struct WatchAlertTrace: Sendable {
         case foreground, presented, opened, acknowledged, retained, hapticRequested = "haptic_requested"
         case controllerActivated = "controller_activated", controllerDeactivated = "controller_deactivated"
         case controllerReceived = "controller_received", viewAppeared = "view_appeared", snapshotReceived = "snapshot_received"
+        case viewActive = "view_active", viewInactive = "view_inactive"
     }
     enum ApplicationState: String, Sendable { case active, inactive, background, unknown }
     struct CallbackTiming: Sendable {
@@ -18,7 +19,18 @@ struct WatchAlertTrace: Sendable {
                 .compactMap { key, value in value.flatMap { (0...3_600_000).contains($0) ? " \(key)=\($0)" : nil } }.joined()
         }
     }
-    enum CollapseScope: String, Sendable { case event, episode, other }
+    enum CollapseScope: String, Sendable {
+        case event, episode, phoneEvent = "phone_event", watchEvent = "watch_event", other
+
+        /// Keep only the relationship to known IDs, never an arbitrary request ID.
+        static func classify(_ identifier: String, alert: WatchCryAlert) -> Self {
+            if UUID(uuidString: identifier) == alert.eventId { return .event }
+            if UUID(uuidString: identifier) == alert.episodeId { return .episode }
+            if identifier.hasPrefix("phone:"), UUID(uuidString: String(identifier.dropFirst(6))) == alert.eventId { return .phoneEvent }
+            if identifier.hasPrefix("watch:"), UUID(uuidString: String(identifier.dropFirst(6))) == alert.eventId { return .watchEvent }
+            return .other
+        }
+    }
     enum HistorySource: String, Sendable { case foreground, cleanup }
     let presentationProfile: WatchNotificationPresentation?
     let callbackID: UUID?
@@ -47,6 +59,9 @@ struct WatchAlertTrace: Sendable {
             key += "|\(attempt)"
         }
         if let callbackID { key += "|\(callbackID.uuidString.lowercased())" }
+        if phase == .retained, let deliveredAt, let delivered = Self.milliseconds(deliveredAt) {
+            key += "|\(collapseScope?.rawValue ?? "unknown")|\(delivered)"
+        }
         return key
     }
     var entry: String? {
@@ -66,7 +81,7 @@ struct WatchAlertTrace: Sendable {
             if delivered < created || observed < delivered { result += " clock_order=check" }
         }
         switch phase {
-        case .controllerReceived, .controllerActivated, .controllerDeactivated, .viewAppeared: result += " callback_scope=long_look"
+        case .controllerReceived, .controllerActivated, .controllerDeactivated, .viewAppeared, .viewActive, .viewInactive: result += " callback_scope=long_look"
         case .foreground: result += " callback_scope=foreground_delegate"
         case .opened, .acknowledged: result += " callback_scope=user_action"
         case .retained: result += " callback_scope=history_observation"
@@ -96,6 +111,13 @@ struct WatchAlertTrace: Sendable {
         if DiagnosticCorrelation.reference(reference) != nil, let attempt = DiagnosticCorrelation.attempt(attempt) { key += "|\(attempt)" }
         if let callbackID = fields.first(where: { $0.hasPrefix("callback_id=") }).flatMap({ UUID(uuidString: String($0.dropFirst("callback_id=".count))) }) {
             key += "|\(callbackID.uuidString.lowercased())"
+        }
+        if phase == .retained,
+           let delivered = fields.first(where: { $0.hasPrefix("delivered_at_ms=") }).flatMap({ Int64($0.dropFirst("delivered_at_ms=".count)) }),
+           abs(Double(delivered)) < 1e15 {
+            let scope = fields.first(where: { $0.hasPrefix("collapse_scope=") })
+                .flatMap { CollapseScope(rawValue: String($0.dropFirst("collapse_scope=".count))) }
+            key += "|\(scope?.rawValue ?? "unknown")|\(delivered)"
         }
         return key
     }

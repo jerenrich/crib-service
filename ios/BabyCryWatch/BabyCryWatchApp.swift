@@ -213,6 +213,11 @@ final class CryNotificationController: WKUserNotificationHostingController<CryNo
 }
 
 struct CryNotificationView: View {
+    private struct Presentation: Equatable {
+        let eventID: UUID?
+        let deliveredAt: Date?
+        let inactive: Bool
+    }
     @State private var model = WatchModel.shared
     let alert: WatchCryAlert?
     let deliveredAt: Date?
@@ -240,6 +245,15 @@ struct CryNotificationView: View {
         .task(id: alert?.eventId) {
             if alert != nil { model.refresh() }
         }
+        .onChange(of: Presentation(eventID: alert?.eventId, deliveredAt: deliveredAt, inactive: inactive), initial: true) { _, state in
+            guard let alert else { return }
+            // Record initial state and subsequent transitions, including when a
+            // reused view receives another event or another delivered copy.
+            let trace = WatchAlertTrace(alert: alert, phase: state.inactive ? .viewInactive : .viewActive,
+                                       deliveredAt: state.deliveredAt, callbackID: UUID())
+            NotificationCallbackJournal.shared.record(trace)
+            model.log.watchAlert(trace)
+        }
         .onAppear {
             if let alert {
                 let observedAt = Date(), callbackID = UUID()
@@ -257,10 +271,7 @@ struct CryNotificationView: View {
 // Never log the arbitrary request identifier; retain its relationship to known IDs.
 extension UNNotification {
     func diagnosticCollapseScope(_ alert: WatchCryAlert) -> WatchAlertTrace.CollapseScope {
-        let id = UUID(uuidString: request.identifier)
-        if id == alert.eventId { return .event }
-        if id == alert.episodeId { return .episode }
-        return .other
+        .classify(request.identifier, alert: alert)
     }
 }
 

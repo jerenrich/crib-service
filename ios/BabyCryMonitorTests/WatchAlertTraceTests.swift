@@ -12,6 +12,40 @@ final class WatchAlertTraceTests: XCTestCase {
         WatchCryAlert(eventId: UUID(), episodeId: UUID(), startedAt: created.addingTimeInterval(-5),
                       createdAt: created, duration: 5, isTest: false)
     }
+    func testRecognizedNotificationIdentitiesDistinguishPhoneAndWatchCopiesWithoutLoggingRawIdentifiers() {
+        let value = alert()
+        XCTAssertEqual(WatchAlertTrace.CollapseScope.classify(value.eventId.uuidString, alert: value), .event)
+        XCTAssertEqual(WatchAlertTrace.CollapseScope.classify(value.episodeId.uuidString, alert: value), .episode)
+        XCTAssertEqual(WatchAlertTrace.CollapseScope.classify("phone:\(value.eventId.uuidString.lowercased())", alert: value), .phoneEvent)
+        XCTAssertEqual(WatchAlertTrace.CollapseScope.classify("watch:\(value.eventId)", alert: value), .watchEvent)
+        for identifier in ["phone:\(UUID())", "watch:\(value.episodeId)", "private-token", "phone:\(value.eventId)\nprivate"] {
+            XCTAssertEqual(WatchAlertTrace.CollapseScope.classify(identifier, alert: value), .other)
+        }
+    }
+    func testHistoryDeduplicationPreservesDistinctCopiesAndDeliveryDatesAcrossRelaunch() throws {
+        let value = alert(), delivered = created.addingTimeInterval(1)
+        let phone = WatchAlertTrace(alert: value, phase: .retained, deliveredAt: delivered, collapseScope: .phoneEvent)
+        let watch = WatchAlertTrace(alert: value, phase: .retained, deliveredAt: delivered, collapseScope: .watchEvent)
+        let redelivery = WatchAlertTrace(alert: value, phase: .retained, deliveredAt: delivered.addingTimeInterval(0.007), collapseScope: .watchEvent)
+        XCTAssertEqual(Set([phone.key, watch.key, redelivery.key]).count, 3)
+        let rescan = WatchAlertTrace(alert: value, phase: .retained, deliveredAt: delivered, observedAt: created.addingTimeInterval(60), collapseScope: .phoneEvent, historySource: .cleanup)
+        XCTAssertEqual(phone.key, rescan.key)
+        for trace in [phone, watch, redelivery, rescan] {
+            XCTAssertEqual(WatchAlertTrace.key(in: "timestamp " + (try XCTUnwrap(trace.entry))), trace.key)
+        }
+    }
+    func testViewStateTransitionsRemainCorrelatedAndAreNotDeduplicatedWhenReactivated() throws {
+        let value = alert()
+        let phases: [WatchAlertTrace.Phase] = [.viewActive, .viewInactive, .viewActive]
+        let traces = phases.map { WatchAlertTrace(alert: value, phase: $0, deliveredAt: created, callbackID: UUID()) }
+        XCTAssertEqual(Set(traces.map(\.key)).count, 3)
+        for trace in traces {
+            let entry = try XCTUnwrap(trace.entry)
+            XCTAssertTrue(entry.contains("callback_scope=long_look"))
+            XCTAssertTrue(entry.contains("event_id=\(value.eventId.uuidString.lowercased())"))
+            XCTAssertEqual(WatchAlertTrace.key(in: "timestamp " + entry), trace.key)
+        }
+    }
     func testReceiptControllerAndViewPhasesPreserveOneOSDateAndIndependentCallbackTimes() throws {
         let value = alert(), delivered = created.addingTimeInterval(1)
         let controller = WatchAlertTrace(alert: value, phase: .controllerReceived, deliveredAt: delivered, observedAt: created.addingTimeInterval(15))

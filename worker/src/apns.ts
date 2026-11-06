@@ -24,8 +24,8 @@ export function payload(alert:Alert) {
 }
 export async function sendPush(env:Env,encryptedToken:string,alert:Alert,target:'phone'|'watch'='phone',latency=new Latency(),silentCryAlarm=false,schedule?:PushSchedule,identity:PushIdentityOptions={},alarmCycle?:string):Promise<PushResult> {
  latency.details.alarm_wake_requested=silentCryAlarm&&target==='phone'&&!alert.isTest;
- const alarmExtension=identity.alarmExtension===true&&target==='phone'&&!alert.isTest;
- latency.details.alarm_extension_requested=alarmExtension;
+ const alarmExtension=identity.alarmExtension===true&&!alert.isTest;
+ latency.details.alarm_extension_requested=alarmExtension&&target==='phone';
  const diagnosticRef=latency.eventRef,deliveryAttempt=latency.deliveryAttempt;
  const correlation=diagnosticRef&&/^[0-9a-f]{64}$/.test(diagnosticRef)&&deliveryAttempt!==undefined&&Number.isSafeInteger(deliveryAttempt)&&deliveryAttempt>0&&deliveryAttempt<=1_000_000?{diagnosticRef,deliveryAttempt}:{};
  const content=payload(alert);
@@ -42,9 +42,10 @@ export async function sendPush(env:Env,encryptedToken:string,alert:Alert,target:
   ...(identity.configuredTest?{configuredAlertTest:true,aps:{...content.aps,
    alert:{title:'Test · Crib Service',body:'Configured alert test. Stop further repetitions from Test alert on either iPhone.'},
    ...(identity.threadID?{'thread-id':identity.threadID}:{})}}:{}),
-  // AlarmKit is additive: retain the phone's normal sound/haptic request so
-  // Apple can forward an alert while the separate direct Watch copy also alerts.
-  ...(silentCryAlarm&&target==='phone'&&!alert.isTest?{silentCryAlarm:true,...(alarmCycle?{alarmCycleId:alarmCycle}:{}),aps:{...content.aps,'content-available':1}}:{}),
+  // Keep both payloads identical for Apple's companion coordination, including
+  // phone-only processing markers. Watch decoding ignores those markers; only
+  // the iOS app/extension schedules AlarmKit. Normal sound/haptics stay enabled.
+  ...(silentCryAlarm&&!alert.isTest?{silentCryAlarm:true,...(alarmCycle?{alarmCycleId:alarmCycle}:{}),aps:{...content.aps,'content-available':1}}:{}),
   // The Parent's notification extension schedules the same alarm without an app wake.
   ...(alarmExtension?{alarmExtension:true,aps:{...content.aps,...(silentCryAlarm?{'content-available':1}:{}),'mutable-content':1}}:{})
  },target,identity.configuredTest?60:alert.isRepeat?15:3600,collapseID,latency,schedule);
