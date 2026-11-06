@@ -31,6 +31,26 @@ export async function requestMonitoring(env:Env,device:Device,value:Record<strin
    AND COALESCE(json_extract(payload,'$.isTest'),0)=0 AND ?=0
    AND EXISTS(SELECT 1 FROM monitoring_commands WHERE id=? AND claim_id=? AND parent_id=? AND listener_id=? AND enabled=0)`)
    .bind(new Date(now).toISOString(),pair.parent_id,pair.listener_id,enabled,id,claim,pair.parent_id,pair.listener_id),
+  // Dismiss the last observed heartbeat's outage, even before it becomes stale.
+  // This remains effective
+  // after an unconfirmed remote Pause expires, without claiming the mic stopped
+  // or suppressing an outage after a later heartbeat.
+  env.DB.prepare(`INSERT INTO connection_notices(id,listener_id,parent_id,state,observed_at,created_at,status)
+   SELECT ?,p.listener_id,p.parent_id,'offline',h.received_at,?,'cancelled'
+   FROM pairs p JOIN heartbeats h ON h.listener_id=p.listener_id
+   WHERE p.parent_id=? AND p.listener_id=? AND p.created_at=? AND ?=0
+   AND json_extract(h.metadata,'$.monitoring')=1
+   AND EXISTS(SELECT 1 FROM monitoring_commands WHERE id=? AND claim_id=? AND enabled=0)
+   ON CONFLICT(listener_id,state,observed_at) DO UPDATE SET status='cancelled',lease_until=NULL
+   WHERE connection_notices.parent_id=excluded.parent_id`)
+   .bind(crypto.randomUUID(),now,pair.parent_id,pair.listener_id,pair.created_at,enabled,id,claim),
+  env.DB.prepare(`UPDATE events SET resolved_at=COALESCE(resolved_at,?)
+   WHERE parent_id=? AND listener_id=? AND json_extract(payload,'$.type')='listener_disconnected'
+   AND json_extract(payload,'$.cryStartedAt')=(SELECT received_at FROM heartbeats WHERE listener_id=?)
+   AND EXISTS(SELECT 1 FROM connection_notices n JOIN heartbeats h ON h.listener_id=n.listener_id
+    WHERE n.parent_id=? AND n.listener_id=? AND n.state='offline' AND n.status='cancelled' AND n.observed_at=h.received_at)
+   AND EXISTS(SELECT 1 FROM monitoring_commands WHERE id=? AND claim_id=? AND enabled=0)`)
+   .bind(new Date(now).toISOString(),pair.parent_id,pair.listener_id,pair.listener_id,pair.parent_id,pair.listener_id,id,claim),
   // End the current shared snooze with this new pause, retaining its actual
   // interval so delayed uploads from that interval remain suppressed. The
   // claim prevents retries of an old command from clearing a newer snooze.

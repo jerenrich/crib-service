@@ -73,9 +73,10 @@ export async function flushConnections(env:Env,requestId=crypto.randomUUID()) {
    env.DB.prepare(`INSERT INTO events(event_id,episode_id,listener_id,parent_id,is_repeat,payload,created_at)
     SELECT ?,?,?,?,0,?,? WHERE EXISTS(SELECT 1 FROM pairs p JOIN devices d ON d.id=p.parent_id
      JOIN heartbeats h ON h.listener_id=p.listener_id WHERE p.parent_id=? AND p.listener_id=?
-     AND p.created_at<=? AND d.connection_alerts=1 AND h.received_at=? AND json_extract(h.metadata,'$.monitoring')=1)
+     AND p.created_at<=? AND d.connection_alerts=1 AND h.received_at=? AND json_extract(h.metadata,'$.monitoring')=1
+     AND EXISTS(SELECT 1 FROM connection_notices n WHERE n.id=? AND n.status<>'cancelled'))
     ON CONFLICT DO NOTHING`).bind(event.eventId,event.episodeId,event.listenerId,outage.parent_id,JSON.stringify(event),now,
-     outage.parent_id,outage.listener_id,outage.created_at,outage.observed_at),
+    outage.parent_id,outage.listener_id,outage.created_at,outage.observed_at,outage.id),
    env.DB.prepare("UPDATE connection_notices SET status='escalated',lease_until=NULL WHERE id=? AND status<>'cancelled'").bind(outage.id)
   ]);
   // Always repair the timer, including after a failed first send or a snooze.
@@ -166,5 +167,8 @@ export async function flushConnections(env:Env,requestId=crypto.randomUUID()) {
   await record(result.reason??result.status);
   }catch(error){latency.failure(error);await record('internal_error');throw error;}
  }
- await env.DB.prepare("DELETE FROM connection_notices WHERE (state<>'offline' OR status='cancelled') AND created_at<?").bind(now-7*86400000).run();
+ await env.DB.prepare(`DELETE FROM connection_notices WHERE (state<>'offline' OR status='cancelled') AND created_at<?
+  AND NOT (state='offline' AND status='cancelled' AND EXISTS(SELECT 1 FROM pairs p JOIN heartbeats h ON h.listener_id=p.listener_id
+   WHERE p.parent_id=connection_notices.parent_id AND p.listener_id=connection_notices.listener_id AND h.received_at=connection_notices.observed_at))`)
+  .bind(now-7*86400000).run();
 }

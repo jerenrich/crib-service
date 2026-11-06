@@ -195,7 +195,7 @@ describe('connection alerts, readiness and replacement',()=>{
   await call('listener/heartbeat',listener,beat(listener,false));
   await flushConnections(testEnv);await flushConnections(testEnv);
   expect(pushRequests).toHaveLength(0);
-  expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM connection_notices').first()).toEqual({n:0});
+  expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM connection_notices WHERE status<>'cancelled'").first()).toEqual({n:0});
   expect(await runReminder(testEnv,parent.deviceId)).toBe(false);
   // A later Start supersedes the Stop; an unexpected stop must still warn.
   await call('monitoring',listener,{id:crypto.randomUUID(),enabled:true});
@@ -1906,6 +1906,62 @@ describe('monitoring controls',()=>{
   await env.DB.prepare('UPDATE monitoring_commands SET expires_at=? WHERE id=?').bind(Date.now()-1,expired.id).run();
   await call('monitoring/complete',listener,{id:expired.id,succeeded:true});
   expect((await status(parent)).monitoringCommand?.status).toBe('expired');
+ });
+ it.each([false,true])('offline Pause dismisses the current outage across expiration and retention (notice already exists: %s)',async(existing)=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  const beat=()=>({listenerId:listener.deviceId,timestamp:new Date(Date.now()).toISOString(),monitoring:true,powerConnected:true,state:'quiet',episodes:[]});
+  await call('listener/heartbeat',listener,beat());await flushConnections(testEnv);
+  const old=new Date(Date.now()-240000).toISOString();
+  await env.DB.prepare('UPDATE heartbeats SET received_at=? WHERE listener_id=?').bind(old,listener.deviceId).run();
+  if(existing){mockPush();await flushConnections(testEnv);expect(pushRequests).toHaveLength(1);}
+  const pause=await command(parent,false);
+  await env.DB.prepare('UPDATE monitoring_commands SET expires_at=? WHERE id=?').bind(Date.now()-1,pause.id).run();
+  expect((await status(parent)).monitoringCommand?.status).toBe('expired');
+  const before=pushRequests.length;
+  await flushConnections(testEnv);expect(await runReminder(testEnv,parent.deviceId)).toBe(false);
+  expect(pushRequests).toHaveLength(before);
+  const notice=await env.DB.prepare("SELECT status FROM connection_notices WHERE listener_id=? AND state='offline' AND observed_at=?").bind(listener.deviceId,old).first<{status:string}>();
+  expect(notice?.status).toBe('cancelled');
+  await env.DB.prepare('UPDATE connection_notices SET created_at=? WHERE listener_id=? AND observed_at=?')
+   .bind(Date.now()-8*86400000,listener.deviceId,old).run();
+  await flushConnections(testEnv);await flushConnections(testEnv);expect(pushRequests).toHaveLength(before);
+  expect((await env.DB.prepare('SELECT COUNT(*) AS n FROM connection_notices WHERE listener_id=? AND observed_at=?').bind(listener.deviceId,old).first<{n:number}>())?.n).toBe(1);
+  // A new heartbeat proves reconnection; a later outage must warn again.
+  await call('listener/heartbeat',listener,beat());await flushConnections(testEnv);
+  const newer=new Date(Date.parse(old)+1000).toISOString();
+  await env.DB.prepare('UPDATE heartbeats SET received_at=? WHERE listener_id=?').bind(newer,listener.deviceId).run();
+  mockPush();await flushConnections(testEnv);expect(pushRequests).toHaveLength(before+1);
+ });
+ it('suppresses the last heartbeat even if Pause precedes the connection-loss threshold',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  const beat={listenerId:listener.deviceId,timestamp:new Date().toISOString(),monitoring:true,powerConnected:true,state:'quiet',episodes:[]};
+  await call('listener/heartbeat',listener,beat);await flushConnections(testEnv);
+  await command(parent,false);
+  const clock=vi.spyOn(Date,'now').mockReturnValue(Date.now()+181000);
+  try{await flushConnections(testEnv);await flushConnections(testEnv);expect(pushRequests).toHaveLength(0);}
+  finally{clock.mockRestore();}
+ });
+ it('does not revive an outage selected by cron before an offline Pause',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  const beat={listenerId:listener.deviceId,timestamp:new Date().toISOString(),monitoring:true,powerConnected:true,state:'quiet',episodes:[]};
+  await call('listener/heartbeat',listener,beat);await flushConnections(testEnv);
+  const old=new Date(Date.now()-240000).toISOString(),notice=crypto.randomUUID();
+  await env.DB.prepare('UPDATE heartbeats SET received_at=? WHERE listener_id=?').bind(old,listener.deviceId).run();
+  await env.DB.prepare("INSERT INTO connection_notices(id,listener_id,parent_id,state,observed_at,created_at) VALUES(?,?,?,'offline',?,?)")
+   .bind(notice,listener.deviceId,parent.deviceId,old,Date.now()).run();
+  let entered!:()=>void,release!:()=>void;
+  const ready=new Promise<void>(r=>{entered=r;}),gate=new Promise<void>(r=>{release=r;});
+  const db=interceptDB(async(sql,_args,method,execute)=>{
+   const result=await execute();
+   if(sql.includes('SELECT n.* FROM connection_notices n')&&method==='all'){entered();await gate;}
+   return result;
+  });
+  const cron=flushConnections({...testEnv,DB:db});await ready;
+  try{await command(parent,false);}finally{release();}
+  await cron;
+  expect(pushRequests).toHaveLength(0);
+  expect((await env.DB.prepare('SELECT status FROM connection_notices WHERE id=?').bind(notice).first<{status:string}>())?.status).toBe('cancelled');
+  expect(await env.DB.prepare('SELECT event_id FROM events WHERE event_id=?').bind(notice).first()).toBeNull();
  });
  it('lets local controls supersede remote requests and makes retries idempotent',async()=>{
   const {parent,listener}=await paired();const start=await command(parent,true);

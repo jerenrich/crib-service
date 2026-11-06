@@ -870,7 +870,7 @@ import UIKit
         guard let command = pendingMonitoringCommand, let deadline = monitoringControlDeadline, currentTime() >= deadline else { return }
         monitoringControlError = command.enabled
             ? "Monitoring could not be started or verified. Open Crib Service on the nursery phone, check microphone permission and internet access, then try again. Do not rely on alerts until Monitoring is confirmed."
-            : "Monitoring pause could not be verified. Check the nursery phone. Detection may still be active; repeating crying alerts were cancelled if the service received your request."
+            : "Monitoring pause could not be verified. Check the nursery phone. Detection may still be active. If the service received your request, repeating crying alerts and the current connection-loss alerts were stopped."
         monitoringControlMessage = nil; pendingMonitoringCommand = nil; monitoringControlDeadline = nil
         persistMonitoringControl()
     }
