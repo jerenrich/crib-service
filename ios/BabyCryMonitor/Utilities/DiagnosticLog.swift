@@ -35,13 +35,13 @@ import Observation
     private var storagePrepared = false
     private static let timestampStyle = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
     private static let events: Set<String> = [
-        "alert_pipeline_ready", "nursery_sound_pipeline_ready", "app_launched", "background_time_expired", "alarm_snapshot_failed", "alarm_snapshot_unavailable", "alarm_lock_probe_failed", "alarm_journal_failed", "alarm_attempts_upload_discarded", "monitoring_start_superseded", "foreground", "background", "monitoring_recovered_after_relaunch",
+        "alert_pipeline_ready", "classifier_alert_pipeline_ready", "nursery_sound_pipeline_ready", "app_launched", "background_time_expired", "alarm_snapshot_failed", "alarm_snapshot_unavailable", "alarm_lock_probe_failed", "alarm_journal_failed", "alarm_attempts_upload_discarded", "monitoring_start_superseded", "foreground", "background", "monitoring_recovered_after_relaunch",
         "paired_successfully", "pairing_created", "pairing_failed", "credential_failed", "metadata_load_failed",
         "monitoring_started", "monitoring_stopped", "monitoring_paused", "monitoring_start_failed", "microphone_permission_denied",
         "test_push_queued", "audio_active", "audio_recovering", "audio_interrupted", "audio_stalled", "audio_recovery_limit",
         "audio_interruption_began", "audio_interruption_ended", "audio_route_changed", "audio_services_reset", "audio_engine_changed",
         "crying_started", "possible_cry", "crying_ended", "crying_resumed", "quiet_gap_started",
-        "alert_threshold_reached", "metadata_write_failed", "alert_apns_accepted", "alert_acknowledged",
+        "alert_threshold_reached", "classifier_alert_threshold_reached", "metadata_write_failed", "alert_apns_accepted", "alert_acknowledged",
         "alert_delivery_failed", "alert_uncertain", "alert_blocked", "alert_server_pending", "alert_retry_scheduled",
         "alert_resolved", "alert_held_for_monitoring_report", "monitoring_failure_alert_queued", "monitoring_failure_alert_cleared",
         "test_push_apns_accepted", "heartbeat_retry_scheduled", "heartbeat_recovered", "settings_synced",

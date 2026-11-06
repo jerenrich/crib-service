@@ -84,17 +84,42 @@ final class BabyCryClassifierTests: XCTestCase {
                 self.origin = origin; self.epoch = epoch; self.control = control; self.emit = emit
                 self.failing = failing; self.onStop = onStop; self.beforeAnalyze = beforeAnalyze
             }
-            func analyze(_ buffer: AVAudioPCMBuffer) {
+            func analyze(_ buffer: AVAudioPCMBuffer, capturedAt: Date) {
                 beforeAnalyze()
                 if failing { failure = .init(error: NSError(domain: "com.apple.SoundAnalysis", code: 2), stage: .analysis) }
                 else if control.currentEpoch == epoch {
                     hasProducedResult = true
                     emit(.result(.init(captureID: id, windowStart: origin, windowEnd: origin.addingTimeInterval(2),
-                                       confidence: 0.01, observedAt: Date())))
+                                       confidence: 0.01, observedAt: Date(), audioWindowEndAt: capturedAt)))
                 }
             }
             func stop() { onStop() }
         }
+    }
+    func testQueuedInferenceKeepsItsOriginalAudioCaptureStamp() async throws {
+        let factory = Factory(), events = Events(), control = SoundClassificationControl()
+        factory.setHealthy(); factory.blockNextAnalysis()
+        let classifier = BabyCryClassifier(control: control, emit: events.append,
+            makeSession: { _, origin, epoch, control, emit in factory.make(origin: origin, epoch: epoch, control: control, emit: emit) })
+        defer { factory.releaseAnalysis(); classifier.stop() }
+        let format = try XCTUnwrap(AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1))
+        let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 1024))
+        buffer.frameLength = 1024; buffer.floatChannelData![0].initialize(repeating: 0, count: 1024)
+        control.setEnabled(true)
+        let submittedAt = Date()
+        classifier.consume(buffer, at: .init(sampleTime: 0, atRate: 48_000), voiceProcessing: false)
+        for _ in 0..<100 {
+            if factory.isBlocked { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(factory.isBlocked)
+        let releasedAt = Date()
+        factory.releaseAnalysis(); await classifier.waitUntilIdle()
+        let score = try XCTUnwrap(events.scores.first)
+        let captured = try XCTUnwrap(score.audioWindowEndAt)
+        XCTAssertGreaterThanOrEqual(captured, submittedAt)
+        XCTAssertLessThan(captured, releasedAt)
+        XCTAssertGreaterThanOrEqual(score.observedAt, releasedAt)
     }
     func testHealthyForegroundTransitionsPreserveTheAnalysisWindow() async throws {
         let factory = Factory(), events = Events(), control = SoundClassificationControl()
@@ -256,6 +281,7 @@ final class BabyCryClassifierTests: XCTestCase {
         XCTAssertFalse(events.unavailable)
         XCTAssertGreaterThanOrEqual(events.scores.count, 595)
         XCTAssertEqual(Set(events.scores.map(\.captureID)).count, 1)
+        XCTAssertTrue(events.scores.allSatisfy { $0.audioWindowEndAt != nil })
     }
     func testLiveBuffersProduceTimestampedScoresAndDisablingInvalidatesLateResults() async throws {
         let events = Events(), control = SoundClassificationControl()
@@ -277,6 +303,8 @@ final class BabyCryClassifierTests: XCTestCase {
         if let score = scores.first {
             XCTAssertTrue((0...1).contains(score.confidence))
             XCTAssertEqual(score.windowEnd.timeIntervalSince(score.windowStart), 2, accuracy: 0.001)
+            let captured = try XCTUnwrap(score.audioWindowEndAt)
+            XCTAssertLessThanOrEqual(captured, score.observedAt)
         }
         control.setEnabled(false)
         try await Task.sleep(for: .milliseconds(200))

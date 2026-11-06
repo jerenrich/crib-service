@@ -40,7 +40,7 @@ public struct AudioLevelSample: Sendable {
 public enum CryState: String, Codable, Sendable { case quiet, possibleCry, crying }
 public struct CryEpisode: Identifiable, Codable, Sendable {
     public let id: UUID
-    public let startedAt: Date
+    public internal(set) var startedAt: Date
     public var endedAt: Date?
     public var quietConfirmed: Bool?
     public var alertQueuedAt: Date?
@@ -103,6 +103,9 @@ public struct SessionSnapshot: Codable, Sendable {
     public var pending: [PendingAlert] = []
     public var failedAlerts: [FailedAlert] = []
     public var lastObservedAt: Date?
+    /// Latest validated audio evidence from either detector. Keep RMS continuity
+    /// in lastObservedAt so classifier callbacks cannot disguise missing levels.
+    public var lastDetectionAt: Date?
     public var timelineScope: String?
     public var timelineEvents: [TimelineEvent] = []
     public var pendingTimelineIDs: [String] = []
@@ -116,7 +119,7 @@ public struct SessionSnapshot: Codable, Sendable {
         return episode.alertQueuedAt == nil ? .notQueued : .acknowledged
     }
     private enum CodingKeys: String, CodingKey {
-        case configuration, history, current, pending, failedAlerts, lastObservedAt, wasMonitoring, timelineEvents, pendingTimelineIDs, timelineScope
+        case configuration, history, current, pending, failedAlerts, lastObservedAt, lastDetectionAt, wasMonitoring, timelineEvents, pendingTimelineIDs, timelineScope
     }
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -126,6 +129,7 @@ public struct SessionSnapshot: Codable, Sendable {
         pending = try values.decode([PendingAlert].self, forKey: .pending)
         failedAlerts = try values.decodeIfPresent([FailedAlert].self, forKey: .failedAlerts) ?? []
         lastObservedAt = try values.decodeIfPresent(Date.self, forKey: .lastObservedAt)
+        lastDetectionAt = try values.decodeIfPresent(Date.self, forKey: .lastDetectionAt)
         wasMonitoring = try values.decode(Bool.self, forKey: .wasMonitoring)
         timelineScope = try values.decodeIfPresent(String.self, forKey: .timelineScope)
         timelineEvents = try values.decodeIfPresent([TimelineEvent].self, forKey: .timelineEvents) ?? []

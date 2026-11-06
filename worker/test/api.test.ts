@@ -1449,6 +1449,35 @@ describe('12-hour event timeline',()=>{
  const beat=(listener:TestDevice)=>({listenerId:listener.deviceId,timestamp:new Date().toISOString(),monitoring:true,powerConnected:true,state:'quiet',episodes:[]});
  async function setup(){const pair=await paired();await env.DB.prepare('UPDATE pairs SET created_at=?').bind(Date.now()-86400000).run();return pair;}
  async function history(d:TestDevice){const response=await call('timeline',d,undefined,'GET');expect(response.status).toBe(200);return await response.json() as {paired:boolean;events:import('../src/timeline').TimelineEvent[];truncated:boolean};}
+ it('corrects an earlier confirmed cry onset without duplicates or regression from delayed heartbeats',async()=>{
+  const {parent,listener}=await setup(),now=Date.now(),episodeID=crypto.randomUUID();
+  const volumeStart=new Date(now-30000).toISOString(),classifierStart=new Date(now-50000).toISOString();
+  const original={...beat(listener),state:'crying',currentEpisode:{id:episodeID,startedAt:volumeStart}};
+  expect((await call('listener/heartbeat',listener,original)).status).toBe(200);
+  expect((await history(parent)).events.find(e=>e.id===`cry:${episodeID}`)?.occurredAt).toBe(volumeStart);
+  // The local journal row may already be acknowledged. The shared episode
+  // itself must carry the correction even without a pending timeline event.
+  const corrected={...original,currentEpisode:{id:episodeID,startedAt:classifierStart}};
+  expect((await call('listener/heartbeat',listener,corrected)).status).toBe(200);
+  expect((await call('listener/heartbeat',listener,original)).status).toBe(200);
+  const events=(await history(parent)).events.filter(e=>e.id===`cry:${episodeID}`);
+  expect(events).toHaveLength(1);expect(events[0].occurredAt).toBe(classifierStart);
+  const row=await env.DB.prepare('SELECT occurred_at FROM timeline_events WHERE id=?').bind(`cry:${episodeID}`).first<{occurred_at:number}>();
+  expect(row!.occurred_at).toBe(Date.parse(classifierStart));
+ });
+ it('never revises other timeline events or another pair through a cry-onset conflict',async()=>{
+  const {parent,listener}=await setup(),now=Date.now(),episodeID=crypto.randomUUID(),id=`cry:${episodeID}`;
+  const earlier=new Date(now-50000).toISOString(),original=new Date(now-30000).toISOString();
+  const transition={id:crypto.randomUUID(),kind:'monitoring_started',occurredAt:original};
+  expect((await call('listener/heartbeat',listener,{...beat(listener),timelineEvents:[transition],currentEpisode:{id:episodeID,startedAt:original}})).status).toBe(200);
+  expect((await call('listener/heartbeat',listener,{...beat(listener),timelineEvents:[{...transition,occurredAt:earlier}]})).status).toBe(200);
+  expect((await history(parent)).events.find(e=>e.id===transition.id)?.occurredAt).toBe(original);
+  const other=await paired();
+  await env.DB.prepare('UPDATE pairs SET created_at=? WHERE parent_id=?').bind(now-86400000,other.parent.deviceId).run();
+  expect((await call('listener/heartbeat',other.listener,{...beat(other.listener),currentEpisode:{id:episodeID,startedAt:earlier}})).status).toBe(200);
+  expect((await history(parent)).events.find(e=>e.id===id)?.occurredAt).toBe(original);
+  expect((await history(other.parent)).events.find(e=>e.id===id)?.occurredAt).toBe(earlier);
+ });
  it('durably merges offline monitoring transitions and episodes without duplicate retries',async()=>{
   const {parent,listener}=await setup(),now=Date.now(),episodeID=crypto.randomUUID();
   const transitions=[{id:crypto.randomUUID(),kind:'monitoring_started',occurredAt:new Date(now-60000).toISOString()},{id:crypto.randomUUID(),kind:'monitoring_stopped',occurredAt:new Date(now-30000).toISOString()}];

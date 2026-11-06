@@ -63,7 +63,7 @@ import BackgroundTasks
         row[16] = nurserySound?.rawValue ?? "off"; row[17] = appActive ? "1" : "0"
         enqueue(row)
     }
-    func classification(_ event: SoundClassificationEvent, appActive: Bool? = nil) {
+    func classification(_ event: SoundClassificationEvent, appActive: Bool? = nil, alert: CryAlert? = nil) {
         func context(_ row: [String]) -> [String] {
             var row = row
             if let appActive { row[17] = appActive ? "1" : "0" }
@@ -88,6 +88,14 @@ import BackgroundTasks
             var row = emptyRow(kind: "classification", at: score.observedAt)
             row[3] = score.captureID.uuidString.lowercased(); row[4] = Self.date(score.windowStart)
             row[5] = Self.date(score.windowEnd); row[6] = number(score.confidence, digits: 6)
+            if let captured = score.audioWindowEndAt, captured.timeIntervalSinceReferenceDate.isFinite {
+                row[18] = "audio_window_end_at=\(Self.date(captured))"
+            }
+            if let alert {
+                row[11] = "1"; row[12] = alert.episodeId.uuidString.lowercased()
+                row[13] = Self.date(alert.cryStartedAt)
+                row[18] += (row[18].isEmpty ? "" : ";") + "alert_trigger=classifier;confidence_threshold=0.80"
+            }
             enqueue(context(row))
         case let .stopped(id, at):
             if liveCaptureID == id {
@@ -111,6 +119,12 @@ import BackgroundTasks
             append(kind: "classifier_event_gap", at: at, detail: "dropped_events_at_least=1")
         case let .droppedBuffers(count, at):
             append(kind: "classifier_gap", at: at, detail: "dropped_buffers=\(max(0, count))")
+        case let .unmappedResult(id, windowEnd, at):
+            var row = emptyRow(kind: "classifier_result_unmapped", at: at)
+            row[3] = id.uuidString.lowercased()
+            if windowEnd.timeIntervalSinceReferenceDate.isFinite { row[5] = Self.date(windowEnd) }
+            row[18] = "reason=input_timestamp_unavailable"
+            enqueue(context(row))
         }
     }
     func classifierStatus(at now: Date) -> String {
@@ -420,9 +434,10 @@ actor SoundAnalysisLogWriter {
         read_failures=\(coverage.readFailures) repaired_partial_rows=\(coverage.repairedPartialRows) invalid_segments=\(segments.filter { !$0.validCSV }.count) coverage_history_incomplete=\(coverage.historyIncomplete)
         write_failures=\(coverage.writeFailures) lost_rows=\(coverage.lostRows) memory_dropped_rows=\(coverage.memoryDroppedRows) memory_dropped_rows_this_run=\(droppedRows)
         Levels: approximately 4 Hz, only while monitoring, with applied threshold, trigger, detector state and initial alert creation.
-        Classifier: version1 baby_crying, 2-second windows, 50% overlap, approximately 1 Hz. Scores are diagnostic only; no confidence threshold is applied.
+        Classifier: version1 baby_crying, 2-second windows, 50% overlap, approximately 1 Hz. Updated builds also alert when consecutive windows at confidence >=0.80 cover the configured alert duration. Historical observational-only builds did not use scores for alerts.
         Join classification window_start_at/window_end_at to level recorded_at within the same run_id. recorded_at on classification rows is result receipt time, not audio time. Rows may arrive out of time order; sort by audio timestamps for analysis.
-        Volume is dBFS, not calibrated sound pressure. Above-threshold is an instantaneous volume trigger; detector_state includes confirmation and quiet-reset logic. alert_queued means the local initial alert was created, not delivered; snooze, server reminders and Watch delivery require operational diagnostics.
+        In updated builds detail.audio_window_end_at independently maps the window's final frame to input-buffer arrival time. Use it to check total audio age; sample-clock window dates may drift relative to wall time during long captures. Inference completion never moves this input-derived timestamp forward.
+        Volume is dBFS, not calibrated sound pressure. Above-threshold is the instantaneous volume test; detector_state is the combined volume/classifier state in updated builds. alert_queued marks local initial alert creation on either a level row or a classification row, not delivery; snooze, reminders and Watch delivery require operational diagnostics.
         No rows means no observation, not silence or zero confidence. Pauses, interruptions, termination, classifier faults, dropped buffers and storage failure create gaps. Wall-clock changes can affect joins; capture_id starts again after a discontinuity. Audio dates are estimated from microphone capture time and sample offsets.
         Data stays on the nursery iPhone, excluded from backups. Uninstall/device loss removes it. Oldest segments expire by age or byte cap, whichever comes first; age is pruned at UTC-day granularity. Export before expiry; export temporarily needs additional free disk space approximately equal to retained CSV data.
         Routine writes are batched about every 5 seconds while observations arrive; sudden termination can lose pending rows. Disk-full/locked-before-first-unlock errors and bounded queue drops lose observations. Failure counters are best effort, not proof of complete coverage.

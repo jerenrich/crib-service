@@ -12,7 +12,7 @@ Crib Service is designed to wake Mom or Dad with an **Apple Watch alert when the
 
 1. **Leave an iPhone in the nursery.** Set it to Listener mode, keep it plugged in, and start monitoring.
 2. **Pair it with your iPhone.** Use Parent mode and connect your Apple Watch with the companion app.
-3. **Choose your wait.** Pick 1, 2, 3, 5, or 10 minutes, or a shorter 5- or 30-second delay. The timer counts from the start of sustained loud sound, including the initial sound check. Brief noises are filtered out.
+3. **Choose your wait.** Pick 1, 2, 3, 5, or 10 minutes, or a shorter 5- or 30-second delay. Either sustained loud sound or Apple's on-device baby-cry confidence staying at 80% or higher for that duration can trigger an alert. Volume confirmation counts toward the wait; classifier timing uses the covered audio windows. Both paths share one alert episode.
 4. **Optionally connect your partner.** On the paired Parent iPhone, open **Devices → Caregivers & duty**, enter your name and create an invitation. On the partner’s iPhone, choose **Parent Mode → Pair iPhones → Join a family**, then enter their name and the invitation code. Each caregiver enables their own iPhone notifications and paired Watch alerts.
 5. **Get a tap on your wrist.** Alerts repeat every 5 seconds by default, or every 2 seconds with Frequent alerts selected in Settings, until you snooze one on your Watch or iPhone, or the Listener confirms the configured quiet period. Listener connection-loss alerts use the same repeat frequency and Snooze action. The Snooze button clears crying and connection-loss notifications on that device and pauses both for your chosen interval; a countdown and Resume alerts control let you end the snooze early.
 
@@ -44,7 +44,7 @@ To build and run it yourself, follow the [developer setup guide](docs/developer-
 
 ### A few important limits
 
-Crib Service currently detects sustained sound levels, so other loud noises can trigger it and quiet crying can be missed. Apple’s on-device baby-cry classifier also runs while monitoring to collect comparison data; it does not control alerts. Export its confidence scores and volume-trigger CSV from the nursery iPhone’s Diagnostics screen. Study data stays local for up to 42 days with a 2 GiB cap; [retention and analysis details](docs/diagnostics-review.md#continuous-cry-classifier-study--3-november-2026). Watch alerts depend on connectivity, notification permissions, and Focus settings; waking a sleeper is not guaranteed. It is not a medical monitor or a substitute for adult supervision.
+Crib Service runs volume detection and Apple's on-device baby-cry classifier in parallel. Either can trigger an alert independently; other loud noises can still trigger the volume path, and classifier confidence is not a calibrated probability. Scores below 80%, capture changes, failures and gaps restart the classifier's qualifying timer. Volume detection continues if classification is unavailable. Export confidence scores and alert-trigger CSV from the nursery iPhone’s Diagnostics screen. Study data stays local for up to 42 days with a 2 GiB cap; [retention and analysis details](docs/diagnostics-review.md#continuous-cry-classifier-study--3-november-2026). Watch alerts depend on connectivity, notification permissions, and Focus settings; waking a sleeper is not guaranteed. It is not a medical monitor or a substitute for adult supervision.
 
 ---
 

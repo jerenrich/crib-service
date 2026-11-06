@@ -217,7 +217,7 @@ import UIKit
             }
             #endif
             let saved = try store.load(); needsRestart = saved.wasMonitoring
-            if saved.wasMonitoring { interruptedMonitoringAt = saved.lastObservedAt }
+            if saved.wasMonitoring { interruptedMonitoringAt = [saved.lastObservedAt, saved.lastDetectionAt].compactMap { $0 }.max() }
             engine = CrySessionManager(snapshot: saved); engine.recoverAfterRelaunch()
             configuration = engine.snapshot.configuration
             try store.save(engine.snapshot)
@@ -226,17 +226,7 @@ import UIKit
         UIDevice.current.isBatteryMonitoringEnabled = true
         audio.onStatus = { [weak self] status in self?.audioChanged(status) }
         audio.onClassification = { [weak self] event in
-            guard let self, self.monitoring else { return }
-            if case .result(let score) = event {
-                guard let start = self.detectionStartedAt, score.windowStart >= start else { return }
-            }
-            let active = UIApplication.shared.applicationState == .active
-            self.log.soundAnalysis.classification(event, appActive: active)
-            if case .unavailable(let at, let failure?, _, _, _) = event {
-                self.log.classifierFailure(failure, appActive: active, at: at)
-            } else if case .result(let score) = event {
-                self.log.classifierRecovered(score, appActive: active)
-            }
+            self?.consumeClassification(event)
         }
         self.liveSound.onFrame = { [weak self] frame in
             guard let self, self.role == .parent, self.paired, self.appActive else { return }
@@ -349,6 +339,7 @@ import UIKit
         if automaticallyStart {
             log.record("app_launched", code: DiagnosticLog.maximumLines)
             log.record("alert_pipeline_ready", code: 8)
+            log.record("classifier_alert_pipeline_ready", code: 1)
             log.checkpointCoverage()
             if needsRestart { log.record("monitoring_recovered_after_relaunch") }
             // Local health and freshness must advance even while a request is suspended.
@@ -464,7 +455,7 @@ import UIKit
         listenerStatusTask?.cancel(); parentRefreshTask?.cancel()
     }
     var snapshot: SessionSnapshot { engine.snapshot }
-    var state: CryState { engine.detector.state }
+    var state: CryState { engine.state }
     var threshold: Double { configuration.absoluteThreshold }
     var listenerID: String { credential?.deviceId.uuidString ?? "Not registered" }
     var shouldKeepScreenAwake: Bool { safetyAccepted && role == .parent && keepScreenAwake }
@@ -1066,30 +1057,12 @@ import UIKit
         currentDBFS = sample.dbFS
         meter.append(sample.dbFS); meter = Array(meter.suffix(SoundLevelFrame.barCount))
         chartSampledAt = sample.timestamp
-        let before = state; let quietBefore = engine.detector.quietSince
+        let before = state; let quietBefore = engine.quietSince
         let events = engine.consume(sample, listenerId: credential.deviceId)
-        if !events.isEmpty { chartNotificationTimes.append(sample.timestamp) }
-        chartNotificationTimes.removeAll { sample.timestamp.timeIntervalSince($0) > SoundLevelFrame.windowDuration }
-        if state != before {
-            log.record(state == .crying ? "crying_started" : state == .possibleCry ? "possible_cry" : "crying_ended")
-        }
-        if state == .crying, engine.detector.quietSince != quietBefore {
-            log.record(engine.detector.quietSince == nil ? "crying_resumed" : "quiet_gap_started")
-        }
-        if !events.isEmpty { log.record("alert_threshold_reached") }
         log.soundAnalysis.level(sample, configuration: configuration, state: state,
             alertQueued: !events.isEmpty, episode: snapshot.current,
             nurserySound: nurserySound.playing ? nurserySound.settings.sound : nil, appActive: appActive)
-        let persistenceStarted = ContinuousClock.now
-        if !events.isEmpty || before != state || sample.timestamp.timeIntervalSince(lastSavedAt) >= 5 { persist(); lastSavedAt = sample.timestamp }
-        if !events.isEmpty, storageHealthy, store != nil {
-            let duration = persistenceStarted.duration(to: .now).components
-            let elapsedMS = Int(duration.seconds * 1000 + duration.attoseconds / 1_000_000_000_000_000)
-            for event in events { log.alertPersisted(event, at: currentTime(), elapsedMS: elapsedMS) }
-        }
-        // Persistence must succeed before any request can observe the new outbox.
-        if !events.isEmpty, storageHealthy, store != nil { requestImmediateAlertDelivery() }
-        if before == .crying, state == .quiet { queueHeartbeat() }
+        completeDetection(events, previousState: before, previousQuiet: quietBefore, at: sample.timestamp)
         // Publish the actual chart window and applied threshold, rather than
         // rebuilding or interpolating a different chart on the Parent.
         if monitoring, (0...1).contains(currentTime().timeIntervalSince(sample.timestamp)) {
@@ -1097,8 +1070,62 @@ import UIKit
                 threshold: threshold, state: state,
                 episodeStartedAt: snapshot.current?.startedAt.timeIntervalSince1970,
                 alertDuration: configuration.alertDuration,
-                notificationTimes: chartNotificationTimes.map(\.timeIntervalSince1970)))
+                notificationTimes: chartNotificationTimes.filter { $0 <= sample.timestamp }.map(\.timeIntervalSince1970)))
         }
+    }
+    private func consumeClassification(_ event: SoundClassificationEvent) {
+        guard monitoring else { return }
+        if case .result(let score) = event {
+            guard let start = detectionStartedAt, score.windowStart >= start else { return }
+        }
+        let before = state; let quietBefore = engine.quietSince
+        let events: [CryAlert]
+        if role == .listener, let credential, storageHealthy, !calibrationActive {
+            events = engine.consumeClassification(event, at: currentTime(), listenerId: credential.deviceId)
+            if let inputAt = engine.latestClassifierInputAt {
+                // Use capture time, not callback arrival: stale, mismatched or
+                // rejected results cannot postpone a genuine microphone stall.
+                let evidence = min(inputAt, currentTime())
+                lastSampleAt = max(lastSampleAt ?? evidence, evidence)
+            }
+        } else { events = [] }
+        let active = UIApplication.shared.applicationState == .active
+        log.soundAnalysis.classification(event, appActive: active, alert: events.first)
+        if case .unavailable(let at, let failure?, _, _, _) = event {
+            log.classifierFailure(failure, appActive: active, at: at)
+        } else if case .result(let score) = event {
+            log.classifierRecovered(score, appActive: active)
+        }
+        completeDetection(events, previousState: before, previousQuiet: quietBefore, at: currentTime())
+        // Classifier-only alerts need the same current episode in the heartbeat
+        // as in the durable outbox, so server reminders and quiet resolution work.
+        if !events.isEmpty { queueHeartbeat() }
+    }
+    private func completeDetection(_ events: [CryAlert], previousState: CryState,
+                                   previousQuiet: Date?, at date: Date) {
+        if !events.isEmpty { chartNotificationTimes.append(date) }
+        chartNotificationTimes.removeAll { date.timeIntervalSince($0) > SoundLevelFrame.windowDuration }
+        if state != previousState {
+            log.record(state == .crying ? "crying_started" : state == .possibleCry ? "possible_cry" : "crying_ended")
+        }
+        if state == .crying, engine.quietSince != previousQuiet {
+            log.record(engine.quietSince == nil ? "crying_resumed" : "quiet_gap_started")
+        }
+        if !events.isEmpty {
+            log.record("alert_threshold_reached")
+            if engine.lastAlertTrigger == .classifier { log.record("classifier_alert_threshold_reached") }
+        }
+        let persistenceStarted = ContinuousClock.now
+        if !events.isEmpty || previousState != state || date.timeIntervalSince(lastSavedAt) >= 5 {
+            persist(); lastSavedAt = date
+        }
+        if !events.isEmpty, storageHealthy, store != nil {
+            let duration = persistenceStarted.duration(to: .now).components
+            let elapsedMS = Int(duration.seconds * 1000 + duration.attoseconds / 1_000_000_000_000_000)
+            for event in events { log.alertPersisted(event, at: currentTime(), elapsedMS: elapsedMS) }
+            requestImmediateAlertDelivery()
+        }
+        if previousState == .crying, state != .crying { queueHeartbeat() }
     }
     func setAppActive(_ active: Bool) {
         audio.setClassificationAppActive(active)

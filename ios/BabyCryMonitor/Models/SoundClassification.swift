@@ -1,12 +1,59 @@
 import Foundation
 
-/// Scores are observations only; they never participate in alert decisions.
+/// On-device audio-window confidence, used independently of volume detection.
 struct SoundClassificationObservation: Sendable {
     let captureID: UUID
     let windowStart: Date
     let windowEnd: Date
     let confidence: Double
     let observedAt: Date
+    /// Independent wall-clock stamp for the window's final audio frame, mapped
+    /// from input buffers before inference. Nil retains compatibility with
+    /// synthetic/legacy observations whose window dates already use wall time.
+    var audioWindowEndAt: Date? = nil
+}
+
+/// An independent audio-frame/wall-time anchor. Only input admission updates
+/// this clock; a delayed inference callback cannot shift a window's capture time.
+struct SoundClassificationAudioClock: Sendable {
+    static let maximumAnchors = 1024
+    let sampleRate: Double
+    private struct Anchor: Sendable {
+        let startFrame: Int64
+        let endFrame: Int64
+        let capturedAt: Date
+    }
+    private var anchors: [Anchor] = []
+    private var oldest = 0
+    private var endFrame: Int64 = 0
+
+    mutating func receive(through frame: Int64, at date: Date) {
+        guard sampleRate.isFinite, sampleRate > 0, frame > endFrame,
+              date.timeIntervalSinceReferenceDate.isFinite else { return }
+        let anchor = Anchor(startFrame: endFrame, endFrame: frame, capturedAt: date)
+        if anchors.count < Self.maximumAnchors { anchors.append(anchor) }
+        else { anchors[oldest] = anchor; oldest = (oldest + 1) % Self.maximumAnchors }
+        endFrame = frame
+    }
+
+    func capturedWindowEnd(at audioSeconds: Double) -> Date? {
+        guard !anchors.isEmpty, audioSeconds.isFinite, audioSeconds >= 0 else { return nil }
+        let requestedFrame = audioSeconds * sampleRate
+        guard requestedFrame.isFinite, requestedFrame <= Double(endFrame) + 1 else { return nil }
+        // A one-sample CMTime conversion tolerance applies only to the end of
+        // admitted input, never to choosing between two known buffer anchors.
+        let frame = min(requestedFrame, Double(endFrame))
+        for offset in 0..<anchors.count {
+            let anchor = anchors[(oldest + offset) % anchors.count]
+            // Use the buffer that actually contained the window end. A newer
+            // buffer's arrival (possibly delayed) must not move old audio.
+            if frame > Double(anchor.startFrame), frame <= Double(anchor.endFrame) {
+                return anchor.capturedAt.addingTimeInterval(-max(0, Double(anchor.endFrame) - frame) / sampleRate)
+            }
+        }
+        // Old/unmapped results fail closed, rather than using a callback stamp.
+        return nil
+    }
 }
 
 enum SoundClassificationEvent: Sendable {
@@ -18,6 +65,42 @@ enum SoundClassificationEvent: Sendable {
                      retryAfterSeconds: Int? = nil, appActive: Bool? = nil)
     case droppedEvents(at: Date)
     case droppedBuffers(count: Int, at: Date)
+    /// A model result outside input timestamp coverage. Unlike channel loss,
+    /// its capture and sample-window identity are known and must stay scoped.
+    case unmappedResult(captureID: UUID, windowEnd: Date, at: Date)
+}
+
+/// Keep capture identity recoverable when bounded event delivery drops its
+/// original start. Replay metadata before the gap, never adopt an unknown score.
+final class SoundClassificationEventDelivery: @unchecked Sendable {
+    private let lock = NSLock()
+    private let continuation: AsyncStream<SoundClassificationEvent>.Continuation
+    private let currentTime: @Sendable () -> Date
+    private var activeStart: SoundClassificationEvent?
+
+    init(_ continuation: AsyncStream<SoundClassificationEvent>.Continuation,
+         currentTime: @escaping @Sendable () -> Date = { Date() }) {
+        self.continuation = continuation; self.currentTime = currentTime
+    }
+
+    func emit(_ event: SoundClassificationEvent) {
+        lock.lock(); defer { lock.unlock() }
+        switch event {
+        case .started:
+            activeStart = event
+        case .stopped(let id, _):
+            if case .started(let activeID, _, _, _, _) = activeStart, id == activeID { activeStart = nil }
+        case let .unavailable(_, failure, id, _, _):
+            let failedID = id ?? failure?.captureID
+            if failedID == nil { activeStart = nil }
+            else if case .started(let activeID, _, _, _, _) = activeStart, failedID == activeID { activeStart = nil }
+        default: break
+        }
+        if case .dropped = continuation.yield(event) {
+            if let activeStart { continuation.yield(activeStart) }
+            continuation.yield(.droppedEvents(at: currentTime()))
+        }
+    }
 }
 
 /// Retry state belongs to classifier failures, not the microphone frame timeline.

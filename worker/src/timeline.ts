@@ -45,11 +45,17 @@ export function heartbeatTimeline(env:Env,pair:Pair,beat:Heartbeat,previous:{rec
  }
  const accepted=events.filter(e=>Date.parse(e.occurredAt)>=pair.created_at&&Date.parse(e.occurredAt)<=now+5000&&
   (!e.episodeID||!e.endAt||Date.parse(e.endAt)>=pair.created_at));
+ // A second detector can confirm an earlier onset after the first heartbeat.
+ // Only move that episode's start earlier; retries and other events stay stable.
  return [env.DB.prepare(`INSERT INTO timeline_events(id,parent_id,listener_id,pair_created_at,kind,occurred_at,payload)
   SELECT json_extract(value,'$.id'),?,?,?,json_extract(value,'$.kind'),
   CAST(ROUND((julianday(json_extract(value,'$.occurredAt'))-2440587.5)*86400000) AS INTEGER),value
   FROM json_each(?) WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?)
-  ON CONFLICT DO NOTHING`).bind(pair.parent_id,pair.listener_id,pair.created_at,JSON.stringify(accepted),pair.parent_id,pair.listener_id,pair.created_at)];
+  ON CONFLICT DO UPDATE SET occurred_at=excluded.occurred_at,payload=excluded.payload
+  WHERE timeline_events.kind='cry_started' AND excluded.kind='cry_started'
+  AND timeline_events.parent_id=excluded.parent_id AND timeline_events.listener_id=excluded.listener_id
+  AND timeline_events.pair_created_at=excluded.pair_created_at
+  AND excluded.occurred_at<timeline_events.occurred_at`).bind(pair.parent_id,pair.listener_id,pair.created_at,JSON.stringify(accepted),pair.parent_id,pair.listener_id,pair.created_at)];
 }
 
 export async function timeline(env:Env,device:Device) {

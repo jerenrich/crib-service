@@ -20,17 +20,112 @@ actor RequestGate {
 }
 
 final class AppModelTests: XCTestCase {
-    @MainActor func testClassifierIsObservationalAndStopsLoggingInStandby() async throws {
+    @MainActor func testRelaunchCoverageUsesTheLatestPersistedClassifierInput() throws {
+        var saved = SessionSnapshot()
+        let now = Date()
+        saved.wasMonitoring = true
+        saved.lastObservedAt = now.addingTimeInterval(-60)
+        saved.lastDetectionAt = now.addingTimeInterval(-5)
+        let fixture = try Fixture(snapshotData: JSONEncoder().encode(saved))
+        XCTAssertTrue(fixture.model.needsRestart)
+        XCTAssertEqual(fixture.model.snapshot.timelineEvents.first { $0.kind == "monitoring_unverified" }?.occurredAt, saved.lastDetectionAt)
+    }
+
+    @MainActor func testVolumeLossAllowsANewClassifierAlertAndPersistsItsSuspensionTime() async throws {
+        let fixture = try Fixture()
+        await fixture.model.start()
+        defer { fixture.model.stop() }
+        let start = fixture.time.now, capture = UUID()
+        fixture.audio.onClassification?(.started(id: capture, at: start, sampleRate: 48_000, voiceProcessing: false))
+        for quarter in 1...24 {
+            fixture.time.now = start.addingTimeInterval(Double(quarter) / 4)
+            fixture.audio.emit(.init(timestamp: fixture.time.now, dbFS: -20))
+            let consumed = await eventually { fixture.model.chartSampledAt == fixture.time.now }
+            XCTAssertTrue(consumed)
+        }
+        let first = try XCTUnwrap(fixture.model.snapshot.current?.id)
+        for second in 7...34 {
+            fixture.time.now = start.addingTimeInterval(Double(second))
+            fixture.audio.onClassification?(.result(.init(captureID: capture,
+                windowStart: fixture.time.now.addingTimeInterval(-2), windowEnd: fixture.time.now,
+                confidence: second <= 30 ? 0 : 0.95, observedAt: fixture.time.now, audioWindowEndAt: fixture.time.now)))
+            await fixture.model.tick()
+            XCTAssertTrue(fixture.model.monitoring)
+        }
+        let sent = await eventually { await fixture.backend.sent.count == 2 }
+        XCTAssertTrue(sent)
+        let alerts = await fixture.backend.sent
+        XCTAssertEqual(Set(alerts.map(\.episodeId)).count, 2)
+        XCTAssertNotEqual(fixture.model.snapshot.current?.id, first)
+        XCTAssertEqual(fixture.model.snapshot.history.first?.quietConfirmed, false)
+        fixture.model.pauseMonitoring()
+        let saved = try MetadataStore(directory: fixture.directory).load()
+        XCTAssertEqual(saved.history.first?.startedAt, start.addingTimeInterval(29))
+        XCTAssertEqual(saved.history.first?.endedAt, start.addingTimeInterval(34))
+        XCTAssertEqual(saved.lastDetectionAt, start.addingTimeInterval(34))
+        XCTAssertEqual(saved.lastObservedAt, start.addingTimeInterval(6))
+    }
+
+    @MainActor func testClassifierOnlyInputSurvivesAutomaticWatchdogButStaleInputStillStopsMonitoring() async throws {
+        let fixture = try Fixture(automaticallyStart: true)
+        await fixture.model.start()
+        defer { fixture.model.stop() }
+        let start = fixture.time.now, capture = UUID()
+        fixture.audio.onClassification?(.started(id: capture, at: start, sampleRate: 48_000, voiceProcessing: false))
+        // No volume samples arrive. These are real input stamps, not just timely callbacks.
+        for second in 2...5 {
+            fixture.time.now = start.addingTimeInterval(Double(second))
+            fixture.audio.onClassification?(.result(.init(captureID: capture,
+                windowStart: fixture.time.now.addingTimeInterval(-2), windowEnd: fixture.time.now,
+                confidence: 0.95, observedAt: fixture.time.now, audioWindowEndAt: fixture.time.now)))
+        }
+        try await Task.sleep(for: .milliseconds(1200))
+        XCTAssertTrue(fixture.model.monitoring)
+        XCTAssertEqual(fixture.model.state, .crying)
+        XCTAssertFalse(fixture.model.log.export.contains("audio_stalled"))
+        let sent = await eventually { await fixture.backend.sent.filter { !$0.isMonitoringFailure }.count == 1 }
+        XCTAssertTrue(sent)
+        // A fresh callback about stale audio must not refresh the watchdog clock.
+        fixture.time.now = start.addingTimeInterval(9)
+        fixture.audio.onClassification?(.result(.init(captureID: capture,
+            windowStart: start.addingTimeInterval(4), windowEnd: start.addingTimeInterval(6),
+            confidence: 0.95, observedAt: fixture.time.now, audioWindowEndAt: start.addingTimeInterval(5))))
+        let stopped = await eventually { !fixture.model.monitoring }
+        XCTAssertTrue(stopped)
+        XCTAssertTrue(fixture.model.needsRestart)
+        XCTAssertTrue(fixture.model.log.export.contains("audio_stalled"))
+    }
+
+    @MainActor func testQuietClassifierInputAlsoKeepsTheMicrophoneWatchdogAlive() async throws {
+        let fixture = try Fixture()
+        await fixture.model.start()
+        defer { fixture.model.stop() }
+        let start = fixture.time.now, capture = UUID()
+        fixture.audio.onClassification?(.started(id: capture, at: start, sampleRate: 48_000, voiceProcessing: false))
+        fixture.time.now = start.addingTimeInterval(5)
+        fixture.audio.onClassification?(.result(.init(captureID: capture,
+            windowStart: start.addingTimeInterval(3), windowEnd: fixture.time.now,
+            confidence: 0, observedAt: fixture.time.now, audioWindowEndAt: fixture.time.now)))
+        await fixture.model.tick()
+        XCTAssertTrue(fixture.model.monitoring)
+        XCTAssertEqual(fixture.model.state, .quiet)
+        XCTAssertNil(fixture.model.snapshot.current)
+        XCTAssertFalse(fixture.model.log.export.contains("audio_stalled"))
+    }
+
+    @MainActor func testClassifierFailureLeavesVolumeAlertsRunningAndStopsLoggingInStandby() async throws {
         let fixture = try Fixture()
         await fixture.model.start()
         XCTAssertTrue(fixture.audio.classificationEnabled)
         let start = fixture.time.now
         let capture = UUID()
         fixture.audio.onClassification?(.started(id: capture, at: start, sampleRate: 48_000, voiceProcessing: false))
+        fixture.time.now = start.addingTimeInterval(2)
         fixture.audio.onClassification?(.result(.init(captureID: capture, windowStart: start,
-            windowEnd: start.addingTimeInterval(2), confidence: 1, observedAt: start.addingTimeInterval(3))))
-        XCTAssertEqual(fixture.model.state, .quiet, "Even confidence 1 cannot start a volume episode")
-        fixture.audio.onClassification?(.unavailable(at: start, failure: .init(
+            windowEnd: start.addingTimeInterval(2), confidence: 1, observedAt: fixture.time.now)))
+        XCTAssertEqual(fixture.model.state, .possibleCry, "One high score has not yet covered the alert duration")
+        XCTAssertNil(fixture.model.snapshot.current)
+        fixture.audio.onClassification?(.unavailable(at: fixture.time.now, failure: .init(
             error: NSError(domain: "com.apple.SoundAnalysis", code: 2), stage: .analysis, captureID: capture)))
         XCTAssertTrue(fixture.model.monitoring, "Classifier failure must not stop microphone monitoring")
         XCTAssertTrue(fixture.model.log.lines.contains { $0.contains("classifier_failure") })
@@ -63,6 +158,132 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(fixture.audio.classificationEnabled)
         fixture.model.stop()
         await fixture.model.log.soundAnalysis.flush()
+    }
+
+    @MainActor func testClassifierOnlyAlertPersistsImmediatelyAndSharesVolumeEpisodeOffline() async throws {
+        let fixture = try Fixture()
+        await fixture.model.start()
+        fixture.connectivity.available = false
+        let start = fixture.time.now, capture = UUID()
+        fixture.audio.onClassification?(.started(id: capture, at: start, sampleRate: 48_000, voiceProcessing: false))
+        for quarter in 1...20 {
+            fixture.time.now = start.addingTimeInterval(Double(quarter) / 4)
+            fixture.audio.emit(.init(timestamp: fixture.time.now, dbFS: -80))
+            let consumed = await eventually { fixture.model.chartSampledAt == fixture.time.now }
+            XCTAssertTrue(consumed)
+            if quarter >= 8, quarter.isMultiple(of: 4) {
+                fixture.audio.onClassification?(.result(.init(captureID: capture,
+                    windowStart: fixture.time.now.addingTimeInterval(-2), windowEnd: fixture.time.now,
+                    confidence: 0.8, observedAt: fixture.time.now, audioWindowEndAt: fixture.time.now)))
+            }
+        }
+        let queued = try XCTUnwrap(fixture.model.snapshot.pending.first?.alert)
+        XCTAssertEqual(queued.createdAt, start.addingTimeInterval(5))
+        XCTAssertEqual(fixture.model.state, .crying)
+        XCTAssertTrue(fixture.model.log.export.contains("classifier_alert_threshold_reached"))
+        let saved = try MetadataStore(directory: fixture.directory).load()
+        XCTAssertEqual(saved.pending.first?.alert.eventId, queued.eventId)
+        XCTAssertEqual(saved.current?.id, queued.episodeId)
+        for quarter in 21...48 {
+            fixture.time.now = start.addingTimeInterval(Double(quarter) / 4)
+            fixture.audio.emit(.init(timestamp: fixture.time.now, dbFS: -20))
+        }
+        let consumed = await eventually { fixture.model.chartSampledAt == fixture.time.now }
+        XCTAssertTrue(consumed)
+        XCTAssertEqual(fixture.model.snapshot.pending.count, 1)
+        XCTAssertEqual(fixture.model.snapshot.current?.id, queued.episodeId)
+        let export = try await fixture.model.log.soundAnalysis.prepareExport()
+        defer { try? FileManager.default.removeItem(at: export[0].deletingLastPathComponent()) }
+        let text = try String(contentsOf: export[0], encoding: .utf8)
+        let triggering = try XCTUnwrap(text.split(separator: "\n").first { $0.contains("alert_trigger=classifier") })
+        let columns = triggering.split(separator: ",", omittingEmptySubsequences: false)
+        XCTAssertEqual(columns[2], "classification"); XCTAssertEqual(columns[11], "1")
+        XCTAssertEqual(String(columns[12]), queued.episodeId.uuidString.lowercased())
+        XCTAssertTrue(columns[18].contains("audio_window_end_at="))
+        fixture.model.pauseMonitoring()
+        fixture.time.now = fixture.time.now.addingTimeInterval(2)
+        fixture.audio.onClassification?(.result(.init(captureID: capture, windowStart: fixture.time.now.addingTimeInterval(-2),
+            windowEnd: fixture.time.now, confidence: 1, observedAt: fixture.time.now)))
+        XCTAssertEqual(fixture.model.state, .quiet)
+        XCTAssertEqual(fixture.model.snapshot.pending.count, 1)
+        fixture.model.stop()
+    }
+
+    @MainActor func testClassifierAlertUploadsWithoutWaitingForOrdinaryTickAndReportsEpisode() async throws {
+        let fixture = try Fixture()
+        await fixture.model.start()
+        let start = fixture.time.now, capture = UUID()
+        fixture.audio.onClassification?(.started(id: capture, at: start, sampleRate: 48_000, voiceProcessing: false))
+        for second in 2...5 {
+            fixture.time.now = start.addingTimeInterval(Double(second))
+            fixture.audio.onClassification?(.result(.init(captureID: capture,
+                windowStart: fixture.time.now.addingTimeInterval(-2), windowEnd: fixture.time.now,
+                confidence: 0.95, observedAt: fixture.time.now)))
+        }
+        let sent = await eventually { await fixture.backend.sent.count == 1 }
+        XCTAssertTrue(sent)
+        let sentAlerts = await fixture.backend.sent
+        let event = try XCTUnwrap(sentAlerts.first)
+        XCTAssertEqual(event.createdAt, start.addingTimeInterval(5))
+        let reported = await eventually {
+            await fixture.backend.beats.contains { $0.state == .crying && $0.currentEpisode?.id == event.episodeId }
+        }
+        XCTAssertTrue(reported, "Server reminders must receive the classifier episode, not quiet volume state")
+        // A classifier callback can run before a queued, slightly older level.
+        // Do not send its new marker in a chart frame whose timestamp predates it.
+        let queuedLevel = start.addingTimeInterval(4.75)
+        fixture.audio.emit(.init(timestamp: queuedLevel, dbFS: -80))
+        let olderConsumed = await eventually { fixture.model.chartSampledAt == queuedLevel }
+        XCTAssertTrue(olderConsumed)
+        let olderFrame = try XCTUnwrap(fixture.liveSound.frames.last)
+        XCTAssertTrue(olderFrame.isValid)
+        XCTAssertEqual(olderFrame.notificationTimes, [])
+        fixture.time.now = start.addingTimeInterval(5.25)
+        fixture.audio.emit(.init(timestamp: fixture.time.now, dbFS: -80))
+        let freshConsumed = await eventually { fixture.model.chartSampledAt == fixture.time.now }
+        XCTAssertTrue(freshConsumed)
+        let freshFrame = try XCTUnwrap(fixture.liveSound.frames.last)
+        XCTAssertTrue(freshFrame.isValid)
+        XCTAssertEqual(freshFrame.notificationTimes, [event.createdAt.timeIntervalSince1970])
+        fixture.model.stop()
+    }
+
+    @MainActor func testRMSDeliveryGapKeepsAHealthyClassifierEpisodeAndItsSingleAlert() async throws {
+        let fixture = try Fixture()
+        await fixture.model.start()
+        fixture.connectivity.available = false
+        let start = fixture.time.now, capture = UUID()
+        fixture.audio.onClassification?(.started(id: capture, at: start, sampleRate: 48_000, voiceProcessing: false))
+        for quarter in 1...18 {
+            fixture.time.now = start.addingTimeInterval(Double(quarter) / 4)
+            fixture.audio.emit(.init(timestamp: fixture.time.now, dbFS: -80))
+            let consumed = await eventually { fixture.model.chartSampledAt == fixture.time.now }
+            XCTAssertTrue(consumed)
+            if quarter >= 8, quarter.isMultiple(of: 4) {
+                fixture.audio.onClassification?(.result(.init(captureID: capture,
+                    windowStart: fixture.time.now.addingTimeInterval(-2), windowEnd: fixture.time.now,
+                    confidence: 0.9, observedAt: fixture.time.now, audioWindowEndAt: fixture.time.now)))
+            }
+        }
+        for second in [5.0, 6.0] {
+            fixture.time.now = start.addingTimeInterval(second)
+            fixture.audio.onClassification?(.result(.init(captureID: capture,
+                windowStart: fixture.time.now.addingTimeInterval(-2), windowEnd: fixture.time.now,
+                confidence: 0.9, observedAt: fixture.time.now, audioWindowEndAt: fixture.time.now)))
+        }
+        let event = try XCTUnwrap(fixture.model.snapshot.pending.first?.alert)
+        fixture.time.now = start.addingTimeInterval(6.75)
+        fixture.audio.emit(.init(timestamp: fixture.time.now, dbFS: -80))
+        let consumed = await eventually { fixture.model.chartSampledAt == fixture.time.now }
+        XCTAssertTrue(consumed)
+        XCTAssertEqual(fixture.model.state, .crying)
+        XCTAssertEqual(fixture.model.snapshot.current?.id, event.episodeId)
+        XCTAssertEqual(fixture.model.snapshot.pending.count, 1)
+        XCTAssertTrue(fixture.model.snapshot.history.isEmpty)
+        let saved = try MetadataStore(directory: fixture.directory).load()
+        XCTAssertEqual(saved.current?.id, event.episodeId)
+        XCTAssertEqual(saved.pending.first?.alert.eventId, event.eventId)
+        fixture.model.stop()
     }
 
     @MainActor func testSoundCommandLogsCorrelateBothPhonesWithoutControlTokens() async throws {

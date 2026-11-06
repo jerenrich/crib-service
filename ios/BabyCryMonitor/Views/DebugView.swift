@@ -168,7 +168,7 @@ struct DebugView: View {
                         ShareLink(items: soundAnalysisExport) { Text("Share prepared sound analysis export") }
                             .disabled(preparingSoundAnalysis)
                     }
-                    Text("Logs sound levels and applied volume triggers about 4 times per second, plus Apple's baby-cry confidence about once per second while monitoring. Scores are observations only; volume detection still controls alerts. No audio is saved or uploaded.").font(.footnote)
+                    Text("Logs sound levels about 4 times per second and Apple's baby-cry confidence about once per second. Confidence of at least 80% for the alert duration or the existing volume detector can trigger an alert. Both share one episode. No audio is saved or uploaded.").font(.footnote)
                     Text("Stored separately on this nursery iPhone for up to 42 days, capped at 2 GiB. The oldest files expire sooner if the cap is reached. Export regularly; app removal or device loss removes the data. An export needs additional free space and includes a coverage report explaining gaps and retention. Sudden termination can lose the latest few seconds.").font(.footnote)
                 }
             }

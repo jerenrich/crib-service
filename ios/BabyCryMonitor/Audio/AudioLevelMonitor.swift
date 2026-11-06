@@ -624,11 +624,8 @@ final class AudioCaptureTap {
         let reducer = RMSReducer(continuation: continuation)
         let classifier: BabyCryClassifier?
         if let classificationControl, let classificationEvents {
-            classifier = BabyCryClassifier(control: classificationControl) { event in
-                if case .dropped = classificationEvents.yield(event) {
-                    classificationEvents.yield(.droppedEvents(at: Date()))
-                }
-            }
+            let delivery = SoundClassificationEventDelivery(classificationEvents)
+            classifier = BabyCryClassifier(control: classificationControl, emit: delivery.emit)
         } else { classifier = nil }
         self.classifier = classifier
         let voiceProcessing = input.isVoiceProcessingEnabled

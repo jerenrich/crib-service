@@ -54,12 +54,12 @@ protocol SoundClassifierStreaming: AnyObject {
     var id: UUID { get }
     var failure: SoundClassificationFailure? { get }
     var hasProducedResult: Bool { get }
-    func analyze(_ buffer: AVAudioPCMBuffer)
+    func analyze(_ buffer: AVAudioPCMBuffer, capturedAt: Date)
     func stop()
 }
 
 final class BabyCryClassifier: @unchecked Sendable {
-    static let windowSeconds = 2.0
+    static let windowSeconds = CryConfidenceDetector.windowDuration
     static let overlap = 0.5
     typealias SessionFactory = @Sendable (AVAudioFormat, Date, Int, SoundClassificationControl,
         @escaping @Sendable (SoundClassificationEvent) -> Void) throws -> any SoundClassifierStreaming
@@ -97,6 +97,7 @@ final class BabyCryClassifier: @unchecked Sendable {
     private struct OwnedBuffer: @unchecked Sendable { let value: AVAudioPCMBuffer }
     func consume(_ buffer: AVAudioPCMBuffer, at time: AVAudioTime, voiceProcessing: Bool) {
         guard let epoch = control.currentEpoch else { return }
+        let end = Date()
         lock.lock()
         guard !stopped, pendingBuffers < 64 else {
             if !stopped { dropped += 1 }
@@ -109,7 +110,6 @@ final class BabyCryClassifier: @unchecked Sendable {
             lock.lock(); pendingBuffers -= 1; dropped += lost + 1; lock.unlock(); return
         }
         let owned = OwnedBuffer(value: copy)
-        let end = Date()
         let start = end.addingTimeInterval(-Double(buffer.frameLength) / buffer.format.sampleRate)
         let frame = time.isSampleTimeValid ? time.sampleTime : nil
         queue.async { [self, owned] in
@@ -139,7 +139,7 @@ final class BabyCryClassifier: @unchecked Sendable {
                     emit(.started(id: created.id, at: start, sampleRate: copy.format.sampleRate,
                                   voiceProcessing: voiceProcessing, reason: nextStartReason))
                 }
-                session?.analyze(copy)
+                session?.analyze(copy, capturedAt: end)
                 guard isCurrent(epoch: epoch) else { endSession(); return }
                 if let failure = session?.failure { fail(failure, at: Date()) }
                 else if session?.hasProducedResult == true { recovery.succeeded(); control.noteSuccess(epoch: epoch) }
@@ -203,6 +203,7 @@ private final class Session: NSObject, SoundClassifierStreaming, SNResultsObserv
     private let control: SoundClassificationControl
     private let emit: @Sendable (SoundClassificationEvent) -> Void
     private var position: AVAudioFramePosition = 0
+    private var audioClock: SoundClassificationAudioClock
     private let lock = NSLock()
     private var recordedFailure: SoundClassificationFailure?
     private var producedResult = false
@@ -211,6 +212,7 @@ private final class Session: NSObject, SoundClassifierStreaming, SNResultsObserv
     init(format: AVAudioFormat, origin: Date, epoch: Int, control: SoundClassificationControl,
          emit: @escaping @Sendable (SoundClassificationEvent) -> Void) throws {
         self.origin = origin; self.epoch = epoch; self.control = control; self.emit = emit
+        audioClock = SoundClassificationAudioClock(sampleRate: format.sampleRate)
         analyzer = SNAudioStreamAnalyzer(format: format)
         super.init()
         let request = try SNClassifySoundRequest(classifierIdentifier: .version1)
@@ -221,7 +223,10 @@ private final class Session: NSObject, SoundClassifierStreaming, SNResultsObserv
         request.overlapFactor = BabyCryClassifier.overlap
         try analyzer.add(request, withObserver: self)
     }
-    func analyze(_ buffer: AVAudioPCMBuffer) {
+    func analyze(_ buffer: AVAudioPCMBuffer, capturedAt: Date) {
+        lock.lock()
+        audioClock.receive(through: position + AVAudioFramePosition(buffer.frameLength), at: capturedAt)
+        lock.unlock()
         analyzer.analyze(buffer, atAudioFramePosition: position)
         position += AVAudioFramePosition(buffer.frameLength)
     }
@@ -232,10 +237,19 @@ private final class Session: NSObject, SoundClassifierStreaming, SNResultsObserv
               let score = result.classification(forIdentifier: "baby_crying"),
               score.confidence.isFinite, (0...1).contains(score.confidence),
               result.timeRange.start.seconds.isFinite, result.timeRange.duration.seconds.isFinite else { return }
-        lock.lock(); producedResult = true; lock.unlock()
+        lock.lock()
+        producedResult = true
+        let capturedEnd = audioClock.capturedWindowEnd(at: CMTimeRangeGetEnd(result.timeRange).seconds)
+        lock.unlock()
+        guard let capturedEnd else {
+            // Preserve capture/window scope: an obsolete callback cannot create
+            // a new global gap that resets the replacement capture's evidence.
+            emit(.unmappedResult(captureID: id, windowEnd: origin.addingTimeInterval(CMTimeRangeGetEnd(result.timeRange).seconds),
+                                 at: Date())); return
+        }
         emit(.result(.init(captureID: id, windowStart: origin.addingTimeInterval(result.timeRange.start.seconds),
             windowEnd: origin.addingTimeInterval(CMTimeRangeGetEnd(result.timeRange).seconds),
-            confidence: score.confidence, observedAt: Date())))
+            confidence: score.confidence, observedAt: Date(), audioWindowEndAt: capturedEnd)))
     }
     func request(_ request: SNRequest, didFailWithError error: any Error) {
         lock.lock(); defer { lock.unlock() }

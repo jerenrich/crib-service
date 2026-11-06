@@ -15,7 +15,7 @@ struct SettingsView: View {
             Form {
                 Section("Settings status") { Text(model.settingsSyncStatus) }
                 Section {
-                    Picker("Alert after loud sound for", selection: setting(\.alertDuration)) {
+                    Picker("Alert after crying for", selection: setting(\.alertDuration)) {
                         ForEach(alertDurations, id: \.self) { value in
                             Text(alertDurationText(value)).tag(value)
                         }
@@ -28,7 +28,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Alert timing")
                 } footer: {
-                    Text("The timer counts from the start of sustained loud sound, including the initial sound check. Brief noises are filtered out.")
+                    Text("Either sustained loud sound or Apple baby-cry confidence of at least 80% can trigger an alert after this duration. The volume timer includes the initial sound check. Both detectors run together and share one alert episode.")
                 }
                 Section {
                     Picker("Reset timer after quiet", selection: setting(\.quietResetDuration)) {
@@ -37,7 +37,7 @@ struct SettingsView: View {
                 } header: {
                     Text("When crying stops")
                 } footer: {
-                    Text("After \(Int(model.configuration.quietResetDuration)) seconds below the sound threshold, the crying timer resets. Shorter pauses keep the timer running.")
+                    Text("An episode resets after both detectors have settled for \(Int(model.configuration.quietResetDuration)) seconds. Shorter pauses keep the episode open. A classifier reading below 80% or missing results restarts its qualifying timer.")
                 }
                 Section {
                     Picker("Sound threshold", selection: setting(\.absoluteThreshold)) {
@@ -185,7 +185,7 @@ struct AlertTimingView: View {
                         }
                     }.pickerStyle(.inline).accessibilityIdentifier("quickAlertDuration")
                 } footer: {
-                    Text("The timer counts from the start of sustained loud sound, including the initial sound check. Brief noises are filtered out.")
+                    Text("Either sustained loud sound or Apple baby-cry confidence of at least 80% can trigger an alert after this duration. Both detectors run together and share one alert episode.")
                 }
                 if let duty = model.caregiverDuty, duty.secondary != nil {
                     Section("Secondary caregiver") {

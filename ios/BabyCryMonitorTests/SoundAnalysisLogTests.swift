@@ -7,6 +7,25 @@ import XCTest
 #endif
 
 final class SoundAnalysisLogTests: XCTestCase {
+    @MainActor func testUnmappedResultRetainsCaptureScopeWithoutInventingAGlobalGap() async throws {
+        let directory = folder(); defer { try? FileManager.default.removeItem(at: directory) }
+        let log = SoundAnalysisLog(directory: directory), now = Date(), old = UUID(), current = UUID()
+        log.classification(.started(id: current, at: now, sampleRate: 48_000, voiceProcessing: false))
+        log.classification(.result(.init(captureID: current, windowStart: now,
+            windowEnd: now.addingTimeInterval(2), confidence: 0.9, observedAt: now.addingTimeInterval(2))))
+        log.classification(.unmappedResult(captureID: old, windowEnd: now.addingTimeInterval(-10), at: now.addingTimeInterval(3)))
+        XCTAssertEqual(log.latestConfidence, 0.9)
+        let export = try await log.prepareExport()
+        defer { try? FileManager.default.removeItem(at: export[0].deletingLastPathComponent()) }
+        let data = try rows(in: export)
+        let row = try XCTUnwrap(data.first { $0[2] == "classifier_result_unmapped" })
+        XCTAssertEqual(row[3], old.uuidString.lowercased())
+        XCTAssertFalse(row[5].isEmpty)
+        XCTAssertEqual(row[6], "")
+        XCTAssertEqual(row[18], "reason=input_timestamp_unavailable")
+        XCTAssertFalse(data.contains { $0[2] == "classifier_event_gap" })
+    }
+
     func testRecoveryUsesMonotonicBackoffAndResetsOnlyAfterSuccess() {
         let now = ContinuousClock.now
         var recovery = SoundClassifierRecovery()
@@ -228,7 +247,7 @@ final class SoundAnalysisLogTests: XCTestCase {
         XCTAssertTrue(try XCTUnwrap(data.first { $0[2] == "capture_start" })[18].contains("reason=after_failure"))
         XCTAssertNil(log.latestConfidence)
     }
-    @MainActor func testExportPreservesQuietScoresAndVolumeTriggersWithoutChangingAlerts() async throws {
+    @MainActor func testExportPreservesQuietScoresAndVolumeTriggersAndDescribesBothAlertPaths() async throws {
         let directory = folder(); defer { try? FileManager.default.removeItem(at: directory) }
         let log = SoundAnalysisLog(directory: directory)
         let now = Date(), capture = UUID()
@@ -261,7 +280,9 @@ final class SoundAnalysisLogTests: XCTestCase {
         XCTAssertNotEqual(scores[0][0], scores[0][5], "Receipt time must remain distinct from audio time")
         XCTAssertEqual(scores[0][3], capture.uuidString.lowercased())
         XCTAssertEqual(log.latestConfidence, 0.987654)
-        XCTAssertTrue(try String(contentsOf: export[1], encoding: .utf8).contains("Scores are diagnostic only"))
+        let coverage = try String(contentsOf: export[1], encoding: .utf8)
+        XCTAssertTrue(coverage.contains("confidence >=0.80"))
+        XCTAssertTrue(coverage.contains("combined volume/classifier state"))
     }
     @MainActor func testSuccessiveBatchesContinueWritingAndExportSurvivesRelaunch() async throws {
         let directory = folder(); defer { try? FileManager.default.removeItem(at: directory) }
