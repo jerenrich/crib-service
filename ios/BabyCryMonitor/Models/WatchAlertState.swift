@@ -43,15 +43,19 @@ import Observation
         persist()
     }
 
-    func receive(_ value: WatchCryAlert) {
+    func receive(_ value: WatchCryAlert, snapshot: WatchSnapshot? = nil, deliveredAt: Date? = nil) {
+        guard snapshot?.notificationIsInactive(value, deliveredAt: deliveredAt) != true else { return }
         guard !isSuppressed(value) else { return }
         localAlert = value
         alert = value
     }
 
-    func handleNotification(_ value: WatchCryAlert, acknowledging: Bool) {
+    @discardableResult func handleNotification(_ value: WatchCryAlert, acknowledging: Bool,
+                                              snapshot: WatchSnapshot? = nil, deliveredAt: Date? = nil) -> Bool {
+        guard snapshot?.notificationIsInactive(value, deliveredAt: deliveredAt) != true else { return false }
         if acknowledging { acknowledge(value) }
         else { receive(value) }
+        return true
     }
 
     func acknowledgeCurrent() {

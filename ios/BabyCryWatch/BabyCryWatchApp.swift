@@ -58,7 +58,7 @@ import UserNotifications
             let actorWaitMS = DiagnosticTiming.elapsedMS(since: queued), handling = ContinuousClock.now
             let model = WatchModel.shared
             if let alert {
-                model.receive(alert)
+                model.receive(alert, deliveredAt: deliveredAt)
                 model.log.watchAlert(WatchAlertTrace(alert: alert, phase: .foreground, deliveredAt: deliveredAt, observedAt: observedAt,
                     applicationState: model.diagnosticApplicationState,
                     timing: .init(presentationRequestMS: presentationMS, mainActorWaitMS: actorWaitMS, handlingMS: DiagnosticTiming.elapsedMS(since: handling), journalWriteMS: journalMS),
@@ -95,7 +95,7 @@ import UserNotifications
                 WatchModel.shared.log.watchAlert(WatchAlertTrace(alert: alert, phase: acknowledge ? .acknowledged : .opened,
                                                                deliveredAt: deliveredAt, observedAt: observedAt, callbackID: callbackID,
                                                                collapseScope: collapse))
-                WatchModel.shared.handleNotification(alert, acknowledging: acknowledge)
+                WatchModel.shared.handleNotification(alert, acknowledging: acknowledge, deliveredAt: deliveredAt)
             } else { WatchModel.shared.log.record("watch_payload_unrecognized", code: 2) }
             completionHandler()
         }
@@ -134,12 +134,17 @@ final class CryNotificationController: WKUserNotificationHostingController<CryNo
     override class var isInteractive: Bool { true }
     override var body: CryNotificationView {
         let deliveredAt = self.deliveredAt
-        return CryNotificationView(alert: alert, deliveredAt: deliveredAt, text: text) { [weak self, alert] in
+        return CryNotificationView(alert: alert, deliveredAt: deliveredAt, text: text, dismiss: { [weak self] in
+            self?.performDismissAction()
+        }) { [weak self, alert] in
             guard let alert else { return }
+            guard WatchModel.shared.handleNotification(alert, acknowledging: true, deliveredAt: deliveredAt) else {
+                self?.performDismissAction()
+                return
+            }
             let trace = WatchAlertTrace(alert: alert, phase: .acknowledged, deliveredAt: deliveredAt, callbackID: UUID())
             NotificationCallbackJournal.shared.record(trace)
             WatchModel.shared.log.watchAlert(trace)
-            WatchModel.shared.handleNotification(alert, acknowledging: true)
             self?.performDismissAction()
         }
     }
@@ -192,7 +197,7 @@ final class CryNotificationController: WKUserNotificationHostingController<CryNo
                 await Task.yield()
                 let actorWaitMS = DiagnosticTiming.elapsedMS(since: queued), handling = ContinuousClock.now
                 let model = WatchModel.shared
-                model.receive(alert)
+                model.receive(alert, deliveredAt: deliveredAt)
                 var traces = [WatchAlertTrace(alert: alert, phase: .controllerReceived, deliveredAt: deliveredAt, observedAt: observedAt,
                     applicationState: model.diagnosticApplicationState,
                     timing: .init(mainActorWaitMS: actorWaitMS, handlingMS: preparedMS + DiagnosticTiming.elapsedMS(since: handling), journalWriteMS: journalMS),
@@ -208,22 +213,34 @@ final class CryNotificationController: WKUserNotificationHostingController<CryNo
 }
 
 struct CryNotificationView: View {
+    @State private var model = WatchModel.shared
     let alert: WatchCryAlert?
     let deliveredAt: Date?
     let text: String
+    let dismiss: () -> Void
     let acknowledge: () -> Void
+    private var inactive: Bool {
+        alert.map { model.snapshot.notificationIsInactive($0, deliveredAt: deliveredAt) } ?? false
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            if alert != nil {
+            if inactive {
+                Button("Close", action: dismiss)
+                    .buttonStyle(.bordered)
+            } else if alert != nil {
                 Button("Snooze", action: acknowledge)
                     .buttonStyle(.borderedProminent).tint(Color(red: 0.62, green: 0.90, blue: 0.79)).foregroundStyle(.black)
                     .frame(maxWidth: .infinity)
             }
-            Label(alert?.isTest == true ? "Test alert" : alert?.isDisconnected == true ? "Listener connection lost" : alert?.isMonitoringFailure == true ? "Nursery monitoring stopped" : "Check on baby", systemImage: "waveform")
+            Label(inactive ? "Alert no longer active" : alert?.isTest == true ? "Test alert" : alert?.isDisconnected == true ? "Listener connection lost" : alert?.isMonitoringFailure == true ? "Nursery monitoring stopped" : "Check on baby", systemImage: "waveform")
                 .font(.headline).foregroundStyle(.orange)
-            Text(text).font(.footnote)
+            Text(inactive ? "Open the app for the latest nursery status." : text).font(.footnote)
             if let alert { Text(alert.createdAt, style: .time).font(.caption).foregroundStyle(.secondary) }
-        }.padding(.vertical, 8).onAppear {
+        }.padding(.vertical, 8)
+        .task(id: alert?.eventId) {
+            if alert != nil { model.refresh() }
+        }
+        .onAppear {
             if let alert {
                 let observedAt = Date(), callbackID = UUID()
                 let trace = WatchAlertTrace(alert: alert, phase: .viewAppeared, deliveredAt: deliveredAt, observedAt: observedAt, callbackID: callbackID)

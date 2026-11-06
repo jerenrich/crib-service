@@ -7,6 +7,87 @@ import XCTest
 #endif
 
 final class WatchAlertStateTests: XCTestCase {
+    private func notificationFixture() -> (WatchCryAlert, Date, WatchSnapshot) {
+        let created = Date(timeIntervalSince1970: 1000)
+        let alert = WatchCryAlert(eventId: UUID(), episodeId: UUID(), startedAt: created,
+                                  createdAt: created, duration: 5, isTest: false)
+        let delivered = created.addingTimeInterval(1)
+        let checked = created.addingTimeInterval(5)
+        let snapshot = WatchSnapshot(updatedAt: checked, parentMode: true, paired: true, statusAvailable: true,
+                                     notificationRelevance: NotificationRelevance(), notificationsCheckedAt: checked)
+        return (alert, delivered, snapshot)
+    }
+
+    func testNotificationPresentationUpdatesOnlyFromAuthoritativeRelevance() {
+        let (alert, delivered, resolved) = notificationFixture()
+        var active = resolved
+        active.notificationRelevance?.cryEpisodeIDs = [alert.episodeId]
+        XCTAssertFalse(active.notificationIsInactive(alert, deliveredAt: delivered))
+        XCTAssertTrue(resolved.notificationIsInactive(alert, deliveredAt: delivered))
+        var unavailable = resolved; unavailable.statusAvailable = false
+        XCTAssertFalse(unavailable.notificationIsInactive(alert, deliveredAt: delivered))
+        var legacy = resolved; legacy.notificationRelevance = nil
+        XCTAssertFalse(legacy.notificationIsInactive(alert, deliveredAt: delivered))
+        var unchecked = resolved; unchecked.notificationsCheckedAt = nil
+        XCTAssertFalse(unchecked.notificationIsInactive(alert, deliveredAt: delivered))
+        var unpaired = resolved; unpaired.paired = false
+        XCTAssertFalse(unpaired.notificationIsInactive(alert, deliveredAt: delivered))
+        var wrongRole = resolved; wrongRole.parentMode = false
+        XCTAssertFalse(wrongRole.notificationIsInactive(alert, deliveredAt: delivered))
+    }
+
+    func testStatusFetchCannotRetireAPushThatArrivesDuringTheFetch() {
+        let (alert, delivered, snapshot) = notificationFixture()
+        var beforeArrival = snapshot
+        beforeArrival.notificationsCheckedAt = delivered.addingTimeInterval(-0.1)
+        XCTAssertFalse(beforeArrival.notificationIsInactive(alert, deliveredAt: delivered))
+        let newer = WatchCryAlert(eventId: UUID(), episodeId: UUID(), startedAt: delivered,
+                                  createdAt: snapshot.updatedAt.addingTimeInterval(1), duration: 5, isTest: false)
+        XCTAssertFalse(snapshot.notificationIsInactive(newer, deliveredAt: delivered))
+        XCTAssertFalse(snapshot.notificationIsInactive(alert, deliveredAt: nil))
+        XCTAssertFalse(snapshot.notificationIsInactive(alert, deliveredAt: Date(timeIntervalSince1970: .nan)))
+    }
+
+    func testTestAlertsAreMatchedByEventAndRealRemindersByEpisode() {
+        let (real, delivered, snapshot) = notificationFixture()
+        let test = WatchCryAlert(eventId: UUID(), episodeId: real.episodeId, startedAt: real.startedAt,
+                                 createdAt: real.createdAt, duration: 5, isTest: true)
+        var relevant = snapshot
+        relevant.notificationRelevance = NotificationRelevance(cryEpisodeIDs: [real.episodeId], testEventIDs: [test.eventId])
+        XCTAssertFalse(relevant.notificationIsInactive(real, deliveredAt: delivered))
+        XCTAssertFalse(relevant.notificationIsInactive(test, deliveredAt: delivered))
+        relevant.notificationRelevance?.testEventIDs = []
+        XCTAssertTrue(relevant.notificationIsInactive(test, deliveredAt: delivered))
+        XCTAssertFalse(relevant.notificationIsInactive(real, deliveredAt: delivered))
+    }
+
+    @MainActor func testResolvedNotificationCannotResurrectAnAlertOrSnoozeANewerEpisode() throws {
+        let fixture = try Fixture(); fixture.activated = true
+        let state = fixture.makeState()
+        let (old, delivered, resolved) = notificationFixture()
+        let current = fixture.alert()
+        state.receive(current)
+        state.receive(old, snapshot: resolved, deliveredAt: delivered)
+        XCTAssertEqual(state.alert, current)
+        XCTAssertFalse(state.handleNotification(old, acknowledging: false, snapshot: resolved, deliveredAt: delivered))
+        XCTAssertFalse(state.handleNotification(old, acknowledging: true, snapshot: resolved, deliveredAt: delivered))
+        XCTAssertEqual(state.alert, current)
+        XCTAssertFalse(state.acknowledgementPending)
+        XCTAssertTrue(fixture.commands.isEmpty)
+        XCTAssertNil(fixture.defaults.object(forKey: "localCryAlertsMutedUntil"))
+    }
+
+    @MainActor func testOfflineUnknownNotificationStillAllowsAnAcknowledgement() throws {
+        let fixture = try Fixture(); fixture.activated = true
+        let state = fixture.makeState()
+        let (alert, delivered, resolved) = notificationFixture()
+        var unknown = resolved; unknown.statusAvailable = false
+        state.receive(alert, snapshot: unknown, deliveredAt: delivered)
+        XCTAssertEqual(state.alert, alert)
+        XCTAssertTrue(state.handleNotification(alert, acknowledging: true, snapshot: unknown, deliveredAt: delivered))
+        XCTAssertEqual(fixture.commands.last?.eventId, alert.eventId)
+    }
+
     @MainActor func testDurableAcknowledgementsKeepRealAndTestClassification() throws {
         let fixture = try Fixture()
         var state = fixture.makeState()

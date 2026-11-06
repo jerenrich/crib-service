@@ -1,5 +1,17 @@
 # Logging and diagnostics review
 
+## Watch inactive notification presentation — 6 November 2026
+
+Opening a custom Watch notification requests fresh Parent status. The visible
+view observes status updates and replaces a known-inactive alert with “Alert no
+longer active” and Close, removing Snooze. A complete relevance snapshot must
+postdate both alert creation and notification delivery before it can mark that
+alert inactive. Unavailable status, missing timestamps and notifications arriving
+during a status fetch remain actionable. Test relevance uses event IDs; real
+alerts use episode IDs. A known-inactive notification cannot resurrect the app
+alert or enqueue a Snooze that mutes a newer episode. Initial OS presentation
+still completes before status checks; no inference or delivery thresholds change.
+
 ## Four-second cry analysis — 6 November 2026
 
 The classifier now analyzes four seconds per score with 75% overlap, retaining

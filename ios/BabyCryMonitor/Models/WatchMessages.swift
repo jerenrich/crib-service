@@ -36,6 +36,19 @@ struct WatchSnapshot: Codable, Equatable, Sendable {
     var connectionWarningDeadline: Date?
     var diagnosticClock: DiagnosticClockSample?
 
+    /// A status fetched before a push arrived cannot retire that push. A missing
+    /// or failed status check supplies no evidence that an alert has resolved.
+    func notificationIsInactive(_ alert: WatchCryAlert, deliveredAt: Date?) -> Bool {
+        guard parentMode, paired, statusAvailable,
+              let relevance = notificationRelevance, let checkedAt = notificationsCheckedAt,
+              checkedAt.timeIntervalSinceReferenceDate.isFinite,
+              alert.createdAt.timeIntervalSinceReferenceDate.isFinite,
+              checkedAt >= alert.createdAt,
+              let deliveredAt, deliveredAt.timeIntervalSinceReferenceDate.isFinite,
+              deliveredAt <= checkedAt else { return false }
+        return !relevance.contains(eventID: alert.eventId, episodeID: alert.episodeId, isTest: alert.isTest)
+    }
+
     var localConnectionDeadline: Date? {
         guard connectionWarningSupported == true, localConnectionWarningEnabled == true, parentMode, paired else { return nil }
         return connectionWarningDeadline

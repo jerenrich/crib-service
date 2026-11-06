@@ -177,18 +177,21 @@ import UserNotifications
         @unknown default: .unknown
         }
     }
-    func receive(_ value: WatchCryAlert) {
-        alertState.receive(value)
+    func receive(_ value: WatchCryAlert, deliveredAt: Date? = nil) {
+        alertState.receive(value, snapshot: snapshot, deliveredAt: deliveredAt)
     }
     func clearReceivedNotifications(deliveredBefore: Date) async {
         await NotificationCleanup.clearReceivedCryingAlerts(deliveredBefore: deliveredBefore,
             beforeRemoving: { [weak self] in self?.recordDeliveredNotifications($0) }, log: log)
     }
-    func handleNotification(_ value: WatchCryAlert, acknowledging: Bool) {
-        alertState.handleNotification(value, acknowledging: acknowledging)
+    @discardableResult func handleNotification(_ value: WatchCryAlert, acknowledging: Bool,
+                                              deliveredAt: Date? = nil) -> Bool {
+        guard alertState.handleNotification(value, acknowledging: acknowledging,
+                                           snapshot: snapshot, deliveredAt: deliveredAt) else { return false }
         if acknowledging {
             Task { [weak self] in await NotificationCleanup.dismissCryingAlerts(testEventID: value.isTest ? value.eventId : nil, beforeRemoving: { self?.recordDeliveredNotifications($0) }, log: self?.log) }
         }
+        return true
     }
     func resumeAlerts() {
         guard let until = snapshot.alertsMutedUntil, until > Date() else { return }
