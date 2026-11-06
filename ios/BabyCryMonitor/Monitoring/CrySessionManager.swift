@@ -59,12 +59,15 @@ public struct CrySessionManager: Sendable {
     }
     @discardableResult public mutating func consume(_ sample: AudioLevelSample, listenerId: UUID) -> [CryAlert] {
         if let last = snapshot.lastObservedAt, sample.timestamp <= last { return [] }
-        guard sample.dbFS.isFinite, sample.timestamp.timeIntervalSinceReferenceDate.isFinite else { return [] }
+        guard detector.accepts(sample) else { return [] }
         confidenceDetector.advance(to: sample.timestamp, configuration: snapshot.configuration)
         // A gap in delivered RMS levels invalidates volume confirmation, not
         // independently observed classifier audio or its shared alert episode.
         expireVolume(at: sample.timestamp)
         _ = detector.consume(sample, configuration: snapshot.configuration)
+        if detector.inputInterrupted, !confidenceDetector.retainsEpisode {
+            end(at: snapshot.lastDetectionAt ?? lastVolumeInputAt ?? sample.timestamp)
+        }
         snapshot.lastObservedAt = sample.timestamp
         lastVolumeInputAt = sample.timestamp
         recordDetection(at: sample.timestamp)
@@ -125,8 +128,7 @@ public struct CrySessionManager: Sendable {
                 snapshot.timelineEvents[index].occurredAt = start
             }
         }
-        let volumeReady = volumeIsLoud && detector.state == .crying
-            && detector.cryStartedAt.map { now.timeIntervalSince($0) >= snapshot.configuration.alertDuration } == true
+        let volumeReady = volumeIsLoud && detector.canAlert(at: now, configuration: snapshot.configuration)
         let classifierReady = confidenceDetector.canAlert(at: now, configuration: snapshot.configuration)
         // Once sustained quiet reaches reset, the episode above has already ended.
         // Defer a due alert during a quiet gap until sound resumes. If the gap

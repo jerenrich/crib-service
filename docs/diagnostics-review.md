@@ -1,5 +1,90 @@
 # Logging and diagnostics review
 
+## PCM timing correction — 6 November 2026
+
+Physical observations exposed a coverage bug in the first time-coverage build:
+250 ms RMS measurements arrived at roughly alternating 200/300 ms timestamps.
+Clipping every timestamp interval to 250 ms discarded about 9.34% of observed
+time in that trial. A borderline 80%-active signal therefore failed with jitter
+although the same signal alerted with regular timestamps.
+
+Native RMS readings now carry their capture ID, sample rate and exact start/end
+PCM frame positions. Confirmation, coverage and settling durations use this
+audio clock. Input-arrival dates remain separate for liveness and wall-clock
+episode dates. The reducer distinguishes multiple completed windows in one
+buffer and discards partial windows across input-frame/format discontinuities.
+Lost delivery windows or a new capture reset only volume qualification; an
+independently healthy classifier keeps its shared episode. A volume episode
+closed by missing capture is an interruption rather than confirmed quiet.
+The AppModel level-clamping step preserves the timing metadata.
+
+A follow-up catch-up regression covers contiguous buffers delivered close
+together: subtracting each buffer tail can otherwise reverse RMS wall dates.
+The reducer now applies the smallest representable Date increment when needed
+to preserve ordering; PCM frames still determine coverage. A backward change
+of the input wall clock keeps the existing out-of-order rejection rather than
+turning old dates into future-dated audio.
+
+`volume_timing=pcm_frames_v1` identifies the corrected build in CSV run-start
+and native level rows. Each level row also includes `audio_capture_id`,
+`audio_start_frame`, `audio_end_frame` and `audio_sample_rate` in `detail`.
+CSV columns and persisted/network settings are unchanged. Old exports and
+synthetic samples without frame metadata retain conservative timestamp-based
+compatibility; they cannot reconstruct captured duration lost to callback jitter.
+No score, coverage, volume, delay or reset threshold is changed by this fix.
+
+## Time coverage alert policy — 6 November 2026
+
+The source now applies one alert qualification rule independently to volume and
+cry-classifier evidence. For a configured observation window of `T` seconds:
+
+- Observe a full `T` seconds after the source's candidate onset; startup never
+  alerts early merely because 80% of `T` has already been positive.
+- Require positive evidence for at least `0.80 * T` seconds in the trailing `T`
+  seconds, and at least four positive seconds in the latest five seconds.
+- Require the latest source observation to be positive and fresh. Volume uses
+  the chosen dBFS threshold; classifier results use a score of at least `0.80`.
+- Keep the two sources' evidence separate. Their partial coverage cannot add up
+  to an alert. Continue sharing one episode, durable initial alert and reminders.
+
+Time is weighted by observed audio duration, not the number of callbacks. Native
+RMS coverage uses the PCM frames described above; missing frames cannot donate
+positive time. The first classifier result labels
+its two-second audio window; each subsequent result labels only the new suffix
+after the preceding endpoint. A high overlapping result cannot overwrite an
+earlier low observation. These are model-evidence timelines, not claims to know
+the sound present in every instant of a model window. Missing observations are
+not positive; the existing capture identity, stale-input rejection, classifier
+gap resets and RMS watchdog remain in force.
+
+The quiet-reset duration remains an episode-grouping grace period. A positive
+reading renews an established episode's activity only if the recent evidence
+also meets the 80% rule. Thus isolated spikes cannot indefinitely restart its
+settling countdown. Brief low readings use the allowed time tolerance instead
+of clearing classifier progress. A long quiet gap requires recent sustained
+activity before alerting again, even when the full trailing window still meets
+80%. Volume threshold changes discard evidence evaluated at the old threshold.
+
+Settings and Monitor describe an observation window rather than promising an
+alert at a particular elapsed episode time. CSV run-start and alert records mark
+`alert_policy=time_coverage_v1`, `required_fraction=0.80` and `recent_window_s=5`;
+the CSV column layout and persisted/network configuration schema are unchanged.
+The previous sections describe earlier policies and historical observations.
+
+This policy addresses reproduced timing failures. Its recognition sensitivity
+and false-alert rate still require caregiver-labelled nursery observations;
+80% is a candidate operating point, not a measured accuracy claim. Source edits
+do not update an installed app or deploy the backend.
+
+Validation passed 283 shared Swift tests, all 524 iPhone unit/integration tests
+on the audit simulator, and the final unsigned combined iPhone, Watch and
+notification-extension build. Regression coverage includes sparse spikes before
+and after an initial alert, exact 80% boundaries, occasional classifier dips,
+recent-activity and latest-positive checks, missing observations, threshold
+changes, overlapping evidence, and the maximum supported one-hour window.
+Receipts are in `/tmp/cry-alert-review/`; no physical installation or backend
+deployment was performed.
+
 ## Parallel volume and Apple cry alerts — 5 November 2026
 
 The nursery now runs both alert triggers independently. The existing volume detector retains its sound threshold, confirmation and quiet-gap behavior. Apple's on-device `baby_crying` confidence can also trigger at **80% or higher continuously for the configured alert duration**, using consecutive overlapping two-second audio windows rather than summing their durations. A five-second timer therefore needs five seconds of covered high-confidence audio, not an extra five seconds after a separate classifier confirmation.

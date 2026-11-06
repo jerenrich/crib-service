@@ -141,10 +141,168 @@ final class CrySessionTests: XCTestCase {
         var s = Simulation(); s.run(300); s.run(30, loud: false)
         XCTAssertTrue(s.emitted.isEmpty); XCTAssertEqual(s.engine.snapshot.history.count, 1)
     }
-    func testQuietGapCrossesThresholdAndAlertsOnResumption() {
+    func testQuietGapCrossesThresholdButResumptionNeedsRecentSustainedActivity() {
         var s = Simulation(); s.run(300); s.run(10, loud: false)
         XCTAssertTrue(s.emitted.isEmpty); s.run(1)
+        XCTAssertTrue(s.emitted.isEmpty, "A short resumption cannot cash in an old timer")
+        s.run(3)
         XCTAssertEqual(s.emitted.count, 1); XCTAssertGreaterThan(s.emitted[0].durationSeconds, 300)
+    }
+
+    func testSparseSpikesCannotPreserveVolumeTimerOrEpisode() throws {
+        var s = Simulation(); var config = MonitoringConfiguration(); config.alertDuration = 60
+        s.engine.configure(config); s.run(6)
+        let id = try XCTUnwrap(s.engine.snapshot.current?.id)
+        for _ in 0..<6 { s.run(14.75, loud: false); s.run(0.25) }
+        XCTAssertTrue(s.emitted.isEmpty)
+        XCTAssertNil(s.engine.snapshot.current)
+        XCTAssertEqual(s.engine.snapshot.history.first?.id, id)
+        s.run(2, loud: false)
+        s.run(60)
+        XCTAssertTrue(s.emitted.isEmpty, "A new sustained sound must wait a complete window")
+        s.run(0.25)
+        XCTAssertEqual(s.emitted.count, 1)
+    }
+
+    func testSparseSpikesCannotKeepAnAlreadyAlertedVolumeEpisodeOpen() {
+        var s = Simulation(); var config = MonitoringConfiguration(); config.alertDuration = 5
+        s.engine.configure(config); s.run(6)
+        XCTAssertEqual(s.emitted.count, 1)
+        for _ in 0..<4 { s.run(14.75, loud: false); s.run(0.25) }
+        XCTAssertNil(s.engine.snapshot.current)
+        XCTAssertEqual(s.engine.snapshot.history.count, 1)
+        s.run(6)
+        XCTAssertEqual(s.emitted.count, 2, "The old episode cannot swallow a new sustained cry")
+    }
+
+    func testVolumeRequiresEightyPercentOfCompleteWindow() {
+        for quietFrames in [4, 5] {
+            var s = Simulation(); var config = MonitoringConfiguration(); config.alertDuration = 5
+            s.engine.configure(config)
+            s.run(2)
+            s.run(Double(quietFrames) / 4, loud: false)
+            s.run(Double(21 - 8 - quietFrames) / 4)
+            XCTAssertEqual(s.emitted.count, quietFrames == 4 ? 1 : 0,
+                           "Exactly 80% qualifies; 75% does not")
+        }
+    }
+
+    func testMissingRMSReadingsDoNotDonatePositiveTime() {
+        var s = Simulation(); var config = MonitoringConfiguration(); config.alertDuration = 5
+        s.engine.configure(config); s.run(3)
+        s.time = s.time.addingTimeInterval(1.25)
+        s.run(1.5)
+        XCTAssertTrue(s.emitted.isEmpty, "A sub-watchdog gap still cannot count as loud audio")
+        s.run(5)
+        XCTAssertEqual(s.emitted.count, 1)
+    }
+
+    func testPCMFrameCoverageMakesEightyPercentIndependentOfCallbackJitter() {
+        for jitter in [false, true] {
+            for positivePerFive in [3, 4] {
+                var engine = CrySessionManager(), config = MonitoringConfiguration()
+                config.alertDuration = 30; engine.configure(config)
+                let origin = Date(timeIntervalSince1970: 1000), capture = UUID(), listener = UUID()
+                var elapsed = 0.0, alerts: [CryAlert] = []
+                for index in 1...121 {
+                    elapsed += jitter ? (index % 2 == 1 ? 0.2 : 0.3) : 0.25
+                    let window = AudioLevelSample.Window(captureID: capture, startFrame: Int64(index - 1) * 12000,
+                                                         endFrame: Int64(index) * 12000, sampleRate: 48000)
+                    alerts += engine.consume(.init(timestamp: origin.addingTimeInterval(elapsed),
+                        dbFS: index % 5 < positivePerFive ? -20 : -70, window: window), listenerId: listener)
+                }
+                XCTAssertEqual(alerts.count, positivePerFive == 4 ? 1 : 0, "jitter=\(jitter); positive=\(positivePerFive)/5")
+            }
+        }
+    }
+
+    func testDroppedPCMWindowRestartsQualificationEvenWithTimelyDelivery() {
+        var engine = CrySessionManager()
+        let capture = UUID(), listener = UUID(), origin = Date(timeIntervalSince1970: 1000)
+        var alerts: [CryAlert] = []
+        for index in 1...37 {
+            // One unobserved 250 ms window after four seconds of sound.
+            let frameIndex = index <= 16 ? index : index + 1
+            let window = AudioLevelSample.Window(captureID: capture, startFrame: Int64(frameIndex - 1) * 12000,
+                                                 endFrame: Int64(frameIndex) * 12000, sampleRate: 48000)
+            alerts += engine.consume(.init(timestamp: origin.addingTimeInterval(Double(index) / 4), dbFS: -20, window: window), listenerId: listener)
+            if index < 37 { XCTAssertTrue(alerts.isEmpty) }
+        }
+        XCTAssertEqual(alerts.count, 1)
+    }
+
+    func testCaptureReplacementClosesOldVolumeEpisodeAsAnInterruption() throws {
+        var engine = CrySessionManager(), config = MonitoringConfiguration()
+        config.alertDuration = 30; engine.configure(config)
+        let listener = UUID(), capture = UUID(), replacement = UUID(), origin = Date(timeIntervalSince1970: 1000)
+        for index in 1...24 {
+            _ = engine.consume(.init(timestamp: origin.addingTimeInterval(Double(index) / 4), dbFS: -20,
+                window: .init(captureID: capture, startFrame: Int64(index - 1) * 12000, endFrame: Int64(index) * 12000, sampleRate: 48000)), listenerId: listener)
+        }
+        let previous = try XCTUnwrap(engine.snapshot.current?.id)
+        _ = engine.consume(.init(timestamp: origin.addingTimeInterval(6.25), dbFS: -20,
+            window: .init(captureID: replacement, startFrame: 0, endFrame: 12000, sampleRate: 48000)), listenerId: listener)
+        XCTAssertNil(engine.snapshot.current)
+        XCTAssertEqual(engine.snapshot.history.first?.id, previous)
+        XCTAssertEqual(engine.snapshot.history.first?.quietConfirmed, false)
+        XCTAssertTrue(engine.snapshot.pending.isEmpty)
+    }
+
+    func testDuplicateAndInvalidPCMWindowsCannotAdvanceOrRefreshEvidence() {
+        var engine = CrySessionManager()
+        let origin = Date(timeIntervalSince1970: 1000), listener = UUID(), capture = UUID()
+        let first = AudioLevelSample.Window(captureID: capture, startFrame: 0, endFrame: 12000, sampleRate: 48000)
+        _ = engine.consume(.init(timestamp: origin, dbFS: -20, window: first), listenerId: listener)
+        for index in 1...30 {
+            _ = engine.consume(.init(timestamp: origin.addingTimeInterval(Double(index)), dbFS: -20, window: first), listenerId: listener)
+        }
+        for rate in [Double.nan, .infinity, 0, 1e30] {
+            _ = engine.consume(.init(timestamp: origin.addingTimeInterval(50), dbFS: -20,
+                window: .init(captureID: capture, startFrame: 0, endFrame: 12000, sampleRate: rate)), listenerId: listener)
+        }
+        XCTAssertEqual(engine.snapshot.lastObservedAt, origin)
+        XCTAssertTrue(engine.snapshot.pending.isEmpty)
+    }
+
+    func testChangingVolumeThresholdDiscardsOldThresholdEvidence() {
+        var s = Simulation(); var config = MonitoringConfiguration(); config.alertDuration = 30
+        s.engine.configure(config); s.run(29)
+        config.absoluteThreshold = -10; s.engine.configure(config)
+        s.run(2, level: -5)
+        XCTAssertTrue(s.emitted.isEmpty)
+        s.run(28, level: -5)
+        XCTAssertEqual(s.emitted.count, 1)
+    }
+
+    func testEvidenceUsesTimeRatherThanObservationCountAndNeverFillsHoles() {
+        let start = Date(timeIntervalSince1970: 1000)
+        func date(_ t: Double) -> Date { start.addingTimeInterval(t) }
+        var evidence = SoundEvidenceWindow()
+        evidence.append(from: date(0), to: date(1.25), positive: false)
+        // Many short positive updates still represent only 75% of five seconds.
+        for frame in 6...20 {
+            evidence.append(from: date(Double(frame - 1) / 4), to: date(Double(frame) / 4), positive: true)
+        }
+        XCTAssertFalse(evidence.qualifies(at: date(5), duration: 5, onset: start))
+        evidence.append(from: date(5), to: date(5.25), positive: true)
+        XCTAssertTrue(evidence.qualifies(at: date(5.25), duration: 5, onset: start))
+        evidence = SoundEvidenceWindow()
+        evidence.append(from: date(0), to: date(2), positive: true)
+        evidence.append(from: date(3.25), to: date(5), positive: true)
+        XCTAssertFalse(evidence.qualifies(at: date(5), duration: 5, onset: start), "Unobserved time is not positive")
+        evidence.append(from: date(4), to: date(5), positive: true)
+        XCTAssertFalse(evidence.qualifies(at: date(5), duration: 5, onset: start), "Duplicate overlapping time cannot fill a hole")
+    }
+
+    func testLongestSupportedWaitStillRequiresAFullFreshWindow() {
+        let start = Date(timeIntervalSince1970: 1000)
+        var evidence = SoundEvidenceWindow()
+        evidence.append(from: start, to: start.addingTimeInterval(3599), positive: true)
+        XCTAssertFalse(evidence.qualifies(at: start.addingTimeInterval(3599), duration: 3600, onset: start))
+        evidence.append(from: start.addingTimeInterval(3599), to: start.addingTimeInterval(10_000), positive: true)
+        XCTAssertTrue(evidence.qualifies(at: start.addingTimeInterval(10_000), duration: 3600, onset: start))
+        evidence.append(from: start.addingTimeInterval(10_000), to: start.addingTimeInterval(13_601), positive: false)
+        XCTAssertFalse(evidence.qualifies(at: start.addingTimeInterval(13_601), duration: 3600, onset: start))
     }
     func testLongPauseEndsEpisode() {
         var s = Simulation(); s.run(120); let id = s.engine.snapshot.current?.id

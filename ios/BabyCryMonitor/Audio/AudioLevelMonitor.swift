@@ -630,7 +630,7 @@ final class AudioCaptureTap {
         self.classifier = classifier
         let voiceProcessing = input.isVoiceProcessingEnabled
         input.installTap(onBus: 0, bufferSize: 1024, format: nil) { buffer, time in
-            reducer.consume(buffer)
+            reducer.consume(buffer, at: time)
             classifier?.consume(buffer, at: time, voiceProcessing: voiceProcessing)
         }
         node = input
@@ -671,18 +671,32 @@ final class RMSReducer: @unchecked Sendable {
     private let continuation: AsyncStream<AudioLevelSample>.Continuation
     private var sum = 0.0
     private var count = 0
+    private var captureID = UUID()
+    private var receivedFrames: Int64 = 0
+    private var expectedInputFrame: AVAudioFramePosition?
+    private var lastInputAt: Date?
+    private var lastEmittedAt: Date?
     init(continuation: AsyncStream<AudioLevelSample>.Continuation) { self.continuation = continuation }
-    func consume(_ buffer: AVAudioPCMBuffer) {
+    func consume(_ buffer: AVAudioPCMBuffer, at time: AVAudioTime? = nil, capturedAt: Date = Date()) {
         let format = buffer.format
         guard format.sampleRate.isFinite, format.sampleRate > 0, format.channelCount > 0,
               format.commonFormat == .pcmFormatFloat32, let channels = buffer.floatChannelData else { return }
         lock.lock(); defer { lock.unlock() }
         let numberOfChannels = Int(format.channelCount)
-        if sampleRate != format.sampleRate || channelCount != numberOfChannels {
+        let inputFrame = time.flatMap { $0.isSampleTimeValid ? $0.sampleTime : nil }
+        let discontinuity = inputFrame.flatMap { frame in expectedInputFrame.map { frame != $0 } } ?? false
+        let unclockedGap = inputFrame == nil && lastInputAt.map { capturedAt.timeIntervalSince($0) > 2 } == true
+        // Do not turn a real backward wall-clock change into future-dated audio.
+        // The consumer retains its existing rejection of out-of-order dates.
+        if let lastInputAt, capturedAt < lastInputAt { lastEmittedAt = nil }
+        if sampleRate != format.sampleRate || channelCount != numberOfChannels || discontinuity || unclockedGap {
             sampleRate = format.sampleRate; channelCount = numberOfChannels
             windowFrames = max(1, Int(sampleRate * 0.25))
             sum = 0; count = 0
+            captureID = UUID(); receivedFrames = 0
         }
+        expectedInputFrame = inputFrame.map { $0 + AVAudioFramePosition(buffer.frameLength) }
+        lastInputAt = capturedAt
         for index in 0..<Int(buffer.frameLength) {
             var energy = 0.0
             for channel in 0..<numberOfChannels {
@@ -692,9 +706,25 @@ final class RMSReducer: @unchecked Sendable {
             sum += energy / Double(numberOfChannels); count += 1
             if count >= windowFrames {
                 let rms = sqrt(sum / Double(count))
-                continuation.yield(AudioLevelSample(timestamp: Date(), dbFS: min(0, max(-100, 20 * log10(max(rms, 0.00001))))))
+                let endFrame = receivedFrames + Int64(index) + 1
+                let window = AudioLevelSample.Window(captureID: captureID, startFrame: endFrame - Int64(windowFrames),
+                                                     endFrame: endFrame, sampleRate: sampleRate)
+                // Input-buffer arrival maps freshness to wall time; the covered
+                // sample frames provide duration, including multiple windows
+                // completed in one callback. Never infer coverage from arrival.
+                let estimatedEndAt = capturedAt.addingTimeInterval(-Double(Int(buffer.frameLength) - index - 1) / sampleRate)
+                // Tail projections can reverse during catch-up callbacks. Keep
+                // ordering with the smallest representable Date increment, not
+                // a synthetic audio-duration step; PCM frames still own timing.
+                let next = lastEmittedAt.map { Date(timeIntervalSinceReferenceDate: $0.timeIntervalSinceReferenceDate.nextUp) }
+                let endAt = max(estimatedEndAt, next ?? estimatedEndAt)
+                lastEmittedAt = endAt
+                let rmsDB = 20 * log10(max(rms, 0.00001))
+                let dbFS = min(0, max(-100, rmsDB))
+                continuation.yield(AudioLevelSample(timestamp: endAt, dbFS: dbFS, window: window))
                 count = 0; sum = 0
             }
         }
+        receivedFrames += Int64(buffer.frameLength)
     }
 }

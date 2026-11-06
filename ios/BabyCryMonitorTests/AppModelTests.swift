@@ -20,6 +20,27 @@ actor RequestGate {
 }
 
 final class AppModelTests: XCTestCase {
+    @MainActor func testLevelClampingPreservesPCMTimeThroughTheRealModelPipeline() async throws {
+        var snapshot = SessionSnapshot(); snapshot.configuration.alertDuration = 30
+        let fixture = try Fixture(snapshotData: JSONEncoder().encode(snapshot))
+        await fixture.model.start()
+        defer { fixture.model.stop() }
+        let start = fixture.time.now, capture = UUID()
+        var elapsed = 0.0
+        for index in 1...121 {
+            elapsed += index % 2 == 1 ? 0.2 : 0.3
+            fixture.time.now = start.addingTimeInterval(elapsed)
+            fixture.audio.emit(.init(timestamp: fixture.time.now, dbFS: index % 5 < 4 ? 3 : -70,
+                window: .init(captureID: capture, startFrame: Int64(index - 1) * 12000,
+                              endFrame: Int64(index) * 12000, sampleRate: 48000)))
+            let consumed = await eventually { fixture.model.chartSampledAt == fixture.time.now }
+            XCTAssertTrue(consumed)
+        }
+        XCTAssertNotNil(fixture.model.snapshot.current?.alertQueuedAt)
+        let delivered = await eventually { await fixture.backend.sent.count == 1 }
+        XCTAssertTrue(delivered)
+    }
+
     @MainActor func testRelaunchCoverageUsesTheLatestPersistedClassifierInput() throws {
         var saved = SessionSnapshot()
         let now = Date()
@@ -3431,6 +3452,122 @@ final class AppModelTests: XCTestCase {
     }
 }
 final class AudioGraphIntegrationTests: XCTestCase {
+    func testCatchUpCallbacksKeepEveryPCMWindowOrderedThroughAlertQualification() async throws {
+        let pair = AsyncStream<AudioLevelSample>.makeStream(), origin = Date(timeIntervalSince1970: 1000)
+        let reducer = RMSReducer(continuation: pair.continuation)
+        let pcm = try buffer(rate: 48000, frames: 1024, amplitude: 0.1)
+        var lastArrival = origin
+        for index in 1...247 {
+            let elapsed = index <= 12 ? 0.5 - Double(12 - index) * 1024 / 48000
+                : 0.5 + Double(index - 12) / 12000
+            lastArrival = origin.addingTimeInterval(elapsed)
+            reducer.consume(pcm, at: .init(sampleTime: Int64(index - 1) * 1024, atRate: 48000), capturedAt: lastArrival)
+        }
+        pair.continuation.finish()
+        var samples: [AudioLevelSample] = []
+        for await sample in pair.stream { samples.append(sample) }
+        XCTAssertEqual(samples.count, 21)
+        XCTAssertEqual(samples[0].timestamp.timeIntervalSince(origin), 0.494, accuracy: 1e-6)
+        XCTAssertGreaterThan(samples[1].timestamp, samples[0].timestamp,
+                             "Callbacks 12 and 24 previously projected 0.494 and 0.489 seconds")
+        XCTAssertEqual(Set(samples.compactMap { $0.window?.captureID }).count, 1)
+        var engine = CrySessionManager(), alerts: [CryAlert] = []
+        let listener = UUID()
+        for (index, sample) in samples.enumerated() {
+            if index > 0 { XCTAssertGreaterThan(sample.timestamp, samples[index - 1].timestamp) }
+            XCTAssertLessThanOrEqual(sample.timestamp, lastArrival)
+            alerts += engine.consume(sample, listenerId: listener)
+            XCTAssertEqual(engine.snapshot.lastObservedAt, sample.timestamp, "No valid window may be dropped")
+            XCTAssertFalse(engine.detector.inputInterrupted)
+            if index < 20 { XCTAssertTrue(alerts.isEmpty, "Catch-up must not shorten the PCM observation window") }
+        }
+        XCTAssertEqual(alerts.count, 1)
+    }
+
+    func testIdenticalArrivalDatesUseOnlyMinimalOrderingAdjustments() async throws {
+        let pair = AsyncStream<AudioLevelSample>.makeStream(), arrival = Date(timeIntervalSince1970: 1000)
+        let reducer = RMSReducer(continuation: pair.continuation)
+        let pcm = try buffer(rate: 48000, frames: 48000, amplitude: 0.1)
+        reducer.consume(pcm, at: .init(sampleTime: 0, atRate: 48000), capturedAt: arrival)
+        reducer.consume(pcm, at: .init(sampleTime: 48000, atRate: 48000), capturedAt: arrival)
+        pair.continuation.finish()
+        var samples: [AudioLevelSample] = []
+        for await sample in pair.stream { samples.append(sample) }
+        XCTAssertEqual(samples.count, 8)
+        for index in 1..<samples.count { XCTAssertGreaterThan(samples[index].timestamp, samples[index - 1].timestamp) }
+        XCTAssertLessThan(samples.last!.timestamp.timeIntervalSince(arrival), 1e-6,
+                          "Do not project queued windows a quarter-second into the future")
+        XCTAssertEqual(samples.last?.window?.endFrame, 96000)
+    }
+
+    func testBackwardWallClockChangeIsNotClampedIntoFutureDatedAudio() async throws {
+        let pair = AsyncStream<AudioLevelSample>.makeStream(), arrival = Date(timeIntervalSince1970: 1000)
+        let reducer = RMSReducer(continuation: pair.continuation)
+        let pcm = try buffer(rate: 48000, frames: 12000, amplitude: 0.1)
+        reducer.consume(pcm, at: .init(sampleTime: 0, atRate: 48000), capturedAt: arrival)
+        reducer.consume(pcm, at: .init(sampleTime: 12000, atRate: 48000), capturedAt: arrival.addingTimeInterval(-60))
+        pair.continuation.finish()
+        var samples: [AudioLevelSample] = []
+        for await sample in pair.stream { samples.append(sample) }
+        XCTAssertEqual(samples.count, 2)
+        XCTAssertEqual(samples[1].timestamp, arrival.addingTimeInterval(-60))
+        var engine = CrySessionManager(); let listener = UUID()
+        _ = engine.consume(samples[0], listenerId: listener)
+        _ = engine.consume(samples[1], listenerId: listener)
+        XCTAssertEqual(engine.snapshot.lastObservedAt, arrival)
+    }
+
+    func testPCMReducerAndDetectorPreserveEightyPercentAcrossJitteredCallbacks() async throws {
+        let pair = AsyncStream<AudioLevelSample>.makeStream(), origin = Date(timeIntervalSince1970: 1000)
+        let reducer = RMSReducer(continuation: pair.continuation)
+        var elapsed = 0.0
+        for index in 1...121 {
+            elapsed += index % 2 == 1 ? 0.2 : 0.3
+            reducer.consume(try buffer(rate: 48000, frames: 12000, amplitude: index % 5 < 4 ? 0.1 : 0.00001),
+                at: .init(sampleTime: Int64(index - 1) * 12000, atRate: 48000), capturedAt: origin.addingTimeInterval(elapsed))
+        }
+        pair.continuation.finish()
+        var engine = CrySessionManager(), config = MonitoringConfiguration(), alerts: [CryAlert] = []
+        config.alertDuration = 30; engine.configure(config)
+        let listener = UUID()
+        for await sample in pair.stream {
+            XCTAssertNotNil(sample.window)
+            alerts += engine.consume(sample, listenerId: listener)
+        }
+        XCTAssertEqual(alerts.count, 1)
+    }
+
+    func testPCMReducerTimestampsAndFramesEachWindowInABatchedBuffer() async throws {
+        let pair = AsyncStream<AudioLevelSample>.makeStream(), origin = Date(timeIntervalSince1970: 1000)
+        let reducer = RMSReducer(continuation: pair.continuation)
+        reducer.consume(try buffer(rate: 48000, frames: 48000, amplitude: 0.1),
+                        at: .init(sampleTime: 0, atRate: 48000), capturedAt: origin.addingTimeInterval(1))
+        pair.continuation.finish()
+        var samples: [AudioLevelSample] = []
+        for await sample in pair.stream { samples.append(sample) }
+        XCTAssertEqual(samples.count, 4)
+        XCTAssertEqual(Set(samples.compactMap { $0.window?.captureID }).count, 1)
+        for (index, sample) in samples.enumerated() {
+            XCTAssertEqual(sample.window?.startFrame, Int64(index) * 12000)
+            XCTAssertEqual(sample.window?.endFrame, Int64(index + 1) * 12000)
+            XCTAssertEqual(sample.timestamp.timeIntervalSince(origin), Double(index + 1) / 4, accuracy: 1e-6)
+        }
+    }
+
+    func testPCMReducerDoesNotJoinPartialWindowsAcrossAnInputFrameGap() async throws {
+        let pair = AsyncStream<AudioLevelSample>.makeStream(), reducer = RMSReducer(continuation: pair.continuation)
+        reducer.consume(try buffer(rate: 48000, frames: 6000, amplitude: 1), at: .init(sampleTime: 0, atRate: 48000))
+        reducer.consume(try buffer(rate: 48000, frames: 6000, amplitude: 0.1), at: .init(sampleTime: 9000, atRate: 48000))
+        reducer.consume(try buffer(rate: 48000, frames: 6000, amplitude: 0.1), at: .init(sampleTime: 15000, atRate: 48000))
+        pair.continuation.finish()
+        var samples: [AudioLevelSample] = []
+        for await sample in pair.stream { samples.append(sample) }
+        XCTAssertEqual(samples.count, 1)
+        XCTAssertEqual(try XCTUnwrap(samples.first).dbFS, -20, accuracy: 0.01)
+        XCTAssertEqual(samples.first?.window?.startFrame, 0)
+        XCTAssertEqual(samples.first?.window?.endFrame, 12000)
+    }
+
     private func buffer(rate: Double, channels: AVAudioChannelCount = 1, frames: Int,
                         amplitude: Float, interleaved: Bool = false) throws -> AVAudioPCMBuffer {
         let format = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: rate,

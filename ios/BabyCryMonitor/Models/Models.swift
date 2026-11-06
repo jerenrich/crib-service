@@ -33,9 +33,34 @@ public struct MonitoringConfiguration: Codable, Equatable, Sendable {
 public protocol ClockProviding: Sendable { var now: Date { get } }
 public struct SystemClock: ClockProviding { public init() {}; public var now: Date { Date() } }
 public struct AudioLevelSample: Sendable {
+    /// Disjoint PCM coverage, independent of callback scheduling and wall time.
+    /// A new capture ID starts after format changes or input-frame discontinuity.
+    public struct Window: Sendable {
+        public let captureID: UUID
+        public let startFrame: Int64
+        public let endFrame: Int64
+        public let sampleRate: Double
+        public init(captureID: UUID, startFrame: Int64, endFrame: Int64, sampleRate: Double) {
+            self.captureID = captureID; self.startFrame = startFrame
+            self.endFrame = endFrame; self.sampleRate = sampleRate
+        }
+        var isValid: Bool {
+            sampleRate.isFinite && (1...384_000).contains(sampleRate)
+                && startFrame >= 0 && endFrame > startFrame
+                && endFrame - startFrame == max(1, Int64(sampleRate * 0.25))
+        }
+        var start: Date { Date(timeIntervalSince1970: Double(startFrame) / sampleRate) }
+        var end: Date { Date(timeIntervalSince1970: Double(endFrame) / sampleRate) }
+    }
     public let timestamp: Date
     public let dbFS: Double
-    public init(timestamp: Date, dbFS: Double) { self.timestamp = timestamp; self.dbFS = dbFS }
+    public let window: Window?
+    public init(timestamp: Date, dbFS: Double, window: Window? = nil) {
+        self.timestamp = timestamp; self.dbFS = dbFS; self.window = window
+    }
+    var isValid: Bool {
+        timestamp.timeIntervalSinceReferenceDate.isFinite && dbFS.isFinite && (window?.isValid ?? true)
+    }
 }
 public enum CryState: String, Codable, Sendable { case quiet, possibleCry, crying }
 public struct CryEpisode: Identifiable, Codable, Sendable {

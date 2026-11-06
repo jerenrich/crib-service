@@ -1042,6 +1042,7 @@ import UIKit
         synchronizeLiveSound()
     }
     private func consume(_ sample: AudioLevelSample) {
+        guard sample.isValid else { return }
         if calibrationActive {
             guard sample.dbFS.isFinite else { return }
             currentDBFS = sample.dbFS
@@ -1054,7 +1055,7 @@ import UIKit
         guard detectionStartedAt.map({ sample.timestamp >= $0 }) ?? false else { return }
         guard monitoring, let credential, storageHealthy, sample.dbFS.isFinite else { return }
         // Full-scale clipping is the loudest sound, not an invalid reading.
-        let sample = AudioLevelSample(timestamp: sample.timestamp, dbFS: min(0, max(-100, sample.dbFS)))
+        let sample = AudioLevelSample(timestamp: sample.timestamp, dbFS: min(0, max(-100, sample.dbFS)), window: sample.window)
         currentDBFS = sample.dbFS
         meter.append(sample.dbFS); meter = Array(meter.suffix(SoundLevelFrame.barCount))
         chartSampledAt = sample.timestamp

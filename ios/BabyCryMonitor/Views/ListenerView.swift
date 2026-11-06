@@ -11,7 +11,7 @@ struct ListenerView: View {
         case .pending: "Alert queued · Waiting for delivery confirmation"
         case .sent: "APNs accepted the alert. Check Parent for delivery."
         case .acknowledged: "Alert acknowledged on Parent."
-        case .notQueued: "Another \(durationText(max(0, snapshot.configuration.alertDuration - episode.duration(at: now)))) before an alert."
+        case .notQueued: "Checking for sustained activity across a \(durationText(snapshot.configuration.alertDuration)) observation window."
         }
     }
 }

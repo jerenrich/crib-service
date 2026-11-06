@@ -175,11 +175,11 @@ struct NightstandView: View {
 
     private func liveHero(alertSent: Bool, at date: Date) -> Hero {
         if let elapsed = elapsed(at: date) {
-            if alertSent || elapsed >= alertDuration {
-                return Hero(title: "Crying-like sound", detail: "For \(clock(elapsed))\(alertSent ? " · Alert sent" : "")", tone: .alert, ring: .full, icon: "bell.fill")
+            if alertSent {
+                return Hero(title: "Crying-like sound", detail: "For \(clock(elapsed)) · Alert sent", tone: .alert, ring: .full, icon: "bell.fill")
             }
-            return Hero(title: "Sound detected", detail: "Alert at \(clock(alertDuration))", tone: .caution,
-                        ring: .progress(elapsed / max(1, alertDuration)), timer: elapsed)
+            return Hero(title: "Sound detected", detail: "Checking \(clock(alertDuration)) window", tone: .caution,
+                        ring: .dashed, timer: elapsed)
         }
         return switch currentState {
         case .crying: Hero(title: "Crying-like sound", detail: "Sustained sound detected", tone: .alert, ring: .full, icon: "bell.fill")
@@ -380,7 +380,7 @@ struct NightstandView: View {
             HStack(spacing: 12) {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Alert timing").font(.subheadline.weight(.semibold))
-                    Text("Cry \(spokenDuration(timingPending ? model.configuration.alertDuration : alertDuration)) · Snooze \(spokenDuration(model.configuration.snoozeDuration))")
+                    Text("Window \(spokenDuration(timingPending ? model.configuration.alertDuration : alertDuration)) · Snooze \(spokenDuration(model.configuration.snoozeDuration))")
                         .font(.caption).foregroundStyle(Palette.muted)
                         .fixedSize(horizontal: false, vertical: true)
                     if timingPending {
@@ -629,7 +629,7 @@ struct NightstandView: View {
     }
 
     private var alertsChip: Chip {
-        Chip(id: "alerts", title: "Alerts", value: "After \(spokenDuration(timingPending ? model.configuration.alertDuration : alertDuration))",
+        Chip(id: "alerts", title: "Alerts", value: "\(spokenDuration(timingPending ? model.configuration.alertDuration : alertDuration)) window",
              icon: "bell", caution: timingPending,
              accessibilityValue: timingPending ? "Requested \(spokenDuration(model.configuration.alertDuration)) · Waiting for nursery confirmation" : nil)
     }

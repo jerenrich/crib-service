@@ -1,16 +1,16 @@
 import Foundation
 
-/// Independent of microphone volume. Consecutive overlapping high-confidence
-/// audio windows must cover the configured alert duration; missing results do
-/// not count as more crying. An already confirmed episode has the normal quiet
-/// grace period, allowing both detectors to share one episode and one outbox.
+/// Independent of microphone volume, with the same 80%-of-time alert policy.
+/// Each overlapping result labels only its newly covered audio suffix. Low
+/// scores consume the tolerance; discontinuities clear evidence. Episode grace
+/// and alert qualification remain separate.
 struct CryConfidenceDetector: Sendable {
     static let threshold = 0.8
     static let windowDuration: TimeInterval = 2
     static let maximumWindowStep: TimeInterval = 1.5
     static let maximumResultAge: TimeInterval = 3
     private(set) var captureID: UUID?
-    private(set) var streakStartedAt: Date?
+    private(set) var observationStartedAt: Date?
     private(set) var cryStartedAt: Date?
     private(set) var quietSince: Date?
     // Positive classifier evidence can keep an existing volume episode open
@@ -25,8 +25,11 @@ struct CryConfidenceDetector: Sendable {
     /// liveness; legacy sample-clock dates are sufficient only for test replay.
     private(set) var latestInputAt: Date?
     private var confirmed = false
+    private var evidence = SoundEvidenceWindow()
+    private var latestPositive = false
+    private var settled = false
 
-    var state: CryState { confirmed ? .crying : streakStartedAt == nil ? .quiet : .possibleCry }
+    var state: CryState { confirmed ? .crying : observationStartedAt == nil ? .quiet : .possibleCry }
 
     mutating func consume(_ event: SoundClassificationEvent, at now: Date, configuration: MonitoringConfiguration) {
         advance(to: now, configuration: configuration)
@@ -70,16 +73,25 @@ struct CryConfidenceDetector: Sendable {
                 || lastObservationAt.map({ score.observedAt.timeIntervalSince($0) > Self.maximumResultAge }) == true {
                 interrupt(at: lastCapturedWindowEndAt ?? now)
             }
+            // The first result covers its full two seconds; subsequent results
+            // contribute only the suffix after the preceding window endpoint.
+            // Low results never get overwritten by a later overlapping high one.
+            let evidenceStart = max(score.windowStart, evidence.endedAt ?? score.windowStart)
+            latestPositive = score.confidence >= Self.threshold
+            evidence.append(from: evidenceStart, to: score.windowEnd, positive: latestPositive)
             lastWindowEnd = score.windowEnd; lastObservationAt = score.observedAt; lastCapturedWindowEndAt = capturedEnd
-            if score.confidence >= Self.threshold {
-                retainsEpisode = true; quietSince = nil
-                if streakStartedAt == nil { streakStartedAt = score.windowStart }
-                if let start = streakStartedAt, score.windowEnd.timeIntervalSince(start) >= configuration.alertDuration {
+            if latestPositive {
+                if observationStartedAt == nil { observationStartedAt = score.windowStart }
+                if evidence.hasRecentActivity(at: score.windowEnd) {
+                    retainsEpisode = true; quietSince = nil; settled = false
+                } else if quietSince == nil { quietSince = capturedEnd }
+                if let start = observationStartedAt,
+                   evidence.qualifies(at: score.windowEnd, duration: configuration.alertDuration, onset: start) {
                     if !confirmed { cryStartedAt = capturedEnd.addingTimeInterval(-score.windowEnd.timeIntervalSince(start)) }
                     confirmed = true
                 }
             } else {
-                interrupt(at: capturedEnd)
+                if quietSince == nil { quietSince = capturedEnd }
             }
         case let .stopped(id, at):
             guard id == captureID else { return }
@@ -105,21 +117,26 @@ struct CryConfidenceDetector: Sendable {
         if let lastCapturedWindowEndAt, now.timeIntervalSince(lastCapturedWindowEndAt) > Self.maximumResultAge {
             interrupt(at: lastCapturedWindowEndAt)
         }
-        if retainsEpisode, let quietSince, now.timeIntervalSince(quietSince) >= configuration.quietResetDuration {
+        if !settled, let quietSince, now.timeIntervalSince(quietSince) >= configuration.quietResetDuration {
             confirmed = false; cryStartedAt = nil; retainsEpisode = false
+            // Keep recent negative observations: a lone positive result at the
+            // settling boundary must not look like a fresh all-positive capture.
+            observationStartedAt = nil; latestPositive = false
+            settled = true
         }
     }
 
     func canAlert(at now: Date, configuration: MonitoringConfiguration) -> Bool {
-        guard confirmed, quietSince == nil, let streakStartedAt, let lastWindowEnd, let lastObservationAt,
+        guard confirmed, latestPositive, quietSince == nil, let observationStartedAt, let lastWindowEnd, let lastObservationAt,
               let lastCapturedWindowEndAt,
               (-1...Self.maximumResultAge).contains(now.timeIntervalSince(lastObservationAt)),
               (-1...Self.maximumResultAge).contains(now.timeIntervalSince(lastCapturedWindowEndAt)) else { return false }
-        return lastWindowEnd.timeIntervalSince(streakStartedAt) >= configuration.alertDuration
+        return evidence.qualifies(at: lastWindowEnd, duration: configuration.alertDuration, onset: observationStartedAt)
     }
 
     private mutating func interrupt(at date: Date) {
-        streakStartedAt = nil
+        observationStartedAt = nil
+        evidence = SoundEvidenceWindow(); latestPositive = false
         if retainsEpisode, quietSince == nil { quietSince = date }
     }
 

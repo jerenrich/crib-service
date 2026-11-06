@@ -237,7 +237,7 @@ final class CryConfidenceTests: XCTestCase {
         s.score(end: 2, captured: 2); s.score(end: 3, captured: 3)
         _ = s.engine.consumeClassification(.unmappedResult(captureID: s.capture, windowEnd: s.date(4), at: s.date(4)),
             at: s.date(4), listenerId: s.listener)
-        XCTAssertNil(s.engine.confidenceDetector.streakStartedAt)
+        XCTAssertNil(s.engine.confidenceDetector.observationStartedAt)
         for end in 5...8 { s.score(end: Double(end), captured: Double(end)); XCTAssertTrue(s.alerts.isEmpty) }
         s.score(end: 9, captured: 9)
         XCTAssertEqual(s.alerts.count, 1)
@@ -266,13 +266,53 @@ final class CryConfidenceTests: XCTestCase {
         XCTAssertEqual(s.alerts.first?.durationSeconds, 30)
     }
 
-    func testBelowEightyPercentBreaksTheStreak() {
+    func testOneLowSecondUsesToleranceInsteadOfRestartingTheWindow() {
         var s = Simulation()
         s.score(end: 2); s.score(end: 3); s.score(0.799999, end: 4)
-        for end in 5...7 { s.score(end: Double(end)); XCTAssertTrue(s.alerts.isEmpty) }
+        XCTAssertTrue(s.alerts.isEmpty)
+        s.score(end: 5)
+        XCTAssertEqual(s.alerts.first?.cryStartedAt, s.origin)
+        XCTAssertEqual(s.alerts.first?.createdAt, s.date(5))
+    }
+
+    func testTwoLowSecondsCannotQualifyAFiveSecondWindow() {
+        var s = Simulation()
+        s.score(end: 2); s.score(0.79, end: 3); s.score(0.79, end: 4); s.score(end: 5)
+        XCTAssertTrue(s.alerts.isEmpty)
+        s.score(end: 6); s.score(end: 7)
+        XCTAssertTrue(s.alerts.isEmpty)
         s.score(end: 8)
-        XCTAssertEqual(s.alerts.first?.cryStartedAt, s.date(3))
         XCTAssertEqual(s.alerts.first?.createdAt, s.date(8))
+    }
+
+    func testOccasionalDipsDoNotPreventALongerClassifierAlert() {
+        var s = Simulation(duration: 30)
+        for end in 2...29 { s.score(end == 20 ? 0.79 : 0.95, end: Double(end)) }
+        XCTAssertTrue(s.alerts.isEmpty)
+        s.score(0.95, end: 30)
+        XCTAssertEqual(s.alerts.first?.createdAt, s.date(30))
+    }
+
+    func testOldClassifierBurstNeedsRecentSustainedActivityAndAPositiveLatestResult() {
+        var s = Simulation(duration: 30)
+        for end in 2...25 { s.score(end: Double(end)) }
+        for end in 26...30 { s.score(0, end: Double(end)) }
+        XCTAssertTrue(s.alerts.isEmpty, "80% historical coverage is insufficient while settled")
+        s.score(end: 31)
+        XCTAssertTrue(s.alerts.isEmpty, "One new high score cannot spend old evidence")
+        for end in 32...34 { s.score(end: Double(end)) }
+        XCTAssertEqual(s.alerts.first?.createdAt, s.date(34))
+    }
+
+    func testSparseHighScoresCannotPreserveAnAlertedClassifierEpisode() {
+        var s = Simulation()
+        for end in 2...6 { s.score(end: Double(end)) }
+        XCTAssertEqual(s.alerts.count, 1)
+        for end in 7...90 { s.score(end % 15 == 6 ? 0.95 : 0, end: Double(end)) }
+        XCTAssertNil(s.engine.snapshot.current)
+        XCTAssertEqual(s.engine.snapshot.history.count, 1)
+        for end in 91...97 { s.score(end: Double(end)) }
+        XCTAssertEqual(s.alerts.count, 2)
     }
 
     func testMissingResultDoesNotCountAsContinuousHighConfidence() {
@@ -339,7 +379,7 @@ final class CryConfidenceTests: XCTestCase {
             windowEnd: s.date(4), confidence: 1, observedAt: s.date(4))
         let events = s.engine.consumeClassification(.result(delayed), at: s.date(10), listenerId: s.listener)
         XCTAssertTrue(events.isEmpty)
-        XCTAssertNil(s.engine.confidenceDetector.streakStartedAt)
+        XCTAssertNil(s.engine.confidenceDetector.observationStartedAt)
     }
 
     func testShortDisjointWindowsCannotClaimFiveSecondsOfCoveredAudio() {
@@ -374,7 +414,7 @@ final class CryConfidenceTests: XCTestCase {
             var s = Simulation()
             s.score(end: 2); s.score(end: 3)
             _ = s.engine.consumeClassification(event, at: s.date(3), listenerId: s.listener)
-            XCTAssertNil(s.engine.confidenceDetector.streakStartedAt)
+            XCTAssertNil(s.engine.confidenceDetector.observationStartedAt)
             s.levels(to: 10, dbfs: -20)
             XCTAssertEqual(s.alerts.count, 1)
             XCTAssertEqual(s.engine.lastAlertTrigger, .volume)
@@ -553,7 +593,7 @@ final class CryConfidenceTests: XCTestCase {
                 s.score(confidence, end: end, observed: received, captured: anchored ? end : nil)
             }
             XCTAssertTrue(s.alerts.isEmpty)
-            XCTAssertNil(s.engine.confidenceDetector.streakStartedAt)
+            XCTAssertNil(s.engine.confidenceDetector.observationStartedAt)
             // A caught-up stream must recover on a new full streak, with the
             // original audio onset rather than an onset shifted by old latency.
             for end in 14...17 { s.score(end: Double(end), captured: anchored ? Double(end) : nil) }
@@ -570,7 +610,7 @@ final class CryConfidenceTests: XCTestCase {
             confidence: 0.9, observedAt: s.date(7), audioWindowEndAt: s.date(5))
         let events = s.engine.consumeClassification(.result(result), at: s.date(8.5), listenerId: s.listener)
         XCTAssertTrue(events.isEmpty, "Neither individual delay exceeds three seconds, but the audio is 3.5 seconds old")
-        XCTAssertNil(s.engine.confidenceDetector.streakStartedAt)
+        XCTAssertNil(s.engine.confidenceDetector.observationStartedAt)
     }
 
     func testAudioClockMapsOldInferenceToItsInputTimeWithoutReanchoring() throws {

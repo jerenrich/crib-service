@@ -381,6 +381,7 @@ final class SoundAnalysisLogTests: XCTestCase {
         XCTAssertEqual(levels.map { $0[10] }, ["quiet", "possibleCry", "crying"])
         XCTAssertEqual(levels.map { $0[11] }, ["0", "0", "1"])
         XCTAssertEqual(levels[2][12], episode.id.uuidString.lowercased())
+        XCTAssertTrue(levels[2][18].contains("alert_trigger=volume;alert_policy=time_coverage_v1"))
         XCTAssertEqual(levels[1][16], "whiteNoise")
         let scores = data.filter { $0[2] == "classification" }
         XCTAssertEqual(scores.map { $0[6] }, ["0.000000", "0.987654"])
@@ -388,7 +389,9 @@ final class SoundAnalysisLogTests: XCTestCase {
         XCTAssertEqual(scores[0][3], capture.uuidString.lowercased())
         XCTAssertEqual(log.latestConfidence, 0.987654)
         let coverage = try String(contentsOf: export[1], encoding: .utf8)
-        XCTAssertTrue(coverage.contains("confidence >=0.80"))
+        XCTAssertTrue(coverage.contains("alert_policy=time_coverage_v1"))
+        XCTAssertTrue(coverage.contains(">=80% qualifying time"))
+        XCTAssertTrue(coverage.contains("overlapping results label only newly covered suffixes"))
         XCTAssertTrue(coverage.contains("combined volume/classifier state"))
     }
     @MainActor func testSuccessiveBatchesContinueWritingAndExportSurvivesRelaunch() async throws {

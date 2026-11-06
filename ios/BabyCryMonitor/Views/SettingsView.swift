@@ -15,7 +15,7 @@ struct SettingsView: View {
             Form {
                 Section("Settings status") { Text(model.settingsSyncStatus) }
                 Section {
-                    Picker("Alert after crying for", selection: setting(\.alertDuration)) {
+                    Picker("Observation window", selection: setting(\.alertDuration)) {
                         ForEach(alertDurations, id: \.self) { value in
                             Text(alertDurationText(value)).tag(value)
                         }
@@ -28,7 +28,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Alert timing")
                 } footer: {
-                    Text("Either sustained loud sound or Apple baby-cry confidence of at least 80% can trigger an alert after this duration. The volume timer includes the initial sound check. Both detectors run together and share one alert episode.")
+                    Text("Each detector observes the full selected window. An alert requires qualifying sound for at least 80% of that window and 80% of the latest 5 seconds, with a qualifying latest reading. Sound qualifies by reaching your volume threshold or, independently, an Apple baby-cry score of at least 0.80. The detectors share one alert episode.")
                 }
                 Section {
                     Picker("Reset timer after quiet", selection: setting(\.quietResetDuration)) {
@@ -37,7 +37,7 @@ struct SettingsView: View {
                 } header: {
                     Text("When crying stops")
                 } footer: {
-                    Text("An episode resets after both detectors have settled for \(Int(model.configuration.quietResetDuration)) seconds. Shorter pauses keep the episode open. A classifier reading below 80% or missing results restarts its qualifying timer.")
+                    Text("An episode resets after both detectors have settled for \(Int(model.configuration.quietResetDuration)) seconds. This groups related activity; it does not add crying time. Isolated sound spikes cannot repeatedly restart settling. Brief low readings use the 20% tolerance. Missing audio contributes no qualifying time, and capture gaps restart the affected detector's observation window.")
                 }
                 Section {
                     Picker("Sound threshold", selection: setting(\.absoluteThreshold)) {
@@ -176,7 +176,7 @@ struct AlertTimingView: View {
         NavigationStack {
             Form {
                 Section {
-                    Picker("Alert after", selection: Binding(get: { model.configuration.alertDuration }, set: { value in
+                    Picker("Observation window", selection: Binding(get: { model.configuration.alertDuration }, set: { value in
                         var settings = model.configuration; settings.alertDuration = value; model.saveSettings(settings)
                     })) {
                         ForEach(durations, id: \.self) { Text(spokenDuration($0)).tag($0) }
@@ -185,7 +185,7 @@ struct AlertTimingView: View {
                         }
                     }.pickerStyle(.inline).accessibilityIdentifier("quickAlertDuration")
                 } footer: {
-                    Text("Either sustained loud sound or Apple baby-cry confidence of at least 80% can trigger an alert after this duration. Both detectors run together and share one alert episode.")
+                    Text("After a full observation window, either detector can alert when at least 80% of that window qualifies, including 80% of the latest 5 seconds and a qualifying latest reading. Missing audio contributes no qualifying time. The detectors share one alert episode.")
                 }
                 if let duty = model.caregiverDuty, duty.secondary != nil {
                     Section("Secondary caregiver") {
