@@ -938,6 +938,33 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(attempts, 1)
         audio.stop()
     }
+    @MainActor func testStartRecoversWhenInterruptionEndIsNeverDelivered() async throws {
+        for reset in [false, true] {
+            let driver = AudioDriver(), audio = AudioLevelMonitor(driver: driver)
+            var active = 0
+            audio.onStatus = { if case .active = $0 { active += 1 } }
+            try await audio.start()
+            NotificationCenter.default.post(name: AVAudioSession.interruptionNotification, object: nil,
+                userInfo: [AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.began.rawValue])
+            let paused = await eventually { await !driver.isRunning }
+            XCTAssertTrue(paused)
+            if reset {
+                // A media-services reset clears the interruption without a person's Start.
+                NotificationCenter.default.post(name: AVAudioSession.mediaServicesWereResetNotification, object: nil)
+                let recovered = await eventually { await driver.isRunning }
+                XCTAssertTrue(recovered)
+            } else {
+                // No interruption-ended notification: Stop, then Start must be able to reactivate.
+                audio.stop()
+                try await audio.start()
+                let running = await driver.isRunning
+                XCTAssertTrue(running)
+            }
+            XCTAssertEqual(active, 2)
+            try await audio.setNurserySound(.init(settings: .init(), action: .play))
+            audio.stop()
+        }
+    }
     @MainActor func testStopSupersedesConfigurationRecoveryInFlight() async throws {
         let driver = AudioDriver(), gate = RequestGate(), audio = AudioLevelMonitor(driver: driver)
         var state = NurserySoundState(), active = 0
@@ -2945,6 +2972,21 @@ final class AppModelTests: XCTestCase {
         let requests = await fixture.backend.monitoringRequests
         XCTAssertFalse(requests.contains { !$0.0 }, "The stall must not report a Stop that would retire alerts")
     }
+    @MainActor func testSwitchingListenerToParentStillReportsThePersonsStop() async throws {
+        let fixture = try Fixture()
+        await fixture.model.start()
+        await fixture.model.tick()
+        var requests = await fixture.backend.monitoringRequests
+        XCTAssertEqual(requests.map(\.0), [true])
+        fixture.model.selectRole(.parent)
+        let reported = await eventually { await fixture.backend.monitoringRequests.count == 2 }
+        XCTAssertTrue(reported)
+        requests = await fixture.backend.monitoringRequests
+        XCTAssertEqual(requests.last?.0, false, "The Stop must reach the server before the Listener state is reset")
+        // Once sent, a later relaunch as Listener must not replay it.
+        let sent = await eventually { !fixture.defaults.dictionaryRepresentation().keys.contains { $0.hasSuffix("|localMonitoringReport") } }
+        XCTAssertTrue(sent)
+    }
     @MainActor func testRelaunchAfterTerminationDoesNotReportAStopButResendsAnUnsentLocalAction() async throws {
         let fixture = try Fixture()
         await fixture.model.start()
@@ -3215,6 +3257,25 @@ final class AppModelTests: XCTestCase {
         await fixture.model.tick()
         XCTAssertEqual(fixture.model.snapshot.pending.first?.attempts, 1)
         XCTAssertTrue(fixture.model.snapshot.failedAlerts.isEmpty)
+    }
+    @MainActor func testRecoveredNetworkRetriesBackedOffAlertImmediately() async throws {
+        let fixture = try Fixture(pending: true)
+        await fixture.backend.configure(sendFail: true)
+        // Failures are stamped with wall-clock Date(); leave margin past each 2 s and 4 s backoff.
+        for delay in [0.0, 3, 5] {
+            fixture.time.now = fixture.time.now.addingTimeInterval(delay)
+            await fixture.model.tick()
+        }
+        XCTAssertEqual(fixture.model.snapshot.pending.first?.attempts, 3)
+        // The next scheduled attempt is 8 seconds away. A recovered path must not wait for it.
+        fixture.connectivity.available = false
+        await fixture.model.tick()
+        fixture.connectivity.available = true
+        await fixture.backend.configure(sendFail: false)
+        await fixture.model.tick()
+        let delivered = await eventually { fixture.model.snapshot.pending.isEmpty }
+        XCTAssertTrue(delivered)
+        XCTAssertTrue(fixture.model.log.export.contains("alert_retry_after_recovery"))
     }
     @MainActor func testFixtureLogsAreIsolatedAndExistingHistoryStillLoads() async throws {
         let first = try Fixture(logEvents: ["alert_apns_accepted"])

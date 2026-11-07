@@ -586,7 +586,8 @@ import UIKit
         clearLiveSound()
         setParentConnectionDeadline(nil)
         cancelCalibration()
-        stop(); environmentRevision += 1; role = value; defaults.set(value.rawValue, forKey: "role")
+        stop(); flushLocalMonitoringReportBeforeReset()
+        environmentRevision += 1; role = value; defaults.set(value.rawValue, forKey: "role")
         resetMonitoringControl()
         timeline = nil; timelineError = nil
         parentStatus = nil; pairingCode = nil; caregiverInvite = nil; caregiverError = nil; credential = nil; uploadedToken = nil; loadCredential()
@@ -605,6 +606,7 @@ import UIKit
               url.path.isEmpty || url.path == "/" else { error = "Enter the HTTPS origin of your deployed Worker."; return }
         if #available(iOS 26.0, *), defaults === UserDefaults.standard { SilentCryAlarmService.shared.disableLocally(source: .backendChanged) }
         setParentConnectionDeadline(nil)
+        flushLocalMonitoringReportBeforeReset()
         resetMonitoringControl()
         environmentRevision += 1; backendURL = url.absoluteString
         if nurserySound.playing { audio.stop() }
@@ -828,6 +830,23 @@ import UIKit
         } catch {
             nextLocalReportAt = currentTime().addingTimeInterval(3)
             log.record("monitoring_control_failed", error: error)
+        }
+    }
+    /// A role or backend change discards the in-memory report. Send it first with
+    /// the Listener identity it belongs to: an unsent Stop would leave the server
+    /// repeating crying reminders that only a person's Stop may end.
+    private func flushLocalMonitoringReportBeforeReset() {
+        guard role == .listener, paired, let report = localMonitoringReport, let client = try? client() else { return }
+        let key = localMonitoringReportKey
+        Task { [weak self, defaults, log] in
+            do {
+                _ = try await client.setMonitoring(report.enabled, id: report.id)
+                // Leave a newer report from a later Listener session in place.
+                if defaults.string(forKey: key) == report.id.uuidString {
+                    defaults.removeObject(forKey: key); defaults.removeObject(forKey: key + "|enabled")
+                }
+                if let self, self.role == .listener, self.localMonitoringReport?.id == report.id { self.clearLocalMonitoringReport() }
+            } catch { log.record("monitoring_control_failed", error: error) }
         }
     }
     private func resetMonitoringControl() {
@@ -1456,6 +1475,11 @@ import UIKit
             }
         } catch { deliveryStatus = "Backend unavailable: \(error.localizedDescription)"; log.record("backend_unavailable", error: error) }
     }
+    private func retryBackedOffAlerts() {
+        guard role == .listener, paired, engine.retryBackedOffAlerts(at: currentTime()) else { return }
+        persist(); log.record("alert_retry_after_recovery")
+        requestImmediateAlertDelivery()
+    }
     private func requestImmediateAlertDelivery() {
         alertDeliveryRequested = true
         guard immediateAlertTask == nil else { return }
@@ -1586,6 +1610,7 @@ import UIKit
         if available && !lastConnectivityAvailable {
             // A recovered path gets one immediate attempt, then normal backoff.
             for key in Array(pendingHeartbeats.keys) { pendingHeartbeats[key]?.nextAttemptAt = currentTime() }
+            retryBackedOffAlerts()
         }
         lastConnectivityAvailable = available
         if (microphoneActive || monitoring || !snapshot.pendingTimelineIDs.isEmpty), let key = heartbeatKey, pendingHeartbeats[key] == nil,
@@ -1626,7 +1651,12 @@ import UIKit
                 if attempt.revision == self.environmentRevision {
                     self.engine.uploadedTimeline(Set((attempt.value.timelineEvents ?? []).map(\.id))); self.persist()
                 }
-                if attempt.failures > 0 { self.log.record("heartbeat_recovered") }
+                if attempt.failures > 0 {
+                    self.log.record("heartbeat_recovered")
+                    // The backend is reachable again even if the network path never
+                    // changed (WAN or Worker outage); do not leave a cry alert backed off.
+                    if attempt.revision == self.environmentRevision { self.retryBackedOffAlerts() }
+                }
                 if self.pendingHeartbeats[key]?.id == attempt.id { self.pendingHeartbeats.removeValue(forKey: key) }
                 if attempt.revision == self.environmentRevision, attempt.observation == self.monitoringGeneration {
                     self.lastHeartbeatAt = self.currentTime(); self.deliveryStatus = "Connected"

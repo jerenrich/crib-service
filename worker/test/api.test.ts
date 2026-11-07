@@ -4077,6 +4077,48 @@ describe('two caregiver families',()=>{
   const row=await env.DB.prepare('SELECT caregiver_plan FROM events WHERE event_id=?').bind(event.eventId).first<{caregiver_plan:string}>();
   expect(JSON.parse(row!.caregiver_plan).started).toBeGreaterThanOrEqual(began);
  });
+ it('escalates reminders when the episode’s first event never received a plan',async()=>{
+  const {parent,partner,listener}=await family();await tokens(parent,'a');await tokens(partner,'c');
+  const event=alert(listener),began=Date.now();mockPush(200,2);
+  expect((await call('listener/event',listener,event)).status).toBe(200);
+  // As when the first upload arrived during a snooze or before the partner joined.
+  await env.DB.prepare('UPDATE events SET caregiver_plan=NULL WHERE event_id=?').bind(event.eventId).run();
+  vi.spyOn(Date,'now').mockReturnValue(began+6000);mockPush(200,2);
+  expect(await runReminder(testEnv,parent.deviceId)).toBe(true);
+  expect(pushRequests).toHaveLength(4);
+  vi.spyOn(Date,'now').mockReturnValue(began+130000);mockPush(200,4);
+  expect(await runReminder(testEnv,parent.deviceId)).toBe(true);
+  expect(pushRequests.slice(4).map(p=>p.url)).toEqual(expect.arrayContaining([expect.stringContaining('c'.repeat(64)),expect.stringContaining('d'.repeat(64))]));
+ });
+ it('suppresses a family alert recorded during a snooze but uploaded after it ended',async()=>{
+  const {parent,partner,listener}=await family();await tokens(parent,'a');await tokens(partner,'c');
+  const original=alert(listener);mockPush(200,2);
+  expect((await call('listener/event',listener,original)).status).toBe(200);
+  expect((await call('alert/acknowledge',parent,{eventId:original.eventId})).status).toBe(200);
+  const mutedUntil=Date.parse((await status(parent)).alertsMutedUntil);
+  const late={...alert(listener),createdAt:new Date(Date.now()+10).toISOString()};
+  vi.spyOn(Date,'now').mockReturnValue(mutedUntil+60000);
+  const response=await call('listener/event',listener,late);expect(response.status).toBe(200);
+  expect((await response.json() as {status:string}).status).toBe('acknowledged');
+  expect(pushRequests).toHaveLength(2);
+ });
+ it('delivers through the single-parent path when the family is removed after the claim',async()=>{
+  const {parent,listener}=await family();await tokens(parent,'a');
+  let reads=0;
+  const db=interceptDB(async(sql,args,_method,execute)=>{
+   if(sql==='SELECT * FROM caregiver_families WHERE owner_id=?'&&++reads===2){
+    await env.DB.prepare('DELETE FROM caregiver_families WHERE owner_id=?').bind(args[0]).run();
+   }
+   return execute();
+  });
+  const event=alert(listener);mockPush(200,2);
+  const response=await worker.fetch(new Request('https://monitor.test/v1/listener/event',{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${listener.deviceId}.${listener.secret}`},
+   body:JSON.stringify(event)}),{...testEnv,DB:db});
+  expect(response.status).toBe(200);expect(reads).toBe(2);
+  expect((await response.json() as {status:string}).status).toBe('sent');
+  expect(pushRequests.map(p=>p.url)).toEqual(expect.arrayContaining([expect.stringContaining('a'.repeat(64)),expect.stringContaining('b'.repeat(64))]));
+  expect(await env.DB.prepare('SELECT status FROM events WHERE event_id=?').bind(event.eventId).first('status')).toBe('sent');
+ });
 
  it('keeps silent-alarm recovery receipts separate for the invited caregiver',async()=>{
   const {parent,partner,listener}=await family();await tokens(parent,'a');await tokens(partner,'c');

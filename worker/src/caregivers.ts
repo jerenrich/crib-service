@@ -4,7 +4,7 @@ import {rateLimit,sha256,uuid} from './security';
 import {sendPush} from './apns';
 import {Latency,type TimingDetails} from './latency';
 import {eventReference,recordDiagnostics,type Diagnostic,type Outcome} from './diagnostics';
-import {stoppedMonitoringSQL} from './monitoring';
+import {stoppedMonitoringSQL,lateUploadSuppressedSQL} from './monitoring';
 import {scheduleReminders} from './reminders';
 import {revokeLiveSound} from './live-sound';
 
@@ -143,9 +143,8 @@ export async function dispatchFamilyEvent(env:Env,eventId:string,requestId=crypt
  try {
  await env.DB.batch([
   env.DB.prepare(`UPDATE events SET resolved_at=(SELECT r.resolved_at FROM resolved_episodes r JOIN pairs p ON p.parent_id=r.parent_id AND p.listener_id=r.listener_id AND p.created_at=r.pair_created_at WHERE r.parent_id=events.parent_id AND r.listener_id=events.listener_id AND r.episode_id=events.episode_id) WHERE event_id=? AND resolved_at IS NULL`).bind(eventId),
-  env.DB.prepare(`UPDATE events SET acknowledged_at=? WHERE event_id=? AND acknowledged_at IS NULL AND (
-   EXISTS(SELECT 1 FROM devices d WHERE d.id=events.parent_id AND d.alerts_muted_until>? AND d.alerts_muted_until>0)
-   OR EXISTS(SELECT 1 FROM alert_snoozes s JOIN pairs p ON p.parent_id=s.parent_id AND p.listener_id=s.listener_id AND p.created_at=s.pair_created_at WHERE s.parent_id=events.parent_id AND s.listener_id=events.listener_id AND events.created_at BETWEEN s.started_at AND s.until_at))`).bind(new Date(now).toISOString(),eventId,now),
+  // Same late-upload rules as the single-parent path: judge by recorded createdAt.
+  env.DB.prepare(`UPDATE events SET acknowledged_at=? WHERE event_id=? AND acknowledged_at IS NULL AND ${lateUploadSuppressedSQL}`).bind(new Date(now).toISOString(),eventId,now,now),
   env.DB.prepare("UPDATE events SET status='failed',last_error='expired_event' WHERE event_id=? AND created_at<?").bind(eventId,now-86400000),
   env.DB.prepare("UPDATE caregiver_deliveries SET state='uncertain',lease_until=NULL WHERE event_id=? AND state='sending' AND lease_until<=?").bind(eventId,now)
  ]);
@@ -157,11 +156,16 @@ export async function dispatchFamilyEvent(env:Env,eventId:string,requestId=crypt
  trace.deliveryAttempt=claimed.attempts;
  if((claimed.lease_until??0)<=Date.now()){routing({phase:'skipped',reason:'expired_lease'},'claim_skipped',undefined,claimed.attempts);return true;}
  const f=await env.DB.prepare('SELECT * FROM caregiver_families WHERE owner_id=?').bind(event.parent_id).first<Family>();
- if(!f){routing({phase:'retry',reason:'family_changed'},'claim_skipped',undefined,claimed.attempts);return true;}
+ if(!f){
+  // The family was removed after the claim. Release it so the single-parent
+  // path can deliver now instead of leaving the event to lease expiry.
+  await env.DB.prepare("UPDATE events SET status='pending',next_attempt=?,lease_until=NULL WHERE event_id=? AND claim_id=? AND status='sending'").bind(now,eventId,claim).run();
+  routing({phase:'retry',reason:'family_changed'},'claim_skipped',undefined,claimed.attempts);return false;
+ }
  const caregivers=(await env.DB.prepare('SELECT * FROM devices WHERE id=? OR id=?').bind(f.owner_id,f.partner_id).all<Caregiver>()).results;
  let plan=claimed.caregiver_plan?JSON.parse(claimed.caregiver_plan) as Plan:null;
  if(!plan){
-  const first=await env.DB.prepare('SELECT caregiver_plan,created_at FROM events WHERE parent_id=? AND episode_id=? ORDER BY created_at ASC,event_id ASC LIMIT 1').bind(event.parent_id,event.episode_id).first<{caregiver_plan:string|null;created_at:number}>();
+  const first=await env.DB.prepare('SELECT caregiver_plan,created_at FROM events WHERE parent_id=? AND episode_id=? AND caregiver_plan IS NOT NULL ORDER BY created_at ASC,event_id ASC LIMIT 1').bind(event.parent_id,event.episode_id).first<{caregiver_plan:string|null;created_at:number}>();
   const secondary=caregivers.find(d=>d.id!==f.primary_id);
   plan=first?.caregiver_plan?JSON.parse(first.caregiver_plan) as Plan:{primary:f.primary_id,secondary:secondary?.secondary_enabled===1?secondary.id:null,after:f.escalation_seconds,started:now};
   // A disconnect can repair the episode while this read is in flight. Never

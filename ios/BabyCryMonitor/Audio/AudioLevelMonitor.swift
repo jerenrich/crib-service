@@ -106,7 +106,8 @@ extension AudioLevelProviding {
     func requestPermission() async -> Bool { await AVAudioApplication.requestRecordPermission() }
     func start() async throws {
         try Task.checkCancellation()
-        guard !interrupted else { throw AudioError.unavailable }
+        // iOS does not guarantee an interruption-ended notification. A person's
+        // Start tries to reactivate; activation fails while the interruption lasts.
         configurationRecoveryAttempts = 0
         wantsMonitoring = true; generation += 1
         let expected = generation
@@ -116,6 +117,8 @@ extension AudioLevelProviding {
             try await driver.activate(generation: expected, clearSound: false)
             guard generation == expected, wantsMonitoring else { throw CancellationError() }
             try Task.checkCancellation()
+            // Any interruption that began during activation bumped the generation.
+            interrupted = false
             if playback.expired(at: currentTime()) {
                 let stopped = finishSound(reason: "timer_expired")
                 try await driver.setSound(nurseryState, capture: true, generation: expected)
@@ -378,6 +381,9 @@ extension AudioLevelProviding {
             name == AVAudioSession.mediaServicesWereResetNotification ? "media_services_reset" : "engine_configuration_changed"
         if name == AVAudioSession.interruptionNotification {
             interrupted = type == AVAudioSession.InterruptionType.began.rawValue
+        } else if name == AVAudioSession.mediaServicesWereResetNotification {
+            // A reset invalidates every session; no earlier interruption survives it.
+            interrupted = false
         }
         generation += 1; let expected = generation
         let stopped = finishSound(reason: stopReason)
