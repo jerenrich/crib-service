@@ -3,7 +3,7 @@ import {reserveAlarmRequest} from './alarm-scheduling';
 import {phoneHeadStartFor} from './notification-coordination';
 import {deliverToBoth} from './dual-delivery';
 import {acceptedDelivery,queueAcceptedDelivery,type AcceptedDelivery} from './accepted-delivery';
-import {stoppedMonitoringSQL,monitoringResumedSQL} from './monitoring';
+import {stoppedMonitoringSQL,monitoringResumedSQL,lateUploadSuppressedSQL} from './monitoring';
 import {scheduleReminders} from './reminders';
 import {Latency} from './latency';
 import {APIError,requireRole,type Alert,type Device,type Env,type StoredEvent} from './types';
@@ -112,18 +112,7 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
   WHERE event_id=? AND COALESCE(json_extract(payload,'$.isTest'),0)=0`).bind(new Date(now-180000).toISOString(),new Date(now).toISOString(),new Date(now).toISOString(),eventId),
  // Suppress uploads during a mute, including delayed offline outbox entries.
  env.DB.prepare(`UPDATE events SET acknowledged_at=COALESCE(acknowledged_at,?) WHERE event_id=? AND acknowledged_at IS NULL
- AND COALESCE(json_extract(payload,'$.isTest'),0)=0 AND (
- EXISTS(SELECT 1 FROM devices d WHERE d.id=events.parent_id AND d.alerts_muted_until>0
- AND (d.alerts_muted_until>? OR CAST(ROUND((julianday(json_extract(events.payload,'$.createdAt'))-2440587.5)*86400000) AS INTEGER) BETWEEN d.alerts_muted_at AND d.alerts_muted_until))
- OR EXISTS(SELECT 1 FROM alert_snoozes s JOIN pairs p ON p.parent_id=s.parent_id AND p.listener_id=s.listener_id AND p.created_at=s.pair_created_at
- WHERE s.parent_id=events.parent_id AND s.listener_id=events.listener_id
- AND CAST(ROUND((julianday(json_extract(events.payload,'$.createdAt'))-2440587.5)*86400000) AS INTEGER) BETWEEN s.started_at AND s.until_at)
- OR ${stoppedMonitoringSQL}
- OR EXISTS(SELECT 1 FROM monitoring_commands m JOIN pairs p ON p.parent_id=m.parent_id AND p.listener_id=m.listener_id AND p.created_at=m.pair_created_at
- WHERE m.parent_id=events.parent_id AND m.listener_id=events.listener_id AND m.enabled=0
- AND CAST(ROUND((julianday(json_extract(events.payload,'$.createdAt'))-2440587.5)*86400000) AS INTEGER)<=m.created_at)
- OR (is_repeat=1 AND EXISTS(SELECT 1 FROM events prior WHERE prior.parent_id=events.parent_id AND prior.episode_id=events.episode_id AND prior.acknowledged_at IS NOT NULL AND prior.created_at>=events.created_at))
- )`).bind(new Date(now).toISOString(),eventId,now,now),
+ AND COALESCE(json_extract(payload,'$.isTest'),0)=0 AND ${lateUploadSuppressedSQL}`).bind(new Date(now).toISOString(),eventId,now,now),
  env.DB.prepare(`UPDATE events SET status='sending',lease_until=?,claim_id=?,attempts=attempts+1,
   delivery_mode=COALESCE(delivery_mode,CASE WHEN ${watchOnlySQL} THEN 'watch_only' END),
   delivery_state=CASE WHEN delivery_mode='watch_only' OR (${watchOnlySQL}) OR (${phoneOnlySQL}) THEN NULL

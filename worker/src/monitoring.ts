@@ -100,3 +100,20 @@ export function stoppedMonitoringForSQL(parentID:string,listenerID:string) {
  AND m.sequence=(SELECT MAX(sequence) FROM monitoring_commands WHERE parent_id=m.parent_id AND listener_id=m.listener_id AND pair_created_at=m.pair_created_at))`;
 }
 export const stoppedMonitoringSQL=stoppedMonitoringForSQL('events.parent_id','events.listener_id');
+// Late-upload suppression shared by the single-parent and family dispatch paths.
+// Judges the alert by its recorded createdAt, not by when the server received it,
+// so an offline outbox entry recorded during a mute, snooze or Stop stays silent.
+// Binds two values, both the current time in milliseconds.
+const payloadCreatedAtMS="CAST(ROUND((julianday(json_extract(events.payload,'$.createdAt'))-2440587.5)*86400000) AS INTEGER)";
+export const lateUploadSuppressedSQL=`(
+ EXISTS(SELECT 1 FROM devices d WHERE d.id=events.parent_id AND d.alerts_muted_until>0
+ AND (d.alerts_muted_until>? OR ${payloadCreatedAtMS} BETWEEN d.alerts_muted_at AND d.alerts_muted_until))
+ OR EXISTS(SELECT 1 FROM alert_snoozes s JOIN pairs p ON p.parent_id=s.parent_id AND p.listener_id=s.listener_id AND p.created_at=s.pair_created_at
+ WHERE s.parent_id=events.parent_id AND s.listener_id=events.listener_id
+ AND ${payloadCreatedAtMS} BETWEEN s.started_at AND s.until_at)
+ OR ${stoppedMonitoringSQL}
+ OR EXISTS(SELECT 1 FROM monitoring_commands m JOIN pairs p ON p.parent_id=m.parent_id AND p.listener_id=m.listener_id AND p.created_at=m.pair_created_at
+ WHERE m.parent_id=events.parent_id AND m.listener_id=events.listener_id AND m.enabled=0
+ AND ${payloadCreatedAtMS}<=m.created_at)
+ OR (is_repeat=1 AND EXISTS(SELECT 1 FROM events prior WHERE prior.parent_id=events.parent_id AND prior.episode_id=events.episode_id AND prior.acknowledged_at IS NOT NULL AND prior.created_at>=events.created_at))
+ )`;

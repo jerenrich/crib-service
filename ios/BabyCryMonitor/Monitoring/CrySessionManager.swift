@@ -194,6 +194,15 @@ public struct CrySessionManager: Sendable {
     public mutating func failed(_ id: UUID, at date: Date) {
         if let index = snapshot.pending.firstIndex(where: { $0.id == id }) { snapshot.pending[index].failed(at: date) }
     }
+    /// Connectivity recovered: give each backed-off alert one immediate attempt.
+    /// Attempts are kept, so a further failure continues the normal backoff.
+    @discardableResult public mutating func retryBackedOffAlerts(at date: Date) -> Bool {
+        var changed = false
+        for index in snapshot.pending.indices where snapshot.pending[index].attempts > 0 && snapshot.pending[index].nextAttemptAt > date {
+            snapshot.pending[index].nextAttemptAt = date; changed = true
+        }
+        return changed
+    }
     public mutating func acknowledged(_ id: UUID) {
         snapshot.pending.removeAll { $0.id == id }
     }
