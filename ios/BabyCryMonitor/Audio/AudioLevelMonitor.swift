@@ -7,6 +7,9 @@ enum AudioCaptureStatus {
     case active
     case recovering(String)
     case failed(String)
+    /// The microphone is running, but another app or system sound is playing on
+    /// this iPhone. Its speaker output reaches the microphone, so detection pauses.
+    case otherAudio
 }
 
 struct NurseryAudioFailure: Error {
@@ -74,9 +77,13 @@ extension AudioLevelProviding {
     private var reported = ReportedCapture.other
     private let otherAudioPlaying: @MainActor () -> Bool
     private let otherAudioPollInterval: Duration
+    private let otherAudioResumeDelay: Duration
     private let reactivationRetryDelays: [Duration]
     private var otherAudioTask: Task<Void, Never>?
-    nonisolated static let otherAudioMessage = "Other audio playing on this iPhone. Detection paused…"
+    /// When other audio was last seen while paused. Resume needs a quiet stretch,
+    /// since sounds such as Find My pulse and would otherwise flap detection.
+    private var otherAudioLastSeen: ContinuousClock.Instant?
+    nonisolated static let otherAudioMessage = "Another sound is playing on this iPhone. Detection paused."
     var onStatus: ((AudioCaptureStatus) -> Void)?
     var onNurserySoundChange: ((NurserySoundState) -> Void)?
     private var playback = NurserySoundPlayback()
@@ -93,7 +100,7 @@ extension AudioLevelProviding {
 
     init(driver: (any AudioCaptureDriving)? = nil, currentTime: @escaping () -> ContinuousClock.Instant = { .now },
          sampleStream: AsyncStream<AudioLevelSample>? = nil, otherAudioPlaying: (@MainActor () -> Bool)? = nil,
-         otherAudioPollInterval: Duration = .seconds(1),
+         otherAudioPollInterval: Duration = .milliseconds(250), otherAudioResumeDelay: Duration = .seconds(5),
          reactivationRetryDelays: [Duration] = [.seconds(1), .seconds(3), .seconds(10)]) {
         let pair = AsyncStream<AudioLevelSample>.makeStream(bufferingPolicy: .bufferingNewest(16))
         let classifications = AsyncStream<SoundClassificationEvent>.makeStream(bufferingPolicy: .bufferingNewest(64))
@@ -109,6 +116,7 @@ extension AudioLevelProviding {
         else if driver == nil { self.otherAudioPlaying = { AVAudioSession.sharedInstance().isOtherAudioPlaying } }
         else { self.otherAudioPlaying = { false } }
         self.otherAudioPollInterval = otherAudioPollInterval
+        self.otherAudioResumeDelay = otherAudioResumeDelay
         self.reactivationRetryDelays = reactivationRetryDelays
         classificationTask = Task { [weak self] in
             for await event in classifications.stream {
@@ -120,6 +128,12 @@ extension AudioLevelProviding {
         observe(AVAudioSession.routeChangeNotification)
         observe(AVAudioSession.mediaServicesWereResetNotification)
         observe(.AVAudioEngineConfigurationChange)
+        // Delivered only while this app is in the foreground; polling covers a
+        // locked Listener. Either way the pause starts at the first sign.
+        observers.append(NotificationCenter.default.addObserver(forName: AVAudioSession.silenceSecondaryAudioHintNotification,
+                                                                object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.pollOtherAudio() }
+        })
     }
     deinit { classificationTask?.cancel(); otherAudioTask?.cancel() }
     func requestPermission() async -> Bool { await AVAudioApplication.requestRecordPermission() }
@@ -267,8 +281,8 @@ extension AudioLevelProviding {
     /// and that playback reaches the microphone. Detection must not score it.
     private func reportActive() {
         let paused = otherAudioPlaying()
-        if paused { log?.record("audio_other_playing") }
-        onStatus?(paused ? .recovering(Self.otherAudioMessage) : .active)
+        if paused { log?.record("audio_other_playing"); otherAudioLastSeen = currentTime() }
+        onStatus?(paused ? .otherAudio : .active)
         reported = paused ? .otherAudio : .live
         watchOtherAudio()
     }
@@ -287,12 +301,16 @@ extension AudioLevelProviding {
     private func pollOtherAudio() {
         // Interruptions and in-flight reconfiguration publish their own status.
         guard !interrupted, configuringGeneration == nil else { return }
+        let playing = otherAudioPlaying(), now = currentTime()
         switch reported {
-        case .live where otherAudioPlaying():
-            log?.record("audio_other_playing")
-            onStatus?(.recovering(Self.otherAudioMessage)); reported = .otherAudio
-        case .otherAudio where !otherAudioPlaying():
-            log?.record("audio_other_stopped")
+        case .live where playing:
+            log?.record("audio_other_playing"); otherAudioLastSeen = now
+            onStatus?(.otherAudio); reported = .otherAudio
+        case .otherAudio where playing:
+            otherAudioLastSeen = now
+        case .otherAudio:
+            guard let seen = otherAudioLastSeen, seen.duration(to: now) >= otherAudioResumeDelay else { return }
+            log?.record("audio_other_stopped"); otherAudioLastSeen = nil
             onStatus?(.active); reported = .live
         default: break
         }

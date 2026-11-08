@@ -26,6 +26,8 @@ struct ParentStatus: Codable, Sendable {
     var batteryLevel: Double?
     var powerConnected: Bool?
     var state: CryState?
+    /// Set while the Listener's microphone runs with detection paused for other audio.
+    var detectionPaused: String? = nil
     var currentEpisode: RemoteEpisode?
     var episodes: [RemoteEpisode]?
     var alerts: [RemoteAlert]?
@@ -92,8 +94,10 @@ struct RemoteAlert: Identifiable, Codable, Sendable {
     var resolvedAt: Date? = nil
     var deliveryTarget: String? = nil
     var type: String? = nil
+    var reason: String? = nil
     var isDisconnected: Bool { type == "listener_disconnected" }
     var isMonitoringFailure: Bool { type == CryAlert.monitoringFailedType }
+    var isDetectionPause: Bool { isMonitoringFailure && reason == CryAlert.otherAudioReason }
     var id: UUID { eventId }
 }
 struct Heartbeat: Codable, Sendable {
@@ -108,6 +112,33 @@ struct Heartbeat: Codable, Sendable {
     var appliedConfiguration: MonitoringConfiguration? = nil
     var timelineEvents: [TimelineEvent]? = nil
     var microphoneActive: Bool? = nil
+    var detectionPaused: String? = nil
+    /// The same check-in without fields an older server would reject outright.
+    func compatible(with features: ServerFeatures) -> Heartbeat {
+        guard !features.detectionPause else { return self }
+        var value = self
+        value.detectionPaused = nil
+        value.timelineEvents = timelineEvents?.map { event in
+            var event = event
+            if event.kind == "detection_paused" { event.kind = "audio_interrupted" }
+            if event.kind == "detection_resumed" { event.kind = "audio_resumed" }
+            return event
+        }
+        return value
+    }
+}
+/// Capabilities the server advertises in `x-crib-features`. Until a response
+/// arrives, new optional fields are withheld: an older server rejects unknown
+/// keys, which would drop a heartbeat or a monitoring-stopped alert entirely.
+final class ServerFeatures: @unchecked Sendable {
+    static let shared = ServerFeatures()
+    private let lock = NSLock()
+    private var advertised: Set<String> = []
+    var detectionPause: Bool { lock.withLock { advertised.contains("detection-pause") } }
+    func observe(_ header: String?) {
+        let values = Set((header ?? "").split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty })
+        lock.withLock { advertised = values }
+    }
 }
 struct PairingCode: Codable, Sendable { let code: String; let expiresAt: Date }
 struct PairingResult: Codable, Sendable { let paired: Bool }
@@ -186,8 +217,12 @@ struct BackendClient: BackendServing {
     func claim(_ code: String) async throws { let _: PairingResult = try await request("/v1/pairing/claim", body: ["code": code]) }
     func status() async throws -> ParentStatus { try await request("/v1/listener/status", method: "GET", body: Optional<String>.none) }
     func timeline() async throws -> TimelineResponse { try await request("/v1/timeline", method: "GET", body: Optional<String>.none) }
-    func heartbeat(_ value: Heartbeat) async throws -> MonitoringConfiguration { try await request("/v1/listener/heartbeat", body: value) }
-    func send(_ alert: CryAlert) async throws -> AlertReceipt { try await request("/v1/listener/event", body: AlertUpload(alert: alert), eventID: alert.eventId) }
+    func heartbeat(_ value: Heartbeat) async throws -> MonitoringConfiguration {
+        try await request("/v1/listener/heartbeat", body: value.compatible(with: .shared))
+    }
+    func send(_ alert: CryAlert) async throws -> AlertReceipt {
+        try await request("/v1/listener/event", body: AlertUpload(alert: alert, includeReason: ServerFeatures.shared.detectionPause), eventID: alert.eventId)
+    }
     func setMonitoring(_ enabled: Bool, id: UUID) async throws -> MonitoringCommand {
         struct Request: Encodable { let id: UUID; let enabled: Bool }
         return try await request("/v1/monitoring", body: Request(id: id, enabled: enabled))
@@ -309,6 +344,7 @@ struct BackendClient: BackendServing {
             await log?.network(operation: operation, outcome: "invalid_response", elapsedMS: DiagnosticTiming.elapsedMS(since: started), eventID: eventID, benchmarkAttempt: benchmarkAttempt, metrics: metricsCollector.snapshot, monotonic: true, clientRequestID: clientRequestID)
             throw BackendError.message("Invalid server response.")
         }
+        ServerFeatures.shared.observe(response.value(forHTTPHeaderField: "x-crib-features"))
         let clock = DiagnosticClockSample.estimate(localStarted: sentAt, localFinished: receivedAt, monotonicMS: networkElapsed,
             remoteReceivedMS: response.value(forHTTPHeaderField: "x-server-received-at-ms").flatMap(Int64.init),
             remoteSentMS: response.value(forHTTPHeaderField: "x-server-sent-at-ms").flatMap(Int64.init))

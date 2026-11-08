@@ -88,6 +88,9 @@ public struct CryAlert: Identifiable, Codable, Equatable, Sendable {
     public let createdAt: Date
     public let isRepeat: Bool
     public let isTest: Bool?
+    /// Why monitoring stopped, for a monitoring-failure alert; nil for an unknown
+    /// or hardware cause. Sent only to servers that advertise support.
+    public let reason: String?
     // Persisted locally only. Missing on an old outbox entry preserves its old
     // second-rounded wire metadata, so an upgrade cannot break UUID deduplication.
     let wireTimestampVersion: Int?
@@ -96,13 +99,22 @@ public struct CryAlert: Identifiable, Codable, Equatable, Sendable {
     /// it like crying until the Listener reports monitoring again.
     public static let monitoringFailedType = "monitoring_failed"
     public var isMonitoringFailure: Bool { type == Self.monitoringFailedType }
-    public init(eventId: UUID = UUID(), episodeId: UUID, listenerId: UUID, cryStartedAt: Date, durationSeconds: Double, createdAt: Date, isRepeat: Bool, isTest: Bool? = nil, type: String = "sustained_cry") {
+    /// Another app or system sound is playing on the Listener, so detection is paused.
+    public static let otherAudioReason = "other_audio"
+    public init(eventId: UUID = UUID(), episodeId: UUID, listenerId: UUID, cryStartedAt: Date, durationSeconds: Double, createdAt: Date, isRepeat: Bool, isTest: Bool? = nil, type: String = "sustained_cry", reason: String? = nil) {
         self.eventId = eventId; self.episodeId = episodeId; self.listenerId = listenerId
         self.type = type; self.cryStartedAt = cryStartedAt; self.durationSeconds = durationSeconds
         self.createdAt = createdAt; self.isRepeat = isRepeat
         self.isTest = isTest
+        self.reason = reason
         self.wireTimestampVersion = 1
     }
+}
+/// Shared wording for a monitoring-stopped alert caused by other audio on the
+/// Listener. Matches the server's push text so every surface says the same thing.
+public enum DetectionPauseCopy {
+    public static let title = "Crying detection paused"
+    public static let body = "Another sound is playing on the nursery iPhone, so crying is not being detected. Detection resumes by itself when the sound stops."
 }
 public struct PendingAlert: Codable, Sendable {
     public let alert: CryAlert

@@ -344,6 +344,9 @@ private extension TimelineEvent {
         case "monitoring_unverified": "Monitoring interrupted"
         case "audio_interrupted": "Microphone interrupted"
         case "audio_resumed": "Microphone resumed"
+        case "detection_paused": "Detection paused · Other sound playing"
+        case "detection_paused_observed": "Detection pause reported"
+        case "detection_resumed": "Detection resumed"
         case "cry_started": "Crying-like sound detected"
         case "cry_ended": "Crying-like sound ended"
         case "alert_acknowledged": "Alert acknowledged"
@@ -369,7 +372,7 @@ private extension TimelineEvent {
     }
     var timelineSubtitle: String {
         switch kind {
-        case "monitoring_observed", "stopped_observed", "standby_observed": "Backend observation · Exact transition time unknown"
+        case "monitoring_observed", "stopped_observed", "standby_observed", "detection_paused_observed": "Backend observation · Exact transition time unknown"
         case "cry_ended": endAt.map { "Episode lasted \(durationText(occurredAt.timeIntervalSince($0)))" } ?? "Quiet period confirmed"
         case "alert", "test_alert", "connection_alert": "\(count ?? 1) \((count ?? 1) == 1 ? "alert" : "alerts, including reminders") · \(destination)"
         case "alert_acknowledged": endAt.map { "Alerts snoozed until \($0.formatted(date: .omitted, time: .standard))" } ?? "Confirmed by parent"
@@ -378,6 +381,7 @@ private extension TimelineEvent {
         case "network_lost": "Alerts may be delayed · Recorded on Listener"
         case "monitoring_unverified": "Previous session could not be verified after relaunch"
         case "audio_interrupted": "Sound detection paused"
+        case "detection_paused": "Microphone on · Another sound is playing on the nursery iPhone"
         case "power_disconnected": "Running on battery"
         default: "Recorded on Listener"
         }
@@ -388,6 +392,7 @@ private extension TimelineEvent {
             if status == "sent" { return "Apple accepted this notification for delivery. Acceptance does not confirm receipt or a wrist tap. Repeated notifications with the same episode, destination and status are grouped. Tests are labelled separately." }
             return "Current delivery status: \(status ?? "pending"). The timestamp is when the alert was created; it is not a confirmed delivery time. A queued, blocked, failed or uncertain notification is not shown as sent."
         case "alert_acknowledged": return "The backend recorded an explicit parent acknowledgement. Outstanding crying and connection-loss alerts were acknowledged. \(endAt.map { "Crying and connection-loss alerts were snoozed until \($0.formatted(date: .omitted, time: .standard))." } ?? "") Connection-loss alerts resume after snooze if the Listener is still disconnected."
+        case "detection_paused", "detection_paused_observed": return "Another app or system sound, such as Find My, was playing on the nursery iPhone. Its own speaker output would have reached the microphone, so crying detection paused while the microphone stayed on. Detection resumes after five seconds without that sound."
         case "monitoring_observed", "stopped_observed", "standby_observed": return "The backend received this monitoring state at the displayed time. It does not establish the exact time the Listener started or stopped."
         case "test_acknowledged": return "A parent acknowledged this test notification. It did not snooze real crying alerts."
         case "heartbeat_missing": return "No heartbeat arrived for more than three minutes. \(endAt.map { "Last update: \($0.formatted(date: .omitted, time: .standard))." } ?? "") Monitoring may have continued locally, but its status could not be verified. The overview marks the interval since that last update as Listener updates missing."
@@ -404,10 +409,11 @@ private extension TimelineEvent {
     }
     var timelineIcon: String {
         switch kind {
-        case "monitoring_started", "audio_resumed": "play"
+        case "monitoring_started", "audio_resumed", "detection_resumed": "play"
         case "monitoring_paused", "standby_observed": "pause"
         case "monitoring_stopped": "stop"
         case "audio_interrupted", "monitoring_unverified": "mic.slash"
+        case "detection_paused", "detection_paused_observed": "speaker.wave.2"
         case "cry_started", "cry_ended": "waveform"
         case "alert_acknowledged", "test_acknowledged": "checkmark.circle"
         case "heartbeat_missing", "network_lost": "wifi.slash"

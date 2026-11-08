@@ -26,9 +26,9 @@ public struct TimelineEvent: Codable, Identifiable, Equatable, Sendable {
     public var isObservation: Bool { kind == "coverage_active" || kind == "coverage_stopped" || kind == "coverage_standby" }
     public var coverageState: TimelineCoverage.State? {
         switch kind {
-        case "monitoring_started", "audio_resumed", "monitoring_observed", "coverage_active": .monitoring
+        case "monitoring_started", "audio_resumed", "detection_resumed", "monitoring_observed", "coverage_active": .monitoring
         case "monitoring_paused", "standby_observed", "coverage_standby": .standby
-        case "monitoring_stopped", "audio_interrupted", "stopped_observed", "coverage_stopped": .stopped
+        case "monitoring_stopped", "audio_interrupted", "detection_paused", "detection_paused_observed", "stopped_observed", "coverage_stopped": .stopped
         case "heartbeat_missing": .updatesMissing
         case "monitoring_unverified": .unverified
         // Only the fresh monitoring observation establishes active capture on reconnect.

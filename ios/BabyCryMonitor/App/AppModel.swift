@@ -19,6 +19,10 @@ import UIKit
     private var detectionPaused = false
     @ObservationIgnored private var detectionStartedAt: Date?
     var standby: Bool { microphoneActive && detectionPaused }
+    /// The microphone runs, but detection is paused while another sound plays on
+    /// this iPhone. Unlike Standby nobody asked for it, so it alerts after a minute.
+    private(set) var otherAudioPaused = false
+    @ObservationIgnored private var otherAudioSince: Date?
     var starting = false
     var recoveringAudio = false
     var paired = false
@@ -772,10 +776,10 @@ import UIKit
     /// Monitoring stopped without a person's Stop or Pause: the nursery is no longer
     /// covered. Send one persistent alert through the durable outbox; the server
     /// repeats it until this Listener reports monitoring again or a person stops it.
-    private func reportUnexpectedStop() {
+    private func reportUnexpectedStop(reason: String? = nil) {
         guard role == .listener, paired, let credential, storageHealthy, store != nil, !monitoringFailureQueued else { return }
         monitoringFailureQueued = true
-        guard let alert = engine.queueMonitoringFailure(listenerId: credential.deviceId, at: currentTime()) else { return }
+        guard let alert = engine.queueMonitoringFailure(listenerId: credential.deviceId, at: currentTime(), reason: reason) else { return }
         persist()
         guard storageHealthy else { return }
         log.alertPersisted(alert, at: currentTime(), elapsedMS: 0)
@@ -1009,7 +1013,7 @@ import UIKit
             switch status {
             case .active: audioStatus = "Checking sound · Monitoring paused"
             case .stopped: break
-            case .recovering, .failed:
+            case .recovering, .failed, .otherAudio:
                 calibrationMessage = "Sound check interrupted. Start again when the microphone is available."
                 calibrationPhase = "idle"; audio.stop()
             }
@@ -1018,8 +1022,11 @@ import UIKit
         let wasActive = monitoring || recoveringAudio || microphoneActive
         let wasRecovering = recoveringAudio
         let wasMonitoring = monitoring
+        let wasOtherAudio = otherAudioPaused
         monitoringGeneration += 1; lastHeartbeatAt = .distantPast
         monitoring = false; recoveringAudio = false; microphoneActive = false; detectionStartedAt = nil
+        otherAudioPaused = false
+        if case .otherAudio = status {} else { otherAudioSince = nil }
         switch status {
         case .active:
             log.record("audio_active")
@@ -1032,7 +1039,7 @@ import UIKit
             engine.markMonitoring(monitoring); lastSampleAt = currentTime(); lastHeartbeatAt = .distantPast
             needsRestart = false; error = nil
             if !wasActive || wasRecovering || monitoring != wasMonitoring {
-                engine.recordTimeline(standby ? "monitoring_paused" : wasRecovering ? "audio_resumed" : "monitoring_started", at: currentTime()); persist()
+                engine.recordTimeline(standby ? "monitoring_paused" : wasOtherAudio ? "detection_resumed" : wasRecovering ? "audio_resumed" : "monitoring_started", at: currentTime()); persist()
             }
             queueHeartbeat()
         case .stopped:
@@ -1056,7 +1063,20 @@ import UIKit
             engine.suspend(); persist()
             error = message; needsRestart = true; recoveringSince = nil
             log.record("audio_interrupted")
-            if wasMonitoring || (wasRecovering && !detectionPaused) { reportUnexpectedStop() }
+            if wasMonitoring || (wasRecovering && !detectionPaused) || (wasOtherAudio && !detectionPaused) { reportUnexpectedStop() }
+            queueHeartbeat()
+        case .otherAudio:
+            // Keep the microphone (and Standby) as they are; only detection pauses.
+            // Heartbeats continue, reporting the reason to servers that accept it.
+            recoveringSince = nil
+            microphoneActive = true; otherAudioPaused = true
+            if !wasOtherAudio { otherAudioSince = currentTime() }
+            meter = Array(repeating: -100, count: SoundLevelFrame.barCount); currentDBFS = -100
+            chartNotificationTimes.removeAll(); chartSampledAt = nil
+            audioStatus = standby ? "Standby · Microphone active" : AudioLevelMonitor.otherAudioMessage
+            lastSampleAt = currentTime(); needsRestart = false
+            if wasMonitoring, !detectionPaused { engine.recordTimeline("detection_paused", at: currentTime()) }
+            engine.suspend(); persist()
             queueHeartbeat()
         }
         synchronizeLiveSound()
@@ -1352,9 +1372,13 @@ import UIKit
         }
         powerConnected = powered
         if microphoneActive, let lastSampleAt, now.timeIntervalSince(lastSampleAt) > 3 {
-            let wasMonitoring = monitoring
+            let wasCovering = monitoring || (otherAudioPaused && !detectionPaused)
             haltMonitoring(); error = "Monitoring stopped: microphone samples stopped arriving."; needsRestart = true; log.record("audio_stalled")
-            if wasMonitoring { reportUnexpectedStop() }
+            if wasCovering { reportUnexpectedStop() }
+        }
+        // Detection has been off for a minute without anyone pausing it.
+        if otherAudioPaused, !detectionPaused, let since = otherAudioSince, now.timeIntervalSince(since) >= 60 {
+            reportUnexpectedStop(reason: CryAlert.otherAudioReason)
         }
         // An interruption that never ends (or never reports its end) leaves the
         // nursery unmonitored. Keep waiting to resume, but tell the Parent.
@@ -1596,7 +1620,8 @@ import UIKit
                          batteryLevel: batteryLevel, powerConnected: powerConnected, state: state,
                          currentEpisode: snapshot.current.map(remote), episodes: Array(snapshot.history.prefix(100)).map(remote), appliedConfiguration: configuration,
                          timelineEvents: Array(snapshot.timelineEvents.filter { snapshot.pendingTimelineIDs.contains($0.id) }.prefix(100)),
-                         microphoneActive: microphoneActive)
+                         microphoneActive: microphoneActive,
+                         detectionPaused: otherAudioPaused && !detectionPaused ? CryAlert.otherAudioReason : nil)
     }
     private func scheduleHeartbeatIfDue() {
         guard !managingDevice else { return }
@@ -2089,7 +2114,8 @@ import UIKit
         value.discardedAcknowledgementEventId = defaults.string(forKey: watchDiscardedKey).flatMap(UUID.init(uuidString:))
         if value.parentMode, let alert = watchAlert {
             value.alert = WatchCryAlert(eventId: alert.eventId, episodeId: alert.episodeId, startedAt: alert.cryStartedAt,
-                                        createdAt: alert.createdAt, duration: alert.durationSeconds, isTest: alert.isTest == true, type: alert.type)
+                                        createdAt: alert.createdAt, duration: alert.durationSeconds, isTest: alert.isTest == true, type: alert.type,
+                                        reason: alert.reason)
         }
         value.message = message
         return value

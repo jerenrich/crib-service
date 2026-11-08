@@ -3683,6 +3683,40 @@ describe('unexpected Listener monitoring stops',()=>{
   const open=await env.DB.prepare("SELECT COUNT(*) AS count FROM events WHERE resolved_at IS NULL AND json_extract(payload,'$.type')='monitoring_failed'").first();
   expect(open).toEqual({count:0});
  });
+ it('explains a pause for other audio on the Listener in the push, its repeats and status',async()=>{
+  const {parent,listener}=await ready();
+  const advertised=await call('listener/heartbeat',listener,beat(listener,true));
+  expect(advertised.headers.get('x-crib-features')).toBe('detection-pause');
+  const paused={...beat(listener,false),microphoneActive:true,detectionPaused:'other_audio',
+   timelineEvents:[{id:crypto.randomUUID(),kind:'detection_paused',occurredAt:new Date().toISOString()}]};
+  expect((await call('listener/heartbeat',listener,paused)).status).toBe(200);
+  const stopped={...failure(listener),reason:'other_audio' as const};mockPush();
+  expect(await (await call('listener/event',listener,stopped)).json()).toEqual({status:'sent'});
+  const body=JSON.parse(String(pushRequests[0].init?.body));
+  expect(body).toMatchObject({type:'monitoring_failed',reason:'other_audio',aps:{alert:{title:'Crying detection paused'}}});
+  expect(body.aps.alert.body).toContain('Another sound is playing on the nursery iPhone');
+  expect(body.aps.alert.body).not.toContain('Tap Start');
+  vi.spyOn(Date,'now').mockReturnValue(Date.now()+6000);
+  mockPush();expect(await runReminder(testEnv,parent.deviceId)).toBe(true);
+  expect(JSON.parse(String(pushRequests[1].init?.body))).toMatchObject({reason:'other_audio',aps:{alert:{title:'Crying detection paused'}}});
+  vi.restoreAllMocks();
+  const status=await (await call('listener/status',parent,undefined,'GET')).json() as {detectionPaused:string|null;alerts:Alert[]};
+  expect(status.detectionPaused).toBe('other_audio');
+  expect(status.alerts.find(a=>a.episodeId===stopped.episodeId)?.reason).toBe('other_audio');
+  const timeline=await (await call('timeline',parent,undefined,'GET')).json() as {events:{kind:string}[]};
+  expect(timeline.events.map(e=>e.kind)).toEqual(expect.arrayContaining(['detection_paused','detection_paused_observed']));
+ });
+ it('rejects pause fields that do not describe a microphone-on pause',async()=>{
+  const {listener}=await ready();
+  for(const invalid of [
+   {...beat(listener,true),microphoneActive:true,detectionPaused:'other_audio'},
+   {...beat(listener,false),detectionPaused:'other_audio'},
+   {...beat(listener,false),microphoneActive:true,detectionPaused:'music'}
+  ])expect((await call('listener/heartbeat',listener,invalid)).status).toBe(400);
+  const cry={...failure(listener),type:'sustained_cry',reason:'other_audio'};
+  expect((await call('listener/event',listener,cry)).status).toBe(400);
+  expect((await call('listener/event',listener,{...failure(listener),reason:'microphone'})).status).toBe(400);
+ });
  it('is not retired by a monitoring heartbeat sent before the stop, and stays quiet once monitoring resumed',async()=>{
   const {parent,listener}=await ready();
   const at=new Date();

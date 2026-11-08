@@ -119,7 +119,7 @@ extension WatchCryAlert {
         }
         guard let startedAt = date(start), let createdAt = date(created) else { return nil }
         return WatchCryAlert(eventId: id, episodeId: episode, startedAt: startedAt, createdAt: createdAt, duration: duration, isTest: info["isTest"] as? Bool == true,
-                             type: info["type"] as? String,
+                             type: info["type"] as? String, reason: info["reason"] as? String,
                              diagnosticRef: DiagnosticCorrelation.reference(info["diagnosticRef"] as? String),
                              deliveryAttempt: DiagnosticCorrelation.attempt(info["deliveryAttempt"] as? Int))
     }
@@ -237,7 +237,7 @@ struct CryNotificationView: View {
                     .buttonStyle(.borderedProminent).tint(Color(red: 0.62, green: 0.90, blue: 0.79)).foregroundStyle(.black)
                     .frame(maxWidth: .infinity)
             }
-            Label(inactive ? "Alert no longer active" : alert?.isTest == true ? "Test alert" : alert?.isDisconnected == true ? "Listener connection lost" : alert?.isMonitoringFailure == true ? "Nursery monitoring stopped" : "Check on baby", systemImage: "waveform")
+            Label(inactive ? "Alert no longer active" : alert?.isTest == true ? "Test alert" : alert?.isDisconnected == true ? "Listener connection lost" : alert?.isDetectionPause == true ? DetectionPauseCopy.title : alert?.isMonitoringFailure == true ? "Nursery monitoring stopped" : "Check on baby", systemImage: "waveform")
                 .font(.headline).foregroundStyle(.orange)
             Text(inactive ? "Open the app for the latest nursery status." : text).font(.footnote)
             if let alert { Text(alert.createdAt, style: .time).font(.caption).foregroundStyle(.secondary) }

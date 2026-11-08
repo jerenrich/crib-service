@@ -74,6 +74,8 @@ struct SilentCryAlarmRequest: Sendable {
     let cycleID: UUID?
     let isDisconnected: Bool
     let isMonitoringFailure: Bool
+    /// Detection paused because another sound plays on the Listener.
+    let isDetectionPause: Bool
     /// A configured Test alert. It takes this same path and differs only where a
     /// test must: its own relevance, no snooze checks and no snooze on Stop.
     let isTest: Bool
@@ -83,6 +85,7 @@ struct SilentCryAlarmRequest: Sendable {
         eventID = fields.0; episodeID = fields.1; createdAt = fields.2
         isDisconnected = payload["type"] as? String == "listener_disconnected"
         isMonitoringFailure = payload["type"] as? String == CryAlert.monitoringFailedType
+        isDetectionPause = isMonitoringFailure && payload["reason"] as? String == CryAlert.otherAudioReason
         cycleID = (payload["alarmCycleId"] as? String).flatMap(UUID.init(uuidString:))
         isTest = payload["isTest"] as? Bool == true
     }

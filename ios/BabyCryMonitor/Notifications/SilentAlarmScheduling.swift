@@ -14,6 +14,7 @@ enum SilentAlarmScheduling {
 
     static func title(for request: SilentCryAlarmRequest) -> String {
         request.isTest ? "Test alarm · Crib Service" : request.isDisconnected ? "Listener connection lost"
+            : request.isDetectionPause ? DetectionPauseCopy.title
             : request.isMonitoringFailure ? "Nursery monitoring stopped" : "Check on baby"
     }
 
