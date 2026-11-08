@@ -531,8 +531,17 @@ final class AppModelTests: XCTestCase {
             if failRecovery { throw URLError(.cannotOpenFile) }
             running = current.capture || current.state.playing
         }
+        var activationAttempts = 0
+        var activationFailures = 0
+        func failNextActivations(_ count: Int) { activationFailures = count }
         func activate(generation requested: Int, clearSound: Bool) throws {
+            activationAttempts += 1
             guard requested >= generation else { throw CancellationError() }; generation = requested
+            if activationFailures > 0 {
+                // The real driver tears down and deactivates when activation fails.
+                activationFailures -= 1; running = false
+                throw NSError(domain: NSOSStatusErrorDomain, code: 560557684)
+            }
             current.capture = true
             if clearSound { current.state.playing = false; current.state.remainingSeconds = 0 }
             operations.append(current); running = true
@@ -962,6 +971,75 @@ final class AppModelTests: XCTestCase {
             }
             XCTAssertEqual(active, 2)
             try await audio.setNurserySound(.init(settings: .init(), action: .play))
+            audio.stop()
+        }
+    }
+    func testCaptureAndPlaybackSessionsAreMixableSoTheyCanActivateInTheBackground() {
+        // A non-mixable session cannot go active in the background ('!int'),
+        // which left a locked Listener without a microphone after Find My.
+        XCTAssertTrue(AudioSessionPolicy.captureOptions.contains(.mixWithOthers))
+        XCTAssertTrue(AudioSessionPolicy.captureOptions.contains(.defaultToSpeaker))
+        XCTAssertTrue(AudioSessionPolicy.playbackOptions.contains(.mixWithOthers))
+    }
+    @MainActor func testOtherAppAudioPausesDetectionUntilItStopsWithoutReleasingCapture() async throws {
+        let driver = AudioDriver()
+        var otherAudio = true
+        let audio = AudioLevelMonitor(driver: driver, otherAudioPlaying: { otherAudio },
+                                      otherAudioPollInterval: .milliseconds(10))
+        var statuses: [String] = []
+        audio.onStatus = { status in
+            switch status {
+            case .active: statuses.append("active")
+            case .recovering(let message): statuses.append(message == AudioLevelMonitor.otherAudioMessage ? "other" : "recovering")
+            case .failed: statuses.append("failed")
+            case .stopped: statuses.append("stopped")
+            }
+        }
+        defer { audio.stop() }
+        // Starting while media plays must not score the speaker output.
+        try await audio.start()
+        XCTAssertEqual(statuses, ["other"])
+        otherAudio = false
+        let resumed = await eventually { statuses.last == "active" }; XCTAssertTrue(resumed)
+        otherAudio = true
+        let paused = await eventually { statuses.last == "other" }; XCTAssertTrue(paused)
+        XCTAssertEqual(statuses, ["other", "active", "other"], "Polling reports transitions only")
+        let running = await driver.isRunning
+        XCTAssertTrue(running, "Other audio pauses detection; the microphone keeps running")
+        // A real interruption owns the status until it ends.
+        NotificationCenter.default.post(name: AVAudioSession.interruptionNotification, object: nil,
+            userInfo: [AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.began.rawValue])
+        let interrupted = await eventually { statuses.last == "recovering" }; XCTAssertTrue(interrupted)
+        otherAudio = false
+        try await Task.sleep(for: .milliseconds(60))
+        XCTAssertEqual(statuses.last, "recovering")
+    }
+    @MainActor func testInterruptionEndRetriesBackgroundReactivationBeforeGivingUp() async throws {
+        for (failures, recovers) in [(2, true), (10, false)] {
+            let driver = AudioDriver()
+            let audio = AudioLevelMonitor(driver: driver,
+                reactivationRetryDelays: [.milliseconds(10), .milliseconds(10), .milliseconds(10)])
+            var active = 0, failed = 0
+            audio.onStatus = { status in
+                if case .active = status { active += 1 }
+                if case .failed = status { failed += 1 }
+            }
+            try await audio.start()
+            NotificationCenter.default.post(name: AVAudioSession.interruptionNotification, object: nil,
+                userInfo: [AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.began.rawValue])
+            let paused = await eventually { await !driver.isRunning }; XCTAssertTrue(paused)
+            await driver.failNextActivations(failures)
+            NotificationCenter.default.post(name: AVAudioSession.interruptionNotification, object: nil,
+                userInfo: [AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.ended.rawValue,
+                           AVAudioSessionInterruptionOptionKey: AVAudioSession.InterruptionOptions.shouldResume.rawValue])
+            let settled = await eventually { recovers ? active == 2 : failed == 1 }
+            XCTAssertTrue(settled, "failures=\(failures)")
+            let attempts = await driver.activationAttempts
+            // One start, the immediate attempt, then up to three retries.
+            XCTAssertEqual(attempts, recovers ? 1 + 1 + failures : 1 + 1 + 3)
+            XCTAssertEqual(failed, recovers ? 0 : 1)
+            let running = await driver.isRunning
+            XCTAssertEqual(running, recovers)
             audio.stop()
         }
     }

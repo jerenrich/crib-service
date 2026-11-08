@@ -2194,7 +2194,7 @@ import UIKit
 }
 
 /// Ends a background-time request exactly once, from completion or expiry.
-@MainActor private final class BackgroundTimeGrant {
+@MainActor final class BackgroundTimeGrant {
     var identifier = UIBackgroundTaskIdentifier.invalid
     static func begin(_ name: String, onExpiry: @escaping @MainActor () -> Void) -> BackgroundTimeGrant {
         let grant = BackgroundTimeGrant()
