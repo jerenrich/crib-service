@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import UIKit
 
 enum AudioCaptureStatus {
     case stopped
@@ -66,6 +67,16 @@ extension AudioLevelProviding {
     private var configurationRecoveryAttempts = 0
     private var configurationRecoveryWindowStarted: ContinuousClock.Instant?
     private var interrupted = false
+    /// What this monitor last told AppModel about capture. Other-audio polling
+    /// only toggles between live capture and its own pause, never overriding an
+    /// interruption, recovery or failure status.
+    private enum ReportedCapture { case live, otherAudio, other }
+    private var reported = ReportedCapture.other
+    private let otherAudioPlaying: @MainActor () -> Bool
+    private let otherAudioPollInterval: Duration
+    private let reactivationRetryDelays: [Duration]
+    private var otherAudioTask: Task<Void, Never>?
+    nonisolated static let otherAudioMessage = "Other audio playing on this iPhone. Detection paused…"
     var onStatus: ((AudioCaptureStatus) -> Void)?
     var onNurserySoundChange: ((NurserySoundState) -> Void)?
     private var playback = NurserySoundPlayback()
@@ -81,7 +92,9 @@ extension AudioLevelProviding {
     weak var log: DiagnosticLog?
 
     init(driver: (any AudioCaptureDriving)? = nil, currentTime: @escaping () -> ContinuousClock.Instant = { .now },
-         sampleStream: AsyncStream<AudioLevelSample>? = nil) {
+         sampleStream: AsyncStream<AudioLevelSample>? = nil, otherAudioPlaying: (@MainActor () -> Bool)? = nil,
+         otherAudioPollInterval: Duration = .seconds(1),
+         reactivationRetryDelays: [Duration] = [.seconds(1), .seconds(3), .seconds(10)]) {
         let pair = AsyncStream<AudioLevelSample>.makeStream(bufferingPolicy: .bufferingNewest(16))
         let classifications = AsyncStream<SoundClassificationEvent>.makeStream(bufferingPolicy: .bufferingNewest(64))
         levels = sampleStream ?? pair.stream
@@ -91,6 +104,12 @@ extension AudioLevelProviding {
             classificationControl: classificationControl, classificationEvents: classifications.continuation,
             recording: recording.writer)
         self.currentTime = currentTime
+        // An injected driver has no real session, so it never sees other audio.
+        if let otherAudioPlaying { self.otherAudioPlaying = otherAudioPlaying }
+        else if driver == nil { self.otherAudioPlaying = { AVAudioSession.sharedInstance().isOtherAudioPlaying } }
+        else { self.otherAudioPlaying = { false } }
+        self.otherAudioPollInterval = otherAudioPollInterval
+        self.reactivationRetryDelays = reactivationRetryDelays
         classificationTask = Task { [weak self] in
             for await event in classifications.stream {
                 guard !Task.isCancelled else { break }
@@ -102,7 +121,7 @@ extension AudioLevelProviding {
         observe(AVAudioSession.mediaServicesWereResetNotification)
         observe(.AVAudioEngineConfigurationChange)
     }
-    deinit { classificationTask?.cancel() }
+    deinit { classificationTask?.cancel(); otherAudioTask?.cancel() }
     func requestPermission() async -> Bool { await AVAudioApplication.requestRecordPermission() }
     func start() async throws {
         try Task.checkCancellation()
@@ -127,7 +146,7 @@ extension AudioLevelProviding {
             }
             armSoundTimer(generation: expected)
             logSound(phase: "audio_applied")
-            onStatus?(.active)
+            reportActive()
         } catch {
             if generation == expected {
                 logSound(phase: "audio_failed", reason: "start_failed", error: error)
@@ -143,13 +162,14 @@ extension AudioLevelProviding {
     }
     func stop() {
         wantsMonitoring = false; generation += 1
+        otherAudioTask?.cancel(); otherAudioTask = nil
         let expected = generation
         let stopped = finishSound(reason: "microphone_stop")
         Task {
             await driver.stop(generation: expected)
             if generation == expected { logStop(stopped, phase: "stopped", reason: "microphone_stop") }
         }
-        onStatus?(.stopped)
+        report(.stopped)
     }
     func setNurserySound(_ request: NurserySoundRequest, commandID: UUID? = nil) async throws {
         try await applyNurserySound(request, commandID: commandID, stopReason: "user_stop")
@@ -178,7 +198,7 @@ extension AudioLevelProviding {
             } else { retainedCapture = false }
             if !retainedCapture {
                 reconfiguringCapture = wantsMonitoring && next.state.playing != nurseryState.playing
-                if reconfiguringCapture { onStatus?(.recovering("Updating nursery speaker and microphone…")) }
+                if reconfiguringCapture { report(.recovering("Updating nursery speaker and microphone…")) }
                 if interrupted { await driver.pause(generation: expected) }
                 else { try await driver.setSound(next.state, capture: wantsMonitoring, generation: expected) }
             }
@@ -192,14 +212,14 @@ extension AudioLevelProviding {
                 guard expected == generation else { throw CancellationError() }
                 if !keptCapture, wantsMonitoring, !reconfiguringCapture {
                     reconfiguringCapture = true
-                    onStatus?(.recovering("Restoring microphone after nursery sound…"))
+                    report(.recovering("Restoring microphone after nursery sound…"))
                     guard expected == generation else { throw CancellationError() }
                 }
                 if !keptCapture { try await driver.setSound(next.state, capture: wantsMonitoring, generation: expected) }
                 guard expected == generation else { throw CancellationError() }
             }
             playback = next; armSoundTimer(generation: expected)
-            if reconfiguringCapture, wantsMonitoring { onStatus?(.active) }
+            if reconfiguringCapture, wantsMonitoring { reportActive() }
             guard expected == generation else { throw CancellationError() }
             if newPlayback, next.state.playing {
                 if previous.state.playing { logStop(previous, phase: "stopped", reason: "replaced") }
@@ -227,17 +247,77 @@ extension AudioLevelProviding {
                 try await driver.setSound(nurseryState, capture: wantsMonitoring, generation: expected)
                 if expected == generation {
                     logStop(stopped, phase: "stopped", reason: "playback_failed")
-                    if wantsMonitoring { logSound(phase: "capture_restored", commandID: commandID); onStatus?(.active) }
+                    if wantsMonitoring { logSound(phase: "capture_restored", commandID: commandID); reportActive() }
                 }
             } catch {
                 if expected == generation, wantsMonitoring {
                     logSound(phase: "capture_restore_failed", commandID: commandID, error: error)
                     wantsMonitoring = false
-                    onStatus?(.failed("Microphone unavailable. Open the app to restart monitoring."))
+                    report(.failed("Microphone unavailable. Open the app to restart monitoring."))
                 }
             }
             throw error
         }
+    }
+    private func report(_ status: AudioCaptureStatus) {
+        reported = .other
+        onStatus?(status)
+    }
+    /// The mixable capture session keeps recording while another app plays,
+    /// and that playback reaches the microphone. Detection must not score it.
+    private func reportActive() {
+        let paused = otherAudioPlaying()
+        if paused { log?.record("audio_other_playing") }
+        onStatus?(paused ? .recovering(Self.otherAudioMessage) : .active)
+        reported = paused ? .otherAudio : .live
+        watchOtherAudio()
+    }
+    private func watchOtherAudio() {
+        guard otherAudioTask == nil else { return }
+        let interval = otherAudioPollInterval
+        otherAudioTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: interval) } catch { return }
+                guard let self else { return }
+                guard self.wantsMonitoring else { self.otherAudioTask = nil; return }
+                self.pollOtherAudio()
+            }
+        }
+    }
+    private func pollOtherAudio() {
+        // Interruptions and in-flight reconfiguration publish their own status.
+        guard !interrupted, configuringGeneration == nil else { return }
+        switch reported {
+        case .live where otherAudioPlaying():
+            log?.record("audio_other_playing")
+            onStatus?(.recovering(Self.otherAudioMessage)); reported = .otherAudio
+        case .otherAudio where !otherAudioPlaying():
+            log?.record("audio_other_stopped")
+            onStatus?(.active); reported = .live
+        default: break
+        }
+    }
+    /// When an interruption ends, the other session may not have released
+    /// audio yet. Retry briefly under background time instead of giving up,
+    /// since a locked Listener otherwise stays deaf until someone opens it.
+    private func retryReactivation(generation expected: Int) async -> Bool {
+        guard !reactivationRetryDelays.isEmpty else { return false }
+        let grant = BackgroundTimeGrant.begin("AudioReactivation") {}
+        defer { grant.end() }
+        for (index, delay) in reactivationRetryDelays.enumerated() {
+            do { try await Task.sleep(for: delay) } catch { return false }
+            guard generation == expected, wantsMonitoring else { return false }
+            do {
+                try await driver.activate(generation: expected, clearSound: true)
+                guard generation == expected, wantsMonitoring else { return false }
+                log?.record("audio_reactivation_recovered", code: index + 1)
+                return true
+            } catch {
+                guard generation == expected, wantsMonitoring else { return false }
+                log?.record("audio_reactivation_failed", code: index + 1, error: error)
+            }
+        }
+        return false
     }
     private func armSoundTimer(generation expected: Int) {
         soundTask?.cancel(); soundTask = nil
@@ -352,17 +432,17 @@ extension AudioLevelProviding {
                 logStop(stopped, phase: "stopped", reason: "engine_configuration_changed")
                 if wantsMonitoring {
                     wantsMonitoring = false
-                    onStatus?(.failed("Audio recovery failed. Open the app to restart monitoring."))
+                    report(.failed("Audio recovery failed. Open the app to restart monitoring."))
                 }
                 return
             }
             configurationRecoveryAttempts += 1
-            if wantsMonitoring { onStatus?(.recovering("Recovering speaker and microphone…")) }
+            if wantsMonitoring { report(.recovering("Recovering speaker and microphone…")) }
             do {
                 try await driver.recoverConfiguration(generation: expected)
                 guard generation == expected else { return }
                 armSoundTimer(generation: expected)
-                if wantsMonitoring { onStatus?(.active) }
+                if wantsMonitoring { reportActive() }
             } catch {
                 guard generation == expected else { return }
                 log?.record("audio_interrupted", error: error)
@@ -370,7 +450,7 @@ extension AudioLevelProviding {
                 await driver.stop(generation: expected)
                 guard generation == expected else { return }
                 logStop(stopped, phase: "stopped", reason: "route_change")
-                if wantsMonitoring { wantsMonitoring = false; onStatus?(.failed("Microphone unavailable. Open the app to restart monitoring.")) }
+                if wantsMonitoring { wantsMonitoring = false; report(.failed("Microphone unavailable. Open the app to restart monitoring.")) }
             }
             return
         }
@@ -406,7 +486,7 @@ extension AudioLevelProviding {
         // Codes: began → AVAudioSession.InterruptionReason, ended → InterruptionOptions
         // (1 = shouldResume; without it one restart is still tried), route → RouteChangeReason.
         if interrupted {
-            onStatus?(.recovering("Audio interrupted. Waiting for microphone…"))
+            report(.recovering("Audio interrupted. Waiting for microphone…"))
             guard expected == generation else { return }
             await driver.pause(generation: expected)
             if generation == expected { logStop(stopped, phase: "stopped", reason: stopReason) }
@@ -418,19 +498,26 @@ extension AudioLevelProviding {
         let unprompted = name == AVAudioSession.interruptionNotification
             && !AVAudioSession.InterruptionOptions(rawValue: options).contains(.shouldResume)
         // End the last observed episode before restarting; no interruption counts as crying.
-        onStatus?(.recovering("Audio route changed. Recovering microphone…"))
+        report(.recovering("Audio route changed. Recovering microphone…"))
         guard expected == generation else { return }
         do {
             try await driver.activate(generation: expected, clearSound: true)
             guard generation == expected, wantsMonitoring else { return }
             logStop(stopped, phase: "stopped", reason: stopReason)
             logSound(phase: "capture_restored")
-            onStatus?(.active)
+            reportActive()
         } catch {
             guard generation == expected, wantsMonitoring else { return }
             log?.record("audio_interrupted", code: unprompted ? 1 : 0, error: error)
+            if await retryReactivation(generation: expected) {
+                logStop(stopped, phase: "stopped", reason: stopReason)
+                logSound(phase: "capture_restored")
+                reportActive()
+                return
+            }
+            guard generation == expected, wantsMonitoring else { return }
             wantsMonitoring = false
-            onStatus?(.failed(unprompted ? "Audio could not resume. Open the app to restart monitoring."
+            report(.failed(unprompted ? "Audio could not resume. Open the app to restart monitoring."
                                          : "Microphone unavailable. Open the app to restart monitoring."))
         }
     }
@@ -486,8 +573,9 @@ private actor AudioCaptureDriver: AudioCaptureDriving {
         var stage = NurseryAudioFailure.Stage.session
         do {
             if captureEnabled {
-                try session.setCategory(.playAndRecord, mode: sound == nil ? .measurement : .voiceChat, options: [.defaultToSpeaker])
-            } else { try session.setCategory(.playback, mode: .default, options: []) }
+                try session.setCategory(.playAndRecord, mode: sound == nil ? .measurement : .voiceChat,
+                                        options: AudioSessionPolicy.captureOptions)
+            } else { try session.setCategory(.playback, mode: .default, options: AudioSessionPolicy.playbackOptions) }
             try session.setPreferredIOBufferDuration(0.02)
             try session.setActive(true); sessionActive = true
             if captureEnabled {
@@ -665,6 +753,18 @@ final class AudioCaptureTap {
         classifier?.stop(); classifier = nil
         node = nil
     }
+}
+
+enum AudioSessionPolicy {
+    /// Sessions must be mixable. iOS refuses to activate a non-mixable session
+    /// from the background (AVAudioSession error '!int', 560557684), so a locked
+    /// Listener lost its microphone permanently after a Find My sound ended,
+    /// even though the system offered shouldResume. Calls, alarms, Find My and
+    /// non-mixable recording still interrupt; ordinary playback from other apps
+    /// mixes instead, so AudioLevelMonitor pauses detection while it plays.
+    /// Nursery sound plays alongside other audio rather than taking it over.
+    static let captureOptions: AVAudioSession.CategoryOptions = [.defaultToSpeaker, .mixWithOthers]
+    static let playbackOptions: AVAudioSession.CategoryOptions = [.mixWithOthers]
 }
 
 enum AudioGraphLifecycle {

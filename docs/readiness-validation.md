@@ -26,6 +26,14 @@ The later diagnostics audit added command/playback correlation, safe audio error
 - Disconnect/reconnect either phone during a Parent request. Parent must show a timeout or unconfirmed change, disable stale controls, and never replay a Play request after reconnecting. If the nursery microphone is fully stopped and the phone is locked without playback, reopen its app to restore remote control availability.
 - Check small iPhone screens and accessibility text: the compact player must remain reachable, the sheet must scroll when needed, and all timer buttons must have accessible minute labels.
 
+
+### Mixable audio session — added 8 November 2026
+
+- [ ] Lock the Listener while it is monitoring, play a Find My sound on it from another device, and let it finish. Confirm the diagnostics log shows `audio_interruption_ended`, then `audio_active` (or `audio_reactivation_recovered`), with heartbeats continuing and no `!int` (560557684) error.
+- [ ] Repeat in Standby and confirm remote Resume from the Parent still works afterwards.
+- [ ] Play music in another app on the nursery iPhone while it is monitoring and locked. Confirm `audio_other_playing` appears, no crying alert fires, the stopped alert reaches the Parent after about a minute, and `audio_other_stopped` and recovery follow when the music stops.
+- [ ] With white noise playing from the Parent and the nursery iPhone locked, confirm the hardware volume buttons still change the nursery sound volume.
+
 ## First device comparison and follow-up fixes — 29 October 2026
 
 Two real cries on J17, unplugged at 50% and locked:
