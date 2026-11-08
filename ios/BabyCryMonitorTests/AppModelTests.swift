@@ -1971,6 +1971,32 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(fixture.liveSound.connectedDevice)
         XCTAssertNil(fixture.model.remoteSound.frame)
     }
+    @MainActor func testParentTreatsAnOtherAudioPauseAsActiveNotStandby() async throws {
+        let fixture = try Fixture(localWarnings: true)
+        fixture.model.selectRole(.parent)
+        fixture.model.paired = true
+        var status = ParentStatus(paired: true, lastHeartbeat: fixture.time.now,
+            monitoring: false, configuration: MonitoringConfiguration(), microphoneActive: true)
+        fixture.model.parentStatus = status
+        XCTAssertTrue(fixture.model.canStartMonitoringRemotely, "Real Standby offers Start")
+        XCTAssertFalse(fixture.model.parentDetectionPaused)
+        status.detectionPaused = CryAlert.otherAudioReason
+        fixture.model.parentStatus = status
+        XCTAssertTrue(fixture.model.parentDetectionPaused)
+        XCTAssertFalse(fixture.model.canStartMonitoringRemotely, "A pause for other audio resumes by itself; offer Pause, not Start")
+        XCTAssertEqual(fixture.model.nightstandDevices.first?.status, "Detection paused · Other sound playing")
+    }
+    @MainActor func testListenerTreatsAnOtherAudioPauseAsActiveUnlessInStandby() async throws {
+        let fixture = try Fixture()
+        await fixture.model.start()
+        fixture.audio.onStatus?(.otherAudio)
+        XCTAssertTrue(fixture.model.listenerDetectionPaused)
+        XCTAssertEqual(fixture.model.nightstandDevices.first?.status, "Detection paused · Other sound playing")
+        fixture.model.pauseMonitoring()
+        XCTAssertTrue(fixture.model.standby)
+        XCTAssertFalse(fixture.model.listenerDetectionPaused, "A person's Standby is Standby")
+        fixture.model.stop()
+    }
     @MainActor func testLiveSoundImmediatelyOffersPauseBeforeStoppedHeartbeatRefreshes() async throws {
         let fixture = try Fixture(localWarnings: true)
         fixture.model.selectRole(.parent)

@@ -477,13 +477,21 @@ import UIKit
         return parentMonitoringEvidence.state(at: now, statusAvailable: parentStatus?.lastHeartbeat != nil && parentStatus?.monitoring != nil)
     }
     var parentDisplaysMonitoring: Bool { parentMonitoringDisplayState == .monitoring }
+    /// The nursery microphone is on and detection is paused for another sound on
+    /// that iPhone. It looks like Standby on the wire, but nobody asked for it and
+    /// it resumes by itself, so controls offer Pause rather than Start.
+    var parentDetectionPaused: Bool {
+        role == .parent && parentMonitoringDisplayState == .standby && parentStatus?.detectionPaused == CryAlert.otherAudioReason
+    }
+    /// The Listener-side equivalent: detection paused for other audio, not Standby.
+    var listenerDetectionPaused: Bool { role == .listener && otherAudioPaused && !standby }
     var parentHasLiveMonitoring: Bool { parentDisplaysMonitoring && remoteSound.isLive(at: now) }
     var parentDisplaysActiveMicrophone: Bool { [.monitoring, .standby].contains(parentMonitoringDisplayState) }
     var canStartMonitoringRemotely: Bool {
         role == .parent && paired && parentStatus?.paired == true &&
         (!connectivity.checked || connectivity.available) &&
         parentMonitoringEvidence.canResume(at: now, statusAvailable: parentStatus?.lastHeartbeat != nil && parentStatus?.monitoring != nil) &&
-        parentMonitoringDisplayState == .standby
+        parentMonitoringDisplayState == .standby && !parentDetectionPaused
     }
     var nurseryConnection: String { parentMonitoringDisplayState.rawValue }
     var settingsSyncStatus: String {
