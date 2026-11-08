@@ -40,7 +40,12 @@ struct NightstandView: View {
     }
     private var confirmedParentState: Bool { ["Monitoring", "Standby", "Stopped"].contains(model.nurseryConnection) }
     private var standby: Bool { listener ? model.standby : model.parentMonitoringDisplayState == .standby }
-    private var monitoringActive: Bool { listener ? model.monitoring || model.recoveringAudio : model.parentDisplaysMonitoring }
+    /// A detection pause for other audio counts as active: it resumes by itself,
+    /// so the control offers Pause (to Standby) rather than Start.
+    private var monitoringActive: Bool {
+        listener ? model.monitoring || model.recoveringAudio || model.listenerDetectionPaused
+                 : model.parentDisplaysMonitoring || model.parentDetectionPaused
+    }
     private var parentStartUnavailable: Bool { !listener && model.paired && !monitoringActive && !model.canStartMonitoringRemotely && model.pendingMonitoringCommand == nil }
     private var busy: Bool { listener ? model.starting : model.requestingMonitoring || model.pendingMonitoringCommand != nil }
     private var currentState: CryState? { listener ? model.state : soundLive ? frame?.state : nil }
@@ -119,7 +124,7 @@ struct NightstandView: View {
             }
             return Hero(title: "Alerts snoozed", detail: actor.map { "\($0) snoozed · Resumes in" } ?? "Resumes in", tone: .caution, ring: .progress(min(1, remaining)), icon: "bell.slash", resumesAt: until)
         }
-        if standby, model.parentStatus?.detectionPaused == CryAlert.otherAudioReason {
+        if model.parentDetectionPaused {
             return Hero(title: "Detection paused", detail: "Another sound is playing on the nursery iPhone.", tone: .caution, ring: .dashed, icon: "speaker.wave.2")
         }
         if standby {
@@ -148,7 +153,7 @@ struct NightstandView: View {
         if model.recoveringAudio {
             return Hero(title: "Monitoring paused", detail: model.audioStatus, tone: .caution, ring: .dashed, icon: "mic.slash")
         }
-        if model.otherAudioPaused, !model.standby {
+        if model.listenerDetectionPaused {
             return Hero(title: "Detection paused", detail: "Another sound is playing on this iPhone. Detection resumes when it stops.",
                         tone: .caution, ring: .dashed, icon: "speaker.wave.2")
         }
