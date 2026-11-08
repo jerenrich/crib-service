@@ -337,6 +337,39 @@ final class CryConfidenceTests: XCTestCase {
         XCTAssertEqual(s.alerts.count, 2)
     }
 
+    func testLonePositiveAfterSettlingExpiresInsteadOfBackdatingALaterCry() throws {
+        var s = Simulation()
+        for end in 4...6 { s.score(0.95, end: Double(end)) }
+        XCTAssertEqual(s.alerts.count, 1)
+        for end in 7...40 { s.score(0, end: Double(end)) }
+        XCTAssertEqual(s.engine.state, .quiet)
+        s.score(0.95, end: 41)
+        XCTAssertEqual(s.engine.state, .possibleCry)
+        for end in 42...700 { s.score(0, end: Double(end)) }
+        XCTAssertEqual(s.engine.state, .quiet, "A lone positive cannot hold Sound detected through hours of quiet")
+        for end in 701...704 { s.score(0.95, end: Double(end)) }
+        XCTAssertEqual(s.alerts.count, 2)
+        let alert = try XCTUnwrap(s.alerts.last)
+        XCTAssertEqual(alert.cryStartedAt, s.date(697), "Onset is the new cry's first window, not the stale positive")
+        XCTAssertEqual(alert.durationSeconds, 7, accuracy: 0.001)
+    }
+
+    func testSparsePositivesCannotBackdateALaterCry() throws {
+        var s = Simulation()
+        for end in 4...6 { s.score(0.95, end: Double(end)) }
+        for end in 7...40 { s.score(0, end: Double(end)) }
+        // Isolated positives closer together than the quiet reset keep a
+        // candidate open, but they are not 80% sustained sound.
+        for end in 41...700 { s.score(end % 15 == 11 ? 0.95 : 0, end: Double(end)) }
+        for end in 701...704 { s.score(0.95, end: Double(end)) }
+        XCTAssertEqual(s.alerts.count, 2)
+        let alert = try XCTUnwrap(s.alerts.last)
+        XCTAssertGreaterThanOrEqual(alert.cryStartedAt, s.date(697))
+        XCTAssertLessThanOrEqual(alert.durationSeconds, 7.001)
+        let episode = try XCTUnwrap(s.engine.snapshot.current)
+        XCTAssertGreaterThanOrEqual(episode.startedAt, s.date(697), "The episode and its timeline start move with the onset")
+    }
+
     func testMissingResultDoesNotCountAsContinuousHighConfidence() {
         var s = Simulation()
         s.score(end: 4)
