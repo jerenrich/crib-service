@@ -3,7 +3,7 @@ import {reserveAlarmRequest} from './alarm-scheduling';
 import {phoneHeadStartFor} from './notification-coordination';
 import {deliverToBoth} from './dual-delivery';
 import {acceptedDelivery,queueAcceptedDelivery,type AcceptedDelivery} from './accepted-delivery';
-import {stoppedMonitoringSQL,monitoringResumedSQL,lateUploadSuppressedSQL} from './monitoring';
+import {stoppedMonitoringSQL,monitoringResumedSQL,lateUploadSuppressedSQL,coveringHeartbeatSQL} from './monitoring';
 import {scheduleReminders} from './reminders';
 import {Latency} from './latency';
 import {APIError,requireRole,type Alert,type Device,type Env,type StoredEvent} from './types';
@@ -104,7 +104,7 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
   CASE WHEN json_extract(payload,'$.type')='listener_disconnected' AND NOT EXISTS(
    SELECT 1 FROM pairs p JOIN devices d ON d.id=p.parent_id JOIN heartbeats h ON h.listener_id=p.listener_id
    WHERE p.parent_id=events.parent_id AND p.listener_id=events.listener_id AND d.connection_alerts=1
-    AND json_extract(h.metadata,'$.monitoring')=1 AND h.received_at=json_extract(events.payload,'$.cryStartedAt')
+    AND ${coveringHeartbeatSQL()} AND h.received_at=json_extract(events.payload,'$.cryStartedAt')
     AND h.received_at<?) THEN ? WHEN ${monitoringResumedSQL} THEN ? END,
   (SELECT r.resolved_at FROM resolved_episodes r
   JOIN pairs p ON p.parent_id=r.parent_id AND p.listener_id=r.listener_id AND p.created_at=r.pair_created_at

@@ -258,6 +258,25 @@ describe('connection alerts, readiness and replacement',()=>{
   expect(content.aps['interruption-level']).toBe('time-sensitive');
   expect((await env.DB.prepare("SELECT status FROM events ORDER BY created_at DESC LIMIT 1").first<{status:string}>())?.status).toBe('sent');
  });
+ it('sends no stopped notice for a detection pause, yet alerts when a paused Listener goes silent',async()=>{
+  const {parent,listener}=await paired();await call('connection-alerts',parent,{enabled:true});
+  await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  await call('listener/heartbeat',listener,beat(listener));await flushConnections(testEnv);
+  const paused={...beat(listener,false),microphoneActive:true,detectionPaused:'other_audio'};
+  expect((await call('listener/heartbeat',listener,paused)).status).toBe(200);
+  await flushConnections(testEnv);await flushConnections(testEnv);
+  expect(pushRequests).toHaveLength(0);
+  expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM connection_notices WHERE state='stopped'").first()).toEqual({n:0});
+  expect((await env.DB.prepare('SELECT state FROM connection_states WHERE listener_id=?').bind(listener.deviceId).first<{state:string}>())?.state).toBe('online');
+  // Silence after a pause is an outage like any other.
+  await stale();mockPush();await flushConnections(testEnv);await flushConnections(testEnv);
+  expect(pushRequests).toHaveLength(1);
+  expect(JSON.parse(String(pushRequests[0].init?.body))).toMatchObject({type:'listener_disconnected',connectionState:'offline'});
+  // A real stop still sends the stopped notice.
+  await call('listener/heartbeat',listener,beat(listener));await flushConnections(testEnv);
+  await call('listener/heartbeat',listener,beat(listener,false));mockPush();await flushConnections(testEnv);await flushConnections(testEnv);
+  expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM connection_notices WHERE state='stopped'").first()).toEqual({n:1});
+ });
  it('does not replay ambiguous health delivery and cancels obsolete outages',async()=>{
   const {parent,listener}=await paired();await call('connection-alerts',parent,{enabled:true});
   await call('device/push-token',parent,{token:'ab'.repeat(32)});await call('listener/heartbeat',listener,beat(listener));await stale();

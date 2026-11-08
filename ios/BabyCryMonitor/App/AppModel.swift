@@ -1384,8 +1384,11 @@ import UIKit
             haltMonitoring(); error = "Monitoring stopped: microphone samples stopped arriving."; needsRestart = true; log.record("audio_stalled")
             if wasCovering { reportUnexpectedStop() }
         }
-        // Detection has been off for a minute without anyone pausing it.
-        if otherAudioPaused, !detectionPaused, let since = otherAudioSince, now.timeIntervalSince(since) >= 60 {
+        // Detection has been off for a minute without anyone pausing it. Once the
+        // sound has stopped, detection is only waiting out its resume delay; an
+        // alert then would arrive after the problem ended (and wake AlarmKit).
+        if otherAudioPaused, !detectionPaused, audio.otherAudioPlayingNow,
+           let since = otherAudioSince, now.timeIntervalSince(since) >= 60 {
             reportUnexpectedStop(reason: CryAlert.otherAudioReason)
         }
         // An interruption that never ends (or never reports its end) leaves the

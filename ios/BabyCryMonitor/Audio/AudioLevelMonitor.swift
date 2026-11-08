@@ -37,6 +37,9 @@ protocol AudioCaptureDriving: Sendable {
     var onStatus: ((AudioCaptureStatus) -> Void)? { get set }
     var onNurserySoundChange: ((NurserySoundState) -> Void)? { get set }
     var onClassification: ((SoundClassificationEvent) -> Void)? { get set }
+    /// During an `.otherAudio` pause: whether that sound is still playing, rather
+    /// than having stopped while detection waits out the quiet period to resume.
+    var otherAudioPlayingNow: Bool { get }
     func setClassificationEnabled(_ enabled: Bool)
     func setClassificationAppActive(_ active: Bool)
     func requestPermission() async -> Bool
@@ -47,6 +50,7 @@ protocol AudioCaptureDriving: Sendable {
 extension AudioLevelProviding {
     var calibrationAudio: CalibrationAudioRecording? { nil }
     var onClassification: ((SoundClassificationEvent) -> Void)? { get { nil } set {} }
+    var otherAudioPlayingNow: Bool { false }
     func setClassificationEnabled(_ enabled: Bool) {}
     func setClassificationAppActive(_ active: Bool) {}
     func setNurserySound(_ request: NurserySoundRequest) async throws { try await setNurserySound(request, commandID: nil) }
@@ -83,6 +87,10 @@ extension AudioLevelProviding {
     /// When other audio was last seen while paused. Resume needs a quiet stretch,
     /// since sounds such as Find My pulse and would otherwise flap detection.
     private var otherAudioLastSeen: ContinuousClock.Instant?
+    var otherAudioPlayingNow: Bool {
+        guard reported == .otherAudio, let seen = otherAudioLastSeen else { return false }
+        return seen.duration(to: currentTime()) < .seconds(1)
+    }
     nonisolated static let otherAudioMessage = "Another sound is playing on this iPhone. Detection paused."
     var onStatus: ((AudioCaptureStatus) -> Void)?
     var onNurserySoundChange: ((NurserySoundState) -> Void)?

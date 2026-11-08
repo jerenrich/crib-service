@@ -4,7 +4,7 @@ import {dispatchEvent} from './alerts';
 import {recordDiagnostic,eventReference} from './diagnostics';
 import {Latency,type Span} from './latency';
 import {persistAcceptedDelivery,type AcceptedDelivery} from './accepted-delivery';
-import {monitoringResumedSQL} from './monitoring';
+import {monitoringResumedSQL,coveringHeartbeatSQL} from './monitoring';
 
 const outcomePrefix='accepted/';
 interface ReminderDelivery {
@@ -226,7 +226,7 @@ export async function runReminder(env:Env,parentId:string,latency=new Latency(),
    JOIN pairs p ON p.parent_id=e.parent_id AND p.listener_id=e.listener_id
    JOIN devices d ON d.id=p.parent_id JOIN heartbeats h ON h.listener_id=p.listener_id
    WHERE e.parent_id=? AND e.resolved_at IS NULL AND json_extract(e.payload,'$.type')='listener_disconnected'
-    AND d.connection_alerts=1 AND json_extract(h.metadata,'$.monitoring')=1
+    AND d.connection_alerts=1 AND ${coveringHeartbeatSQL()}
     AND h.received_at=json_extract(e.payload,'$.cryStartedAt') AND h.received_at<?
    ORDER BY e.created_at DESC LIMIT 1`).bind(parentId,new Date(now-180000).toISOString()));
  }

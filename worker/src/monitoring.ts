@@ -39,7 +39,7 @@ export async function requestMonitoring(env:Env,device:Device,value:Record<strin
    SELECT ?,p.listener_id,p.parent_id,'offline',h.received_at,?,'cancelled'
    FROM pairs p JOIN heartbeats h ON h.listener_id=p.listener_id
    WHERE p.parent_id=? AND p.listener_id=? AND p.created_at=? AND ?=0
-   AND json_extract(h.metadata,'$.monitoring')=1
+   AND ${coveringHeartbeatSQL()}
    AND EXISTS(SELECT 1 FROM monitoring_commands WHERE id=? AND claim_id=? AND enabled=0)
    ON CONFLICT(listener_id,state,observed_at) DO UPDATE SET status='cancelled',lease_until=NULL
    WHERE connection_notices.parent_id=excluded.parent_id`)
@@ -83,6 +83,14 @@ export async function completeMonitoring(env:Env,device:Device,value:Record<stri
  return {ok:result.meta.changes>0};
 }
 
+/** A heartbeat that should be covered by connection-loss alerts: monitoring, or
+ * detection paused for other audio. That pause is not a person's choice, so if
+ * the Listener then goes silent, the Parent must still hear about it. */
+export const coveringHeartbeatSQL=(alias='h')=>`(json_extract(${alias}.metadata,'$.monitoring')=1 OR json_extract(${alias}.metadata,'$.detectionPaused') IS NOT NULL)`;
+export function coveringHeartbeat(metadata:string):boolean {
+ const beat=JSON.parse(metadata) as {monitoring?:boolean;detectionPaused?:string};
+ return beat.monitoring===true||beat.detectionPaused!=null;
+}
 // A monitoring_failed episode ends once the Listener reports monitoring again.
 // Compare Listener timestamps with each other, never with server time, so a
 // skewed clock cannot let the pre-failure heartbeat retire the new alert.
