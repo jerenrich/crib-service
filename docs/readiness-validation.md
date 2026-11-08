@@ -31,7 +31,9 @@ The later diagnostics audit added command/playback correlation, safe audio error
 
 - [ ] Lock the Listener while it is monitoring, play a Find My sound on it from another device, and let it finish. Confirm the diagnostics log shows `audio_interruption_ended`, then `audio_active` (or `audio_reactivation_recovered`), with heartbeats continuing and no `!int` (560557684) error.
 - [ ] Repeat in Standby and confirm remote Resume from the Parent still works afterwards.
-- [ ] Play music in another app on the nursery iPhone while it is monitoring and locked. Confirm `audio_other_playing` appears, no crying alert fires, the stopped alert reaches the Parent after about a minute, and `audio_other_stopped` and recovery follow when the music stops.
+- [ ] Play music in another app on the nursery iPhone while it is monitoring and locked. Confirm `audio_other_playing` appears within about a second with no `possible_cry` before it, no crying alert fires, and both iPhones show “Detection paused”. After about a minute the Parent and Watch should receive **Crying detection paused** alerts, without “Tap Start”. When the music stops, `audio_other_stopped` should follow about five seconds later, and the alerts end.
+- [ ] Repeat with a Find My sound on the locked Listener. Its pulses must not produce `audio_other_stopped` until the sound has ended.
+- [ ] Start white noise from the Parent while the Listener monitors. Confirm no `audio_other_playing` appears and that a real cry is still detected.
 - [ ] With white noise playing from the Parent and the nursery iPhone locked, confirm the hardware volume buttons still change the nursery sound volume.
 
 ## First device comparison and follow-up fixes — 29 October 2026

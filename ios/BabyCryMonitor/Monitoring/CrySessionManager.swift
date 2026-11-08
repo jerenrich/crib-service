@@ -46,10 +46,10 @@ public struct CrySessionManager: Sendable {
     }
     /// Queue one persistent "monitoring stopped" alert for an unexpected stop. Its
     /// start is the stop time, so the server can tell a later monitoring heartbeat.
-    @discardableResult public mutating func queueMonitoringFailure(listenerId: UUID, at date: Date) -> CryAlert? {
+    @discardableResult public mutating func queueMonitoringFailure(listenerId: UUID, at date: Date, reason: String? = nil) -> CryAlert? {
         guard !snapshot.pending.contains(where: { $0.alert.isMonitoringFailure }) else { return nil }
         let alert = CryAlert(episodeId: UUID(), listenerId: listenerId, cryStartedAt: date, durationSeconds: 0,
-                             createdAt: date, isRepeat: false, type: CryAlert.monitoringFailedType)
+                             createdAt: date, isRepeat: false, type: CryAlert.monitoringFailedType, reason: reason)
         snapshot.pending.append(PendingAlert(alert: alert))
         return alert
     }

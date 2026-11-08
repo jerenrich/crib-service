@@ -29,8 +29,8 @@ export function heartbeatTimeline(env:Env,pair:Pair,beat:Heartbeat,previous:{rec
   events.push({id:`restored:${previous.received_at}`,kind:'connection_restored',occurredAt:stamp,endAt:previous.received_at});
  }
  // Never describe the first observation as an exact start/stop time.
- if(!old||old.monitoring!==beat.monitoring||old.microphoneActive!==beat.microphoneActive||previous&&now-Date.parse(previous.received_at)>180000)
-  events.push({id:`state:${stamp}`,kind:beat.monitoring?'monitoring_observed':beat.microphoneActive?'standby_observed':'stopped_observed',occurredAt:stamp});
+ if(!old||old.monitoring!==beat.monitoring||old.microphoneActive!==beat.microphoneActive||old.detectionPaused!==beat.detectionPaused||previous&&now-Date.parse(previous.received_at)>180000)
+  events.push({id:`state:${stamp}`,kind:beat.monitoring?'monitoring_observed':beat.detectionPaused?'detection_paused_observed':beat.microphoneActive?'standby_observed':'stopped_observed',occurredAt:stamp});
  events.push({id:`coverage:${Math.floor(now/hour)}`,kind:beat.monitoring?'coverage_active':beat.microphoneActive?'coverage_standby':'coverage_stopped',occurredAt:stamp});
  if(old&&!(beat.timelineEvents?.length)) {
   if(old.powerConnected!==beat.powerConnected)events.push({id:`power:${stamp}`,kind:beat.powerConnected?'power_connected':'power_disconnected',occurredAt:stamp});
@@ -66,7 +66,7 @@ export async function timeline(env:Env,device:Device) {
   env.DB.prepare('SELECT payload FROM timeline_events WHERE parent_id=? AND listener_id=? AND pair_created_at=? AND occurred_at>=? AND occurred_at<=? ORDER BY occurred_at DESC,id LIMIT 1001')
    .bind(pair.parent_id,pair.listener_id,pair.created_at,cutoff,now).all<{payload:string}>(),
   env.DB.prepare(`SELECT payload FROM timeline_events WHERE parent_id=? AND listener_id=? AND pair_created_at=? AND occurred_at<?
-   AND kind IN ('monitoring_started','monitoring_stopped','monitoring_paused','audio_interrupted','audio_resumed','monitoring_unverified','monitoring_observed','stopped_observed','standby_observed','heartbeat_missing','connection_restored','coverage_active','coverage_stopped','coverage_standby') ORDER BY occurred_at DESC,id DESC LIMIT 1`)
+   AND kind IN ('monitoring_started','monitoring_stopped','monitoring_paused','audio_interrupted','audio_resumed','monitoring_unverified','monitoring_observed','stopped_observed','standby_observed','detection_paused','detection_resumed','detection_paused_observed','heartbeat_missing','connection_restored','coverage_active','coverage_stopped','coverage_standby') ORDER BY occurred_at DESC,id DESC LIMIT 1`)
    .bind(pair.parent_id,pair.listener_id,pair.created_at,cutoff).first<{payload:string}>(),
   env.DB.prepare(`SELECT episode_id,CASE WHEN delivery_state IS NOT NULL THEN 'both' ELSE push_target END AS push_target,status,COALESCE(json_extract(payload,'$.isTest'),0) AS test,
    COALESCE(json_extract(payload,'$.type') IN ('listener_disconnected','monitoring_failed'),0) AS disconnected,COUNT(*) AS count,MIN(COALESCE(sent_at,json_extract(payload,'$.createdAt'))) AS first_at,
@@ -99,7 +99,7 @@ export async function timeline(env:Env,device:Device) {
   truncated:journal.results.length>1000||groups.results.length>400||notices.results.length>200};
 }
 
-export const localTimelineKinds=['monitoring_started','monitoring_stopped','monitoring_paused','audio_interrupted','audio_resumed','monitoring_unverified','power_connected','power_disconnected','network_lost','network_restored','cry_started','cry_ended'] as const;
+export const localTimelineKinds=['monitoring_started','monitoring_stopped','monitoring_paused','audio_interrupted','detection_paused','detection_resumed','audio_resumed','monitoring_unverified','power_connected','power_disconnected','network_lost','network_restored','cry_started','cry_ended'] as const;
 export function validateTimelineEvents(value:unknown):TimelineEvent[] {
  if(!Array.isArray(value)||value.length>100)throw new APIError(400,'Invalid timeline batch.');
  return value.map(item=>{

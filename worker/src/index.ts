@@ -11,7 +11,7 @@ export {LiveSound} from './live-sound';
 export {ProviderTokens} from './provider-token';
 import {providerTokens} from './provider-token';
 import {openLiveSound} from './live-sound';
-import {APIError,type Env} from './types';
+import {APIError,type Env,serverFeatures} from './types';
 import {body,rateLimit} from './security';
 import {admitAlert,admitHeartbeat,authenticate,register,savePushToken,saveWatchPushToken,saveSilentWatchAlarms,removeDeviceData,pairFor,listenerSnoozeDevice} from './devices';
 import {connectionPreferences,flushConnections} from './connections';
@@ -33,13 +33,13 @@ export default {
    if((operation==='status'||operation==='heartbeat')&&outcome==='ok'&&ctx){
     const diagnostic={requestId,started,stage,outcome,httpStatus:status,details:latency.progressDetails()};
     const state=operation==='status'?queueStatusDiagnostic(env,ctx,{...diagnostic,operation}):queueHeartbeatDiagnostic(env,ctx,{...diagnostic,operation});
-    return Response.json(result,{status,headers:{'cache-control':'no-store','x-content-type-options':'nosniff','x-request-id':requestId,
+    return Response.json(result,{status,headers:{'cache-control':'no-store','x-content-type-options':'nosniff','x-request-id':requestId,'x-crib-features':serverFeatures,
      'x-diagnostics-status':state,'x-diagnostics-elapsed-ms':'0','x-server-received-at-ms':String(started),'x-server-sent-at-ms':String(Date.now())}});
    }
    const journalStarted=performance.now();
    const saved=await latency.measure('journal_ms',()=>recordDiagnostic(env,{requestId,started,operation,stage,outcome,httpStatus:status,eventRef:latency.eventRef,details:latency.details}));
    return Response.json(result,{status,headers:{'cache-control':'no-store','x-content-type-options':'nosniff',
-    'x-request-id':requestId,'x-diagnostics-status':saved?'recorded':'unavailable','x-diagnostics-elapsed-ms':String(Math.round(Math.max(0,performance.now()-journalStarted))),
+    'x-request-id':requestId,'x-crib-features':serverFeatures,'x-diagnostics-status':saved?'recorded':'unavailable','x-diagnostics-elapsed-ms':String(Math.round(Math.max(0,performance.now()-journalStarted))),
     'x-server-received-at-ms':String(started),'x-server-sent-at-ms':String(Date.now())}});
   };
   try {

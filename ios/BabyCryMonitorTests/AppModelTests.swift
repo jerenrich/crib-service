@@ -639,6 +639,7 @@ final class AppModelTests: XCTestCase {
                 case .recovering: transitions.append("recovering")
                 case .stopped: transitions.append("stopped")
                 case .failed: transitions.append("failed")
+                case .otherAudio: transitions.append("other")
                 }
             }
             try await audio.start()
@@ -985,12 +986,13 @@ final class AppModelTests: XCTestCase {
         let driver = AudioDriver()
         var otherAudio = true
         let audio = AudioLevelMonitor(driver: driver, otherAudioPlaying: { otherAudio },
-                                      otherAudioPollInterval: .milliseconds(10))
+                                      otherAudioPollInterval: .milliseconds(10), otherAudioResumeDelay: .milliseconds(150))
         var statuses: [String] = []
         audio.onStatus = { status in
             switch status {
             case .active: statuses.append("active")
-            case .recovering(let message): statuses.append(message == AudioLevelMonitor.otherAudioMessage ? "other" : "recovering")
+            case .otherAudio: statuses.append("other")
+            case .recovering: statuses.append("recovering")
             case .failed: statuses.append("failed")
             case .stopped: statuses.append("stopped")
             }
@@ -999,6 +1001,12 @@ final class AppModelTests: XCTestCase {
         // Starting while media plays must not score the speaker output.
         try await audio.start()
         XCTAssertEqual(statuses, ["other"])
+        // A pulsing sound (Find My) has short gaps; they must not resume detection.
+        for _ in 0..<3 {
+            otherAudio = false; try await Task.sleep(for: .milliseconds(50))
+            otherAudio = true; try await Task.sleep(for: .milliseconds(30))
+        }
+        XCTAssertEqual(statuses, ["other"], "Gaps shorter than the resume delay keep detection paused")
         otherAudio = false
         let resumed = await eventually { statuses.last == "active" }; XCTAssertTrue(resumed)
         otherAudio = true
@@ -1013,6 +1021,89 @@ final class AppModelTests: XCTestCase {
         otherAudio = false
         try await Task.sleep(for: .milliseconds(60))
         XCTAssertEqual(statuses.last, "recovering")
+    }
+    @MainActor func testOtherAudioPauseKeepsCheckInsAndAlertsWithItsReasonAfterAMinute() async throws {
+        // The one-second local-state timer runs the stall check and the minute check.
+        let fixture = try Fixture(automaticallyStart: true)
+        await fixture.model.start()
+        fixture.audio.onStatus?(.otherAudio)
+        XCTAssertTrue(fixture.model.otherAudioPaused)
+        XCTAssertFalse(fixture.model.monitoring)
+        XCTAssertTrue(fixture.model.microphoneActive, "The microphone stays on")
+        XCTAssertFalse(fixture.model.standby, "Nobody asked for this pause")
+        XCTAssertTrue(fixture.model.snapshot.timelineEvents.contains { $0.kind == "detection_paused" })
+        let reported = await eventually {
+            await fixture.backend.beats.last.map { $0.detectionPaused == CryAlert.otherAudioReason && $0.microphoneActive == true && !$0.monitoring } ?? false
+        }
+        XCTAssertTrue(reported, "Check-ins continue and carry the reason")
+        // Keep samples arriving so the stall check sees a healthy microphone.
+        let start = fixture.time.now
+        for second in stride(from: 2, through: 58, by: 2) {
+            fixture.time.now = start.addingTimeInterval(Double(second))
+            fixture.audio.emit(AudioLevelSample(timestamp: fixture.time.now, dbFS: -10))
+            for _ in 0..<5 { await Task.yield() }
+            await fixture.model.tick()
+        }
+        // Let the local timer observe 58 seconds before checking nothing was queued.
+        try await Task.sleep(for: .milliseconds(1300))
+        var failures = await fixture.backend.sent.filter(\.isMonitoringFailure)
+        XCTAssertTrue(failures.isEmpty, "Under a minute: no alert")
+        XCTAssertTrue(fixture.model.otherAudioPaused)
+        fixture.time.now = start.addingTimeInterval(60)
+        fixture.audio.emit(AudioLevelSample(timestamp: fixture.time.now, dbFS: -10))
+        for _ in 0..<5 { await Task.yield() }
+        await fixture.model.tick()
+        let sent = await eventually { await fixture.backend.sent.contains { $0.isMonitoringFailure } }
+        XCTAssertTrue(sent)
+        failures = await fixture.backend.sent.filter(\.isMonitoringFailure)
+        XCTAssertEqual(failures.first?.reason, CryAlert.otherAudioReason)
+        // When the sound stops, detection resumes and the alert is withdrawn locally.
+        fixture.audio.onStatus?(.active)
+        XCTAssertTrue(fixture.model.monitoring)
+        XCTAssertFalse(fixture.model.otherAudioPaused)
+        XCTAssertTrue(fixture.model.snapshot.timelineEvents.contains { $0.kind == "detection_resumed" })
+        XCTAssertTrue(fixture.model.log.export.contains("monitoring_failure_alert_cleared"))
+        fixture.model.stop()
+    }
+    @MainActor func testOtherAudioDuringStandbyNeverAlerts() async throws {
+        let fixture = try Fixture(automaticallyStart: true)
+        await fixture.model.start()
+        fixture.model.pauseMonitoring()
+        fixture.audio.onStatus?(.otherAudio)
+        XCTAssertTrue(fixture.model.standby)
+        let start = fixture.time.now
+        for second in stride(from: 2, through: 70, by: 2) {
+            fixture.time.now = start.addingTimeInterval(Double(second))
+            fixture.audio.emit(AudioLevelSample(timestamp: fixture.time.now, dbFS: -10))
+            for _ in 0..<5 { await Task.yield() }
+            await fixture.model.tick()
+        }
+        try await Task.sleep(for: .milliseconds(1300))
+        let failures = await fixture.backend.sent.filter(\.isMonitoringFailure)
+        XCTAssertTrue(failures.isEmpty, "A person's Standby already means detection is off")
+        let lastBeat = await fixture.backend.beats.last
+        XCTAssertNil(lastBeat?.detectionPaused, "Standby is reported as Standby")
+        fixture.model.stop()
+    }
+    func testOlderServersNeverReceivePauseFields() throws {
+        let alert = CryAlert(episodeId: UUID(), listenerId: UUID(), cryStartedAt: Date(), durationSeconds: 0, createdAt: Date(),
+                             isRepeat: false, type: CryAlert.monitoringFailedType, reason: CryAlert.otherAudioReason)
+        let plain = try JSONSerialization.jsonObject(with: JSONEncoder().encode(AlertUpload(alert: alert))) as? [String: Any]
+        XCTAssertNil(plain?["reason"], "Unknown keys make older servers reject the whole alert")
+        let supported = try JSONSerialization.jsonObject(with: JSONEncoder().encode(AlertUpload(alert: alert, includeReason: true))) as? [String: Any]
+        XCTAssertEqual(supported?["reason"] as? String, CryAlert.otherAudioReason)
+        let beat = Heartbeat(listenerId: UUID(), timestamp: Date(), monitoring: false, batteryLevel: nil, powerConnected: true, state: .quiet,
+                             currentEpisode: nil, episodes: [],
+                             timelineEvents: [TimelineEvent(kind: "detection_paused", occurredAt: Date()), TimelineEvent(kind: "detection_resumed", occurredAt: Date())],
+                             microphoneActive: true, detectionPaused: CryAlert.otherAudioReason)
+        let features = ServerFeatures()
+        let old = beat.compatible(with: features)
+        XCTAssertNil(old.detectionPaused)
+        XCTAssertEqual(old.timelineEvents?.map(\.kind), ["audio_interrupted", "audio_resumed"])
+        features.observe("detection-pause")
+        XCTAssertEqual(beat.compatible(with: features).detectionPaused, CryAlert.otherAudioReason)
+        features.observe(nil)
+        XCTAssertFalse(features.detectionPause, "A response without the header withdraws support")
     }
     @MainActor func testInterruptionEndRetriesBackgroundReactivationBeforeGivingUp() async throws {
         for (failures, recovers) in [(2, true), (10, false)] {

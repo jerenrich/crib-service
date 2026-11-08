@@ -119,6 +119,9 @@ struct NightstandView: View {
             }
             return Hero(title: "Alerts snoozed", detail: actor.map { "\($0) snoozed · Resumes in" } ?? "Resumes in", tone: .caution, ring: .progress(min(1, remaining)), icon: "bell.slash", resumesAt: until)
         }
+        if standby, model.parentStatus?.detectionPaused == CryAlert.otherAudioReason {
+            return Hero(title: "Detection paused", detail: "Another sound is playing on the nursery iPhone.", tone: .caution, ring: .dashed, icon: "speaker.wave.2")
+        }
         if standby {
             return Hero(title: "Standby", detail: "Microphone active · Detection paused", tone: .inactive, icon: "pause.circle")
         }
@@ -144,6 +147,10 @@ struct NightstandView: View {
         }
         if model.recoveringAudio {
             return Hero(title: "Monitoring paused", detail: model.audioStatus, tone: .caution, ring: .dashed, icon: "mic.slash")
+        }
+        if model.otherAudioPaused, !model.standby {
+            return Hero(title: "Detection paused", detail: "Another sound is playing on this iPhone. Detection resumes when it stops.",
+                        tone: .caution, ring: .dashed, icon: "speaker.wave.2")
         }
         if model.starting {
             return Hero(title: "Starting…", detail: "Turning on the microphone", tone: .inactive, ring: .dashed, icon: "mic")
@@ -988,9 +995,9 @@ struct NightstandView: View {
 
     private func alertPanel(_ alert: RemoteAlert) -> some View {
         Panel {
-            Label(alert.isDisconnected ? "Listener connection lost" : alert.isMonitoringFailure ? "Nursery monitoring stopped" : "Check on baby", systemImage: "bell.badge")
+            Label(alert.isDisconnected ? "Listener connection lost" : alert.isDetectionPause ? DetectionPauseCopy.title : alert.isMonitoringFailure ? "Nursery monitoring stopped" : "Check on baby", systemImage: "bell.badge")
                 .font(.title2.weight(.semibold)).foregroundStyle(Palette.amber)
-            Text(alert.isDisconnected ? "No Listener update for at least 3 minutes. Check the nursery phone’s power, internet and monitoring." : alert.isMonitoringFailure ? "The nursery iPhone stopped listening unexpectedly. Tap Start on it. Crying is not being detected." : "Crying-like sound was detected. Check on baby.")
+            Text(alert.isDisconnected ? "No Listener update for at least 3 minutes. Check the nursery phone’s power, internet and monitoring." : alert.isDetectionPause ? DetectionPauseCopy.body : alert.isMonitoringFailure ? "The nursery iPhone stopped listening unexpectedly. Tap Start on it. Crying is not being detected." : "Crying-like sound was detected. Check on baby.")
                 .font(.subheadline)
             Text("Sent \(alert.createdAt.formatted(date: .omitted, time: .shortened)) · Delivery: \(alert.status)")
                 .font(.caption).foregroundStyle(Palette.muted)
