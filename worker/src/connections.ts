@@ -1,7 +1,7 @@
 import {sharedAccess} from './devices';
 import {dispatchEvent} from './alerts';
 import {scheduleReminders} from './reminders';
-import {stoppedMonitoringForSQL} from './monitoring';
+import {stoppedMonitoringForSQL,coveringHeartbeatSQL,coveringHeartbeat} from './monitoring';
 import {deliverToBoth} from './dual-delivery';
 import {timelineInsert,missingHeartbeat} from './timeline';
 import {APIError,requireRole,type Alert,type Device,type Env} from './types';
@@ -30,7 +30,8 @@ export async function flushConnections(env:Env,requestId=crypto.randomUUID()) {
  FROM pairs p JOIN heartbeats h ON h.listener_id=p.listener_id
  LEFT JOIN connection_states s ON s.listener_id=p.listener_id`).all<{parent_id:string;listener_id:string;received_at:string;metadata:string;state:string|null;pair_created_at:number}>();
  for(const row of rows.results){
-  const active=JSON.parse(row.metadata).monitoring===true;
+  // A detection pause is not a stop: no stopped notice, but an outage still alerts.
+  const active=coveringHeartbeat(row.metadata);
   const state=active?(now-Date.parse(row.received_at)>180000?'offline':'online'):'stopped';
   // Never warn about a device which has not started monitoring.
   if(!row.state){
@@ -59,7 +60,7 @@ export async function flushConnections(env:Env,requestId=crypto.randomUUID()) {
   JOIN devices d ON d.id=p.parent_id JOIN heartbeats h ON h.listener_id=p.listener_id
   WHERE n.state='offline' AND n.status<>'cancelled' AND n.created_at>=p.created_at
    AND (n.status<>'escalated' OR NOT EXISTS(SELECT 1 FROM events e WHERE e.event_id=n.id))
-   AND d.connection_alerts=1 AND json_extract(h.metadata,'$.monitoring')=1
+   AND d.connection_alerts=1 AND ${coveringHeartbeatSQL()}
    AND h.received_at=n.observed_at AND h.received_at<?
   ORDER BY n.created_at LIMIT 25`).bind(new Date(now-180000).toISOString())
   .all<{id:string;parent_id:string;listener_id:string;observed_at:string;created_at:number}>();
@@ -73,7 +74,7 @@ export async function flushConnections(env:Env,requestId=crypto.randomUUID()) {
    env.DB.prepare(`INSERT INTO events(event_id,episode_id,listener_id,parent_id,is_repeat,payload,created_at)
     SELECT ?,?,?,?,0,?,? WHERE EXISTS(SELECT 1 FROM pairs p JOIN devices d ON d.id=p.parent_id
      JOIN heartbeats h ON h.listener_id=p.listener_id WHERE p.parent_id=? AND p.listener_id=?
-     AND p.created_at<=? AND d.connection_alerts=1 AND h.received_at=? AND json_extract(h.metadata,'$.monitoring')=1
+     AND p.created_at<=? AND d.connection_alerts=1 AND h.received_at=? AND ${coveringHeartbeatSQL()}
      AND EXISTS(SELECT 1 FROM connection_notices n WHERE n.id=? AND n.status<>'cancelled'))
     ON CONFLICT DO NOTHING`).bind(event.eventId,event.episodeId,event.listenerId,outage.parent_id,JSON.stringify(event),now,
     outage.parent_id,outage.listener_id,outage.created_at,outage.observed_at,outage.id),
@@ -88,12 +89,12 @@ export async function flushConnections(env:Env,requestId=crypto.randomUUID()) {
   WHERE resolved_at IS NULL AND json_extract(payload,'$.type')='listener_disconnected' AND NOT EXISTS(
    SELECT 1 FROM pairs p JOIN devices d ON d.id=p.parent_id JOIN heartbeats h ON h.listener_id=p.listener_id
    WHERE p.parent_id=events.parent_id AND p.listener_id=events.listener_id AND d.connection_alerts=1
-    AND json_extract(h.metadata,'$.monitoring')=1 AND h.received_at=json_extract(events.payload,'$.cryStartedAt')
+    AND ${coveringHeartbeatSQL()} AND h.received_at=json_extract(events.payload,'$.cryStartedAt')
     AND h.received_at<?)`).bind(new Date(now).toISOString(),new Date(now-180000).toISOString()).run();
  await env.DB.prepare(`UPDATE connection_notices SET status='cancelled',lease_until=NULL WHERE state='offline'
   AND NOT EXISTS(SELECT 1 FROM pairs p JOIN devices d ON d.id=p.parent_id JOIN heartbeats h ON h.listener_id=p.listener_id
    WHERE p.parent_id=connection_notices.parent_id AND p.listener_id=connection_notices.listener_id
-    AND d.connection_alerts=1 AND json_extract(h.metadata,'$.monitoring')=1
+    AND d.connection_alerts=1 AND ${coveringHeartbeatSQL()}
     AND h.received_at=connection_notices.observed_at AND h.received_at<?)`)
   .bind(new Date(now-180000).toISOString()).run();
  // A person's Stop/Pause also cancels queued legacy notices before any retry.
@@ -135,7 +136,7 @@ export async function flushConnections(env:Env,requestId=crypto.randomUUID()) {
     .bind(dispatchNow+4000,id,notice.attempts,dispatchNow).run());
    latency.details.exit_reason='not_pending';await record('claim_skipped','dispatch_skip');continue;
   }
-  const current=context?(JSON.parse(context.metadata).monitoring===true?(dispatchNow-Date.parse(context.received_at)>180000?'offline':'online'):'stopped'):null;
+  const current=context?(coveringHeartbeat(context.metadata)?(dispatchNow-Date.parse(context.received_at)>180000?'offline':'online'):'stopped'):null;
   if((notice.state!=='offline'&&notice.state!=='stopped')||!context?.connection_alerts||context.deliberately_stopped||current!==notice.state||dispatchNow-notice.created_at>600000){
    await latency.db('outcome_storage_ms',()=>env.DB.prepare("UPDATE connection_notices SET status='cancelled',lease_until=NULL WHERE id=? AND status='sending' AND attempts=?").bind(id,notice.attempts).run());
    await record('notice_cancelled','dispatch_skip');continue;

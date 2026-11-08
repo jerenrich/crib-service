@@ -1007,7 +1007,10 @@ final class AppModelTests: XCTestCase {
             otherAudio = true; try await Task.sleep(for: .milliseconds(30))
         }
         XCTAssertEqual(statuses, ["other"], "Gaps shorter than the resume delay keep detection paused")
+        XCTAssertTrue(audio.otherAudioPlayingNow)
         otherAudio = false
+        let quiet = await eventually { !audio.otherAudioPlayingNow }
+        XCTAssertTrue(quiet, "Reports the sound stopped before detection resumes")
         let resumed = await eventually { statuses.last == "active" }; XCTAssertTrue(resumed)
         otherAudio = true
         let paused = await eventually { statuses.last == "other" }; XCTAssertTrue(paused)
@@ -1063,6 +1066,29 @@ final class AppModelTests: XCTestCase {
         XCTAssertFalse(fixture.model.otherAudioPaused)
         XCTAssertTrue(fixture.model.snapshot.timelineEvents.contains { $0.kind == "detection_resumed" })
         XCTAssertTrue(fixture.model.log.export.contains("monitoring_failure_alert_cleared"))
+        fixture.model.stop()
+    }
+    @MainActor func testOtherAudioThatAlreadyStoppedNeverAlertsWhileDetectionWaitsToResume() async throws {
+        let fixture = try Fixture(automaticallyStart: true)
+        await fixture.model.start()
+        fixture.audio.onStatus?(.otherAudio)
+        let start = fixture.time.now
+        for second in stride(from: 2, through: 56, by: 2) {
+            fixture.time.now = start.addingTimeInterval(Double(second))
+            fixture.audio.emit(AudioLevelSample(timestamp: fixture.time.now, dbFS: -10))
+            for _ in 0..<5 { await Task.yield() }
+        }
+        // The sound stops at 57 s; detection is still paused for its quiet period.
+        fixture.audio.otherAudioPlayingNow = false
+        for second in [58.0, 60, 62] {
+            fixture.time.now = start.addingTimeInterval(second)
+            fixture.audio.emit(AudioLevelSample(timestamp: fixture.time.now, dbFS: -10))
+            for _ in 0..<5 { await Task.yield() }
+            try await Task.sleep(for: .milliseconds(1100))
+        }
+        XCTAssertTrue(fixture.model.otherAudioPaused)
+        let failures = await fixture.backend.sent.filter(\.isMonitoringFailure)
+        XCTAssertTrue(failures.isEmpty, "No alert after the sound stopped")
         fixture.model.stop()
     }
     @MainActor func testOtherAudioDuringStandbyNeverAlerts() async throws {
@@ -1655,6 +1681,7 @@ final class AppModelTests: XCTestCase {
             soundPlayback.apply(request, at: .now); onNurserySoundChange?(soundPlayback.state)
         }
         var permissionGranted = true
+        var otherAudioPlayingNow = true
         var recoveryGate: RequestGate?
         var startFailure: Error?
         var recoveringOnStartFailure = false
