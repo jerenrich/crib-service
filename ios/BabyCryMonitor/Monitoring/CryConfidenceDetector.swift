@@ -27,6 +27,10 @@ struct CryConfidenceDetector: Sendable {
     private var lastWindowEnd: Date?
     private var lastObservationAt: Date?
     private var lastCapturedWindowEndAt: Date?
+    private var lastPositiveCapturedAt: Date?
+    /// The latest sustained positive run: its first window's start (reported
+    /// onset) and where its own evidence began (checked for 80% coverage).
+    private var run: (windowStart: Date, evidenceStart: Date)?
     /// Only explicitly input-stamped, validated results can prove microphone
     /// liveness; legacy sample-clock dates are sufficient only for test replay.
     private(set) var latestInputAt: Date?
@@ -87,13 +91,23 @@ struct CryConfidenceDetector: Sendable {
             evidence.append(from: evidenceStart, to: score.windowEnd, positive: latestPositive)
             lastWindowEnd = score.windowEnd; lastObservationAt = score.observedAt; lastCapturedWindowEndAt = capturedEnd
             if latestPositive {
-                if observationStartedAt == nil { observationStartedAt = score.windowStart }
+                lastPositiveCapturedAt = capturedEnd
+                if observationStartedAt == nil { observationStartedAt = score.windowStart; run = nil }
+                // Isolated positives can keep a candidate open without being a cry.
+                // Report the onset of the latest sustained run; the alert gate
+                // still uses the candidate's start, so qualification is unchanged.
+                if !confirmed, run.map({ !evidence.sustains(since: $0.evidenceStart, at: score.windowEnd) }) ?? true {
+                    run = (score.windowStart, evidenceStart)
+                }
                 if evidence.hasRecentActivity(at: score.windowEnd) {
                     retainsEpisode = true; quietSince = nil; settled = false
                 } else if quietSince == nil { quietSince = capturedEnd }
                 if let start = observationStartedAt,
                    evidence.qualifies(at: score.windowEnd, duration: configuration.alertDuration, onset: start) {
-                    if !confirmed { cryStartedAt = capturedEnd.addingTimeInterval(-score.windowEnd.timeIntervalSince(start)) }
+                    if !confirmed {
+                        let onset = max(start, run?.windowStart ?? start)
+                        cryStartedAt = capturedEnd.addingTimeInterval(-score.windowEnd.timeIntervalSince(onset))
+                    }
                     confirmed = true
                 }
             } else {
@@ -129,6 +143,13 @@ struct CryConfidenceDetector: Sendable {
             // settling boundary must not look like a fresh all-positive capture.
             observationStartedAt = nil; latestPositive = false
             settled = true
+        }
+        // Once settled, the reset above no longer runs, so an unconfirmed
+        // candidate must expire on its own: otherwise a lone positive holds
+        // Sound detected through hours of quiet and backdates the next cry.
+        if !confirmed, observationStartedAt != nil, let lastPositiveCapturedAt,
+           now.timeIntervalSince(lastPositiveCapturedAt) >= configuration.quietResetDuration {
+            observationStartedAt = nil
         }
     }
 

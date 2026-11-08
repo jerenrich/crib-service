@@ -45,6 +45,13 @@ struct SoundEvidenceWindow: Sendable {
             >= duration * Self.requiredFraction
     }
 
+    /// Whether everything observed since `start` is still at least 80% positive.
+    func sustains(since start: Date, at end: Date) -> Bool {
+        guard endedAt == end, end > start else { return false }
+        return positiveDuration(from: start, to: end) + 1e-9
+            >= end.timeIntervalSince(start) * Self.requiredFraction
+    }
+
     private func positiveDuration(from start: Date, to end: Date) -> TimeInterval {
         var duration: TimeInterval = 0
         for interval in intervals[head...] where interval.positive && interval.end > start {
