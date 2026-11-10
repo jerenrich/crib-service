@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Calibration Lab</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1c1a; --muted: #6b6860; --line: #e3e0d8; --soft: #efede8;
+  --accent: #c2410c; --accent-soft: #fbe3d6; --cry: #1d6fb8; --cry-soft: #dcebf8; --noise: #8a8578; --noise-soft: #ebe9e3;
+  --wave: #6b7280; --wave-loud: #c2410c; --conf: #7c3aed; --grid: #ecebe6; --gap: #f1efea;
+  --font: ui-sans-serif, -apple-system, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #161514; --panel: #1f1e1c; --ink: #edeae4; --muted: #a29e94; --line: #34322e; --soft: #2a2926;
+    --accent: #f97341; --accent-soft: #4a2414; --cry: #6aaee8; --cry-soft: #17324a; --noise: #a29e94; --noise-soft: #34322e;
+    --wave: #a8a39a; --wave-loud: #f97341; --conf: #a78bfa; --grid: #2a2926; --gap: #242321;
+  }
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { height: 100%; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 var(--font); display: flex; flex-direction: column; }
+header { display: flex; align-items: center; gap: 12px; padding: 12px 20px; flex-wrap: wrap; }
+h1 { font-size: 18px; margin: 0; letter-spacing: -0.01em; }
+h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0; font-weight: 600; }
+#status { color: var(--muted); font-size: 13px; }
+#status.warn { color: var(--accent); }
+#busy { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); opacity: 0; transition: opacity .3s; }
+#busy.on { opacity: 1; animation: pulse 1s infinite; }
+@keyframes pulse { 50% { opacity: .3; } }
+.keys { margin-left: auto; color: var(--muted); font-size: 12px; display: flex; gap: 10px; flex-wrap: wrap; }
+kbd { font: 11px var(--mono); border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 0 4px; background: var(--panel); color: var(--ink); }
+
+main { flex: 1; min-height: 0; display: grid; grid-template-columns: 290px minmax(0, 1fr); gap: 14px; padding: 0 20px 16px; }
+aside { min-height: 0; overflow: auto; display: flex; flex-direction: column; gap: 14px; }
+.content { min-height: 0; display: flex; flex-direction: column; gap: 14px; overflow: auto; }
+@media (max-width: 1100px) {
+  main { grid-template-columns: 240px minmax(0, 1fr); gap: 10px; padding: 0 10px 10px; }
+  header { padding: 10px 12px; }
+  .keys { display: none; }
+  .panel { padding: 12px; }
+}
+@media (max-width: 700px) {
+  body { display: block; height: auto; }
+  main { display: flex; flex-direction: column; padding: 0 12px 90px; }
+  aside, .content { overflow: visible; }
+  .keys { display: none; }
+}
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+.panel-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+
+/* nights */
+.nights { display: flex; flex-direction: column; max-height: 300px; overflow: auto; margin: 0 -6px; }
+.nrow { display: grid; grid-template-columns: 22px 1fr auto; align-items: center; gap: 6px; padding: 5px 6px; border-radius: 7px; cursor: pointer; }
+.nrow > span:nth-child(2) { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 13px; }
+.nrow:hover { background: var(--soft); }
+.nrow.focus { background: var(--ink); color: var(--panel); }
+.nrow.focus .muted, .nrow.focus .tag { color: color-mix(in srgb, var(--panel) 70%, transparent); }
+.nrow input { margin: 0; accent-color: var(--accent); cursor: pointer; }
+.ncount { font: 12px var(--mono); white-space: nowrap; }
+.tag { font-size: 11px; color: var(--muted); margin-left: 6px; font-weight: 400; }
+.spin { display: inline-block; width: 9px; height: 9px; border-radius: 50%; border: 2px solid var(--line); border-top-color: var(--accent); animation: spin .8s linear infinite; vertical-align: -1px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.linkbtn { border: 0; background: none; color: var(--muted); font: inherit; font-size: 12px; cursor: pointer; padding: 0; text-decoration: underline; text-underline-offset: 2px; }
+
+/* settings */
+.field { margin-bottom: 14px; }
+.field:last-child { margin-bottom: 0; }
+.field label, .field .label { display: flex; justify-content: space-between; font-weight: 500; margin-bottom: 4px; }
+.field output, .value { font-family: var(--mono); font-size: 13px; }
+.hint { color: var(--muted); font-size: 12px; margin-top: 3px; }
+input[type=range] { width: 100%; accent-color: var(--accent); margin: 2px 0; }
+.seg { display: flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+.seg button { flex: 1; border: 0; background: transparent; color: var(--ink); padding: 5px 8px; font: inherit; font-size: 13px; cursor: pointer; white-space: nowrap; }
+.seg button + button { border-left: 1px solid var(--line); }
+.seg button.on { background: var(--ink); color: var(--panel); }
+.field label.check { display: flex; justify-content: flex-start; gap: 8px; align-items: center; font-weight: 500; cursor: pointer; }
+.sub { padding-left: 24px; margin-top: 8px; }
+.sub[hidden] { display: none; }
+button.btn { border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 7px; padding: 5px 10px; font: inherit; font-size: 13px; cursor: pointer; white-space: nowrap; }
+button.btn:hover { background: var(--soft); }
+button.btn:disabled { opacity: .45; cursor: default; background: var(--panel); }
+details summary { cursor: pointer; color: var(--muted); font-weight: 500; margin-bottom: 8px; }
+
+/* cards */
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; flex: none; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; transition: opacity .2s; }
+.card .n { font-size: 24px; font-weight: 600; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; line-height: 1.2; }
+.card .t { color: var(--muted); font-size: 12px; }
+.card .d { font-size: 12px; margin-top: 1px; min-height: 1.4em; }
+.card.action { cursor: pointer; }
+.card.action:hover { border-color: var(--muted); }
+.updating { opacity: .55; }
+
+/* chart */
+.chart-panel { flex: none; padding-bottom: 10px; }
+.toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.toolbar .title { font-weight: 600; font-variant-numeric: tabular-nums; margin-right: auto; }
+.toolbar .title .muted { font-weight: 400; }
+.legend { display: flex; gap: 12px; color: var(--muted); font-size: 12px; flex-wrap: wrap; align-items: center; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+#chartWrap { position: relative; height: clamp(230px, 38vh, 420px); }
+#chartWrap canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+#overlay { cursor: grab; touch-action: pan-y; outline: none; }
+#overlay.grabbing { cursor: grabbing; }
+#overlay.zooming { cursor: crosshair; }
+#overlay.pointing { cursor: pointer; }
+#overlay:focus-visible { box-shadow: 0 0 0 2px var(--accent-soft); border-radius: 4px; }
+#overview { width: 100%; height: 46px; display: block; margin-top: 6px; cursor: grab; touch-action: none; }
+#tip { position: absolute; pointer-events: none; background: var(--ink); color: var(--panel); font: 12px var(--mono); padding: 5px 8px; border-radius: 6px; white-space: pre; display: none; z-index: 2; line-height: 1.4; }
+.chart-foot { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-top: 6px; color: var(--muted); font-size: 12px; }
+
+/* bottom tabs */
+.bottom { flex: 1 0 260px; min-height: 260px; display: flex; flex-direction: column; padding: 0; overflow: hidden; }
+.tabs { display: flex; align-items: center; gap: 4px; padding: 8px 10px 0; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.tabs button.tab { border: 0; background: none; font: inherit; font-weight: 600; color: var(--muted); padding: 8px 10px 9px; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; }
+.tabs button.tab.on { color: var(--ink); border-bottom-color: var(--accent); }
+.tabs .spacer { flex: 1; }
+.tabs .note { margin: 0 6px 6px; }
+.scroll { flex: 1; min-height: 0; overflow: auto; padding: 4px 10px 10px; }
+@media (max-width: 700px) { .bottom { overflow: visible; } .scroll { overflow: visible; } }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+th { text-align: left; font-weight: 500; color: var(--muted); font-size: 12px; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; position: sticky; top: 0; background: var(--panel); z-index: 1; }
+td { padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+tr:last-child td { border-bottom: 0; }
+tbody tr { cursor: pointer; }
+tbody tr:hover td { background: color-mix(in srgb, var(--soft) 60%, transparent); }
+tr.sel td { background: var(--soft); }
+tr.sel td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+.mono { font-family: var(--mono); font-size: 13px; }
+.badge { display: inline-block; font-size: 12px; padding: 1px 8px; border-radius: 999px; white-space: nowrap; }
+.b-new { background: var(--accent-soft); color: var(--accent); }
+.b-same { background: var(--soft); color: var(--ink); }
+.b-gone { background: transparent; color: var(--muted); border: 1px dashed var(--line); }
+.labels { display: inline-flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+.labels button { border: 0; background: transparent; color: var(--muted); font: inherit; font-size: 12px; padding: 3px 8px; cursor: pointer; }
+.labels button + button { border-left: 1px solid var(--line); }
+.labels button.on.cry { background: var(--cry-soft); color: var(--cry); font-weight: 600; }
+.labels button.on.noise { background: var(--noise-soft); color: var(--ink); font-weight: 600; }
+.play { border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 50%; width: 28px; height: 28px; cursor: pointer; font-size: 11px; }
+.play:hover { background: var(--soft); }
+.play:disabled { opacity: .3; cursor: default; }
+.play.on { background: var(--ink); color: var(--panel); }
+.empty { color: var(--muted); padding: 18px 8px; }
+.sweep td.bar { width: 38%; }
+.sweep .barwrap { display: flex; gap: 2px; height: 14px; }
+.sweep .barwrap span { display: block; height: 100%; border-radius: 2px; }
+.sweep tr.current td { background: var(--soft); font-weight: 600; }
+.sweep td:first-child { white-space: nowrap; }
+.muted { color: var(--muted); }
+.note { font-size: 12px; color: var(--muted); }
+
+#player { position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%); background: var(--ink); color: var(--panel); border-radius: 999px; padding: 6px 8px 6px 16px; display: none; gap: 8px; align-items: center; box-shadow: 0 6px 24px rgba(0,0,0,.25); z-index: 5; max-width: calc(100vw - 32px); }
+#player button { background: transparent; color: inherit; border: 1px solid color-mix(in srgb, var(--panel) 35%, transparent); border-radius: 999px; padding: 4px 10px; font: inherit; font-size: 13px; cursor: pointer; }
+#player .mono { color: inherit; min-width: 9ch; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Calibration Lab</h1>
+  <span id="busy" title="Working…"></span>
+  <span id="status">Asking the Listener for its logs…</span>
+  <div class="keys">
+    <span><kbd>[</kbd> <kbd>]</kbd> previous / next alert</span>
+    <span><kbd>Space</kbd> listen</span>
+    <span><kbd>C</kbd> cry · <kbd>N</kbd> not a cry</span>
+  </div>
+</header>
+<main>
+  <aside>
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Nights</h2>
+        <span class="note">alerts now <span class="muted">/ sent</span></span>
+      </div>
+      <div class="nights" id="nights"></div>
+      <div class="hint" style="margin-top:8px">Ticked nights count towards the totals and the comparison. <button class="linkbtn" id="tickAll">Tick all</button></div>
+    </section>
+    <section class="panel" id="controls">
+      <div class="panel-head"><h2>Settings</h2><button class="btn" id="useRecorded" title="Use the settings the phone used that night">Night's settings</button></div>
+      <div class="field">
+        <label for="threshold">Sound threshold <output id="thresholdOut"></output></label>
+        <input type="range" id="threshold" min="-60" max="-10" step="5">
+        <div class="hint" id="thresholdHint"></div>
+      </div>
+      <div class="field">
+        <label for="duration">Observation window <output id="durationOut"></output></label>
+        <input type="range" id="duration" min="5" max="60" step="1">
+        <div class="hint">How long sound must last (80% of the time) before an alert. The app offers 5 s, 30 s, 60 s, 2 min and up.</div>
+      </div>
+      <div class="field">
+        <div class="label">Reset after quiet</div>
+        <div class="seg" id="reset"><button data-v="10">10 s</button><button data-v="20">20 s</button><button data-v="30">30 s</button><button data-v="60">60 s</button></div>
+      </div>
+      <div class="field">
+        <label class="check"><input type="checkbox" id="appSteps"> Only values the app offers</label>
+      </div>
+      <div class="field">
+        <label class="check"><input type="checkbox" id="classifier"> Classifier can alert on its own</label>
+        <div class="sub" id="classifierSub">
+          <label for="classThr" class="label">Confidence needed <output id="classThrOut"></output></label>
+          <input type="range" id="classThr" min="0.1" max="0.95" step="0.05">
+          <div class="hint">Fixed at 0.60 in the app.</div>
+        </div>
+      </div>
+      <div class="field">
+        <label class="check"><input type="checkbox" id="gate"> Volume alerts need classifier support <span class="muted">(not in app)</span></label>
+        <div class="sub" id="gateSub">
+          <label for="gateMin" class="label">Score at least <output id="gateMinOut"></output></label>
+          <input type="range" id="gateMin" min="0.02" max="0.6" step="0.01">
+          <label for="gateWin" class="label" style="margin-top:8px">within the last <output id="gateWinOut"></output></label>
+          <input type="range" id="gateWin" min="3" max="30" step="1">
+        </div>
+      </div>
+      <details>
+        <summary>Advanced</summary>
+        <div class="field">
+          <label for="fraction">Required coverage <output id="fractionOut"></output></label>
+          <input type="range" id="fraction" min="0.5" max="1" step="0.05">
+          <div class="hint">Share of the window that must be above the threshold. 80% in the app.</div>
+        </div>
+      </details>
+    </section>
+  </aside>
+  <div class="content">
+    <div class="cards" id="cards"></div>
+    <section class="panel chart-panel">
+      <div class="toolbar">
+        <div class="title" id="chartTitle">Night</div>
+        <button class="btn" id="prevAlert" title="Previous alert ( [ )">‹ Alert</button>
+        <button class="btn" id="nextAlert" title="Next alert ( ] )">Alert ›</button>
+        <div class="seg" id="spans">
+          <button data-span="60">1 min</button><button data-span="300">5 min</button><button data-span="1800">30 min</button><button data-span="7200">2 h</button><button data-span="0">Night</button>
+        </div>
+      </div>
+      <div id="chartWrap"><canvas id="chart"></canvas><canvas id="overlay" tabindex="0" aria-label="Sound level chart"></canvas><div id="tip"></div></div>
+      <canvas id="overview" title="The whole night. Drag the box to move, drag its edges to resize, or click to jump."></canvas>
+      <div class="chart-foot">
+        <span>Scroll or pinch to zoom · drag to move · click to listen</span>
+        <span class="legend">
+          <span><i style="background:var(--wave)"></i>Sound level</span>
+          <span><i style="background:var(--wave-loud)"></i>Above threshold</span>
+          <span><i style="background:var(--conf)"></i>Classifier</span>
+          <span>▼ alert with these settings · ▽ alert sent</span>
+        </span>
+      </div>
+    </section>
+    <section class="panel bottom">
+      <div class="tabs">
+        <button class="tab" data-tab="alerts" id="tabAlerts">Alerts</button>
+        <button class="tab" data-tab="sweep">Compare settings</button>
+        <span class="spacer"></span>
+        <span class="note" id="tabNote"></span>
+        <div class="seg" id="sweepBy" style="margin:0 0 6px"><button data-v="threshold">Threshold</button><button data-v="alertDuration">Observation window</button></div>
+      </div>
+      <div class="scroll" id="paneAlerts"><table id="events"></table></div>
+      <div class="scroll" id="paneSweep" hidden><table class="sweep" id="sweep"></table><div class="note" id="sweepNote" style="margin-top:8px"></div></div>
+    </section>
+  </div>
+</main>
+<div id="player">
+  <span class="mono" id="playerTime">--:--:--</span>
+  <button id="playerBack" title="Back 10 s">−10 s</button>
+  <button id="playerToggle">Pause</button>
+  <button id="playerFwd" title="Forward 10 s">+10 s</button>
+  <button id="playerClose" title="Stop">✕</button>
+</div>
+<audio id="audio" preload="auto"></audio>
+<script type="module" src="app.js"></script>
+</body>
+</html>
