@@ -53,3 +53,60 @@ struct NurseryMonitoringInstruction: View {
         .accessibilityIdentifier("nurseryMonitoringInstruction")
     }
 }
+
+/// A slider over fixed stops that saves once per gesture. Dragging only updates
+/// the displayed value; `commit` runs when the drag ends, or immediately for a
+/// VoiceOver adjustment, so settings sync is not flooded mid-drag. A saved value
+/// that is not a stop stays displayed until the slider is moved.
+struct SteppedSlider: View {
+    let title: String
+    let stops: [Double]
+    let value: Double
+    let label: (Double) -> String
+    var lowLabel: String? = nil
+    var highLabel: String? = nil
+    var identifier: String
+    let commit: (Double) -> Void
+    @State private var draft: Int?
+    @State private var editing = false
+
+    private var nearest: Int {
+        stops.indices.min { abs(stops[$0] - value) < abs(stops[$1] - value) } ?? 0
+    }
+    private var shown: Double { draft.map { stops[$0] } ?? value }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(title)
+                Spacer()
+                Text(label(shown)).monospacedDigit().foregroundStyle(.secondary)
+            }.accessibilityHidden(true)
+            Slider(value: Binding(get: { Double(draft ?? nearest) }, set: { raw in
+                let index = min(max(Int(raw.rounded()), 0), stops.count - 1)
+                draft = index
+                if !editing { finish() }
+            }), in: 0...Double(max(stops.count - 1, 1)), step: 1) {
+                Text(title)
+            } onEditingChanged: { active in
+                editing = active
+                if !active { finish() }
+            }
+            .disabled(stops.count < 2)
+            .accessibilityValue(label(shown))
+            .accessibilityIdentifier(identifier)
+            if lowLabel != nil || highLabel != nil {
+                HStack {
+                    Text(lowLabel ?? ""); Spacer(); Text(highLabel ?? "")
+                }.font(.caption).foregroundStyle(.secondary).accessibilityHidden(true)
+            }
+        }
+    }
+
+    private func finish() {
+        guard let draft else { return }
+        let chosen = stops[draft]
+        self.draft = nil
+        if chosen != value { commit(chosen) }
+    }
+}

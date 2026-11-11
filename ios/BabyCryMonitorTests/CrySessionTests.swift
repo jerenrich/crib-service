@@ -559,12 +559,15 @@ final class CrySessionTests: XCTestCase {
         XCTAssertEqual(s.engine.snapshot.alertStatus(for: try XCTUnwrap(s.engine.snapshot.current)), .sent)
     }
     func testSnoozeSelectionValidationAndPersistence() throws {
+        XCTAssertEqual(MonitoringConfiguration.snoozeDurations.count, 15)
+        XCTAssertEqual(MonitoringConfiguration.snoozeDurations.first, 60)
+        XCTAssertEqual(MonitoringConfiguration.snoozeDurations.last, 900)
         for duration in MonitoringConfiguration.snoozeDurations {
             var config = MonitoringConfiguration(); config.snoozeDuration = duration
             XCTAssertTrue(config.isValid)
             XCTAssertEqual(try JSONDecoder().decode(MonitoringConfiguration.self, from: JSONEncoder().encode(config)).snoozeDuration, duration)
         }
-        for duration in [0.0, 30, 61, .infinity, .nan] {
+        for duration in [0.0, 30, 61, 90, 960, .infinity, .nan] {
             var config = MonitoringConfiguration(); config.snoozeDuration = duration
             XCTAssertFalse(config.isValid)
         }

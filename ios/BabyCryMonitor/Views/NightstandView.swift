@@ -1002,7 +1002,7 @@ struct NightstandView: View {
         Panel {
             Label(alert.isDisconnected ? "Listener connection lost" : alert.isDetectionPause ? DetectionPauseCopy.title : alert.isMonitoringFailure ? "Nursery monitoring stopped" : "Check on baby", systemImage: "bell.badge")
                 .font(.title2.weight(.semibold)).foregroundStyle(Palette.amber)
-            Text(alert.isDisconnected ? "No Listener update for at least 3 minutes. Check the nursery phone’s power, internet and monitoring." : alert.isDetectionPause ? DetectionPauseCopy.body : alert.isMonitoringFailure ? "The nursery iPhone stopped listening unexpectedly. Tap Start on it. Crying is not being detected." : "Crying-like sound was detected. Check on baby.")
+            Text(alert.isDisconnected ? ConnectionLossCopy.body(silentFor: alert.durationSeconds) : alert.isDetectionPause ? DetectionPauseCopy.body : alert.isMonitoringFailure ? "The nursery iPhone stopped listening unexpectedly. Tap Start on it. Crying is not being detected." : "Crying-like sound was detected. Check on baby.")
                 .font(.subheadline)
             Text("Sent \(alert.createdAt.formatted(date: .omitted, time: .shortened)) · Delivery: \(alert.status)")
                 .font(.caption).foregroundStyle(Palette.muted)

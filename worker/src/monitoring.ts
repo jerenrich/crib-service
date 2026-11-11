@@ -86,6 +86,13 @@ export async function completeMonitoring(env:Env,device:Device,value:Record<stri
 /** A heartbeat that should be covered by connection-loss alerts: monitoring, or
  * detection paused for other audio. That pause is not a person's choice, so if
  * the Listener then goes silent, the Parent must still hear about it. */
+// Connection-loss timing. A Listener counts as offline after 3 minutes without an
+// update (or sooner, if the Parent's alert delay is shorter); the alert waits for
+// the Parent's chosen delay. Each cutoff is ISO text comparable with received_at,
+// with `?` bound to the current time in milliseconds. `device` is the Parent row.
+export const offlineDetectionMs=180000;
+export const outageAlertCutoffSQL=(device='d')=>`strftime('%Y-%m-%dT%H:%M:%fZ',(?-${device}.connection_alert_delay*1000)/1000.0,'unixepoch')`;
+export const connectionAlertDelays=Array.from({length:20},(_,i)=>(i+1)*60);
 export const coveringHeartbeatSQL=(alias='h')=>`(json_extract(${alias}.metadata,'$.monitoring')=1 OR json_extract(${alias}.metadata,'$.detectionPaused') IS NOT NULL)`;
 export function coveringHeartbeat(metadata:string):boolean {
  const beat=JSON.parse(metadata) as {monitoring?:boolean;detectionPaused?:string};

@@ -491,7 +491,7 @@ import Observation
             "id", "startedAt", "endedAt", "alertQueuedAt", "alertSentAt", "lastAlertQueuedAt", "maximumDBFS", "averageDBFS", "sampleCount",
             "alert", "attempts", "nextAttemptAt", "failedAt", "eventId", "episodeId", "listenerId", "type", "cryStartedAt",
             "durationSeconds", "createdAt", "isRepeat", "isTest", "paired", "pairingID", "watchPushRegistered", "phonePushRegistered",
-            "connectionAlertsEnabled", "listenerConfiguration", "lastHeartbeat", "serverTime", "nextHeartbeatExpectedAt", "monitoring", "batteryLevel", "powerConnected",
+            "connectionAlertsEnabled", "connectionAlertDelay", "listenerConfiguration", "lastHeartbeat", "serverTime", "nextHeartbeatExpectedAt", "monitoring", "batteryLevel", "powerConnected",
             "state", "currentEpisode", "episodes", "alerts", "status", "acknowledgedAt", "deliveryTarget", "ok", "expiresAt",
             "deviceId", "role", "registered", "updatedAt", "parentMode", "message", "acknowledgedEventId", "kind",
             "settings", "sound", "volume", "timerMinutes", "action", "restartTimer", "playing", "remainingSeconds", "commandID", "controlToken", "requestID"
