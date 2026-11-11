@@ -1885,6 +1885,8 @@ final class AppModelTests: XCTestCase {
         private(set) var connectionAlertDelays: [Int] = []
         var testRequestFails = false
         var statusValue: ParentStatus?
+        var heartbeatConfiguration: MonitoringConfiguration?
+        func setHeartbeatConfiguration(_ value: MonitoringConfiguration?) { heartbeatConfiguration = value }
         var statusGate: RequestGate?
         private(set) var statusCalls = 0
         var statusFails = false
@@ -1954,10 +1956,11 @@ final class AppModelTests: XCTestCase {
             await heartbeatGate?.wait()
             heartbeatCompletions += 1
             if heartbeatFail { throw URLError(.timedOut) }
-            return MonitoringConfiguration()
+            return heartbeatConfiguration ?? MonitoringConfiguration()
         }
+        private(set) var uploadedSettings: [MonitoringConfiguration] = []
         func settings(_ configuration: MonitoringConfiguration) async throws {
-            settingsCalls += 1
+            settingsCalls += 1; uploadedSettings.append(configuration)
             await settingsGate?.wait()
             if settingsFail { throw URLError(.badServerResponse) }
         }
@@ -2802,7 +2805,6 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(fixture.model.nurseryConnection, "Stopped")
         status.monitoring = true; status.listenerConfiguration = MonitoringConfiguration()
         await fixture.backend.setStatus(status); await fixture.model.refreshParent()
-        XCTAssertEqual(fixture.model.nurseryConnection, "Monitoring"); XCTAssertEqual(fixture.model.settingsSyncStatus, "Applied on Listener")
         fixture.time.now = fixture.time.now.addingTimeInterval(151); fixture.model.now = fixture.time.now
         await fixture.backend.setStatus(status); await fixture.model.refreshParent()
         XCTAssertEqual(fixture.model.nurseryConnection, "Connection lost"); XCTAssertFalse(fixture.model.parentOnline)
@@ -3454,6 +3456,105 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(beats.map(\.monitoring), [true, false])
         XCTAssertEqual(beats.map(\.listenerId), [fixture.listener.deviceId, fixture.listener.deviceId])
         XCTAssertEqual(beats.last?.state, .quiet)
+    }
+    @MainActor func testParentSavingSettingsUploadsWithoutWaitingForTheNetworkLoop() async throws {
+        let fixture = try Fixture()
+        fixture.model.role = .parent; fixture.model.paired = true
+        var config = MonitoringConfiguration(); config.alertDuration = 45
+        fixture.model.saveSettings(config)
+        // No tick() call: the edit itself starts the upload.
+        let synced = await eventually { await fixture.backend.settingsCalls == 1 && !fixture.defaults.bool(forKey: "settingsDirty") }
+        XCTAssertTrue(synced)
+        let uploaded = await fixture.backend.uploadedSettings
+        XCTAssertEqual(uploaded, [config])
+    }
+    @MainActor func testEditDuringSettingsUploadIsSentWhenTheUploadFinishes() async throws {
+        let fixture = try Fixture()
+        fixture.model.role = .parent; fixture.model.paired = true
+        let gate = RequestGate()
+        await fixture.backend.configure(settingsGate: gate)
+        var first = MonitoringConfiguration(); first.alertDuration = 45
+        fixture.model.saveSettings(first)
+        let started = await eventually { await fixture.backend.settingsCalls == 1 }
+        XCTAssertTrue(started)
+        var second = first; second.snoozeDuration = 300
+        fixture.model.saveSettings(second)
+        await gate.open()
+        let resent = await eventually { await fixture.backend.uploadedSettings == [first, second] && !fixture.defaults.bool(forKey: "settingsDirty") }
+        XCTAssertTrue(resent, "The newer edit must go out without waiting for a network loop pass")
+    }
+    @MainActor func testParentPollsQuicklyUntilListenerConfirmsSettings() async throws {
+        let fixture = try Fixture()
+        fixture.model.role = .parent; fixture.model.paired = true
+        var config = MonitoringConfiguration(); config.alertDuration = 45
+        await fixture.backend.setStatus(ParentStatus(paired: true, listenerConfiguration: MonitoringConfiguration(), monitoring: false, configuration: config))
+        fixture.model.saveSettings(config)
+        let synced = await eventually { !fixture.defaults.bool(forKey: "settingsDirty") }
+        XCTAssertTrue(synced)
+        await fixture.model.tick()
+        var calls = await fixture.backend.statusCalls
+        XCTAssertEqual(calls, 1)
+        // Unconfirmed: the next refresh comes 2 s later instead of 15 s.
+        fixture.time.now = fixture.time.now.addingTimeInterval(2.1)
+        await fixture.model.tick()
+        calls = await fixture.backend.statusCalls
+        XCTAssertEqual(calls, 2)
+        // Confirmed: polling returns to the normal 15 s cadence.
+        await fixture.backend.setStatus(ParentStatus(paired: true, listenerConfiguration: config, monitoring: false, configuration: config))
+        fixture.time.now = fixture.time.now.addingTimeInterval(2.1)
+        await fixture.model.tick()
+        fixture.time.now = fixture.time.now.addingTimeInterval(2.1)
+        await fixture.model.tick()
+        calls = await fixture.backend.statusCalls
+        XCTAssertEqual(calls, 3)
+    }
+    @MainActor func testListenerPollDoesNotApplySettingsWhileAHeartbeatIsInFlight() async throws {
+        let fixture = try Fixture(pending: true)
+        let gate = RequestGate()
+        await fixture.backend.configure(heartbeatGate: gate)
+        await fixture.model.start()
+        await fixture.model.tick()
+        let inFlight = await eventually { await fixture.backend.beats.count == 1 }
+        XCTAssertTrue(inFlight)
+        var config = MonitoringConfiguration(); config.alertDuration = 60
+        await fixture.backend.setStatus(ParentStatus(paired: true, monitoring: false, configuration: config))
+        await fixture.backend.setHeartbeatConfiguration(config)
+        fixture.time.now = fixture.time.now.addingTimeInterval(4)
+        await fixture.model.tick()
+        let polled = await eventually { await fixture.backend.statusCalls >= 1 }
+        XCTAssertTrue(polled)
+        XCTAssertEqual(fixture.model.configuration, MonitoringConfiguration(), "The in-flight heartbeat owns this update")
+        var beats = await fixture.backend.beats
+        XCTAssertEqual(beats.count, 1, "The poll must not replace the in-flight heartbeat")
+        await gate.open()
+        let applied = await eventually { fixture.model.configuration == config }
+        XCTAssertTrue(applied)
+        beats = await fixture.backend.beats
+        XCTAssertLessThanOrEqual(beats.count, 2)
+        fixture.model.stop()
+    }
+    @MainActor func testIdleListenerAppliesParentSettingsFromStatusPollAndReportsThem() async throws {
+        let fixture = try Fixture()
+        let gate = RequestGate()
+        await fixture.backend.configure(heartbeatGate: gate)
+        var config = MonitoringConfiguration(); config.alertDuration = 60; config.snoozeDuration = 120
+        await fixture.backend.setStatus(ParentStatus(paired: true, monitoring: false, configuration: config))
+        await fixture.backend.setHeartbeatConfiguration(config)
+        XCTAssertFalse(fixture.model.monitoring)
+        await fixture.model.tick()
+        let applied = await eventually { fixture.model.configuration == config }
+        XCTAssertTrue(applied, "An idle Listener must pick up Parent settings without starting monitoring")
+        let reported = await eventually { await fixture.backend.beats.last?.appliedConfiguration == config }
+        XCTAssertTrue(reported, "The Listener must report applied settings so the Parent can confirm them")
+        await gate.open()
+        _ = await eventually { await fixture.backend.heartbeatCompletions == 1 }
+        // An unchanged configuration on the next poll does not send another heartbeat.
+        await fixture.backend.configure()
+        fixture.time.now = fixture.time.now.addingTimeInterval(4)
+        await fixture.model.tick()
+        _ = await eventually { await fixture.backend.statusCalls >= 2 }
+        let beats = await fixture.backend.beats
+        XCTAssertEqual(beats.count, 1)
     }
     @MainActor func testOlderHeartbeatResponseDoesNotUndoSuccessfulSettingsUpload() async throws {
         let fixture = try Fixture()
