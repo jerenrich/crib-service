@@ -4,7 +4,10 @@
 import { parseNight, resolveRunThresholds } from './parse.js';
 import { simulate } from './detector.js';
 
-const nights = new Map();
+const nights = new Map();  // id -> { parsed, from }
+// Replay starts this long before the night, so an episode already under way at
+// 18:00 is replayed as the phone saw it; results before the night are dropped.
+const WARMUP = 1800;
 
 async function fetchText(name) {
   const res = await fetch('/api/sound/' + encodeURIComponent(name));
@@ -21,12 +24,12 @@ self.onmessage = async ({ data: m }) => {
   try {
     if (m.type === 'load') {
       const [texts, runs] = await Promise.all([Promise.all(m.files.map(fetchText)), fetchRuns()]);
-      const parsed = parseNight(texts, m.from, m.to, { runs });
-      nights.set(m.id, parsed);
+      const parsed = parseNight(texts, m.from - WARMUP, m.to, { runs });
+      nights.set(m.id, { parsed, from: m.from });
       const view = {
         levels: { t: parsed.levels.t.slice(), db: parsed.levels.db.slice() },
         scores: { at: parsed.scores.at.slice(), conf: parsed.scores.conf.slice() },
-        recordedAlerts: parsed.recordedAlerts, recordedSettings: parsed.recordedSettings,
+        recordedAlerts: parsed.recordedAlerts.filter((a) => a.t >= m.from), recordedSettings: parsed.recordedSettings,
         otherSettings: parsed.otherSettings, legacy: parsed.legacy, settingsChanges: parsed.settingsChanges,
       };
       self.postMessage({ req: m.req, view },
@@ -34,12 +37,17 @@ self.onmessage = async ({ data: m }) => {
     } else if (m.type === 'runs') {
       // Re-resolve each night's per-run classifier thresholds with a newer index.
       const changes = {};
-      for (const [id, night] of nights) changes[id] = resolveRunThresholds(night.settingsChanges, night.runs, m.runs);
+      for (const [id, { parsed }] of nights) changes[id] = resolveRunThresholds(parsed.settingsChanges, parsed.runs, m.runs);
       self.postMessage({ req: m.req, changes });
     } else if (m.type === 'sim') {
       const night = nights.get(m.id);
       if (!night) throw new Error('night not loaded');
-      self.postMessage({ req: m.req, result: simulate(night, m.settings) });
+      const { alerts, episodes } = simulate(night.parsed, m.settings);
+      const result = {
+        alerts: alerts.filter((a) => a.alertAt >= night.from),
+        episodes: episodes.filter((ep) => (ep.endedAt ?? Infinity) >= night.from),
+      };
+      self.postMessage({ req: m.req, result });
     }
   } catch (err) {
     self.postMessage({ req: m.req, error: String(err?.message || err) });

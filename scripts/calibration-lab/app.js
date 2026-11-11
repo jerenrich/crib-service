@@ -69,8 +69,9 @@ function buildNights() {
     const from = new Date(d); from.setHours(NIGHT_START_HOUR);
     const to = new Date(d); to.setDate(to.getDate() + 1); to.setHours(NIGHT_END_HOUR);
     const f = from.getTime() / 1000, t = to.getTime() / 1000;
-    const files = state.sound.filter((file, i) => file.start < t && (state.sound[i + 1]?.start ?? last) > f);
-    if (!files.length) continue;
+    // Include the half hour before the night: the workers replay it to warm the detectors up.
+    const files = state.sound.filter((file, i) => file.start < t && (state.sound[i + 1]?.start ?? last) > f - 1800);
+    if (!files.length || f > last) continue;  // no logs, or the night hasn't started yet
     const id = `${from.getFullYear()}-${String(from.getMonth() + 1).padStart(2, '0')}-${String(from.getDate()).padStart(2, '0')}`;
     nights.push({ id, from: f, to: t, files, label: nightLabel(from, to) });
   }
@@ -185,15 +186,13 @@ async function loadRecentInBackground() {
 // Each load caches more logs, which can reveal markers for runs that earlier
 // nights belong to. When the server's run index changes, have the workers
 // re-resolve their nights' classifier thresholds and replay again.
-let lastRuns = null, runsTimer = null;
+// Every night is re-resolved each time (cheap), so one parsed with an older
+// index than the last sync's is still caught up.
+let runsTimer = null;
 function scheduleRunsSync() { clearTimeout(runsTimer); runsTimer = setTimeout(syncRuns, 400); }
 async function syncRuns() {
   let runs;
   try { runs = await (await api('/api/runs')).json(); } catch { return; }
-  const key = JSON.stringify(runs);
-  if (key === lastRuns) return;
-  const first = lastRuns === null;
-  lastRuns = key;
   const replies = await Promise.all(engines.map((e) => send(e, { type: 'runs', runs }).catch(() => null)));
   let changed = false;
   for (const reply of replies) {
@@ -202,7 +201,7 @@ async function syncRuns() {
       if (JSON.stringify(data.settingsChanges) !== JSON.stringify(changes)) { data.settingsChanges = changes; changed = true; }
     }
   }
-  if (changed || !first) { runsVersion++; refresh(); }
+  if (changed) { runsVersion++; refresh(); }
 }
 
 function statusLine() {
@@ -213,7 +212,19 @@ function statusLine() {
 // Labels: each change is an operation ({op: 'set', t, kind} or {op: 'delete', t}).
 // Unsent operations are kept in localStorage and sent one batch at a time, so a
 // change made while the server is down survives a reload and lands later.
-let pendingOps = store.get('pendingLabelOps', []), flushing = null;
+// Each op has an id, so a batch removes exactly the ops it sent even if another
+// tab changed the shared queue meanwhile (see the storage listener below).
+const opId = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
+// The queue in localStorage is shared by every lab tab and is the source of
+// truth: read it (with ids filled in) before changing it.
+const readQueue = (raw = store.get('pendingLabelOps', [])) => (Array.isArray(raw) ? raw : []).map((op) => (op.id ? op : { ...op, id: opId() }));
+let pendingOps = readQueue(), flushing = null;
+store.set('pendingLabelOps', pendingOps);
+const dropOps = (ids) => { pendingOps = readQueue().filter((op) => !ids.has(op.id)); store.set('pendingLabelOps', pendingOps); };
+window.addEventListener('storage', (ev) => {  // another lab tab changed labels or the queue
+  if (ev.key === 'calib:pendingLabelOps') { try { pendingOps = readQueue(JSON.parse(ev.newValue)); } catch { /* keep ours */ } }
+  if (ev.key === 'calib:labels') { try { state.labels = JSON.parse(ev.newValue) ?? state.labels; renderAll(); scheduleSweep(0); } catch { /* keep ours */ } }
+});
 function applyOps(labels, ops) {
   for (const op of ops) {
     labels = labels.filter((l) => Math.abs(l.t - op.t) > 1e-3);
@@ -229,35 +240,39 @@ async function loadLabels() {
   if (pendingOps.length) flushLabels();
 }
 function changeLabels(op) {
+  op = { ...op, id: opId() };
   state.labels = applyOps(state.labels, [op]);
-  pendingOps.push(op);
+  pendingOps = [...readQueue(), op];  // keep other tabs' queued ops
   store.set('labels', state.labels); store.set('pendingLabelOps', pendingOps);
   flushLabels();
 }
 const postOps = (ops) => fetch('/api/labels', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ops }) });
 function flushLabels() {
   if (flushing) return flushing;
-  flushing = (async () => {
+  // One tab at a time sends the shared queue, so a stale copy in another tab
+  // can't re-send a change after a later one (Web Locks; plain call without them).
+  const exclusive = (fn) => (navigator.locks ? navigator.locks.request('calib-label-queue', fn) : fn());
+  flushing = Promise.resolve(exclusive(async () => {
     let rejected = 0;
     try {
-      while (pendingOps.length) {
+      while ((pendingOps = readQueue()).length) {
         // Send the queue in one batch; if the server refuses it, send the changes
         // one at a time so only the ones it refuses are dropped.
-        const batch = pendingOps.slice();
-        let res = await postOps(batch), sent = batch.length;
+        let batch = pendingOps.slice();
+        const strip = (ops) => ops.map(({ id, ...op }) => op);
+        let res = await postOps(strip(batch));
         if (res.status === 400) {
-          sent = 1;
-          res = await postOps(batch.slice(0, 1));
+          batch = batch.slice(0, 1);
+          res = await postOps(strip(batch));
           if (res.status === 400) {  // this change can never be saved: drop it, keep the rest
-            pendingOps = pendingOps.slice(1); store.set('pendingLabelOps', pendingOps);
+            dropOps(new Set([batch[0].id]));
             rejected++;
             continue;
           }
         }
         if (!res.ok) throw new Error(`saving labels failed: ${res.status}`);
         const saved = await res.json();
-        pendingOps = pendingOps.slice(sent);
-        store.set('pendingLabelOps', pendingOps);
+        dropOps(new Set(batch.map((op) => op.id)));
         // The server's list, plus anything changed while this batch was in flight.
         state.labels = applyOps(saved, pendingOps); store.set('labels', state.labels);
       }
@@ -270,8 +285,8 @@ function flushLabels() {
     } catch {
       setStatus(`Labels not saved to the lab server yet (${pendingOps.length} change${pendingOps.length === 1 ? '' : 's'} kept in this browser)`
         + (rejected ? `; ${rejected} refused and dropped` : ''), true);
-    } finally { flushing = null; }
-  })();
+    }
+  })).finally(() => { flushing = null; });
   return flushing;
 }
 setInterval(() => { if (pendingOps.length) flushLabels(); }, 15000);
@@ -1043,7 +1058,7 @@ async function playAt(t, { follow: f = true } = {}) {
     audio.src = '/api/audio/' + encodeURIComponent(seg.name);
     warmAudio([state.audio[seg.index + 1]?.name]);
     try { await new Promise((ok, fail) => { audio.onloadedmetadata = ok; audio.onerror = () => fail(new Error('audio unavailable')); }); }
-    catch (err) { $('playerTime').textContent = `Couldn't play: ${err.message}`; return; }
+    catch (err) { segment = null; $('playerTime').textContent = `Couldn't play: ${err.message}`; return; }
   }
   audio.currentTime = Math.max(0, t - seg.start);
   playhead = t;
