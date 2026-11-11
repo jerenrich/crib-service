@@ -98,10 +98,20 @@ function send(e, msg) {
 }
 
 const owner = new Map();       // night id -> engine
-// Bumped when the run index changes: replays "as recorded" depend on it.
-let runsVersion = 0;
-const cacheKey = (id, settings) => `${runsVersion}|${id}|${settingsKey(settings)}`;
-const simCache = new Map();    // `${id}|${settingsKey}` -> result
+// Per night: dataVersion is bumped when the night is reloaded with newer logs,
+// runsVersion when the run index changes its per-run classifier thresholds.
+const dataVersion = new Map(), runsVersion = new Map();
+const bump = (m, id) => m.set(id, (m.get(id) ?? 0) + 1);
+// Replaying "as recorded" takes the threshold, window and reset from the
+// night's own changes, so those don't distinguish results; only such replays
+// depend on the run index.
+const RECORDED_OVERRIDES = new Set(['threshold', 'alertDuration', 'quietResetDuration']);
+function cacheKey(id, settings) {
+  const recorded = settings.asRecorded && state.data.get(id)?.settingsChanges?.length > 0;
+  const keyed = recorded ? SETTING_KEYS.map((k) => (RECORDED_OVERRIDES.has(k) ? '' : settings[k])).join('|') : settingsKey(settings);
+  return `${id}|${dataVersion.get(id) ?? 0}|${recorded ? runsVersion.get(id) ?? 0 : '-'}|${keyed}`;
+}
+const simCache = new Map();    // cacheKey -> result
 const simPending = new Map();  // same key -> job
 const shown = new Map();       // night id -> last result drawn (kept while the next one computes)
 
@@ -163,7 +173,7 @@ function loadNight(id, { quiet = false } = {}) {
   if (!quiet) setStatus(`Loading ${night.label}…`);
   const job = send(e, { type: 'load', id, files: night.files.map((f) => f.name), from: night.from, to: night.to })
     .then(({ view }) => {
-      owner.set(id, e); state.data.set(id, { ...view, id, night });
+      owner.set(id, e); state.data.set(id, { ...view, id, night, loadedAt: Date.now() / 1000 });
       setStatus(statusLine(), state.offline);
       scheduleRunsSync();
       return true;
@@ -183,6 +193,42 @@ async function loadRecentInBackground() {
   };
   await Promise.all(engines.map(next));
 }
+// While the page is open the phone keeps logging: pick up new files and audio,
+// and reload a night that was still being recorded when it was loaded. The old
+// copy stays on screen until the new one is parsed.
+const FILES_POLL = 60000;
+const reloading = new Set();
+function reloadNight(night) {
+  const e = owner.get(night.id);
+  if (!e || reloading.has(night.id) || loadingNow.has(night.id)) return;
+  reloading.add(night.id);
+  send(e, { type: 'load', id: night.id, files: night.files.map((f) => f.name), from: night.from, to: night.to })
+    .then(({ view }) => {
+      state.data.set(night.id, { ...view, id: night.id, night, loadedAt: Date.now() / 1000 });
+      bump(dataVersion, night.id); scheduleRunsSync(); refresh();
+    }, () => { /* keep the copy we have; try again next poll */ })
+    .finally(() => reloading.delete(night.id));
+}
+async function refreshFiles() {
+  if (document.hidden || !state.nights.length) return;
+  let files;
+  try { files = await (await api('/api/files')).json(); } catch { return; }
+  const sig = (n) => n.files.map((f) => `${f.name}:${f.size}`).join(',');
+  const before = new Map(state.nights.map((n) => [n.id, sig(n)]));
+  const wasOffline = state.offline;
+  state.sound = files.sound; state.audio = files.audio; state.offline = files.offline;
+  state.nights = buildNights();
+  for (const n of state.nights) {
+    const data = state.data.get(n.id);
+    // A night loaded well after it ended can't gain rows; the server may serve
+    // a growing log from its cache for a minute or two, hence the margin.
+    if (data && data.loadedAt < n.to + 600 && before.get(n.id) !== sig(n)) reloadNight(n);
+  }
+  if (state.offline !== wasOffline) setStatus(statusLine(), state.offline);
+  scheduleRender();
+}
+setInterval(refreshFiles, FILES_POLL);
+
 // Each load caches more logs, which can reveal markers for runs that earlier
 // nights belong to. When the server's run index changes, have the workers
 // re-resolve their nights' classifier thresholds and replay again.
@@ -198,10 +244,10 @@ async function syncRuns() {
   for (const reply of replies) {
     for (const [id, changes] of Object.entries(reply?.changes ?? {})) {
       const data = state.data.get(id); if (!data) continue;
-      if (JSON.stringify(data.settingsChanges) !== JSON.stringify(changes)) { data.settingsChanges = changes; changed = true; }
+      if (JSON.stringify(data.settingsChanges) !== JSON.stringify(changes)) { data.settingsChanges = changes; bump(runsVersion, id); changed = true; }
     }
   }
-  if (changed) { runsVersion++; refresh(); }
+  if (changed) refresh();
 }
 
 function statusLine() {
@@ -1049,17 +1095,31 @@ function warmAlertAudio() {
   }
   warmAudio(names);
 }
+// Only the latest request to play wins: an earlier one still waiting for its
+// segment to load gives up instead of seeking back to where it was asked.
+let playSeq = 0, segmentLoad = null;  // segmentLoad: { ready, cancel } for the segment loading now
 async function playAt(t, { follow: f = true } = {}) {
   const seg = audioFor(t); if (!seg) return;
+  const mine = ++playSeq;
   follow = f;
   $('player').style.display = 'flex';
   if (segment?.name !== seg.name) {
+    segmentLoad?.cancel();
     segment = seg; $('playerTime').textContent = 'Loading…';
+    let cancel;
+    const ready = new Promise((ok, fail) => {
+      cancel = () => fail(new Error('superseded'));
+      audio.onloadedmetadata = ok; audio.onerror = () => fail(new Error('audio unavailable'));
+    });
+    segmentLoad = { ready, cancel };
     audio.src = '/api/audio/' + encodeURIComponent(seg.name);
     warmAudio([state.audio[seg.index + 1]?.name]);
-    try { await new Promise((ok, fail) => { audio.onloadedmetadata = ok; audio.onerror = () => fail(new Error('audio unavailable')); }); }
-    catch (err) { segment = null; $('playerTime').textContent = `Couldn't play: ${err.message}`; return; }
   }
+  try { await segmentLoad?.ready; } catch (err) {
+    if (mine === playSeq) { segment = null; segmentLoad = null; $('playerTime').textContent = `Couldn't play: ${err.message}`; }
+    return;
+  }
+  if (mine !== playSeq) return;  // a later click (or Close) took over
   audio.currentTime = Math.max(0, t - seg.start);
   playhead = t;
   try { await audio.play(); } catch (err) { $('playerTime').textContent = `Couldn't play: ${err.message}`; }
@@ -1086,7 +1146,7 @@ audio.addEventListener('play', () => { $('playerToggle').textContent = 'Pause'; 
 $('playerToggle').onclick = () => (audio.paused ? audio.play() : audio.pause());
 $('playerBack').onclick = () => playhead !== null && playAt(playhead - 10);
 $('playerFwd').onclick = () => playhead !== null && playAt(playhead + 10);
-$('playerClose').onclick = () => { audio.pause(); playhead = null; segment = null; $('player').style.display = 'none'; drawOverlay(); drawOverview(); };
+$('playerClose').onclick = () => { playSeq++; segmentLoad?.cancel(); segmentLoad = null; audio.pause(); playhead = null; segment = null; $('player').style.display = 'none'; drawOverlay(); drawOverview(); };
 
 // ---------- compare settings ----------
 let sweepGen = 0, sweepTimer = null;
@@ -1105,6 +1165,7 @@ async function runSweep() {
   const used = new Set(ids.map((id) => state.data.get(id).recordedSettings?.[by]).filter((x) => x !== undefined));
   const maxAlerts = Math.max(1, ...rows.map((r) => r.alerts));
   const anyLabels = rows.some((r) => r.cries || r.falseAlarms);
+  const missing = Math.max(...rows.map((r) => r.missing));  // nights whose replay failed for some setting
   const scale = (n) => (n / maxAlerts) * 100;
   table.innerHTML = `<thead><tr><th>${def.head}</th><th>Alerts</th><th class="bar"></th><th>Cries caught</th><th>False alarms</th><th>To label</th></tr></thead><tbody>${rows.map((r) => {
     const cur = !state.settings.asRecorded && r.v === state.settings[by];
@@ -1121,7 +1182,9 @@ async function runSweep() {
   $('sweepNote').textContent = (anyLabels
     ? 'Bars: blue = alerts on a labelled cry, grey = labelled false alarms, orange = not labelled yet.'
     : 'Label alerts as Cry or Not a cry to count cries caught and false alarms at each setting.')
-    + ` Covers ${ids.length} ticked night${ids.length === 1 ? '' : 's'}. Click a row to use that setting.`;
+    + ` Covers ${ids.length} ticked night${ids.length === 1 ? '' : 's'}. Click a row to use that setting.`
+    + (missing ? ` ${missing} night${missing === 1 ? '' : 's'} couldn't be replayed for some settings and ${missing === 1 ? "isn't" : "aren't"} counted in those rows.` : '');
+  $('sweepNote').classList.toggle('warn', missing > 0);
 }
 $('sweep').addEventListener('click', (ev) => {
   const tr = ev.target.closest('tbody tr[data-v]'); if (!tr) return;

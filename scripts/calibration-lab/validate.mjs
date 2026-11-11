@@ -71,11 +71,13 @@ let nightMismatches = 0, nights = 0, nightAlerts = 0;
 const first = new Date(strictFrom * 1000); first.setHours(18, 0, 0, 0);  // nights run 18:00 to 11:00, local time
 if (first.getTime() / 1000 > strictFrom) first.setDate(first.getDate() - 1);
 for (const d = first; d.getTime() / 1000 < Date.now() / 1000; d.setDate(d.getDate() + 1)) {
-  const f = d.getTime() / 1000, t = f + 17 * 3600;
+  // 11:00 local the next morning, as the page has it (not f + 17 h, which is off by an hour when the clocks change).
+  const end = new Date(d); end.setDate(end.getDate() + 1); end.setHours(11, 0, 0, 0);
+  const f = d.getTime() / 1000, t = end.getTime() / 1000;
   const mine = texts.filter((_, i) => starts[i] < t && (starts[i + 1] ?? Infinity) > f - WARMUP);
   nights++;
   if (!mine.length) continue;
-  const one = parseNight(mine, f - WARMUP, t, { runs: night.runs });
+  const one = parseNight(mine, f - WARMUP, t, { runs: night.runs, countFrom: f });
   const lo = Math.max(f, strictFrom);
   const sentN = one.recordedAlerts.filter((a) => a.t >= lo).map((a) => a.t);
   const simN = simulate(one, { asRecorded: true, classifierThreshold: 0.3 }).alerts.map((a) => a.alertAt).filter((x) => x >= lo);

@@ -51,8 +51,10 @@ export function resolveRunThresholds(changes, localRuns, runs = {}) {
  * capture the night's first classifier scores belong to.
  * `runs` ({ runId: { threshold, policy } }, from the server's /api/runs) fills
  * in run markers logged outside these files.
+ * Rows before `countFrom` (a warm-up before the night) are replayed but left
+ * out of the summaries: recorded alerts, monitoring, the settings tally, legacy.
  */
-export function parseNight(texts, from = -Infinity, to = Infinity, { runs = {} } = {}) {
+export function parseNight(texts, from = -Infinity, to = Infinity, { runs = {}, countFrom = from } = {}) {
   const recordedAlerts = [], monitoring = [], caps = [], capIndex = new Map();
   const order = [], at = [];  // kind code, index into that kind's columns
   const L = { t: [], db: [], cap: [], sf: [], ef: [], sr: [] };
@@ -93,7 +95,7 @@ export function parseNight(texts, from = -Infinity, to = Infinity, { runs = {} }
         order.push(KIND.S); at.push(S.t.length); S.t.push(startBefore[0]); S.cap.push(cap(startBefore[1]));
         startBefore = null;
       }
-      const detail = c.slice(18).join(',');
+      const detail = c.slice(18).join(','), counted = t >= countFrom;
       if (kind === 'level') {
         const db = +c[7];
         if (!Number.isFinite(db)) continue;
@@ -106,12 +108,15 @@ export function parseNight(texts, from = -Infinity, to = Infinity, { runs = {} }
           L.ef.push(+detailValue(detail, 'audio_end_frame')); L.sr.push(+detailValue(detail, 'audio_sample_rate'));
         } else { L.cap.push(-1); L.sf.push(NaN); L.ef.push(NaN); L.sr.push(NaN); }
         const key = `${c[8]}|${c[14]}|${c[15]}`;
-        settingsSeen.set(key, (settingsSeen.get(key) ?? 0) + 1);
-        if (key + c[1] !== lastKey && c[8] !== '' && Number.isFinite(+c[8])) {
-          lastKey = key + c[1];
-          changes.push({ i: L.t.length - 1, t, run: c[1], threshold: +c[8], alertDuration: +c[14] || 5, quietResetDuration: +c[15] || 20 });
+        // Rows without settings (older exports) say nothing about them: '' would read as 0.
+        if (c[8] !== '' && Number.isFinite(+c[8])) {
+          if (counted) settingsSeen.set(key, (settingsSeen.get(key) ?? 0) + 1);
+          if (key + c[1] !== lastKey) {
+            lastKey = key + c[1];
+            changes.push({ i: L.t.length - 1, t, run: c[1], threshold: +c[8], alertDuration: +c[14] || 5, quietResetDuration: +c[15] || 20 });
+          }
         }
-        if (c[11] === '1') {
+        if (c[11] === '1' && counted) {
           // Builds before the time-coverage policy (before ~6 Nov 2026) did not tag alerts.
           const legacy = !detail.includes('alert_policy=');
           recordedAlerts.push({ t, trigger: detailValue(detail, 'alert_trigger') ?? 'volume', legacy });
@@ -122,7 +127,7 @@ export function parseNight(texts, from = -Infinity, to = Infinity, { runs = {} }
         const ae = isoSeconds(detailValue(detail, 'audio_window_end_at'));
         order.push(KIND.C); at.push(C.t.length);
         C.t.push(t); C.ws.push(ws); C.we.push(we); C.conf.push(conf); C.ae.push(ae ?? NaN); C.cap.push(cap(c[3]));
-        if (c[11] === '1') recordedAlerts.push({ t, trigger: 'classifier' });
+        if (c[11] === '1' && counted) recordedAlerts.push({ t, trigger: 'classifier' });
       } else if (kind in EVENT_KINDS) {
         order.push(KIND.E); at.push(E.t.length);
         E.t.push(t); E.type.push(EVENT_KINDS[kind]); E.cap.push(c[3] ? cap(c[3]) : -1); E.we.push(isoSeconds(c[5]) ?? NaN);
@@ -130,9 +135,9 @@ export function parseNight(texts, from = -Infinity, to = Infinity, { runs = {} }
         order.push(KIND.S); at.push(S.t.length); S.t.push(t); S.cap.push(cap(c[3]));
       } else if (kind === 'monitoring_stop' || kind === 'run_start') {
         order.push(KIND.X); at.push(X.t.length); X.t.push(t);
-        monitoring.push({ t, kind });
+        if (counted) monitoring.push({ t, kind });
       } else if (kind === 'monitoring_start') {
-        monitoring.push({ t, kind });
+        if (counted) monitoring.push({ t, kind });
       }
     }
   }
@@ -143,13 +148,13 @@ export function parseNight(texts, from = -Infinity, to = Infinity, { runs = {} }
   for (const [key, n] of settingsSeen) {
     if (n > best) {
       best = n; const [thr, dur, reset] = key.split('|').map(Number);
-      recordedSettings = { threshold: thr, alertDuration: dur, quietResetDuration: reset };
+      recordedSettings = { threshold: thr, alertDuration: dur || 5, quietResetDuration: reset || 20 };
     }
   }
   // Other settings used for more than a minute of this range.
   const otherSettings = [...settingsSeen].filter(([, n]) => n < best && n > 240).map(([key]) => {
     const [threshold, alertDuration] = key.split('|').map(Number);
-    return { threshold, alertDuration };
+    return { threshold, alertDuration: alertDuration || 5 };
   });
   return {
     recordedAlerts, recordedSettings, monitoring, otherSettings, caps, settingsChanges: changes,

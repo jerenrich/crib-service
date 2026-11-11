@@ -24,12 +24,13 @@ self.onmessage = async ({ data: m }) => {
   try {
     if (m.type === 'load') {
       const [texts, runs] = await Promise.all([Promise.all(m.files.map(fetchText)), fetchRuns()]);
-      const parsed = parseNight(texts, m.from - WARMUP, m.to, { runs });
+      // The warm-up is replayed, but the night's summaries start at m.from.
+      const parsed = parseNight(texts, m.from - WARMUP, m.to, { runs, countFrom: m.from });
       nights.set(m.id, { parsed, from: m.from });
       const view = {
         levels: { t: parsed.levels.t.slice(), db: parsed.levels.db.slice() },
         scores: { at: parsed.scores.at.slice(), conf: parsed.scores.conf.slice() },
-        recordedAlerts: parsed.recordedAlerts.filter((a) => a.t >= m.from), recordedSettings: parsed.recordedSettings,
+        recordedAlerts: parsed.recordedAlerts, recordedSettings: parsed.recordedSettings,
         otherSettings: parsed.otherSettings, legacy: parsed.legacy, settingsChanges: parsed.settingsChanges,
       };
       self.postMessage({ req: m.req, view },

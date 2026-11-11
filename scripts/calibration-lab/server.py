@@ -13,6 +13,7 @@ the page still works from whatever is already cached.
 """
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
@@ -236,6 +237,8 @@ def apply_label_ops(labels, ops):
     """Apply [{op: 'set', t, kind} | {op: 'delete', t}] to a label list."""
     for op in ops:
         t = float(op["t"])
+        if not math.isfinite(t):  # json.loads accepts NaN, which would match no label and drop them all
+            raise ValueError("t must be a finite number")
         labels = [l for l in labels if abs(l["t"] - t) > 1e-3]
         if op["op"] == "set":
             if op.get("kind") not in ("cry", "noise"):
@@ -284,6 +287,12 @@ class Handler(SimpleHTTPRequestHandler):
             else:
                 start = max(0, size - int(m.group(2)))
             end = min(end, size - 1)
+            if start > end:  # past the end, or 'bytes=-0', or an empty file
+                self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             self.send_response(HTTPStatus.PARTIAL_CONTENT)
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         else:
