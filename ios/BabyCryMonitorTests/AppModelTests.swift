@@ -534,8 +534,15 @@ final class AppModelTests: XCTestCase {
         var activationAttempts = 0
         var activationFailures = 0
         func failNextActivations(_ count: Int) { activationFailures = count }
-        func activate(generation requested: Int, clearSound: Bool) throws {
-            activationAttempts += 1
+        var captureTestModes: [AudioCaptureTestMode] = []
+        func setCaptureTestMode(_ mode: AudioCaptureTestMode, generation requested: Int) throws -> AudioCaptureTestResult {
+            guard requested >= generation else { throw CancellationError() }; generation = requested
+            captureTestModes.append(mode)
+            return AudioCaptureTestResult(voiceProcessing: mode != .measurement, bypassed: mode == .bypassed, rebuilt: mode == .measurement)
+        }
+        var idleVoiceProcessingRequests: [Bool] = []
+        func activate(generation requested: Int, clearSound: Bool, idleVoiceProcessing: Bool) throws -> Bool {
+            activationAttempts += 1; idleVoiceProcessingRequests.append(idleVoiceProcessing)
             guard requested >= generation else { throw CancellationError() }; generation = requested
             if activationFailures > 0 {
                 // The real driver tears down and deactivates when activation fails.
@@ -545,6 +552,7 @@ final class AppModelTests: XCTestCase {
             current.capture = true
             if clearSound { current.state.playing = false; current.state.remainingSeconds = 0 }
             operations.append(current); running = true
+            return idleVoiceProcessing || current.state.playing
         }
         func setSound(_ state: NurserySoundState, capture: Bool, generation requested: Int) async throws {
             setAttempts += 1
@@ -948,6 +956,42 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(attempts, 1)
         audio.stop()
     }
+    @MainActor final class ForegroundFlag { var value = true }
+    @MainActor func testVoiceProcessingCaptureRecoversInMeasurementWhileLocked() async throws {
+        let foreground = ForegroundFlag()
+        let driver = AudioDriver(), audio = AudioLevelMonitor(driver: driver, isForeground: { foreground.value })
+        try await audio.start(idleVoiceProcessing: true)
+        func routeLost(attempts: Int) async -> Bool {
+            NotificationCenter.default.post(name: AVAudioSession.routeChangeNotification, object: nil,
+                userInfo: [AVAudioSessionRouteChangeReasonKey: AVAudioSession.RouteChangeReason.oldDeviceUnavailable.rawValue])
+            return await eventually { await driver.activationAttempts == attempts }
+        }
+        // Locked: reactivate in .measurement, which iOS allows in the background.
+        foreground.value = false
+        let locked = await routeLost(attempts: 2); XCTAssertTrue(locked)
+        foreground.value = true
+        let open = await routeLost(attempts: 3); XCTAssertTrue(open)
+        audio.stop()
+        // Calibration and a background Start never ask for voice processing.
+        try await audio.start()
+        foreground.value = false
+        audio.stop(); try await audio.start(idleVoiceProcessing: true)
+        let requests = await driver.idleVoiceProcessingRequests
+        XCTAssertEqual(requests, [true, false, true, false, false])
+        audio.stop()
+    }
+    @MainActor func testCaptureTestRestoresTheStartModeAndNeverRunsUnderSound() async throws {
+        let driver = AudioDriver(), audio = AudioLevelMonitor(driver: driver, isForeground: { true })
+        do { _ = try await audio.setCaptureTestMode(.measurement); XCTFail("needs monitoring") } catch {}
+        try await audio.start(idleVoiceProcessing: true)
+        _ = try await audio.setCaptureTestMode(.bypassed)
+        _ = try await audio.setCaptureTestMode(nil)
+        try await audio.setNurserySound(.init(settings: .init(), action: .play))
+        do { _ = try await audio.setCaptureTestMode(.measurement); XCTFail("sound playing") } catch {}
+        let modes = await driver.captureTestModes
+        XCTAssertEqual(modes, [.bypassed, .voiceProcessing])
+        audio.stop()
+    }
     @MainActor func testStartRecoversWhenInterruptionEndIsNeverDelivered() async throws {
         for reset in [false, true] {
             let driver = AudioDriver(), audio = AudioLevelMonitor(driver: driver)
@@ -1265,6 +1309,56 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(fixture.audio.soundRequests.count, 1)
         fixture.model.stop()
         XCTAssertFalse(fixture.model.nurserySound.playing)
+    }
+    @MainActor func testLockedNurseryReportsBlockedRemotePlayAndStartRequestsVoiceProcessing() async throws {
+        let fixture = try Fixture()
+        await fixture.model.start()
+        // A foreground Start prepares capture for remote sound while locked.
+        XCTAssertEqual(fixture.audio.idleVoiceProcessingRequests, [true])
+        fixture.audio.soundError = NurseryAudioFailure(stage: .session,
+            underlying: NSError(domain: NSOSStatusErrorDomain, code: 560557684))
+        fixture.liveSound.onNurserySoundRequest?()
+        let token = try XCTUnwrap(fixture.liveSound.soundUpdates.last?.controlToken)
+        let command = NurserySoundCommand(id: UUID(), controlToken: token,
+            request: NurserySoundRequest(settings: .init(sound: .whiteNoise, timerMinutes: 5), action: .play))
+        fixture.liveSound.onNurserySoundCommand?(command)
+        let rejected = await eventually { fixture.liveSound.soundUpdates.last?.commandID == command.id }
+        XCTAssertTrue(rejected)
+        XCTAssertEqual(fixture.liveSound.soundUpdates.last?.failure, "backgroundBlocked")
+        XCTAssertEqual(fixture.liveSound.soundUpdates.last?.isValid, true)
+        XCTAssertTrue(fixture.model.nurserySoundError?.contains("locked") == true)
+        // Other playback failures keep the generic rejection.
+        fixture.audio.soundError = NurseryAudioFailure(stage: .player, underlying: URLError(.cannotOpenFile))
+        fixture.liveSound.onNurserySoundRequest?()
+        let retryToken = try XCTUnwrap(fixture.liveSound.soundUpdates.last?.controlToken)
+        let retry = NurserySoundCommand(id: UUID(), controlToken: retryToken, request: command.request)
+        fixture.liveSound.onNurserySoundCommand?(retry)
+        let failed = await eventually { fixture.liveSound.soundUpdates.last?.commandID == retry.id }
+        XCTAssertTrue(failed)
+        XCTAssertEqual(fixture.liveSound.soundUpdates.last?.failure, "playbackFailed")
+        fixture.model.stop()
+    }
+    @MainActor func testCaptureTestCyclesModesAndRestores() async throws {
+        let fixture = try Fixture()
+        await fixture.model.start()
+        fixture.model.captureTestTiming = (segment: .milliseconds(5), total: .milliseconds(80))
+        fixture.model.startCaptureTest()
+        XCTAssertTrue(fixture.model.captureTestRunning)
+        let finished = await eventually { !fixture.model.captureTestRunning }
+        XCTAssertTrue(finished)
+        let modes = fixture.audio.captureTestModes
+        XCTAssertEqual(Array(modes.prefix(3)), [.measurement, .voiceProcessing, .measurement])
+        XCTAssertEqual(modes.last, .some(nil))
+        XCTAssertEqual(fixture.model.captureTestStatus, "Finished. Export sound analysis to compare.")
+        fixture.model.stop()
+    }
+    func testParentExplainsALockedNurseryRejection() {
+        XCTAssertNil(AppModel.nurserySoundFailureMessage(nil))
+        XCTAssertTrue(AppModel.nurserySoundFailureMessage("backgroundBlocked")?.contains("Start the sound on the nursery iPhone") == true)
+        XCTAssertEqual(AppModel.nurserySoundFailureMessage("playbackFailed"),
+                       "The nursery could not apply that sound change. Try again on the nursery iPhone.")
+        XCTAssertTrue(NurseryAudioFailure(stage: .session, underlying: NSError(domain: NSOSStatusErrorDomain, code: 560557684)).blockedInBackground)
+        XCTAssertFalse(NurseryAudioFailure(stage: .session, underlying: NSError(domain: NSOSStatusErrorDomain, code: 560557673)).blockedInBackground)
     }
     @MainActor func testExpiredAndLocallySupersededCommandsCannotStartSound() async throws {
         let fixture = try Fixture()
@@ -1674,10 +1768,12 @@ final class AppModelTests: XCTestCase {
         var onNurserySoundChange: ((NurserySoundState) -> Void)?
         var soundRequests: [NurserySoundRequest] = []
         var soundFailure = false
+        var soundError: Error?
         var soundPlayback = NurserySoundPlayback()
         func setNurserySound(_ request: NurserySoundRequest, commandID: UUID? = nil) async throws {
             soundRequests.append(request)
             if soundFailure { throw URLError(.cannotOpenFile) }
+            if let soundError { throw soundError }
             soundPlayback.apply(request, at: .now); onNurserySoundChange?(soundPlayback.state)
         }
         var permissionGranted = true
@@ -1693,8 +1789,9 @@ final class AppModelTests: XCTestCase {
         }
         func emit(_ sample: AudioLevelSample) { continuation.yield(sample) }
         func requestPermission() async -> Bool { permissionGranted }
-        func start() async throws {
-            starts += 1
+        var idleVoiceProcessingRequests: [Bool] = []
+        func start(idleVoiceProcessing: Bool) async throws {
+            starts += 1; idleVoiceProcessingRequests.append(idleVoiceProcessing)
             if let recoveryGate {
                 onStatus?(.recovering("Audio route changed. Recovering microphone…"))
                 await recoveryGate.wait()
@@ -1706,6 +1803,11 @@ final class AppModelTests: XCTestCase {
             onStatus?(.active)
         }
         func stop() { stops += 1; soundPlayback.stop(); onNurserySoundChange?(soundPlayback.state); onStatus?(.stopped) }
+        var captureTestModes: [AudioCaptureTestMode?] = []
+        func setCaptureTestMode(_ mode: AudioCaptureTestMode?) async throws -> AudioCaptureTestResult {
+            captureTestModes.append(mode)
+            return AudioCaptureTestResult(voiceProcessing: mode != .measurement, bypassed: mode == .bypassed, rebuilt: false)
+        }
     }
     @MainActor final class Connectivity: ConnectivityProviding {
         var available = true

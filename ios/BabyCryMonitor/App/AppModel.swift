@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import Observation
 import UIKit
@@ -130,6 +131,11 @@ import UIKit
     @ObservationIgnored private let liveSound: any LiveSoundStreaming
     @ObservationIgnored private var appActive = true
     @ObservationIgnored private let alerts = AlertCoordinator()
+    /// Diagnostics A/B test of capture modes on the Listener.
+    private(set) var captureTestStatus: String?
+    private(set) var captureTestRunning = false
+    @ObservationIgnored private var captureTestTask: Task<Void, Never>?
+    @ObservationIgnored var captureTestTiming = (segment: Duration.seconds(15), total: Duration.seconds(120))
     var changingCaregiverDuty = false
     var caregiverInvite: PairingCode?
     var caregiverError: String?
@@ -278,7 +284,7 @@ import UIKit
             guard let self, self.role == .parent, self.paired, self.appActive, update.isValid else { return }
             self.remoteNurserySound.receive(update, at: self.currentTime())
             if let id = self.pendingSoundCommand, update.commandID == id {
-                self.finishNurserySoundCommand(error: update.failure == nil ? nil : "The nursery could not apply that sound change. Try again on the nursery iPhone.",
+                self.finishNurserySoundCommand(error: Self.nurserySoundFailureMessage(update.failure),
                     phase: update.failure == nil ? "confirmed" : "rejected", reason: update.failure)
             }
         }
@@ -742,7 +748,9 @@ import UIKit
             // lose the ability to resume while the nursery phone is locked.
             detectionPaused = false
             if microphoneActive { audioChanged(.active) }
-            else { try await audio.start() }
+            // In the foreground, start ready for remote nursery sound: a locked
+            // Listener cannot switch into voice processing later.
+            else { try await audio.start(idleVoiceProcessing: appActive) }
             guard revision == environmentRevision, control == controlGeneration,
                   deadline.map({ currentTime() < $0 }) ?? true else { audio.stop(); return }
             engine.markMonitoring(true); persist()
@@ -1256,6 +1264,15 @@ import UIKit
             }
         }
     }
+    /// Parent-side text for a Listener's sound rejection; nil when it succeeded.
+    nonisolated static func nurserySoundFailureMessage(_ failure: String?) -> String? {
+        switch failure {
+        case nil: return nil
+        case "backgroundBlocked":
+            return "The nursery iPhone is locked, and iOS would not let it start sound. Start the sound on the nursery iPhone once; after that, Play from here works while it stays locked."
+        default: return "The nursery could not apply that sound change. Try again on the nursery iPhone."
+        }
+    }
     private func applyNurserySound(_ request: NurserySoundRequest, commandID: UUID, receivedAt: ContinuousClock.Instant? = nil) async {
         guard !Task.isCancelled, request.settings.isValid, safetyAccepted, role == .listener else { return }
         changingNurserySound = true
@@ -1274,9 +1291,13 @@ import UIKit
             logSoundCommand(phase: "applied", id: commandID, request: request, origin: origin, state: nurserySound, startedAt: started)
         } catch {
             guard soundOperationID == operation, revision == environmentRevision else { return }
-            failure = "playbackFailed"
-            logSoundCommand(phase: "failed", id: commandID, request: request, origin: origin, reason: "playback_failed", startedAt: started, error: error)
-            nurserySoundError = "Could not play nursery sound. Check the speaker on the nursery iPhone and try again."
+            let blocked = (error as? NurseryAudioFailure)?.blockedInBackground == true
+            failure = blocked ? "backgroundBlocked" : "playbackFailed"
+            logSoundCommand(phase: "failed", id: commandID, request: request, origin: origin,
+                            reason: blocked ? "background_blocked" : "playback_failed", startedAt: started, error: error)
+            nurserySoundError = blocked
+                ? "iOS would not start nursery sound while this iPhone was locked. Start it here; Play from the Parent then works while locked."
+                : "Could not play nursery sound. Check the speaker on the nursery iPhone and try again."
         }
         changingNurserySound = false; soundOperationID = nil; activeRemoteSoundCommand = nil
         activeSoundDiagnosticID = nil; activeSoundRequest = nil; activeSoundStartedAt = nil
@@ -1905,6 +1926,77 @@ import UIKit
             guard revision == environmentRevision else { return false }
             self.error = error.localizedDescription; log.record("acknowledgement_failed", error: error)
             return false
+        }
+    }
+    /// Cycles capture through measurement, voice processing and bypassed voice
+    /// processing so their levels and cry scores can be compared on the same
+    /// sounds. While locked, measurement cannot switch back to voice processing,
+    /// so the test alternates voice processing with bypass instead and records
+    /// whether each switch worked. Monitoring and alerts continue throughout.
+    func startCaptureTest() {
+        guard role == .listener, monitoring, !captureTestRunning else { return }
+        guard !nurserySound.playing else { captureTestStatus = "Stop the nursery sound first."; return }
+        captureTestRunning = true
+        captureTestTask = Task { [weak self] in await self?.runCaptureTest() }
+    }
+    func stopCaptureTest() { captureTestTask?.cancel() }
+    private func runCaptureTest() async {
+        let testID = UUID(), started = ContinuousClock.now
+        // Bypass raised the quiet floor to about -40 dBFS on J14 (10 Nov), so
+        // the test compares measurement with voice processing only. Keep the
+        // screen on: a locked Listener cannot switch into voice processing.
+        let order: [AudioCaptureTestMode] = [.measurement, .voiceProcessing]
+        var step = 0
+        UIApplication.shared.isIdleTimerDisabled = true
+        defer { UIApplication.shared.isIdleTimerDisabled = false }
+        log.soundAnalysis.captureTest(phase: "start", testID: testID, mode: nil, result: nil, failure: nil, appActive: appActive,
+                                      microphoneMode: Self.microphoneModeName)
+        while !Task.isCancelled, monitoring, !nurserySound.playing {
+            let elapsed = started.duration(to: .now)
+            guard elapsed < captureTestTiming.total else { break }
+            let mode: AudioCaptureTestMode
+            if appActive { mode = order[step % order.count]; step += 1 }
+            else { mode = .voiceProcessing }
+            let remaining = Int((captureTestTiming.total - elapsed).components.seconds)
+            do {
+                let result = try await audio.setCaptureTestMode(mode)
+                log.soundAnalysis.captureTest(phase: "segment", testID: testID, mode: mode, result: result, failure: nil, appActive: appActive,
+                                              microphoneMode: Self.microphoneModeName)
+                log.record("audio_capture_test", code: (order.firstIndex(of: mode) ?? 0) + (result.failure == nil ? 0 : 10))
+                captureTestStatus = (result.failure == nil ? "Testing \(Self.captureTestTitle(mode))" : "\(Self.captureTestTitle(mode)) blocked; kept \(result.voiceProcessing ? "voice processing" : "measurement")")
+                    + " · \(remaining / 60):\(String(format: "%02d", remaining % 60)) left"
+            } catch {
+                let failure = ((error as? NurseryAudioFailure)?.underlying ?? error) as NSError
+                log.soundAnalysis.captureTest(phase: "segment", testID: testID, mode: mode, result: nil,
+                                              failure: "\(failure.domain):\(failure.code)", appActive: appActive)
+                log.record("audio_capture_test", code: -1, error: error)
+                if error is CancellationError { break }
+                captureTestStatus = "\(Self.captureTestTitle(mode)) unavailable · retrying"
+            }
+            try? await Task.sleep(for: captureTestTiming.segment)
+        }
+        let completed = started.duration(to: .now) >= captureTestTiming.total
+        let restored = monitoring && !nurserySound.playing ? try? await audio.setCaptureTestMode(nil) : nil
+        log.soundAnalysis.captureTest(phase: completed ? "end" : "cancelled", testID: testID, mode: nil, result: restored,
+                                      failure: nil, appActive: appActive)
+        captureTestStatus = completed ? "Finished. Export sound analysis to compare." : "Stopped early."
+        captureTestTask = nil; captureTestRunning = false
+    }
+    /// The Control Center mic mode (Standard, Wide Spectrum, Voice Isolation)
+    /// applies only while voice processing runs and only the person can change it.
+    private static var microphoneModeName: String {
+        switch AVCaptureDevice.activeMicrophoneMode {
+        case .standard: "standard"
+        case .wideSpectrum: "wide_spectrum"
+        case .voiceIsolation: "voice_isolation"
+        @unknown default: "unknown"
+        }
+    }
+    private static func captureTestTitle(_ mode: AudioCaptureTestMode) -> String {
+        switch mode {
+        case .measurement: "measurement"
+        case .voiceProcessing: "voice processing"
+        case .bypassed: "voice processing bypassed"
         }
     }
     func startWatchTest(interval: Double) {

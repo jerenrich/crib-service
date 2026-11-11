@@ -32,7 +32,7 @@ export function nurserySoundState(value:unknown) {
   for(const id of v.requestIDs)uuid(id);
  }
  if(v.commandID!=null)uuid(v.commandID);
- if(v.failure!=null&&(typeof v.failure!=='string'||!['playbackFailed','expired','unavailable'].includes(v.failure)))throw new APIError(400,'Invalid nursery sound failure.');
+ if(v.failure!=null&&(typeof v.failure!=='string'||!['playbackFailed','backgroundBlocked','expired','unavailable'].includes(v.failure)))throw new APIError(400,'Invalid nursery sound failure.');
  const state=record(v.state);keys(state,['settings','playing','remainingSeconds']);
  const s=settings(state.settings);
  if(typeof state.playing!=='boolean'||typeof state.remainingSeconds!=='number'||!Number.isFinite(state.remainingSeconds)

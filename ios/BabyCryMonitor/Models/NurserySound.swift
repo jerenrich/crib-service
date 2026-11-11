@@ -98,7 +98,7 @@ struct NurserySoundUpdate: Codable, Equatable, Sendable {
         && (requestID.map { UUID(uuidString: $0) != nil } ?? true)
         && (requestIDs?.count ?? 0) <= 16
         && (requestIDs ?? []).allSatisfy { UUID(uuidString: $0) != nil }
-        && (failure.map { ["playbackFailed", "expired", "unavailable"].contains($0) } ?? true)
+        && (failure.map { ["playbackFailed", "backgroundBlocked", "expired", "unavailable"].contains($0) } ?? true)
     }
 }
 

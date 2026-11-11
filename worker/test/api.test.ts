@@ -1892,6 +1892,9 @@ describe('live sound relay',()=>{
    expect(rows.results).toHaveLength(2);
    expect(rows.results.map(row=>JSON.parse(row.details).live_sound.phase).sort()).toEqual(['command_relayed','confirmation_relayed']);
   },{timeout:2000,interval:10});
+  // A locked nursery reports why it could not start sound.
+  const blocked={...state,commandID:crypto.randomUUID(),failure:'backgroundBlocked'};
+  listener.socket.send(JSON.stringify(blocked));expect(await parent.next()).toEqual(blocked);
   // A control/state message can be adjacent to a level frame or keepalive.
   listener.socket.send(JSON.stringify(frame()));expect((await parent.next()).type).toBe('levels');
   other.socket.send(JSON.stringify({type:'ping'}));expect(await other.next()).toEqual({type:'pong'});
