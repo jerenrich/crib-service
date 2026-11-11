@@ -1,7 +1,8 @@
 import {sharedAccess} from './devices';
 import {dispatchEvent} from './alerts';
 import {scheduleReminders} from './reminders';
-import {stoppedMonitoringForSQL,coveringHeartbeatSQL,coveringHeartbeat,outageAlertCutoffSQL,offlineAfterMs,connectionAlertDelays} from './monitoring';
+import {stoppedMonitoringForSQL,coveringHeartbeatSQL,coveringHeartbeat} from './monitoring';
+import {outageAlertCutoffSQL,offlineAfterMs,connectionAlertDelays} from './connection-timing';
 import {deliverToBoth} from './dual-delivery';
 import {timelineInsert,missingHeartbeat} from './timeline';
 import {APIError,requireRole,type Alert,type Device,type Env} from './types';

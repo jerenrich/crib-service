@@ -121,7 +121,7 @@ struct SteppedSlider: View {
 
 /// The stop a slider shows while saves run. Only the latest save's completion
 /// clears it, so an earlier save finishing cannot snap the thumb back.
-struct SliderSaveTracker: Equatable {
+struct SliderSaveTracker {
     private(set) var index: Int?
     private var latest = 0
     mutating func begin(_ index: Int) -> Int {
