@@ -1617,14 +1617,14 @@ import UIKit
         let revision = environmentRevision, generation = settingsGeneration
         let config = configuration
         settingsTask = Task { [weak self] in
-            defer { self?.settingsTask = nil }
             do {
                 try await client.settings(config)
-                guard let self, revision == self.environmentRevision else { return }
+                guard let self else { return }
+                self.settingsTask = nil
+                guard revision == self.environmentRevision else { return }
                 guard generation == self.settingsGeneration else {
-                    // A newer edit arrived mid-upload: send it as soon as this task ends.
-                    Task { [weak self] in self?.requestSettingsUpload() }
-                    return
+                    // A newer edit arrived mid-upload: send it now.
+                    self.requestSettingsUpload(); return
                 }
                 self.settingsDirty = false; self.defaults.set(false, forKey: "settingsDirty")
                 self.log.record("settings_synced")
@@ -1635,7 +1635,9 @@ import UIKit
                     self.nextParentRefreshAt = min(self.nextParentRefreshAt, self.currentTime().addingTimeInterval(2))
                 }
             } catch {
-                guard let self, revision == self.environmentRevision else { return }
+                guard let self else { return }
+                self.settingsTask = nil
+                guard revision == self.environmentRevision else { return }
                 self.deliveryStatus = "Settings sync pending: \(error.localizedDescription)"
                 self.log.record("settings_sync_failed", error: error)
             }
@@ -1777,6 +1779,7 @@ import UIKit
             }
             if !status.paired || (parentStatus?.pairingID != nil && parentStatus?.pairingID != status.pairingID) {
                 timeline = nil; timelineError = nil; clearLiveSound()
+                settingsConfirmationDeadline = .distantPast
             }
             parentStatus = status; paired = status.paired; defaults.set(paired, forKey: pairingKey)
             notificationsCheckedAt = checkedAt
@@ -1798,7 +1801,7 @@ import UIKit
             setParentConnectionDeadline(warn ? currentTime().addingTimeInterval(ConnectionWarningNotification.timeout) : nil)
             if !settingsDirty, generation == settingsGeneration { applyRemote(status.configuration) }
             var delay = pendingMonitoringCommand != nil ? 1 : status.refreshDelay()
-            if currentTime() < settingsConfirmationDeadline {
+            if status.paired, currentTime() < settingsConfirmationDeadline {
                 if status.listenerConfiguration == configuration { settingsConfirmationDeadline = .distantPast }
                 else { delay = min(delay, 2) }
             }
@@ -1848,7 +1851,11 @@ import UIKit
                 // An idle Listener sends no heartbeats, so this poll is its only
                 // source of Parent settings. Report a change once so the Parent
                 // can confirm it was applied.
-                if status.paired, !self.settingsDirty, generation == self.settingsGeneration,
+                // Skip while a heartbeat is queued, in flight, or answered during this
+                // poll: its reply may be newer, and replacing it would reset backoff.
+                let heartbeatIdle = self.heartbeatTask == nil && self.lastHeartbeatAt < fetchedAt
+                    && self.heartbeatKey.map { self.pendingHeartbeats[$0] == nil } ?? true
+                if status.paired, heartbeatIdle, !self.settingsDirty, generation == self.settingsGeneration,
                    status.configuration.isValid, status.configuration != self.configuration {
                     self.applyRemote(status.configuration)
                     self.queueHeartbeat()
