@@ -9,8 +9,14 @@ python3 scripts/calibration-lab/server.py --device <listener UDID or name>
 
 Then open http://127.0.0.1:8787. The server fetches logs and audio from the
 phone with `xcrun devicectl` on demand and caches them in `data/` (git-ignored,
-along with your labels in `data/labels.json`). Without the phone it works from
-the cache. Nothing is sent anywhere else.
+along with your labels in `data/labels.json`). A cached file that the phone was
+still writing is fetched again once it changes, and files the phone has since
+pruned stay available from the cache. Without the phone it works from the
+cache. The server only answers requests addressed to 127.0.0.1 or localhost,
+and nothing is sent anywhere else.
+
+Labels are saved as individual changes. If the server is down, they are kept in
+the browser and sent when it is back.
 
 Using it:
 

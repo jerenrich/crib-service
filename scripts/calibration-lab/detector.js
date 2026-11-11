@@ -5,6 +5,8 @@
 //   ios/BabyCryMonitor/Monitoring/CrySessionManager.swift     (episodes and first alerts)
 // Keep it in step with those files. All times are seconds (wall clock unless noted).
 
+import { EVENT } from './parse.js';
+
 export const DEFAULTS = Object.freeze({
   threshold: -35,          // absoluteThreshold, dBFS
   alertDuration: 5,        // seconds of qualifying sound before an alert
@@ -64,26 +66,41 @@ class EvidenceWindow {
   }
 }
 
-/// Volume detector (CryDetector.swift). `ws`/`we` are the PCM-clock window.
+/// Volume detector (CryDetector.swift). A sample is { t, db, cap, sf, ef, sr }:
+/// `cap` is -1 for old exports without PCM frames, otherwise the window is
+/// [sf, ef] frames at `sr` Hz of capture `cap`.
 class VolumeDetector {
   constructor(fraction) { this.f = fraction; this.reset(); }
   reset() {
     this.state = 'quiet'; this.quietSince = null; this.cryStartedAt = null;
     this.frames = []; this.firstFrame = null; this.activeSince = null; this.lastTimestamp = null;
+    this.lastCap = -1; this.lastSr = 0; this.lastEf = 0;  // the last accepted window (lastCap -1 = none)
     this.evidence = new EvidenceWindow(this.f); this.evidenceThreshold = null;
     this.lastEvidenceTime = null; this.quietEvidenceSince = null; this.cryEvidenceSince = null;
     this.inputInterrupted = false;
   }
-  accepts(s) { return this.lastTimestamp === null || s.t > this.lastTimestamp; }
+  accepts(s) {
+    if (this.lastTimestamp !== null && !(s.t > this.lastTimestamp)) return false;
+    // Frames from the same capture must move forward.
+    return !(s.cap >= 0 && this.lastCap === s.cap && this.lastSr === s.sr && s.ef <= this.lastEf);
+  }
   consume(s, cfg) {
     if (!this.accepts(s)) return;
     this.inputInterrupted = false;
-    if (this.lastTimestamp !== null && !s.cont) { this.reset(); this.inputInterrupted = true; }
-    const time = s.we, thr = cfg.threshold;
+    const windowed = s.cap >= 0;
+    if (this.lastTimestamp !== null) {
+      // Compared with the last sample this detector accepted, not the previous log row.
+      const continuous = windowed && this.lastCap >= 0
+        ? this.lastCap === s.cap && this.lastSr === s.sr && this.lastEf === s.sf
+        : !windowed && this.lastCap < 0;
+      if (!continuous) { this.reset(); this.inputInterrupted = true; }
+    }
+    const thr = cfg.threshold, loud = s.db >= thr, time = windowed ? s.ef / s.sr : s.t;
     if (this.evidenceThreshold !== thr) { this.evidence = new EvidenceWindow(this.f); this.evidenceThreshold = thr; }
-    const loud = s.db >= thr;
-    this.evidence.append(s.ws, s.we, loud);
+    if (windowed) this.evidence.append(s.sf / s.sr, s.ef / s.sr, loud);
+    else if (this.lastTimestamp !== null) this.evidence.append(Math.max(this.lastTimestamp, s.t - 0.25), s.t, loud);
     this.lastTimestamp = s.t; this.lastEvidenceTime = time;
+    if (windowed) { this.lastCap = s.cap; this.lastSr = s.sr; this.lastEf = s.ef; } else this.lastCap = -1;
     if (this.firstFrame === null) this.firstFrame = time;
     this.frames.push([time, loud]);
     while (this.frames.length && time - this.frames[0][0] >= 5) this.frames.shift();
@@ -125,14 +142,16 @@ class VolumeDetector {
   }
 }
 
-/// Classifier detector (CryConfidenceDetector.swift), minus the input-health
-/// paths the log cannot replay (dropped buffers, unmapped results).
+/// Classifier detector (CryConfidenceDetector.swift). Scores whose capture is
+/// not the current one are ignored; gaps, stops and unavailability clear the
+/// evidence, as in the app.
 class ConfidenceDetector {
   constructor(fraction) { this.f = fraction; this.reset(); }
   reset() {
-    this.captureID = null; this.observationStartedAt = null; this.cryStartedAt = null; this.quietSince = null;
+    this.captureID = null; this.captureStartedAt = -Infinity; this.minimumCapturedWindowStart = -Infinity;
+    this.observationStartedAt = null; this.cryStartedAt = null; this.quietSince = null;
     this.retainsEpisode = false; this.lastWindowEnd = null; this.lastObservationAt = null;
-    this.lastCapturedWindowEndAt = null; this.lastPositiveCapturedAt = null; this.run = null;
+    this.lastCapturedWindowEndAt = null; this.lastPositiveCapturedAt = null; this.run = null; this.latestInputAt = null;
     this.confirmed = false; this.evidence = new EvidenceWindow(this.f); this.latestPositive = false; this.settled = false;
   }
   get state() { return this.confirmed ? 'crying' : this.observationStartedAt === null ? 'quiet' : 'possibleCry'; }
@@ -140,29 +159,59 @@ class ConfidenceDetector {
     this.observationStartedAt = null; this.evidence = new EvidenceWindow(this.f); this.latestPositive = false;
     if (this.retainsEpisode && this.quietSince === null) this.quietSince = date;
   }
-  started(id, at) {
-    if (id === this.captureID) return;
-    this.interrupt(at); this.captureID = id;
-    this.lastWindowEnd = null; this.lastObservationAt = null; this.lastCapturedWindowEndAt = null;
+  started(id, at, now, cfg) {
+    this.advance(now, cfg);
+    if (!(at <= now + 1) || at < this.captureStartedAt || id === this.captureID) return;
+    this.interrupt(at);
+    this.captureID = id; this.captureStartedAt = at; this.minimumCapturedWindowStart = -Infinity;
+    this.lastWindowEnd = null; this.lastObservationAt = null; this.lastCapturedWindowEndAt = null; this.latestInputAt = null;
+    this.advance(now, cfg);
   }
-  stopped(at) { this.interrupt(at); this.captureID = null; }
+  stopped(id, at, now, cfg) {
+    this.advance(now, cfg);
+    if (id !== this.captureID) return;
+    this.interrupt(Math.min(at, now)); this.captureID = null;
+    this.advance(now, cfg);
+  }
+  unavailable(id, at, now, cfg) {  // id null: no capture named
+    this.advance(now, cfg);
+    if (id !== null && id !== this.captureID) return;
+    this.interrupt(Math.min(at, now)); this.captureID = null;
+    this.advance(now, cfg);
+  }
+  gap(at, now, cfg) {  // dropped buffers or dropped events
+    this.advance(now, cfg);
+    this.interrupt(Math.min(at, now));
+    this.minimumCapturedWindowStart = Math.max(this.minimumCapturedWindowStart, Math.min(at, now));
+    this.advance(now, cfg);
+  }
+  unmapped(id, windowEnd, at, now, cfg) {
+    this.advance(now, cfg);
+    // A late or retired result is not a new hole in current audio.
+    if (id !== this.captureID || !Number.isFinite(windowEnd) || (this.lastWindowEnd !== null && !(windowEnd > this.lastWindowEnd))) return;
+    this.interrupt(Math.min(at, now));
+    this.minimumCapturedWindowStart = Math.max(this.minimumCapturedWindowStart, Math.min(at, now));
+    this.advance(now, cfg);
+  }
   result(c, now, cfg) {
     this.advance(now, cfg);
-    if (c.cap !== this.captureID) this.started(c.cap, now);
-    if (this.lastWindowEnd !== null && !(c.we > this.lastWindowEnd)) return;
+    if (c.cap !== this.captureID || (this.lastWindowEnd !== null && !(c.we > this.lastWindowEnd))) return;
     const dur = c.we - c.ws, capturedEnd = c.ae ?? c.we;
-    const age = now - capturedEnd;
+    const age = now - capturedEnd, observedAge = now - c.t;
     // The app checks 4 s ± 0.1; older builds logged 2 s windows, so accept
     // any plausible length here rather than discard those nights.
-    if (dur < 0.5 || dur > 10 || age < -1 || age > 3) { this.interrupt(now); return; }
+    if (dur < 0.5 || dur > 10 || !(c.conf >= 0 && c.conf <= 1) || c.ws < this.captureStartedAt
+      || age < -1 || age > 3 || observedAge < -1 || observedAge > 3) { this.interrupt(now); return; }
+    if (c.ae !== null) this.latestInputAt = Math.max(this.latestInputAt ?? capturedEnd, capturedEnd);
+    if (capturedEnd - dur < this.minimumCapturedWindowStart) { this.interrupt(now); return; }
     if (this.lastWindowEnd !== null && (c.we - this.lastWindowEnd > 1.5
-      || (this.lastObservationAt !== null && now - this.lastObservationAt > 3))) {
+      || (this.lastObservationAt !== null && c.t - this.lastObservationAt > 3))) {
       this.interrupt(this.lastCapturedWindowEndAt ?? now);
     }
     const evidenceStart = Math.max(c.ws, this.evidence.endedAt ?? c.ws);
     this.latestPositive = c.conf >= cfg.classifierThreshold;
     this.evidence.append(evidenceStart, c.we, this.latestPositive);
-    this.lastWindowEnd = c.we; this.lastObservationAt = now; this.lastCapturedWindowEndAt = capturedEnd;
+    this.lastWindowEnd = c.we; this.lastObservationAt = c.t; this.lastCapturedWindowEndAt = capturedEnd;
     if (this.latestPositive) {
       this.lastPositiveCapturedAt = capturedEnd;
       if (this.observationStartedAt === null) { this.observationStartedAt = c.ws; this.run = null; }
@@ -264,14 +313,27 @@ export function simulate(night, settings) {
     vol.reset(); cls.reset(); lastVolumeInputAt = null;
   };
 
-  const L = night.levels, C = night.scores, S = night.starts, X = night.stops;
-  const lv = { t: 0, db: 0, ws: 0, we: 0, cont: true };
+  // After any classifier event the app records detection, expires stale volume
+  // input and reconciles the episode (CrySessionManager.consumeClassification).
+  const afterClassifier = (now) => {
+    if (cls.latestInputAt !== null) record(Math.min(cls.latestInputAt, now));
+    expireVolume(now);
+    reconcile(now, false);
+  };
+
+  const L = night.levels, C = night.scores, S = night.starts, X = night.stops, E = night.events;
+  const lv = { t: 0, db: 0, cap: -1, sf: 0, ef: 0, sr: 0 };
   const sc = { t: 0, cap: 0, ws: 0, we: 0, conf: 0, ae: null };
+  // Captures this replay has seen start. A score from a capture it has never
+  // seen means the log missed that capture_start (older builds didn't log
+  // restarts, and a night's log can begin mid-capture): treat it as started.
+  // A score from a capture that has already been replaced is late, and is ignored.
+  const knownCaptures = new Set();
   for (let n = 0; n < night.order.length; n++) {
     const i = night.at[n];
     switch (night.order[n]) {
       case 1: { // level
-        lv.t = L.t[i]; lv.db = L.db[i]; lv.ws = L.ws[i]; lv.we = L.we[i]; lv.cont = L.cont[i] === 1;
+        lv.t = L.t[i]; lv.db = L.db[i]; lv.cap = L.cap[i]; lv.sf = L.sf[i]; lv.ef = L.ef[i]; lv.sr = L.sr[i];
         const e = lv;
         if (lastObservedAt !== null && e.t <= lastObservedAt) break;
         if (!vol.accepts(e)) break;
@@ -288,17 +350,27 @@ export function simulate(night, settings) {
         sc.t = C.t[i]; sc.cap = C.cap[i]; sc.ws = C.ws[i]; sc.we = C.we[i]; sc.conf = C.conf[i];
         sc.ae = Number.isNaN(C.ae[i]) ? null : C.ae[i];
         const e = sc;
+        if (!knownCaptures.has(e.cap)) { knownCaptures.add(e.cap); cls.started(e.cap, Math.min(e.ws, e.t), e.t, cfg); }
         cls.result(e, e.t, cfg);
         recentScores.push([e.ae ?? e.t, e.conf]);
         if (recentScores.length > 256) recentScores.splice(0, 128);
-        if (e.ae !== null) record(Math.min(e.ae, e.t));
-        expireVolume(e.t);
-        reconcile(e.t, false);
+        afterClassifier(e.t);
         if (current) current.maxConf = Math.max(current.maxConf, e.conf);
         break;
       }
-      case 3: cls.started(S.cap[i], S.t[i]); break; // capture_start
+      case 3: knownCaptures.add(S.cap[i]); cls.started(S.cap[i], S.t[i], S.t[i], cfg); afterClassifier(S.t[i]); break; // capture_start
       case 4: suspend(); break;                     // monitoring_stop / run_start
+      case 5: { // other classifier events
+        const t = E.t[i], cap = E.cap[i] < 0 ? null : E.cap[i];
+        switch (E.type[i]) {
+          case EVENT.stop: cls.stopped(cap, t, t, cfg); break;
+          case EVENT.unavailable: cls.unavailable(cap, t, t, cfg); break;
+          case EVENT.gap: cls.gap(t, t, cfg); break;
+          case EVENT.unmapped: cls.unmapped(cap, E.we[i], t, t, cfg); break;
+        }
+        afterClassifier(t);
+        break;
+      }
     }
   }
   if (current) { current.endedAt = null; episodes.push(current); }

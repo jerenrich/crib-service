@@ -4,9 +4,14 @@ const $ = (id) => document.getElementById(id);
 const NIGHT_START_HOUR = 18, NIGHT_END_HOUR = 11, BACKGROUND_NIGHTS = 10;
 const SWEEPS = {
   threshold: { values: [-60, -55, -50, -45, -40, -35, -30, -25, -20, -15, -10], fmt: (v) => `${v} dBFS`, head: 'Threshold' },
-  alertDuration: { values: [5, 10, 15, 20, 30, 45, 60], fmt: (v) => `${v} s`, head: 'Window' },
+  alertDuration: { values: [5, 10, 15, 20, 30, 45, 60, 120, 180, 300, 600], fmt: (v) => fmtDuration(v), head: 'Window' },
 };
-const APP_DURATIONS = [5, 30, 60];
+// Observation windows the app offers (SettingsView.swift), and the finer steps
+// the slider walks when "Only values the app offers" is off.
+const APP_DURATIONS = [5, 30, 60, 120, 180, 300, 600];
+const ALL_DURATIONS = [5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 240, 300, 450, 600];
+const durationSteps = () => (state.appSteps ? APP_DURATIONS : ALL_DURATIONS);
+const fmtDuration = (v) => (v < 60 ? `${v} s` : v % 60 ? `${Math.floor(v / 60)} min ${v % 60} s` : `${v / 60} min`);
 const SETTING_KEYS = Object.keys(DEFAULTS);
 const settingsKey = (s) => SETTING_KEYS.map((k) => s[k]).join('|');
 
@@ -177,15 +182,52 @@ function statusLine() {
   return `${state.offline ? 'Phone not reachable, using cached logs' : 'Connected to the Listener'} · ${n} night${n === 1 ? '' : 's'} loaded`;
 }
 
+// Labels: each change is an operation ({op: 'set', t, kind} or {op: 'delete', t}).
+// Unsent operations are kept in localStorage and sent one batch at a time, so a
+// change made while the server is down survives a reload and lands later.
+let pendingOps = store.get('pendingLabelOps', []), flushing = null;
+function applyOps(labels, ops) {
+  for (const op of ops) {
+    labels = labels.filter((l) => Math.abs(l.t - op.t) > 1e-3);
+    if (op.op === 'set') labels.push({ t: op.t, kind: op.kind });
+  }
+  return labels.sort((a, b) => a.t - b.t);
+}
 async function loadLabels() {
-  try { state.labels = await (await api('/api/labels')).json(); }
-  catch { state.labels = store.get('labels', []); }
-}
-async function saveLabels() {
+  let server = null;
+  try { server = await (await api('/api/labels')).json(); } catch { /* offline: use the last copy */ }
+  state.labels = applyOps(server ?? store.get('labels', []), pendingOps);
   store.set('labels', state.labels);
-  try { await fetch('/api/labels', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(state.labels) }); }
-  catch { /* kept locally */ }
+  if (pendingOps.length) flushLabels();
 }
+function changeLabels(op) {
+  state.labels = applyOps(state.labels, [op]);
+  pendingOps.push(op);
+  store.set('labels', state.labels); store.set('pendingLabelOps', pendingOps);
+  flushLabels();
+}
+function flushLabels() {
+  if (flushing) return flushing;
+  flushing = (async () => {
+    try {
+      while (pendingOps.length) {
+        const batch = pendingOps.slice();
+        const res = await fetch('/api/labels', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ops: batch }) });
+        if (!res.ok) throw new Error(`saving labels failed: ${res.status}`);
+        const saved = await res.json();
+        pendingOps = pendingOps.slice(batch.length);
+        store.set('pendingLabelOps', pendingOps);
+        // The server's list, plus anything changed while this batch was in flight.
+        state.labels = applyOps(saved, pendingOps); store.set('labels', state.labels);
+      }
+      setStatus(statusLine(), state.offline);
+    } catch {
+      setStatus(`Labels not saved to the lab server yet (${pendingOps.length} change${pendingOps.length === 1 ? '' : 's'} kept in this browser)`, true);
+    } finally { flushing = null; }
+  })();
+  return flushing;
+}
+setInterval(() => { if (pendingOps.length) flushLabels(); }, 15000);
 
 // ---------- refresh ----------
 let gen = 0, renderQueued = false;
@@ -377,11 +419,10 @@ $('events').addEventListener('click', (ev) => {
 });
 
 function setLabel(row, kind) {
-  const existing = row.label ? state.labels.find((l) => l === row.label) : null;
-  if (existing && existing.kind === kind) state.labels.splice(state.labels.indexOf(existing), 1);
-  else if (existing) existing.kind = kind;
-  else state.labels.push({ t: row.recordedT ?? row.t, kind });
-  saveLabels(); renderAll(); scheduleSweep(0);
+  const existing = row.label;
+  if (existing && existing.kind === kind) changeLabels({ op: 'delete', t: existing.t });
+  else changeLabels({ op: 'set', t: existing ? existing.t : row.recordedT ?? row.t, kind });
+  renderAll(); scheduleSweep(0);
 }
 
 function selectAlert(row, { scroll = true, zoom = true } = {}) {
@@ -993,7 +1034,9 @@ function syncControls() {
   $('threshold').step = state.appSteps ? 5 : 1;
   $('threshold').value = s.threshold; $('thresholdOut').textContent = `${s.threshold} dBFS`;
   $('thresholdHint').textContent = state.appSteps ? 'The app offers −60 to −10 dBFS in steps of 5.' : 'Steps of 1 dB. The app only offers steps of 5.';
-  $('duration').value = Math.min(60, s.alertDuration); $('durationOut').textContent = `${s.alertDuration} s`;
+  // The slider walks an index into the list of steps, so 5 s and 10 min are both reachable.
+  const steps = durationSteps(), nearest = steps.reduce((a, b, i) => (Math.abs(b - s.alertDuration) < Math.abs(steps[a] - s.alertDuration) ? i : a), 0);
+  $('duration').max = steps.length - 1; $('duration').value = nearest; $('durationOut').textContent = fmtDuration(s.alertDuration);
   document.querySelectorAll('#reset button').forEach((b) => b.classList.toggle('on', +b.dataset.v === s.quietResetDuration));
   $('appSteps').checked = state.appSteps;
   $('classifier').checked = s.classifierEnabled; $('classifierSub').hidden = !s.classifierEnabled;
@@ -1013,7 +1056,7 @@ function bind(id, key, snap = (v) => v) {
 }
 const snapDuration = (v) => (state.appSteps ? APP_DURATIONS.reduce((a, b) => (Math.abs(b - v) < Math.abs(a - v) ? b : a)) : v);
 bind('threshold', 'threshold');
-bind('duration', 'alertDuration', snapDuration);
+bind('duration', 'alertDuration', (i) => durationSteps()[i]);
 bind('classThr', 'classifierThreshold');
 bind('gateMin', 'gateMin');
 bind('gateWin', 'gateWindow');

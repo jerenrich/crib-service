@@ -3,7 +3,8 @@
 
 Serves the page and fetches the Listener's sound-analysis logs and saved audio
 from the phone on demand with `xcrun devicectl`, caching them in ./data
-(git-ignored). Binds to 127.0.0.1 only; nothing leaves this Mac.
+(git-ignored). Binds to 127.0.0.1 and only answers requests addressed to it;
+nothing leaves this Mac.
 
     python3 scripts/calibration-lab/server.py --device <listener UDID or name>
 
@@ -35,7 +36,9 @@ KINDS = {
               re.compile(r"^(\d{13})-[0-9A-F-]{36}\.m4a$")),
 }
 LISTING_TTL = 60
-GROWING_TTL = 90  # refetch the newest sound log once it is this stale
+GROWING_TTL = 90  # don't refetch a cached file more often than this
+LABELS = DATA / "labels.json"
+LABELS_LOCK = threading.Lock()
 
 
 class Device:
@@ -47,16 +50,21 @@ class Device:
         self.guard = threading.Lock()
 
     def _run(self, args, attempts=3):
-        last = None
+        last = "devicectl failed"
         for attempt in range(attempts):
-            proc = subprocess.run(["xcrun", "devicectl", *args, "--device", self.device,
-                                   "--domain-type", "appDataContainer", "--domain-identifier", self.bundle],
-                                  capture_output=True, text=True, timeout=180)
+            if attempt:
+                time.sleep(attempt)  # back off between attempts, not after the last one
+            try:
+                proc = subprocess.run(["xcrun", "devicectl", *args, "--device", self.device,
+                                       "--domain-type", "appDataContainer", "--domain-identifier", self.bundle],
+                                      capture_output=True, text=True, timeout=120)
+            except subprocess.TimeoutExpired:
+                last = "devicectl timed out"
+                continue
             if proc.returncode == 0:
                 return
-            last = (proc.stderr or proc.stdout).strip().splitlines()[-1:] or ["devicectl failed"]
-            time.sleep(1 + attempt)
-        raise RuntimeError(last[0])
+            last = ((proc.stderr or proc.stdout).strip().splitlines() or [last])[-1]
+        raise RuntimeError(last)
 
     def lock(self, key):
         with self.guard:
@@ -94,11 +102,14 @@ class Device:
             items = [{"name": f["name"], "start": int(m.group(1)) / 1000, "size": f["metadata"]["size"]}
                      for f in files if (m := pattern.match(f["name"]))]
             error = None
-        except Exception as exc:  # fall back to the cache
+        except Exception as exc:  # phone unreachable: the cache below is all there is
             items, error = [], str(exc)
-            for path in (DATA / kind).glob("*"):
-                if m := pattern.match(path.name):
-                    items.append({"name": path.name, "start": int(m.group(1)) / 1000, "size": path.stat().st_size})
+        # Files the phone has since pruned stay usable from the cache.
+        on_phone = {i["name"] for i in items}
+        for path in (DATA / kind).glob("*"):
+            if path.name not in on_phone and (m := pattern.match(path.name)):
+                items.append({"name": path.name, "start": int(m.group(1)) / 1000, "size": path.stat().st_size,
+                              "cached_only": True})
         items.sort(key=lambda i: i["start"])
         self.listings[kind] = (time.time(), items, error)
         return items, error
@@ -110,18 +121,26 @@ class Device:
         target = DATA / kind / name
         with self.lock(f"{kind}:{name}"):
             if target.exists():
-                if kind == "audio":
-                    return target
                 items, error = self.listing(kind, wait=False)
-                newest = items[-1]["name"] if items else None
-                remote = next((i for i in items if i["name"] == name), None)
-                fresh = time.time() - target.stat().st_mtime < GROWING_TTL
-                if not (error or name != newest or fresh or (remote and remote["size"] == target.stat().st_size)):
-                    # The log the phone is still writing: serve what we have and
-                    # pull the newer copy in the background for the next request.
-                    if self.device and target not in self.refreshing:
+                remote = next((i for i in items if i["name"] == name and not i.get("cached_only")), None)
+                stat = target.stat()
+                if (error or not self.device or remote is None or remote["size"] == stat.st_size
+                        or time.time() - stat.st_mtime < GROWING_TTL):
+                    return target
+                # The phone's copy differs from ours: it was still being written when
+                # we cached it. The newest sound log is still growing, so serve what
+                # we have and refresh it in the background; anything else is finished
+                # on the phone now, so fetch it once before serving.
+                newest = next((i["name"] for i in reversed(items) if not i.get("cached_only")), None)
+                if kind == "sound" and name == newest:
+                    if target not in self.refreshing:
                         self.refreshing.add(target)
                         threading.Thread(target=self._refetch, args=(folder, name, target), daemon=True).start()
+                    return target
+                try:
+                    self._copy(folder, name, target)
+                except Exception:
+                    pass  # keep serving the cached copy
                 return target
             if not self.device:
                 raise FileNotFoundError(name)
@@ -143,8 +162,37 @@ class Device:
             self.refreshing.discard(target)
 
 
+def read_labels():
+    return json.loads(LABELS.read_text()) if LABELS.exists() else []
+
+
+def apply_label_ops(labels, ops):
+    """Apply [{op: 'set', t, kind} | {op: 'delete', t}] to a label list."""
+    for op in ops:
+        t = float(op["t"])
+        labels = [l for l in labels if abs(l["t"] - t) > 1e-3]
+        if op["op"] == "set":
+            if op.get("kind") not in ("cry", "noise"):
+                raise ValueError("kind must be cry or noise")
+            labels.append({"t": t, "kind": op["kind"]})
+        elif op["op"] != "delete":
+            raise ValueError("unknown op")
+    return sorted(labels, key=lambda l: l["t"])
+
+
 class Handler(SimpleHTTPRequestHandler):
     device: Device = None
+    port: int = 0
+
+    def allowed(self):
+        """Only answer requests addressed to this machine, so a web page that
+        rebinds its own hostname to 127.0.0.1 can't read nursery audio or labels."""
+        hosts = {f"127.0.0.1:{self.port}", f"localhost:{self.port}", f"[::1]:{self.port}"}
+        origin = self.headers.get("Origin")
+        if self.headers.get("Host", "") in hosts and (origin is None or origin.split("://", 1)[-1] in hosts):
+            return True
+        self.send_json({"error": "forbidden host"}, HTTPStatus.FORBIDDEN)
+        return False
 
     def log_message(self, fmt, *args):
         if "/api/" in (self.path or ""):
@@ -189,21 +237,28 @@ class Handler(SimpleHTTPRequestHandler):
                 self.wfile.write(chunk)
                 remaining -= len(chunk)
 
-    def do_PUT(self):
+    def do_POST(self):
+        """Label changes arrive as operations and are applied to the stored list
+        under a lock, so overlapping saves (or two open pages) can't undo each other."""
+        if not self.allowed():
+            return
         if urlparse(self.path).path != "/api/labels":
             return self.send_error(HTTPStatus.NOT_FOUND)
         try:
-            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0)) or 0) or b"[]")
-            labels = [{"t": float(l["t"]), "kind": l["kind"]} for l in body if l.get("kind") in ("cry", "noise")]
-        except (ValueError, KeyError, TypeError, AttributeError):
-            return self.send_json({"error": "expected [{t, kind}]"}, HTTPStatus.BAD_REQUEST)
-        DATA.mkdir(parents=True, exist_ok=True)
-        tmp = DATA / "labels.json.part"
-        tmp.write_text(json.dumps(sorted(labels, key=lambda l: l["t"]), indent=1))
-        os.replace(tmp, DATA / "labels.json")
-        self.send_json({"saved": len(labels)})
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0)) or 0) or b"{}")
+            with LABELS_LOCK:
+                labels = apply_label_ops(read_labels(), body["ops"])
+                DATA.mkdir(parents=True, exist_ok=True)
+                tmp = LABELS.with_suffix(f".{threading.get_ident()}.part")
+                tmp.write_text(json.dumps(labels, indent=1))
+                os.replace(tmp, LABELS)
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            return self.send_json({"error": f"expected {{ops: [...]}}: {exc}"}, HTTPStatus.BAD_REQUEST)
+        self.send_json(labels)
 
     def do_GET(self):
+        if not self.allowed():
+            return
         path = unquote(urlparse(self.path).path)
         try:
             if path in STATIC:
@@ -211,8 +266,8 @@ class Handler(SimpleHTTPRequestHandler):
                 kind = "text/html" if name.endswith(".html") else "text/javascript"
                 return self.send_file(ROOT / name, kind + "; charset=utf-8")
             if path == "/api/labels":
-                labels = DATA / "labels.json"
-                return self.send_json(json.loads(labels.read_text()) if labels.exists() else [])
+                with LABELS_LOCK:
+                    return self.send_json(read_labels())
             if path == "/api/files":
                 sound, sound_error = self.device.listing("sound", wait=False)
                 audio, audio_error = self.device.listing("audio", wait=False)
@@ -239,6 +294,7 @@ def main():
     parser.add_argument("--port", type=int, default=8787)
     args = parser.parse_args()
     Handler.device = Device(args.device, args.bundle)
+    Handler.port = args.port
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     print(f"Calibration Lab on http://127.0.0.1:{args.port} (device: {args.device or 'none, cache only'})", flush=True)
     server.serve_forever()
