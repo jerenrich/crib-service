@@ -83,7 +83,7 @@ struct SettingsView: View {
                             LabeledContent("Server connection alerts", value: model.paired ? "Status unavailable" : "On by default")
                         }
                     } header: { Text("Monitoring connection") } footer: {
-                        Text("On by default for new registrations. The server alerts you when the Listener stops unexpectedly, or when it sends no update for \(connectionAlertDelay.map { "\(alertDurationText($0)) (checked each minute, so up to a minute later)" } ?? "about 3 minutes"), for example during an internet outage. This works even while Parent Mode is closed or the phone is locked. Missing-update alerts repeat at your chosen alert frequency until snoozed or the Listener reconnects, and use Silent Watch alarms when enabled. Snooze pauses crying and connection-loss alerts together. Receiving these alerts requires internet and allowed notifications.")
+                        Text("On by default for new registrations. The server alerts you when the Listener stops unexpectedly, or when it sends no update for \(model.connectionAlertDelay.map { "\(alertDurationText($0)) (checked each minute, so up to a minute later)" } ?? "about 3 minutes"), for example during an internet outage. This works even while Parent Mode is closed or the phone is locked. Missing-update alerts repeat at your chosen alert frequency until snoozed or the Listener reconnects, and use Silent Watch alarms when enabled. Snooze pauses crying and connection-loss alerts together. Receiving these alerts requires internet and allowed notifications.")
                     }
                     Section {
                         Toggle("Local overdue-check warning", isOn: Binding(get: { model.localConnectionWarningEnabled }, set: { model.setLocalConnectionWarning($0) }))
@@ -143,9 +143,6 @@ struct SettingsView: View {
         }.tint(Palette.mint)
     }
 
-    /// The server's saved delay, or nil for a server that predates the setting
-    /// (it alerts after 3 minutes and cannot change that).
-    private var connectionAlertDelay: Double? { model.parentStatus?.connectionAlertDelay }
 
     private func alertDurationText(_ seconds: Double) -> String {
         if seconds.truncatingRemainder(dividingBy: 60) == 0 {

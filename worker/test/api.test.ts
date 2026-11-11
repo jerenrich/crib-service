@@ -3775,6 +3775,15 @@ describe('unexpected Listener monitoring stops',()=>{
   const open=await env.DB.prepare("SELECT COUNT(*) AS count FROM events WHERE resolved_at IS NULL AND json_extract(payload,'$.type')='monitoring_failed'").first();
   expect(open).toEqual({count:0});
  });
+ it('records each observed state change even when two heartbeats share a millisecond',async()=>{
+  const {parent,listener}=await ready();
+  vi.spyOn(Date,'now').mockReturnValue(Date.now());
+  await call('listener/heartbeat',listener,beat(listener,true));
+  await call('listener/heartbeat',listener,{...beat(listener,false),microphoneActive:true,detectionPaused:'other_audio'});
+  vi.restoreAllMocks();
+  const timeline=await (await call('timeline',parent,undefined,'GET')).json() as {events:{kind:string}[]};
+  expect(timeline.events.map(e=>e.kind)).toEqual(expect.arrayContaining(['monitoring_observed','detection_paused_observed']));
+ });
  it('explains a pause for other audio on the Listener in the push, its repeats and status',async()=>{
   const {parent,listener}=await ready();
   const advertised=await call('listener/heartbeat',listener,beat(listener,true));

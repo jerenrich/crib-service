@@ -2005,11 +2005,12 @@ import UIKit
         }
         catch { self.error = error.localizedDescription; log.record("connection_preferences_failed", error: error) }
     }
-    /// The connection-loss delay to offer in Settings: nil while alerts are off,
-    /// or for a server that predates the setting (it alerts after 3 minutes).
+    /// The server's saved connection-loss delay, or nil for a server that
+    /// predates the setting (it alerts after 3 minutes and cannot change that).
+    var connectionAlertDelay: Double? { parentStatus?.connectionAlertDelay }
+    /// The delay to offer in Settings: nil while alerts are off or for an older server.
     var adjustableConnectionAlertDelay: Double? {
-        guard parentStatus?.connectionAlertsEnabled == true else { return nil }
-        return parentStatus?.connectionAlertDelay
+        parentStatus?.connectionAlertsEnabled == true ? connectionAlertDelay : nil
     }
     /// Whole minutes, 1 to 20; the Worker rejects anything else.
     static let connectionAlertDelays: [Double] = (1...20).map { Double($0 * 60) }

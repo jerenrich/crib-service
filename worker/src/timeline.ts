@@ -1,4 +1,4 @@
-import {connectionAlertDelays} from './monitoring';
+import {connectionAlertDelays} from './connection-timing';
 import {APIError,type Device,type Env,type Heartbeat} from './types';
 import {pairFor} from './devices';
 
@@ -34,8 +34,12 @@ export function heartbeatTimeline(env:Env,pair:Pair,beat:Heartbeat,previous:{rec
   events.push({id:`restored:${previous.received_at}`,kind:'connection_restored',occurredAt:stamp,endAt:previous.received_at});
  }
  // Never describe the first observation as an exact start/stop time.
- if(!old||old.monitoring!==beat.monitoring||old.microphoneActive!==beat.microphoneActive||old.detectionPaused!==beat.detectionPaused||previous&&now-Date.parse(previous.received_at)>180000)
-  events.push({id:`state:${stamp}`,kind:beat.monitoring?'monitoring_observed':beat.detectionPaused?'detection_paused_observed':beat.microphoneActive?'standby_observed':'stopped_observed',occurredAt:stamp});
+ if(!old||old.monitoring!==beat.monitoring||old.microphoneActive!==beat.microphoneActive||old.detectionPaused!==beat.detectionPaused||previous&&now-Date.parse(previous.received_at)>180000){
+  // The kind is part of the id: two heartbeats in one millisecond must not
+  // collide and silently drop the second state.
+  const kind=beat.monitoring?'monitoring_observed':beat.detectionPaused?'detection_paused_observed':beat.microphoneActive?'standby_observed':'stopped_observed';
+  events.push({id:`state:${stamp}:${kind}`,kind,occurredAt:stamp});
+ }
  events.push({id:`coverage:${Math.floor(now/hour)}`,kind:beat.monitoring?'coverage_active':beat.microphoneActive?'coverage_standby':'coverage_stopped',occurredAt:stamp});
  if(old&&!(beat.timelineEvents?.length)) {
   if(old.powerConnected!==beat.powerConnected)events.push({id:`power:${stamp}`,kind:beat.powerConnected?'power_connected':'power_disconnected',occurredAt:stamp});
