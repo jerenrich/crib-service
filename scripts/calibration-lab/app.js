@@ -11,6 +11,7 @@ const SWEEPS = {
 const APP_DURATIONS = [5, 30, 60, 120, 180, 300, 600];
 const ALL_DURATIONS = [5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 240, 300, 450, 600];
 const durationSteps = () => (state.appSteps ? APP_DURATIONS : ALL_DURATIONS);
+const nearestIndex = (list, v) => list.reduce((best, x, i) => (Math.abs(x - v) < Math.abs(list[best] - v) ? i : best), 0);
 const fmtDuration = (v) => (v < 60 ? `${v} s` : v % 60 ? `${Math.floor(v / 60)} min ${v % 60} s` : `${v / 60} min`);
 const SETTING_KEYS = Object.keys(DEFAULTS);
 const settingsKey = (s) => SETTING_KEYS.map((k) => s[k]).join('|');
@@ -209,10 +210,19 @@ function changeLabels(op) {
 function flushLabels() {
   if (flushing) return flushing;
   flushing = (async () => {
+    let rejected = 0;
     try {
       while (pendingOps.length) {
         const batch = pendingOps.slice();
         const res = await fetch('/api/labels', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ops: batch }) });
+        if (res.status === 400) {
+          // The server will never accept these: drop them rather than block every later change.
+          pendingOps = pendingOps.slice(batch.length); store.set('pendingLabelOps', pendingOps);
+          rejected += batch.length;
+          state.labels = applyOps(await (await api('/api/labels')).json(), pendingOps); store.set('labels', state.labels);
+          renderAll();
+          continue;
+        }
         if (!res.ok) throw new Error(`saving labels failed: ${res.status}`);
         const saved = await res.json();
         pendingOps = pendingOps.slice(batch.length);
@@ -220,7 +230,7 @@ function flushLabels() {
         // The server's list, plus anything changed while this batch was in flight.
         state.labels = applyOps(saved, pendingOps); store.set('labels', state.labels);
       }
-      setStatus(statusLine(), state.offline);
+      setStatus(rejected ? `${rejected} label change${rejected === 1 ? ' was' : 's were'} rejected by the lab server and dropped` : statusLine(), rejected > 0 || state.offline);
     } catch {
       setStatus(`Labels not saved to the lab server yet (${pendingOps.length} change${pendingOps.length === 1 ? '' : 's'} kept in this browser)`, true);
     } finally { flushing = null; }
@@ -404,7 +414,7 @@ function renderEvents() {
       <td><span class="badge ${badge[r.status][0]}">${badge[r.status][1]}</span></td>
       <td class="muted">${r.trigger}</td>
       <td class="mono">${Number.isFinite(r.peak) ? r.peak.toFixed(0) + ' dB' : '–'}</td>
-      <td class="mono" style="color:${r.conf >= state.settings.classifierThreshold ? 'var(--conf)' : 'inherit'}">${r.conf.toFixed(2)}</td>
+      <td class="mono" style="color:${r.conf >= settingSegments(data, r.t, r.t + 1e-3, 'classifierThreshold')[0].thr ? 'var(--conf)' : 'inherit'}">${r.conf.toFixed(2)}</td>
       <td><span class="labels"><button data-l="cry" class="cry ${kind === 'cry' ? 'on' : ''}">Cry</button><button data-l="noise" class="noise ${kind === 'noise' ? 'on' : ''}">Not a cry</button></span></td>
     </tr>`;
   }).join('')}</tbody>`;
@@ -538,19 +548,28 @@ function scheduleDraw() {
   document.hidden ? setTimeout(run, 0) : requestAnimationFrame(run);
 }
 
-/// The sound threshold in effect over [a, b]: one segment normally, or one per
-/// change the phone made when replaying "as recorded".
-function thresholdSegments(data, a, b) {
-  const ch = data?.settingsChanges;
-  if (!state.settings.asRecorded || !ch?.length) return [{ a, b, thr: state.settings.threshold }];
-  let k = Math.max(0, lowerBound(ch.map((c) => c.t), a + 1e-9) - 1);
+/// A setting's value over [a, b]: one segment normally, or one per change the
+/// phone made when replaying "as recorded". `key` is 'threshold' or
+/// 'classifierThreshold' (null in a change: unknown for that run, so the
+/// configured value applies, as in the replay).
+function settingSegments(data, a, b, key = 'threshold') {
+  const ch = data?.settingsChanges, mine = state.settings[key];
+  if (!state.settings.asRecorded || !ch?.length) return [{ a, b, thr: mine }];
+  let lo = 0, hi = ch.length;  // first change after a
+  while (lo < hi) { const m = (lo + hi) >> 1; if (ch[m].t <= a) lo = m + 1; else hi = m; }
   const segs = [];
-  for (let from = a; k < ch.length && from < b; k++) {
+  for (let k = Math.max(0, lo - 1), from = a; k < ch.length && from < b; k++) {
     const to = Math.min(b, ch[k + 1]?.t ?? b);
-    if (to > from) segs.push({ a: from, b: to, thr: ch[k].threshold });
+    if (to > from) segs.push({ a: from, b: to, thr: ch[k][key] ?? mine });
     from = Math.max(from, to);
   }
-  return segs.length ? segs : [{ a, b, thr: ch[ch.length - 1].threshold }];
+  return segs.length ? segs : [{ a, b, thr: ch[ch.length - 1][key] ?? mine }];
+}
+const thresholdSegments = (data, a, b) => settingSegments(data, a, b, 'threshold');
+/// Walks segments in time order: at(t) for increasing t, without searching again.
+function segmentWalker(segs) {
+  let k = 0;
+  return (t) => { while (k < segs.length - 1 && segs[k].b <= t) k++; return segs[k].thr; };
 }
 
 let geo = null;  // geometry of the last base draw, for pointer handling and the overlay
@@ -621,7 +640,8 @@ function drawChart() {
     loudClip();
     g.strokeStyle = C['wave-loud']; g.stroke(path); g.restore();
   } else {
-    let i = i0, prevT = null, sk = 0;
+    let i = i0, prevT = null;
+    const thrAt = segmentWalker(segs);
     const quiet = new Path2D(), loud = new Path2D();
     g.fillStyle = C.gap;
     for (let c = 0; c < cols && i < i1; c++) {
@@ -633,8 +653,7 @@ function drawChart() {
       }
       if (mx === -Infinity) continue;
       const px = PAD.l + c, top = yDb(mx), bot = Math.max(yDb(mn), top + 1);
-      while (sk < segs.length - 1 && segs[sk].b <= tEnd - span / cols / 2) sk++;
-      const cthr = segs[sk].thr, cyt = yDb(cthr);
+      const cthr = thrAt(tEnd - span / cols / 2), cyt = yDb(cthr);
       if (mx >= cthr) {
         if (bot > cyt) quiet.rect(px, Math.max(top, cyt), 1, bot - Math.max(top, cyt));
         loud.rect(px, top, 1, Math.max(1, Math.min(bot, cyt) - top));
@@ -652,28 +671,34 @@ function drawChart() {
   g.stroke(); g.setLineDash([]);
 
   // classifier lane
-  const S = data.scores, cthr = state.settings.classifierThreshold;
+  const S = data.scores, csegs = settingSegments(data, v0, v1, 'classifierThreshold');
   const j0 = Math.max(0, lowerBound(S.at, v0) - 1), j1 = Math.min(S.at.length, lowerBound(S.at, v1) + 1);
   g.fillStyle = C.conf;
   if (j1 - j0 < cols / 4) {
-    const bw = Math.max(2, (x(1) - x(0)) * 0.7);
+    const bw = Math.max(2, (x(1) - x(0)) * 0.7), cthrAt = segmentWalker(csegs);
     for (let j = j0; j < j1; j++) {
-      g.globalAlpha = S.conf[j] >= cthr ? 1 : 0.5;
+      g.globalAlpha = S.conf[j] >= cthrAt(S.at[j]) ? 1 : 0.5;
       g.fillRect(x(S.at[j]) - bw, yConf(S.conf[j]), bw, Math.max(1, yConf(0) - yConf(S.conf[j])));
     }
   } else {
     let j = j0;
+    const cthrAt = segmentWalker(csegs);
     for (let c = 0; c < cols && j < j1; c++) {
       const tEnd = v0 + ((c + 1) / cols) * span; let mx = -1;
       while (j < j1 && S.at[j] < tEnd) { if (S.conf[j] > mx) mx = S.conf[j]; j++; }
       if (mx < 0) continue;
-      g.globalAlpha = mx >= cthr ? 1 : 0.5;
+      g.globalAlpha = mx >= cthrAt(tEnd - span / cols / 2) ? 1 : 0.5;
       g.fillRect(PAD.l + c, yConf(mx), 1, Math.max(1, yConf(0) - yConf(mx)));
     }
   }
   g.globalAlpha = 1;
-  g.strokeStyle = C.conf; g.setLineDash([3, 3]); const yc = yConf(cthr);
-  g.beginPath(); g.moveTo(PAD.l, yc + .5); g.lineTo(w - PAD.r, yc + .5); g.stroke(); g.setLineDash([]);
+  g.strokeStyle = C.conf; g.setLineDash([3, 3]); g.beginPath();
+  csegs.forEach((sg, k) => {
+    const y = yConf(sg.thr) + .5;
+    if (k) g.lineTo(x(sg.a), y); else g.moveTo(x(sg.a), y);
+    g.lineTo(x(sg.b), y);
+  });
+  g.stroke(); g.setLineDash([]);
 
   // alert markers
   const colorFor = (t0, t1) => {
@@ -879,9 +904,10 @@ function drawOverview() {
   const px = (t) => PAD.l + ((t - f0) / total) * plotW;
   const yOf = (db) => barsH * (1 - (Math.min(DB_MAX, Math.max(DB_MIN, db)) - DB_MIN) / (DB_MAX - DB_MIN));
   g.globalAlpha = .6;
+  const thrAt = segmentWalker(thresholdSegments(data, f0, f1));
   for (let c = 0; c < bins; c++) {
     if (max[c] === -Infinity) continue;
-    g.fillStyle = max[c] >= thresholdSegments(data, f0 + (c + .5) * total / bins, f0 + (c + .5) * total / bins + 1e-3)[0].thr ? C['wave-loud'] : C.wave;
+    g.fillStyle = max[c] >= thrAt(f0 + (c + .5) * total / bins) ? C['wave-loud'] : C.wave;
     const y = yOf(max[c]); g.fillRect(PAD.l + (c / bins) * plotW, y, plotW / bins + .5, barsH - y);
   }
   g.globalAlpha = 1;
@@ -1085,8 +1111,8 @@ function syncControls() {
   $('threshold').value = s.threshold; $('thresholdOut').textContent = `${s.threshold} dBFS`;
   $('thresholdHint').textContent = state.appSteps ? 'The app offers −60 to −10 dBFS in steps of 5.' : 'Steps of 1 dB. The app only offers steps of 5.';
   // The slider walks an index into the list of steps, so 5 s and 10 min are both reachable.
-  const steps = durationSteps(), nearest = steps.reduce((a, b, i) => (Math.abs(b - s.alertDuration) < Math.abs(steps[a] - s.alertDuration) ? i : a), 0);
-  $('duration').max = steps.length - 1; $('duration').value = nearest; $('durationOut').textContent = fmtDuration(s.alertDuration);
+  const steps = durationSteps();
+  $('duration').max = steps.length - 1; $('duration').value = nearestIndex(steps, s.alertDuration); $('durationOut').textContent = fmtDuration(s.alertDuration);
   document.querySelectorAll('#reset button').forEach((b) => b.classList.toggle('on', +b.dataset.v === s.quietResetDuration));
   $('appSteps').checked = state.appSteps;
   $('classifier').checked = s.classifierEnabled; $('classifierSub').hidden = !s.classifierEnabled;
@@ -1106,7 +1132,7 @@ function bind(id, key, snap = (v) => v) {
     touched(); syncControls(); refresh();
   });
 }
-const snapDuration = (v) => (state.appSteps ? APP_DURATIONS.reduce((a, b) => (Math.abs(b - v) < Math.abs(a - v) ? b : a)) : v);
+const snapDuration = (v) => (state.appSteps ? APP_DURATIONS[nearestIndex(APP_DURATIONS, v)] : v);
 bind('threshold', 'threshold');
 bind('duration', 'alertDuration', (i) => durationSteps()[i]);
 bind('classThr', 'classifierThreshold');

@@ -12,10 +12,18 @@ async function fetchText(name) {
   return res.text();
 }
 
+// Run markers from all cached logs (a night's own files often miss its run's start).
+let runsPromise = null;
+function fetchRuns() {
+  runsPromise ??= fetch('/api/runs').then((r) => (r.ok ? r.json() : {})).catch(() => ({}));
+  return runsPromise;
+}
+
 self.onmessage = async ({ data: m }) => {
   try {
     if (m.type === 'load') {
-      const parsed = parseNight(await Promise.all(m.files.map(fetchText)), m.from, m.to);
+      const [texts, runs] = await Promise.all([Promise.all(m.files.map(fetchText)), fetchRuns()]);
+      const parsed = parseNight(texts, m.from, m.to, { runs });
       nights.set(m.id, parsed);
       const view = {
         levels: { t: parsed.levels.t.slice(), db: parsed.levels.db.slice() },

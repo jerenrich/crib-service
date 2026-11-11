@@ -34,8 +34,10 @@ function detailValue(detail, key) {
  * decided by the detector, against the last sample it accepted, as the app does.
  * The latest capture_start before `from` is kept too, so the replay knows which
  * capture the night's first classifier scores belong to.
+ * `runs` ({ runId: { threshold, policy } }, from the server's /api/runs) fills
+ * in run markers logged outside these files.
  */
-export function parseNight(texts, from = -Infinity, to = Infinity) {
+export function parseNight(texts, from = -Infinity, to = Infinity, { runs = {} } = {}) {
   const recordedAlerts = [], monitoring = [], caps = [], capIndex = new Map();
   const order = [], at = [];  // kind code, index into that kind's columns
   const L = { t: [], db: [], cap: [], sf: [], ef: [], sr: [] };
@@ -60,6 +62,12 @@ export function parseNight(texts, from = -Infinity, to = Infinity) {
       const kind = c[2];
       const t = isoSeconds(c[0]);
       if (t === null) continue;
+      if (kind === 'run_start' || line.includes('confidence_threshold=')) {  // run markers, wherever they fall
+        const detail = c.slice(18).join(',');
+        const ct = detail.includes('confidence_threshold=') ? +detailValue(detail, 'confidence_threshold') : NaN;
+        if (Number.isFinite(ct) && !runThreshold.has(c[1])) runThreshold.set(c[1], ct);
+        if (kind === 'run_start' && detail.includes('alert_policy=')) policyRuns.add(c[1]);
+      }
       if (t < from) {
         if (kind === 'capture_start') startBefore = [t, c[3]];
         else if ((kind === 'capture_stop' && startBefore?.[1] === c[3]) || kind === 'monitoring_stop' || kind === 'run_start') startBefore = null;
@@ -71,9 +79,6 @@ export function parseNight(texts, from = -Infinity, to = Infinity) {
         startBefore = null;
       }
       const detail = c.slice(18).join(',');
-      const ct = detail.includes('confidence_threshold=') ? +detailValue(detail, 'confidence_threshold') : NaN;
-      if (Number.isFinite(ct) && !runThreshold.has(c[1])) runThreshold.set(c[1], ct);
-      if (kind === 'run_start' && detail.includes('alert_policy=')) policyRuns.add(c[1]);
       if (kind === 'level') {
         const db = +c[7];
         if (!Number.isFinite(db)) continue;
@@ -117,7 +122,10 @@ export function parseNight(texts, from = -Infinity, to = Infinity) {
     }
   }
   for (const ch of changes) {
-    ch.classifierThreshold = runThreshold.get(ch.run) ?? (policyRuns.has(ch.run) ? 0.8 : null);
+    const known = runs[ch.run], threshold = runThreshold.get(ch.run) ?? known?.threshold ?? null;
+    const policy = policyRuns.has(ch.run) || !!known?.policy;
+    // null: the run's threshold is unknown, so the replay uses the configured one.
+    ch.classifierThreshold = threshold ?? (policy ? 0.8 : null);
     delete ch.run;
   }
   let recordedSettings = null, best = 0;
@@ -134,6 +142,9 @@ export function parseNight(texts, from = -Infinity, to = Infinity) {
   });
   return {
     recordedAlerts, recordedSettings, monitoring, otherSettings, caps, settingsChanges: changes,
+    // Run markers seen in these texts, in the shape parseNight's `runs` option takes.
+    runs: Object.fromEntries([...new Set([...runThreshold.keys(), ...policyRuns])]
+      .map((r) => [r, { threshold: runThreshold.get(r) ?? null, policy: policyRuns.has(r) }])),
     legacy: recordedAlerts.some((a) => a.legacy),
     order: Uint8Array.from(order), at: Uint32Array.from(at),
     levels: { t: f64(L.t), db: f64(L.db), cap: Int32Array.from(L.cap), sf: f64(L.sf), ef: f64(L.ef), sr: f64(L.sr) },

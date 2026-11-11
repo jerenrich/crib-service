@@ -58,5 +58,33 @@ if (policyFrom < strictFrom) {
 const r = compare(strictFrom, Infinity);
 console.log(`Runs with PCM-framed levels from ${iso(strictFrom)} (${files.length} logs): ${r.sent.length} alerts sent, ${r.sim.length} replayed.`);
 report(r);
-if (r.missing.length || r.extra.length) { console.log('MISMATCH'); process.exit(1); }
+
+// Night by night, as the page loads them: only that night's files, run markers
+// from the whole cache (as /api/runs serves them), and a deliberately wrong
+// classifier slider, so a run whose threshold isn't found shows up.
+const starts = files.map((f) => +f.split('-')[4] / 1000);
+let nightMismatches = 0, nights = 0, nightAlerts = 0;
+const first = new Date(strictFrom * 1000); first.setHours(18, 0, 0, 0);  // nights run 18:00 to 11:00, local time
+if (first.getTime() / 1000 > strictFrom) first.setDate(first.getDate() - 1);
+for (const d = first; d.getTime() / 1000 < Date.now() / 1000; d.setDate(d.getDate() + 1)) {
+  const f = d.getTime() / 1000, t = f + 17 * 3600;
+  const mine = files.filter((_, i) => starts[i] < t && (starts[i + 1] ?? Infinity) > f);
+  nights++;
+  if (!mine.length) continue;
+  const one = parseNight(mine.map((x) => fs.readFileSync(path.join(dir, x), 'utf8')), f, t, { runs: night.runs });
+  const lo = Math.max(f, strictFrom);
+  const sentN = one.recordedAlerts.filter((a) => a.t >= lo).map((a) => a.t);
+  const simN = simulate(one, { asRecorded: true, classifierThreshold: 0.3 }).alerts.map((a) => a.alertAt).filter((x) => x >= lo);
+  const miss = sentN.filter((x) => !simN.some((y) => Math.abs(x - y) < TOLERANCE));
+  const extra = simN.filter((x) => !sentN.some((y) => Math.abs(x - y) < TOLERANCE));
+  nightAlerts += sentN.length;
+  if (miss.length || extra.length) {
+    nightMismatches++;
+    console.log(`Night from ${iso(f)}:`);
+    report({ missing: miss, extra });
+  }
+}
+console.log(`Night by night (${nights} nights, as the page loads them): ${nightAlerts} alerts sent, ${nightMismatches} night(s) differ.`);
+
+if (r.missing.length || r.extra.length || nightMismatches) { console.log('MISMATCH'); process.exit(1); }
 console.log(`OK: every alert matches to within ${TOLERANCE * 1000} ms.`);

@@ -261,9 +261,11 @@ export function simulate(night, settings) {
   const cfg = { ...DEFAULTS, ...settings };
   const changes = cfg.asRecorded ? night.settingsChanges ?? [] : [];
   let nextChange = 0;
+  const configuredClassifierThreshold = cfg.classifierThreshold;
   const applyChange = (c) => {
     cfg.threshold = c.threshold; cfg.alertDuration = c.alertDuration; cfg.quietResetDuration = c.quietResetDuration;
-    if (c.classifierThreshold !== null) cfg.classifierThreshold = c.classifierThreshold;
+    // A run whose threshold is unknown uses the configured one, not the previous run's.
+    cfg.classifierThreshold = c.classifierThreshold ?? configuredClassifierThreshold;
   };
   if (changes.length) applyChange(changes[0]);
   const vol = new VolumeDetector(cfg.requiredFraction);

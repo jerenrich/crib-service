@@ -128,11 +128,11 @@ class Device:
                         or time.time() - stat.st_mtime < GROWING_TTL):
                     return target
                 # The phone's copy differs from ours: it was still being written when
-                # we cached it. The newest sound log is still growing, so serve what
-                # we have and refresh it in the background; anything else is finished
-                # on the phone now, so fetch it once before serving.
+                # we cached it. The newest file is still growing, so serve what we
+                # have and refresh it in the background; anything else is finished on
+                # the phone now, so fetch it once before serving.
                 newest = next((i["name"] for i in reversed(items) if not i.get("cached_only")), None)
-                if kind == "sound" and name == newest:
+                if name == newest:  # the log, or audio segment, the phone is writing now
                     if target not in self.refreshing:
                         self.refreshing.add(target)
                         threading.Thread(target=self._refetch, args=(folder, name, target), daemon=True).start()
@@ -150,8 +150,11 @@ class Device:
     def _copy(self, folder, name, target):
         target.parent.mkdir(parents=True, exist_ok=True)
         partial = target.with_suffix(target.suffix + f".{threading.get_ident()}.part")
-        self._run(["device", "copy", "from", "--source", f"{folder}/{name}", "--destination", str(partial)])
-        os.replace(partial, target)
+        try:
+            self._run(["device", "copy", "from", "--source", f"{folder}/{name}", "--destination", str(partial)])
+            os.replace(partial, target)
+        finally:
+            partial.unlink(missing_ok=True)  # a failed or interrupted copy leaves nothing behind
 
     def _refetch(self, folder, name, target):
         try:
@@ -160,6 +163,55 @@ class Device:
             pass  # keep the cached copy
         finally:
             self.refreshing.discard(target)
+
+
+_run_cache, _run_lock = {}, threading.Lock()
+
+
+def _scan_runs(data):
+    """Run ids with a run_start (and whether it named an alert policy) or a
+    confidence_threshold marker, found by searching for the markers directly."""
+    found = {}
+    def line_at(i):
+        start = data.rfind(b"\n", 0, i) + 1
+        end = data.find(b"\n", i)
+        return data[start:end if end >= 0 else len(data)]
+    i = data.find(b",run_start,")
+    while i >= 0:
+        line = line_at(i)
+        run = line.split(b",", 2)[1].decode()
+        found.setdefault(run, {})["policy"] = b"alert_policy=" in line
+        i = data.find(b",run_start,", i + 1)
+    i = data.find(b"confidence_threshold=")
+    while i >= 0:
+        line = line_at(i)
+        run = line.split(b",", 2)[1].decode()
+        value = re.match(rb"confidence_threshold=([0-9.]+)", data[i:i + 40])
+        if value:
+            found.setdefault(run, {}).setdefault("threshold", float(value.group(1)))
+        # one marker per run is enough: skip to the next line
+        nl = data.find(b"\n", i)
+        i = data.find(b"confidence_threshold=", nl) if nl >= 0 else -1
+    return found
+
+
+def run_index():
+    """Per run id, from every cached sound log: its classifier threshold marker
+    (if any row logged one) and whether its run_start carried an alert policy.
+    A night's own files often don't include its run's start, so the replay asks
+    for this instead. Each file is scanned once per size."""
+    runs = {}
+    with _run_lock:
+        for path in sorted((DATA / "sound").glob("sound-*.csv")):
+            key = (path.name, path.stat().st_size)
+            if key not in _run_cache:
+                _run_cache[key] = _scan_runs(path.read_bytes())
+            for run, info in _run_cache[key].items():
+                merged = runs.setdefault(run, {"threshold": None, "policy": False})
+                if merged["threshold"] is None and info.get("threshold") is not None:
+                    merged["threshold"] = info["threshold"]
+                merged["policy"] = merged["policy"] or info.get("policy", False)
+    return runs
 
 
 def read_labels():
@@ -268,6 +320,8 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/api/labels":
                 with LABELS_LOCK:
                     return self.send_json(read_labels())
+            if path == "/api/runs":
+                return self.send_json(run_index())
             if path == "/api/files":
                 sound, sound_error = self.device.listing("sound", wait=False)
                 audio, audio_error = self.device.listing("audio", wait=False)
@@ -295,6 +349,7 @@ def main():
     args = parser.parse_args()
     Handler.device = Device(args.device, args.bundle)
     Handler.port = args.port
+    threading.Thread(target=run_index, daemon=True).start()  # warm the run index
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     print(f"Calibration Lab on http://127.0.0.1:{args.port} (device: {args.device or 'none, cache only'})", flush=True)
     server.serve_forever()

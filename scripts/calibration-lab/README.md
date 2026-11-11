@@ -38,7 +38,8 @@ How it works:
 - After changing `detector.js` or the Swift detectors, run
   `node scripts/calibration-lab/validate.mjs`. It replays every cached log with
   the phone's own settings and fails if any alert sent by a run that logs PCM
-  frames (6 Nov 2026 onwards) is missing, extra or more than 10 ms off. It
+  frames (6 Nov 2026 onwards) is missing, extra or more than 10 ms off, both
+  across the whole cache and night by night as the page loads them. It
   catches changes to rules the cached nights exercise (coverage, recent
   activity), but not to cases they never hit, such as long classifier gaps.
 - `parse.js` reads `SoundAnalysisLog.swift`'s CSV into packed columns.
