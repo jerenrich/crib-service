@@ -101,7 +101,6 @@ const owner = new Map();       // night id -> engine
 // Per night: dataVersion is bumped when the night is reloaded with newer logs,
 // runsVersion when the run index changes its per-run classifier thresholds.
 const dataVersion = new Map(), runsVersion = new Map();
-const bump = (m, id) => m.set(id, (m.get(id) ?? 0) + 1);
 // Replaying "as recorded" takes the threshold, window and reset from the
 // night's own changes, so those don't distinguish results; only such replays
 // depend on the run index.
@@ -115,7 +114,25 @@ const simCache = new Map();    // cacheKey -> result
 const simPending = new Map();  // same key -> job
 const shown = new Map();       // night id -> last result drawn (kept while the next one computes)
 
+// A version bump makes that night's older results unreachable: drop them, so
+// they can't crowd live results out of the cache (a night being recorded is
+// reloaded every minute).
+const dropCached = (prefix) => { for (const k of simCache.keys()) if (k.startsWith(prefix)) simCache.delete(k); };
+function bumpData(id) {
+  dropCached(`${id}|`);
+  dataVersion.set(id, (dataVersion.get(id) ?? 0) + 1);
+}
+function bumpRuns(id) {
+  dropCached(`${id}|${dataVersion.get(id) ?? 0}|${runsVersion.get(id) ?? 0}|`);
+  runsVersion.set(id, (runsVersion.get(id) ?? 0) + 1);
+}
+/// Whether a key still names the night's current data and run index.
+function isCurrent(key) {
+  const [id, data, runs] = key.split('|', 3);
+  return +data === (dataVersion.get(id) ?? 0) && (runs === '-' || +runs === (runsVersion.get(id) ?? 0));
+}
 function remember(key, result) {
+  if (!isCurrent(key)) return;  // computed for a version that has since been replaced
   if (simCache.size > 4000) simCache.delete(simCache.keys().next().value);
   simCache.set(key, result);
 }
@@ -173,7 +190,7 @@ function loadNight(id, { quiet = false } = {}) {
   if (!quiet) setStatus(`Loading ${night.label}…`);
   const job = send(e, { type: 'load', id, files: night.files.map((f) => f.name), from: night.from, to: night.to })
     .then(({ view }) => {
-      owner.set(id, e); state.data.set(id, { ...view, id, night, loadedAt: Date.now() / 1000 });
+      owner.set(id, e); state.data.set(id, { ...view, id, night, loadedAt: Date.now() / 1000, sig: filesSig(night) });
       setStatus(statusLine(), state.offline);
       scheduleRunsSync();
       return true;
@@ -195,37 +212,46 @@ async function loadRecentInBackground() {
 }
 // While the page is open the phone keeps logging: pick up new files and audio,
 // and reload a night that was still being recorded when it was loaded. The old
-// copy stays on screen until the new one is parsed.
-const FILES_POLL = 60000;
+// copy stays on screen until the new one is parsed. The night on screen is
+// reloaded as soon as its logs change; others at most every RELOAD_OTHERS.
+const FILES_POLL = 60000, RELOAD_OTHERS = 600;
 const reloading = new Set();
-function reloadNight(night) {
-  const e = owner.get(night.id);
-  if (!e || reloading.has(night.id) || loadingNow.has(night.id)) return;
+const filesSig = (night) => night.files.map((f) => `${f.name}:${f.size}`).join(',');
+function reloadIfChanged(night, { now = Date.now() / 1000 } = {}) {
+  const data = state.data.get(night.id), e = owner.get(night.id);
+  // A night loaded well after it ended can't gain rows; the server may serve
+  // a growing log from its cache for a minute or two, hence the margin.
+  if (!data || !e || data.sig === filesSig(night) || data.loadedAt >= night.to + 600) return;
+  if (night.id !== state.focus && now - data.loadedAt < RELOAD_OTHERS) return;
+  if (reloading.has(night.id) || loadingNow.has(night.id)) return;
   reloading.add(night.id);
   send(e, { type: 'load', id: night.id, files: night.files.map((f) => f.name), from: night.from, to: night.to })
     .then(({ view }) => {
-      state.data.set(night.id, { ...view, id: night.id, night, loadedAt: Date.now() / 1000 });
-      bump(dataVersion, night.id); scheduleRunsSync(); refresh();
+      state.data.set(night.id, { ...view, id: night.id, night, loadedAt: Date.now() / 1000, sig: filesSig(night) });
+      bumpData(night.id); scheduleRunsSync(); refresh();  // the old result stays drawn until the new one is ready
     }, () => { /* keep the copy we have; try again next poll */ })
     .finally(() => reloading.delete(night.id));
 }
+let polling = false;
 async function refreshFiles() {
-  if (document.hidden || !state.nights.length) return;
-  let files;
-  try { files = await (await api('/api/files')).json(); } catch { return; }
-  const sig = (n) => n.files.map((f) => `${f.name}:${f.size}`).join(',');
-  const before = new Map(state.nights.map((n) => [n.id, sig(n)]));
-  const wasOffline = state.offline;
-  state.sound = files.sound; state.audio = files.audio; state.offline = files.offline;
-  state.nights = buildNights();
-  for (const n of state.nights) {
-    const data = state.data.get(n.id);
-    // A night loaded well after it ended can't gain rows; the server may serve
-    // a growing log from its cache for a minute or two, hence the margin.
-    if (data && data.loadedAt < n.to + 600 && before.get(n.id) !== sig(n)) reloadNight(n);
-  }
-  if (state.offline !== wasOffline) setStatus(statusLine(), state.offline);
-  scheduleRender();
+  if (document.hidden || polling) return;
+  if (!started) { await begin(); return; }  // the first attempt found no server or no logs
+  polling = true;
+  try {
+    let files;
+    try { files = await (await api('/api/files')).json(); } catch { return; }
+    const view = () => JSON.stringify([state.offline, state.audio.map((a) => a.name), state.nights.map((n) => n.id + filesSig(n))]);
+    const before = view(), known = new Set(state.nights.map((n) => n.id)), wasOffline = state.offline;
+    state.sound = files.sound; state.audio = files.audio; state.offline = files.offline;
+    state.nights = buildNights();
+    if (view() === before) return;  // nothing new: leave the page alone
+    const now = Date.now() / 1000;
+    for (const n of state.nights) reloadIfChanged(n, { now });
+    if (state.offline !== wasOffline) setStatus(statusLine(), state.offline);
+    renderAll();
+    // A night that began since the page opened is loaded like the others were.
+    if (state.nights.some((n) => !known.has(n.id))) loadRecentInBackground();
+  } finally { polling = false; }
 }
 setInterval(refreshFiles, FILES_POLL);
 
@@ -244,7 +270,7 @@ async function syncRuns() {
   for (const reply of replies) {
     for (const [id, changes] of Object.entries(reply?.changes ?? {})) {
       const data = state.data.get(id); if (!data) continue;
-      if (JSON.stringify(data.settingsChanges) !== JSON.stringify(changes)) { data.settingsChanges = changes; bump(runsVersion, id); changed = true; }
+      if (JSON.stringify(data.settingsChanges) !== JSON.stringify(changes)) { data.settingsChanges = changes; bumpRuns(id); changed = true; }
     }
   }
   if (changed) refresh();
@@ -397,10 +423,11 @@ function peakAround(data, from, to) {
 }
 
 /// Totals over nights for given settings (from the cache).
-function score(ids, settings) {
+/// `results` (one per id, null if missing) scores replays already in hand.
+function score(ids, settings, results) {
   let alerts = 0, falseAlarms = 0, unlabeled = 0, cries = 0, caught = 0, missing = 0;
-  for (const id of ids) {
-    const res = settings ? simCache.get(cacheKey(id, settings)) : resultFor(id);
+  for (const [k, id] of ids.entries()) {
+    const res = results ? results[k] : settings ? simCache.get(cacheKey(id, settings)) : resultFor(id);
     if (!res) { missing++; continue; }
     const night = state.data.get(id).night, windows = res.alerts.map(alertWindow);
     alerts += res.alerts.length;
@@ -447,6 +474,8 @@ async function focusNight(id) {
   renderAll();
   await loadNight(id);
   if (state.focus !== id) return;
+  const night = state.nights.find((n) => n.id === id);
+  if (night) reloadIfChanged(night);
   const data = state.data.get(id);
   if (data?.recordedSettings && !store.get('settingsTouched', false)) useRecorded();
   syncControls();
@@ -1069,6 +1098,8 @@ overview.addEventListener('wheel', (e) => {
 // ---------- audio ----------
 const audio = $('audio');
 let segment = null, follow = true;
+/// The segment after `seg` (by start time: state.audio is replaced as the phone's list changes).
+const nextAudio = (seg) => state.audio.find((a) => a.start > seg.start) ?? null;
 function audioFor(t) {
   const list = state.audio; let lo = 0, hi = list.length - 1, found = null;
   while (lo <= hi) { const m = (lo + hi) >> 1; if (list[m].start <= t) { found = m; lo = m + 1; } else hi = m - 1; }
@@ -1091,7 +1122,7 @@ function warmAlertAudio() {
   const names = [];
   for (const r of currentRows) {
     const seg = audioFor(r.t - 10);
-    if (seg) names.push(seg.name, state.audio[seg.index + 1]?.name);
+    if (seg) names.push(seg.name, nextAudio(seg)?.name);
   }
   warmAudio(names);
 }
@@ -1113,7 +1144,7 @@ async function playAt(t, { follow: f = true } = {}) {
     });
     segmentLoad = { ready, cancel };
     audio.src = '/api/audio/' + encodeURIComponent(seg.name);
-    warmAudio([state.audio[seg.index + 1]?.name]);
+    warmAudio([nextAudio(seg)?.name]);
   }
   try { await segmentLoad?.ready; } catch (err) {
     if (mine === playSeq) { segment = null; segmentLoad = null; $('playerTime').textContent = `Couldn't play: ${err.message}`; }
@@ -1138,7 +1169,7 @@ audio.addEventListener('timeupdate', () => {
   } else { drawOverlay(); drawOverview(); }
 });
 audio.addEventListener('ended', () => {
-  const next = state.audio[segment?.index + 1];
+  const next = segment && nextAudio(segment);
   if (next && next.start - (segment.start + audio.duration) < 1.5) { segment = null; playAt(next.start, { follow }); }
 });
 audio.addEventListener('pause', () => { $('playerToggle').textContent = 'Play'; });
@@ -1150,18 +1181,23 @@ $('playerClose').onclick = () => { playSeq++; segmentLoad?.cancel(); segmentLoad
 
 // ---------- compare settings ----------
 let sweepGen = 0, sweepTimer = null;
-function scheduleSweep(delay = 200) { clearTimeout(sweepTimer); sweepTimer = setTimeout(runSweep, delay); }
+// Bumping sweepGen here, not only when the timer fires, makes a sweep that is
+// still waiting give up at once rather than draw from data that just changed.
+function scheduleSweep(delay = 200) { sweepGen++; clearTimeout(sweepTimer); sweepTimer = setTimeout(runSweep, delay); }
 async function runSweep() {
   const g = ++sweepGen, stale = () => g !== sweepGen;
   const by = state.sweepBy, def = SWEEPS[by], ids = includedIds(), settings = { ...state.settings };
   const table = $('sweep');
-  if (!ids.length) { table.innerHTML = '<tr><td class="empty">Load a night first.</td></tr>'; return; }
+  if (!ids.length) {
+    const msg = state.data.size ? 'No nights are ticked. Tick some nights (or Tick all) to compare settings over them.' : 'Load a night first.';
+    table.innerHTML = `<tr><td class="empty">${msg}</td></tr>`; $('sweepNote').textContent = ''; return;
+  }
   table.classList.add('updating');
   const variant = (v) => ({ ...settings, asRecorded: false, [by]: v });
-  await Promise.all(def.values.flatMap((v) => ids.map((id) => simulateNight(id, variant(v), 'low', stale))));
+  const results = await Promise.all(def.values.map((v) => Promise.all(ids.map((id) => simulateNight(id, variant(v), 'low', stale)))));
   if (stale()) return;
   table.classList.remove('updating');
-  const rows = def.values.map((v) => ({ v, ...score(ids, variant(v)) }));
+  const rows = def.values.map((v, k) => ({ v, ...score(ids, variant(v), results[k]) }));
   const used = new Set(ids.map((id) => state.data.get(id).recordedSettings?.[by]).filter((x) => x !== undefined));
   const maxAlerts = Math.max(1, ...rows.map((r) => r.alerts));
   const anyLabels = rows.some((r) => r.cries || r.falseAlarms);
@@ -1271,15 +1307,23 @@ $('asRecorded').onchange = () => {
 };
 
 // ---------- start ----------
-async function start() {
-  syncControls(); syncTabs();
-  await loadLabels();
-  try {
-    const files = await (await api('/api/files')).json();
-    state.sound = files.sound; state.audio = files.audio; state.offline = files.offline;
-  } catch (err) { setStatus(`Can't reach the lab server: ${err.message}`, true); return; }
-  state.nights = buildNights();
-  if (!state.nights.length) { setStatus('No sound-analysis logs found on the phone or in the cache.', true); return; }
+// Until a first listing finds nights, the file poll keeps calling begin().
+let started = false, beginning = null;
+function begin() {
+  beginning ??= (async () => {
+    await loadLabels();
+    try {
+      const files = await (await api('/api/files')).json();
+      state.sound = files.sound; state.audio = files.audio; state.offline = files.offline;
+    } catch (err) { setStatus(`Can't reach the lab server: ${err.message} (trying again every minute)`, true); return; }
+    state.nights = buildNights();
+    if (!state.nights.length) { setStatus('No sound-analysis logs found on the phone or in the cache yet.', true); return; }
+    started = true;
+    await firstNight();
+  })().finally(() => { beginning = null; });
+  return beginning;
+}
+async function firstNight() {
   if (!state.focus || !state.nights.some((n) => n.id === state.focus)) state.focus = state.nights[0].id;
   setStatus(statusLine(), state.offline);
   await focusNight(state.focus);
@@ -1287,4 +1331,5 @@ async function start() {
   await simulateNight(state.focus, state.settings, 'high', () => false);
   loadRecentInBackground();
 }
-start();
+syncControls(); syncTabs();
+begin();
