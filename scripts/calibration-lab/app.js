@@ -340,7 +340,8 @@ async function focusNight(id) {
   await loadNight(id);
   if (state.focus !== id) return;
   const data = state.data.get(id);
-  if (data?.recordedSettings && !store.get('settingsTouched', false)) { Object.assign(state.settings, data.recordedSettings); syncControls(); }
+  if (data?.recordedSettings && !store.get('settingsTouched', false)) useRecorded();
+  syncControls();
   refresh();
 }
 
@@ -537,6 +538,21 @@ function scheduleDraw() {
   document.hidden ? setTimeout(run, 0) : requestAnimationFrame(run);
 }
 
+/// The sound threshold in effect over [a, b]: one segment normally, or one per
+/// change the phone made when replaying "as recorded".
+function thresholdSegments(data, a, b) {
+  const ch = data?.settingsChanges;
+  if (!state.settings.asRecorded || !ch?.length) return [{ a, b, thr: state.settings.threshold }];
+  let k = Math.max(0, lowerBound(ch.map((c) => c.t), a + 1e-9) - 1);
+  const segs = [];
+  for (let from = a; k < ch.length && from < b; k++) {
+    const to = Math.min(b, ch[k + 1]?.t ?? b);
+    if (to > from) segs.push({ a: from, b: to, thr: ch[k].threshold });
+    from = Math.max(from, to);
+  }
+  return segs.length ? segs : [{ a, b, thr: ch[ch.length - 1].threshold }];
+}
+
 let geo = null;  // geometry of the last base draw, for pointer handling and the overlay
 function drawChart() {
   const [g, w, h] = fit(base);
@@ -552,7 +568,7 @@ function drawChart() {
   const yDb = (db) => dbTop + (1 - (Math.min(DB_MAX, Math.max(DB_MIN, db)) - DB_MIN) / (DB_MAX - DB_MIN)) * dbH;
   const yConf = (c) => confTop + (1 - c) * CONF_H;
   geo = { w, h, plotW, dbTop, dbH, confTop, v0, v1, x, inv: (px) => v0 + ((px - PAD.l) / plotW) * span };
-  const res = resultFor(state.focus), thr = state.settings.threshold;
+  const res = resultFor(state.focus), segs = thresholdSegments(data, v0, v1), thr = segs[segs.length - 1].thr;
   $('chartTitle').innerHTML = `${data.night.label} <span class="muted">· ${fmtHM(v0)}–${fmtHM(v1)} · ${fmtSpan(span)}</span>`;
   document.querySelectorAll('#spans button').forEach((b) => {
     const s = +b.dataset.span; b.classList.toggle('on', s ? Math.abs(span - s) / s < 0.08 : !state.zoom);
@@ -590,6 +606,7 @@ function drawChart() {
   const L = data.levels;
   const i0 = Math.max(0, lowerBound(L.t, v0) - 1), i1 = Math.min(L.t.length, lowerBound(L.t, v1) + 1);
   const cols = Math.max(1, Math.floor(plotW)), yt = yDb(thr);
+  const loudClip = () => { g.beginPath(); for (const sg of segs) g.rect(x(sg.a), dbTop, x(sg.b) - x(sg.a), yDb(sg.thr) - dbTop); g.clip(); };
   if (i1 - i0 < cols * 2) {
     const path = new Path2D(); let open = false;
     g.fillStyle = C.gap;
@@ -601,10 +618,10 @@ function drawChart() {
     }
     g.save(); g.beginPath(); g.rect(PAD.l, dbTop, plotW, dbH); g.clip();
     g.lineWidth = 1.5; g.lineJoin = 'round'; g.strokeStyle = C.wave; g.stroke(path);
-    g.beginPath(); g.rect(PAD.l, dbTop, plotW, yt - dbTop); g.clip();
+    loudClip();
     g.strokeStyle = C['wave-loud']; g.stroke(path); g.restore();
   } else {
-    let i = i0, prevT = null;
+    let i = i0, prevT = null, sk = 0;
     const quiet = new Path2D(), loud = new Path2D();
     g.fillStyle = C.gap;
     for (let c = 0; c < cols && i < i1; c++) {
@@ -616,15 +633,23 @@ function drawChart() {
       }
       if (mx === -Infinity) continue;
       const px = PAD.l + c, top = yDb(mx), bot = Math.max(yDb(mn), top + 1);
-      if (mx >= thr) {
-        if (bot > yt) quiet.rect(px, Math.max(top, yt), 1, bot - Math.max(top, yt));
-        loud.rect(px, top, 1, Math.max(1, Math.min(bot, yt) - top));
+      while (sk < segs.length - 1 && segs[sk].b <= tEnd - span / cols / 2) sk++;
+      const cthr = segs[sk].thr, cyt = yDb(cthr);
+      if (mx >= cthr) {
+        if (bot > cyt) quiet.rect(px, Math.max(top, cyt), 1, bot - Math.max(top, cyt));
+        loud.rect(px, top, 1, Math.max(1, Math.min(bot, cyt) - top));
       } else quiet.rect(px, top, 1, bot - top);
     }
     g.fillStyle = C.wave; g.fill(quiet); g.fillStyle = C['wave-loud']; g.fill(loud);
   }
   // threshold line
-  g.strokeStyle = C['wave-loud']; g.setLineDash([5, 4]); g.beginPath(); g.moveTo(PAD.l, yt + .5); g.lineTo(w - PAD.r, yt + .5); g.stroke(); g.setLineDash([]);
+  g.strokeStyle = C['wave-loud']; g.setLineDash([5, 4]); g.beginPath();
+  segs.forEach((sg, k) => {
+    const y = yDb(sg.thr) + .5;
+    if (k) g.lineTo(x(sg.a), y); else g.moveTo(x(sg.a), y);
+    g.lineTo(x(sg.b), y);
+  });
+  g.stroke(); g.setLineDash([]);
 
   // classifier lane
   const S = data.scores, cthr = state.settings.classifierThreshold;
@@ -856,7 +881,7 @@ function drawOverview() {
   g.globalAlpha = .6;
   for (let c = 0; c < bins; c++) {
     if (max[c] === -Infinity) continue;
-    g.fillStyle = max[c] >= state.settings.threshold ? C['wave-loud'] : C.wave;
+    g.fillStyle = max[c] >= thresholdSegments(data, f0 + (c + .5) * total / bins, f0 + (c + .5) * total / bins + 1e-3)[0].thr ? C['wave-loud'] : C.wave;
     const y = yOf(max[c]); g.fillRect(PAD.l + (c / bins) * plotW, y, plotW / bins + .5, barsH - y);
   }
   g.globalAlpha = 1;
@@ -994,16 +1019,17 @@ async function runSweep() {
   const table = $('sweep');
   if (!ids.length) { table.innerHTML = '<tr><td class="empty">Load a night first.</td></tr>'; return; }
   table.classList.add('updating');
-  await Promise.all(def.values.flatMap((v) => ids.map((id) => simulateNight(id, { ...settings, [by]: v }, 'low', stale))));
+  const variant = (v) => ({ ...settings, asRecorded: false, [by]: v });
+  await Promise.all(def.values.flatMap((v) => ids.map((id) => simulateNight(id, variant(v), 'low', stale))));
   if (stale()) return;
   table.classList.remove('updating');
-  const rows = def.values.map((v) => ({ v, ...score(ids, { ...settings, [by]: v }) }));
+  const rows = def.values.map((v) => ({ v, ...score(ids, variant(v)) }));
   const used = new Set(ids.map((id) => state.data.get(id).recordedSettings?.[by]).filter((x) => x !== undefined));
   const maxAlerts = Math.max(1, ...rows.map((r) => r.alerts));
   const anyLabels = rows.some((r) => r.cries || r.falseAlarms);
   const scale = (n) => (n / maxAlerts) * 100;
   table.innerHTML = `<thead><tr><th>${def.head}</th><th>Alerts</th><th class="bar"></th><th>Cries caught</th><th>False alarms</th><th>To label</th></tr></thead><tbody>${rows.map((r) => {
-    const cur = r.v === state.settings[by];
+    const cur = !state.settings.asRecorded && r.v === state.settings[by];
     const tags = [cur ? 'current' : null, used.has(r.v) ? 'used' : null, by === 'alertDuration' && !APP_DURATIONS.includes(r.v) ? 'not in app' : null].filter(Boolean);
     return `<tr data-v="${r.v}" class="${cur ? 'current' : ''}"><td class="mono">${def.fmt(r.v)}${tags.map((t) => `<span class="tag">${t}</span>`).join('')}</td>
       <td class="mono">${r.alerts}</td>
@@ -1021,7 +1047,7 @@ async function runSweep() {
 }
 $('sweep').addEventListener('click', (ev) => {
   const tr = ev.target.closest('tbody tr[data-v]'); if (!tr) return;
-  state.settings[state.sweepBy] = +tr.dataset.v; touched(); syncControls(); refresh();
+  state.settings[state.sweepBy] = +tr.dataset.v; state.settings.asRecorded = false; touched(); syncControls(); refresh();
 });
 document.querySelectorAll('#sweepBy button').forEach((b) => {
   b.onclick = () => { state.sweepBy = b.dataset.v; store.set('sweepBy', state.sweepBy); syncControls(); scheduleSweep(0); };
@@ -1029,8 +1055,32 @@ document.querySelectorAll('#sweepBy button').forEach((b) => {
 
 // ---------- settings ----------
 function touched() { store.set('settingsTouched', true); store.set('settings', state.settings); }
+const RECORDED_KEYS = ['threshold', 'alertDuration', 'quietResetDuration', 'classifierThreshold'];
+/// Replay with the phone's own settings: the sliders show the night's main ones.
+function useRecorded() {
+  const rec = state.data.get(state.focus)?.recordedSettings;
+  Object.assign(state.settings, rec ?? {}, { asRecorded: true });
+  store.set('settingsTouched', false); store.set('settings', state.settings);
+}
+function recordedSummary(data) {
+  const ch = data?.settingsChanges ?? [];
+  if (!ch.length) return 'This night has no recorded settings.';
+  const fmt = (c) => `${c.threshold} dBFS · ${fmtDuration(c.alertDuration)} · ${c.quietResetDuration} s reset`;
+  const parts = [`From ${fmtHM(ch[0].t)}: ${fmt(ch[0])}`];
+  for (let k = 1; k < ch.length; k++) {
+    const a = ch[k - 1], b = ch[k];
+    if (a.threshold === b.threshold && a.alertDuration === b.alertDuration && a.quietResetDuration === b.quietResetDuration) continue;
+    parts.push(`from ${fmtHM(b.t)}: ${fmt(b)}`);
+  }
+  return parts.join('; ') + '.';
+}
 function syncControls() {
   const s = state.settings;
+  $('asRecorded').checked = s.asRecorded;
+  $('controls').classList.toggle('as-recorded', s.asRecorded);
+  $('recordedHint').textContent = s.asRecorded
+    ? recordedSummary(state.data.get(state.focus)) + ' Move a slider to try your own.'
+    : 'Replays each moment with the settings the phone used then.';
   $('threshold').step = state.appSteps ? 5 : 1;
   $('threshold').value = s.threshold; $('thresholdOut').textContent = `${s.threshold} dBFS`;
   $('thresholdHint').textContent = state.appSteps ? 'The app offers −60 to −10 dBFS in steps of 5.' : 'Steps of 1 dB. The app only offers steps of 5.';
@@ -1050,8 +1100,10 @@ function syncControls() {
 function bind(id, key, snap = (v) => v) {
   $(id).addEventListener('input', () => {
     const v = snap(Number($(id).value));
-    if (state.settings[key] === v) return;
-    state.settings[key] = v; touched(); syncControls(); refresh();
+    if (state.settings[key] === v && !(state.settings.asRecorded && RECORDED_KEYS.includes(key))) return;
+    state.settings[key] = v;
+    if (RECORDED_KEYS.includes(key)) state.settings.asRecorded = false;
+    touched(); syncControls(); refresh();
   });
 }
 const snapDuration = (v) => (state.appSteps ? APP_DURATIONS.reduce((a, b) => (Math.abs(b - v) < Math.abs(a - v) ? b : a)) : v);
@@ -1062,7 +1114,7 @@ bind('gateMin', 'gateMin');
 bind('gateWin', 'gateWindow');
 bind('fraction', 'requiredFraction');
 document.querySelectorAll('#reset button').forEach((b) => {
-  b.onclick = () => { state.settings.quietResetDuration = +b.dataset.v; touched(); syncControls(); refresh(); };
+  b.onclick = () => { state.settings.quietResetDuration = +b.dataset.v; state.settings.asRecorded = false; touched(); syncControls(); refresh(); };
 });
 $('appSteps').onchange = () => {
   state.appSteps = $('appSteps').checked; store.set('appSteps', state.appSteps);
@@ -1071,9 +1123,9 @@ $('appSteps').onchange = () => {
 };
 $('classifier').onchange = () => { state.settings.classifierEnabled = $('classifier').checked; touched(); syncControls(); refresh(); };
 $('gate').onchange = () => { state.settings.gateEnabled = $('gate').checked; touched(); syncControls(); refresh(); };
-$('useRecorded').onclick = () => {
-  const rec = state.data.get(state.focus)?.recordedSettings;
-  state.settings = { ...DEFAULTS, ...(rec ?? {}) }; store.set('settingsTouched', false); store.set('settings', state.settings);
+$('asRecorded').onchange = () => {
+  if ($('asRecorded').checked) useRecorded();
+  else { state.settings.asRecorded = false; touched(); }
   syncControls(); refresh();
 };
 

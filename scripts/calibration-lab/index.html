@@ -80,6 +80,8 @@ input[type=range] { width: 100%; accent-color: var(--accent); margin: 2px 0; }
 .seg button.on { background: var(--ink); color: var(--panel); }
 .field label.check { display: flex; justify-content: flex-start; gap: 8px; align-items: center; font-weight: 500; cursor: pointer; }
 .sub { padding-left: 24px; margin-top: 8px; }
+.field.recorded { padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+#controls.as-recorded .tunable { opacity: .5; }
 .sub[hidden] { display: none; }
 button.btn { border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 7px; padding: 5px 10px; font: inherit; font-size: 13px; cursor: pointer; white-space: nowrap; }
 button.btn:hover { background: var(--soft); }
@@ -181,18 +183,22 @@ tr.sel td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
       <div class="hint" style="margin-top:8px">Ticked nights count towards the totals and the comparison. <button class="linkbtn" id="tickAll">Tick all</button></div>
     </section>
     <section class="panel" id="controls">
-      <div class="panel-head"><h2>Settings</h2><button class="btn" id="useRecorded" title="Use the settings the phone used that night">Night's settings</button></div>
-      <div class="field">
+      <div class="panel-head"><h2>Settings</h2></div>
+      <div class="field recorded">
+        <label class="check"><input type="checkbox" id="asRecorded"> Use the phone's own settings</label>
+        <div class="hint" id="recordedHint"></div>
+      </div>
+      <div class="field tunable">
         <label for="threshold">Sound threshold <output id="thresholdOut"></output></label>
         <input type="range" id="threshold" min="-60" max="-10" step="5">
         <div class="hint" id="thresholdHint"></div>
       </div>
-      <div class="field">
+      <div class="field tunable">
         <label for="duration">Observation window <output id="durationOut"></output></label>
         <input type="range" id="duration" min="0" max="6" step="1">
         <div class="hint">How long sound must last (80% of the time) before an alert. The app offers 5 s, 30 s, 1, 2, 3, 5 and 10 min.</div>
       </div>
-      <div class="field">
+      <div class="field tunable">
         <div class="label">Reset after quiet</div>
         <div class="seg" id="reset"><button data-v="10">10 s</button><button data-v="20">20 s</button><button data-v="30">30 s</button><button data-v="60">60 s</button></div>
       </div>

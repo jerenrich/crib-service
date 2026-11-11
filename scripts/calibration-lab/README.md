@@ -26,14 +26,21 @@ Using it:
 - `[` / `]` step through alerts, `Space` plays the selected one, `C` / `N`
   label it as a cry or not, `←` / `→` move, `+` / `−` zoom, `0` whole night.
 - Ticked nights count towards the totals and the Compare settings table.
+- "Use the phone's own settings" replays each moment with the settings the
+  phone logged then (including changes during the night, and each run's
+  classifier threshold). Moving a slider switches to your own settings.
 
 How it works:
 
 - `detector.js` ports `CryDetector.swift`, `CryConfidenceDetector.swift` and the
   first-alert logic of `CrySessionManager.swift`. Keep it in step with them.
-  Replaying 6–10 Nov 2026 with the recorded settings reproduced every alert
-  sent under the current alert policy to the millisecond. Older nights ran an
-  earlier build, and the page says so.
+  Older nights ran an earlier build, and the page says so.
+- After changing `detector.js` or the Swift detectors, run
+  `node scripts/calibration-lab/validate.mjs`. It replays every cached log with
+  the phone's own settings and fails if any alert sent by a run that logs PCM
+  frames (6 Nov 2026 onwards) is missing, extra or more than 10 ms off. It
+  catches changes to rules the cached nights exercise (coverage, recent
+  activity), but not to cases they never hit, such as long classifier gaps.
 - `parse.js` reads `SoundAnalysisLog.swift`'s CSV into packed columns.
 - `engine.js` is a worker that loads nights and runs simulations; the page runs
   a few of them and caches results per night and settings, so the page itself

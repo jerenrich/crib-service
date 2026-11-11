@@ -17,6 +17,9 @@ export const DEFAULTS = Object.freeze({
   // Experimental, not in the app: a volume alert also needs the classifier to
   // have scored at least gateMin within the last gateWindow seconds.
   gateEnabled: false,
+  // Replay with the settings the phone logged for each sample (threshold,
+  // observation window, quiet reset, and each run's classifier threshold).
+  asRecorded: false,
   gateMin: 0.1,
   gateWindow: 10,
 });
@@ -256,6 +259,13 @@ class ConfidenceDetector {
  */
 export function simulate(night, settings) {
   const cfg = { ...DEFAULTS, ...settings };
+  const changes = cfg.asRecorded ? night.settingsChanges ?? [] : [];
+  let nextChange = 0;
+  const applyChange = (c) => {
+    cfg.threshold = c.threshold; cfg.alertDuration = c.alertDuration; cfg.quietResetDuration = c.quietResetDuration;
+    if (c.classifierThreshold !== null) cfg.classifierThreshold = c.classifierThreshold;
+  };
+  if (changes.length) applyChange(changes[0]);
   const vol = new VolumeDetector(cfg.requiredFraction);
   const cls = new ConfidenceDetector(cfg.requiredFraction);
   let current = null, lastObservedAt = null, lastVolumeInputAt = null, lastDetectionAt = null;
@@ -333,6 +343,10 @@ export function simulate(night, settings) {
     const i = night.at[n];
     switch (night.order[n]) {
       case 1: { // level
+        // The app swaps settings in without resetting anything (CrySessionManager.configure).
+        while (nextChange < changes.length && changes[nextChange].i <= i) {
+          applyChange(changes[nextChange++]);
+        }
         lv.t = L.t[i]; lv.db = L.db[i]; lv.cap = L.cap[i]; lv.sf = L.sf[i]; lv.ef = L.ef[i]; lv.sr = L.sr[i];
         const e = lv;
         if (lastObservedAt !== null && e.t <= lastObservedAt) break;

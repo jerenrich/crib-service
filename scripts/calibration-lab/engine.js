@@ -21,7 +21,7 @@ self.onmessage = async ({ data: m }) => {
         levels: { t: parsed.levels.t.slice(), db: parsed.levels.db.slice() },
         scores: { at: parsed.scores.at.slice(), conf: parsed.scores.conf.slice() },
         recordedAlerts: parsed.recordedAlerts, recordedSettings: parsed.recordedSettings,
-        otherSettings: parsed.otherSettings, legacy: parsed.legacy,
+        otherSettings: parsed.otherSettings, legacy: parsed.legacy, settingsChanges: parsed.settingsChanges,
       };
       self.postMessage({ req: m.req, view },
         [view.levels.t.buffer, view.levels.db.buffer, view.scores.at.buffer, view.scores.conf.buffer]);

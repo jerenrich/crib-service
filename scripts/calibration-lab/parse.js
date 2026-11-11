@@ -44,6 +44,11 @@ export function parseNight(texts, from = -Infinity, to = Infinity) {
   let startBefore = null;  // [t, capture id] of the last capture_start before `from`
   const cap = (id) => { let i = capIndex.get(id); if (i === undefined) { i = caps.length; caps.push(id); capIndex.set(id, i); } return i; };
   const settingsSeen = new Map();
+  // Each level row logs the settings it was judged with; keep where they change.
+  // The classifier threshold is per run: a confidence_threshold marker when the
+  // run logged one, else 0.80 for early time-coverage builds (which didn't).
+  const changes = []; let lastKey = null;
+  const runThreshold = new Map(), policyRuns = new Set();
   for (const text of texts) {
     let pos = 0;
     while (pos < text.length) {
@@ -66,6 +71,9 @@ export function parseNight(texts, from = -Infinity, to = Infinity) {
         startBefore = null;
       }
       const detail = c.slice(18).join(',');
+      const ct = detail.includes('confidence_threshold=') ? +detailValue(detail, 'confidence_threshold') : NaN;
+      if (Number.isFinite(ct) && !runThreshold.has(c[1])) runThreshold.set(c[1], ct);
+      if (kind === 'run_start' && detail.includes('alert_policy=')) policyRuns.add(c[1]);
       if (kind === 'level') {
         const db = +c[7];
         if (!Number.isFinite(db)) continue;
@@ -79,6 +87,10 @@ export function parseNight(texts, from = -Infinity, to = Infinity) {
         } else { L.cap.push(-1); L.sf.push(NaN); L.ef.push(NaN); L.sr.push(NaN); }
         const key = `${c[8]}|${c[14]}|${c[15]}`;
         settingsSeen.set(key, (settingsSeen.get(key) ?? 0) + 1);
+        if (key + c[1] !== lastKey && c[8] !== '' && Number.isFinite(+c[8])) {
+          lastKey = key + c[1];
+          changes.push({ i: L.t.length - 1, t, run: c[1], threshold: +c[8], alertDuration: +c[14] || 5, quietResetDuration: +c[15] || 20 });
+        }
         if (c[11] === '1') {
           // Builds before the time-coverage policy (before ~6 Nov 2026) did not tag alerts.
           const legacy = !detail.includes('alert_policy=');
@@ -104,6 +116,10 @@ export function parseNight(texts, from = -Infinity, to = Infinity) {
       }
     }
   }
+  for (const ch of changes) {
+    ch.classifierThreshold = runThreshold.get(ch.run) ?? (policyRuns.has(ch.run) ? 0.8 : null);
+    delete ch.run;
+  }
   let recordedSettings = null, best = 0;
   for (const [key, n] of settingsSeen) {
     if (n > best) {
@@ -117,7 +133,7 @@ export function parseNight(texts, from = -Infinity, to = Infinity) {
     return { threshold, alertDuration };
   });
   return {
-    recordedAlerts, recordedSettings, monitoring, otherSettings, caps,
+    recordedAlerts, recordedSettings, monitoring, otherSettings, caps, settingsChanges: changes,
     legacy: recordedAlerts.some((a) => a.legacy),
     order: Uint8Array.from(order), at: Uint32Array.from(at),
     levels: { t: f64(L.t), db: f64(L.db), cap: Int32Array.from(L.cap), sf: f64(L.sf), ef: f64(L.ef), sr: f64(L.sr) },
