@@ -1780,6 +1780,7 @@ final class AppModelTests: XCTestCase {
         private(set) var deletedDevice = false
         private(set) var requestedTest = false
         private(set) var connectionAlertPreferences: [Bool] = []
+        private(set) var connectionAlertDelays: [Int] = []
         var testRequestFails = false
         var statusValue: ParentStatus?
         var statusGate: RequestGate?
@@ -1841,6 +1842,10 @@ final class AppModelTests: XCTestCase {
         func connectionAlerts(_ enabled: Bool) async throws {
             connectionAlertPreferences.append(enabled)
             statusValue?.connectionAlertsEnabled = enabled
+        }
+        func connectionAlertDelay(_ seconds: Int) async throws {
+            connectionAlertDelays.append(seconds)
+            statusValue?.connectionAlertDelay = TimeInterval(seconds)
         }
         func heartbeat(_ value: Heartbeat) async throws -> MonitoringConfiguration {
             beats.append(value)
@@ -2719,6 +2724,20 @@ final class AppModelTests: XCTestCase {
         await fixture.model.setConnectionAlerts(true)
         XCTAssertFalse(fixture.model.localConnectionWarningEnabled)
         XCTAssertNil(fixture.model.parentConnectionDeadline)
+    }
+
+    @MainActor func testConnectionAlertDelaySavesWholeMinutesOnly() async throws {
+        let fixture = try Fixture()
+        await fixture.backend.setStatus(ParentStatus(paired: true, connectionAlertsEnabled: true,
+            monitoring: true, configuration: MonitoringConfiguration()))
+        fixture.model.selectRole(.parent); await fixture.model.refreshParent()
+        XCTAssertNil(fixture.model.parentStatus?.connectionAlertDelay)
+        await fixture.model.setConnectionAlertDelay(420)
+        XCTAssertEqual(fixture.model.parentStatus?.connectionAlertDelay, 420)
+        for invalid in [0.0, 30, 90, 1260] { await fixture.model.setConnectionAlertDelay(invalid) }
+        let sent = await fixture.backend.connectionAlertDelays
+        XCTAssertEqual(sent, [420])
+        XCTAssertEqual(fixture.model.parentStatus?.connectionAlertsEnabled, true)
     }
 
     @MainActor func testUpgradeClearsLegacyLocalWarningWithoutOptIn() async throws {

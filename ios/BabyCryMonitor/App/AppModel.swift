@@ -2005,6 +2005,21 @@ import UIKit
         }
         catch { self.error = error.localizedDescription; log.record("connection_preferences_failed", error: error) }
     }
+    /// Whole minutes, 1 to 20; the Worker rejects anything else.
+    static let connectionAlertDelays: [Double] = (1...20).map { Double($0 * 60) }
+    func setConnectionAlertDelay(_ seconds: TimeInterval) async {
+        guard role == .parent, !changingConnectionAlerts, Self.connectionAlertDelays.contains(seconds) else { return }
+        changingConnectionAlerts = true; defer { changingConnectionAlerts = false }
+        let revision = environmentRevision
+        do {
+            let client = try await registeredClient(); try await client.connectionAlertDelay(Int(seconds))
+            guard revision == environmentRevision, role == .parent else { return }
+            // Show the saved value at once; the refresh confirms it.
+            parentStatus?.connectionAlertDelay = seconds
+            await refreshParent()
+        }
+        catch { self.error = error.localizedDescription; log.record("connection_preferences_failed", error: error) }
+    }
     func removePairing(deleteDevice: Bool) async {
         guard !managingDevice else { return }
         managingDevice = true

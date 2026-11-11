@@ -3,8 +3,11 @@ import Foundation
 public enum DeviceRole: String, Codable, CaseIterable, Sendable { case listener, parent }
 public struct MonitoringConfiguration: Codable, Equatable, Sendable {
     public static let soundThresholds = Array(stride(from: -60.0, through: -10.0, by: 5.0))
+    /// Observation-window stops offered in Settings. Any 5...3600 second value stays valid.
+    public static let alertDurations: [TimeInterval] = [5, 10, 30, 60, 120, 180, 300, 600]
     public var alertDuration: TimeInterval = 5
-    public static let snoozeDurations: [TimeInterval] = [60, 120, 300, 600, 900]
+    /// Every whole minute from 1 to 15. The Worker enforces the same set.
+    public static let snoozeDurations: [TimeInterval] = (1...15).map { TimeInterval($0 * 60) }
     public var snoozeDuration: TimeInterval = 60
     public var quietResetDuration: TimeInterval = 20
     public static let repeatIntervals: [TimeInterval] = [5, 2]
@@ -108,6 +111,14 @@ public struct CryAlert: Identifiable, Codable, Equatable, Sendable {
         self.isTest = isTest
         self.reason = reason
         self.wireTimestampVersion = 1
+    }
+}
+/// Shared wording for a connection-loss alert. Matches the server's push text.
+public enum ConnectionLossCopy {
+    /// `seconds` is the alert's duration: the Parent's chosen delay (3 minutes on older servers).
+    public static func body(silentFor seconds: Double) -> String {
+        let minutes = max(1, Int((seconds / 60).rounded()))
+        return "No Listener update for at least \(minutes) \(minutes == 1 ? "minute" : "minutes"). Check the nursery phone’s power, internet and monitoring."
     }
 }
 /// Shared wording for a monitoring-stopped alert caused by other audio on the

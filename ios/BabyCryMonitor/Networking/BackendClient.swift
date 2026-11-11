@@ -15,6 +15,8 @@ struct ParentStatus: Codable, Sendable {
         enum CodingKeys: String, CodingKey { case appWake, extensionMethod = "extension" }
     }
     var connectionAlertsEnabled: Bool?
+    /// Seconds without a Listener update before the server sends a connection-loss alert.
+    var connectionAlertDelay: TimeInterval? = nil
     var alertsMutedUntil: Date?
     var listenerConfiguration: MonitoringConfiguration?
     var listenerId: UUID?
@@ -164,6 +166,7 @@ protocol BackendServing: AlertSending {
     func pushToken(_ token: String) async throws
     func watchPushToken(_ token: String?) async throws
     func connectionAlerts(_ enabled: Bool) async throws
+    func connectionAlertDelay(_ seconds: Int) async throws
     func requestTestPush() async throws
     func alertTest() async throws -> AlertTestResponse
     func startAlertTest(id: UUID, configuration: AlertTestConfiguration) async throws -> AlertTestResponse
@@ -194,6 +197,7 @@ extension BackendServing {
     func completeMonitoring(_ id: UUID, succeeded: Bool) async throws { throw BackendError.message("Monitoring confirmation unavailable.") }
     func timeline() async throws -> TimelineResponse { throw BackendError.message("Timeline requires an updated connection service.") }
     func connectionAlerts(_ enabled: Bool) async throws { throw BackendError.message("Connection alerts unavailable.") }
+    func connectionAlertDelay(_ seconds: Int) async throws { throw BackendError.message("Connection alerts unavailable.") }
     func requestTestPush() async throws { throw BackendError.message("Remote test unavailable.") }
     func unpair() async throws { throw BackendError.message("Unpairing unavailable.") }
     func deleteDevice() async throws { throw BackendError.message("Deletion unavailable.") }
@@ -270,6 +274,7 @@ struct BackendClient: BackendServing {
         let _: EmptyResponse = try await request("/v1/alarm/attempts", body: ["attempts": items])
     }
     func connectionAlerts(_ enabled: Bool) async throws { let _: EmptyResponse = try await request("/v1/connection-alerts", body: ["enabled": enabled]) }
+    func connectionAlertDelay(_ seconds: Int) async throws { let _: EmptyResponse = try await request("/v1/connection-alerts", body: ["delaySeconds": seconds]) }
     func alertTest() async throws -> AlertTestResponse {
         try await request("/v1/alert-test", method: "GET", body: Optional<String>.none)
     }

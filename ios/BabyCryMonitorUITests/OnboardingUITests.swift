@@ -221,7 +221,9 @@ final class OnboardingUITests: XCTestCase {
         timing.tap()
         XCTAssertTrue(app.navigationBars["Alert timing"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.staticTexts["The timer counts from the start of sustained loud sound, including the initial sound check. Brief noises are filtered out."].exists)
-        app.buttons["30 sec"].tap()
+        let window = app.sliders["quickAlertDuration"]
+        XCTAssertTrue(window.waitForExistence(timeout: 5))
+        setSlider(window, stop: 2, in: ["5 sec", "10 sec", "30 sec", "1 min", "2 min", "3 min", "5 min", "10 min"])
         app.buttons["Done"].tap()
         XCTAssertTrue(timing.label.contains("30 sec"), timing.debugDescription)
         XCTAssertFalse(app.descendants(matching: .any)["pairedDevice_listener"].exists)
@@ -685,19 +687,19 @@ final class OnboardingUITests: XCTestCase {
         XCTAssertTrue(app.navigationBars["Settings"].waitForExistence(timeout: 5))
         XCTAssertFalse(app.buttons["Save alert settings"].exists)
         XCTAssertFalse(app.buttons["Custom alert duration"].exists)
-        let duration = app.buttons["alertDurationPicker"]
+        let durationLabels = ["5 seconds", "10 seconds", "30 seconds", "1 minute", "2 minutes", "3 minutes", "5 minutes", "10 minutes"]
+        let thresholdLabels = stride(from: -60, through: -10, by: 5).map { "\($0) dBFS" }
+        let snoozeLabels = (1...15).map { $0 == 1 ? "1 minute" : "\($0) minutes" }
+        let duration = app.sliders["alertDurationSlider"]
         XCTAssertTrue(duration.waitForExistence(timeout: 5))
-        XCTAssertTrue(duration.label.contains("5 seconds") || duration.staticTexts["5 seconds"].exists, duration.debugDescription)
+        XCTAssertEqual(duration.value as? String, "5 seconds")
         XCTAssertFalse(app.buttons["Check room sound"].exists)
-        duration.tap()
-        app.buttons["30 seconds"].tap()
+        setSlider(duration, stop: 2, in: durationLabels)
         XCTAssertTrue(app.navigationBars["Settings"].exists)
-        XCTAssertTrue(duration.label.contains("30 seconds") || duration.staticTexts["30 seconds"].exists, duration.debugDescription)
         app.buttons["Done"].tap()
         app.buttons["Settings"].tap()
-        XCTAssertTrue(duration.label.contains("30 seconds") || duration.staticTexts["30 seconds"].exists, duration.debugDescription)
-        duration.tap()
-        app.buttons["5 seconds"].tap()
+        XCTAssertEqual(duration.value as? String, "30 seconds")
+        setSlider(duration, stop: 1, in: durationLabels)
         let settingsForm = app.descendants(matching: .any)["settingsForm"]
         func reveal(_ element: XCUIElement) {
             for _ in 0..<12 {
@@ -705,31 +707,29 @@ final class OnboardingUITests: XCTestCase {
                 scrollDown(in: settingsForm)
             }
         }
-        let threshold = app.buttons["soundThresholdPicker"]
+        let threshold = app.sliders["soundThresholdSlider"]
         reveal(threshold)
-        XCTAssertTrue(threshold.waitForExistence(timeout: 5)); threshold.tap()
-        let thresholdOption = app.buttons["-45 dBFS"]
-        XCTAssertTrue(thresholdOption.waitForExistence(timeout: 5))
-        thresholdOption.coordinate(withNormalizedOffset: CGVector(dx: 0.25, dy: 0.5)).tap()
-        XCTAssertTrue(NSPredicate(format: "label CONTAINS %@", "-45 dBFS").evaluate(with: threshold))
-        let snooze = app.buttons["snoozeDurationPicker"]
+        XCTAssertTrue(threshold.waitForExistence(timeout: 5))
+        setSlider(threshold, stop: 3, in: thresholdLabels)
+        let snooze = app.sliders["snoozeDurationSlider"]
         reveal(snooze)
         XCTAssertTrue(snooze.waitForExistence(timeout: 5))
-        XCTAssertTrue(snooze.label.contains("1 minute") || snooze.staticTexts["1 minute"].exists, snooze.debugDescription)
-        snooze.tap(); app.buttons["2 minutes"].tap()
+        XCTAssertEqual(snooze.value as? String, "1 minute")
+        // 7 minutes was not offered by the old picker.
+        setSlider(snooze, stop: 6, in: snoozeLabels)
         // Terminate with Settings still open: saving must happen on selection.
         app.terminate(); app.launch()
         XCTAssertTrue(app.buttons["Settings"].waitForExistence(timeout: 5))
         app.buttons["Settings"].tap()
         XCTAssertTrue(duration.waitForExistence(timeout: 5))
-        XCTAssertTrue(duration.label.contains("5 seconds") || duration.staticTexts["5 seconds"].exists, duration.debugDescription)
+        XCTAssertEqual(duration.value as? String, "10 seconds")
         reveal(threshold)
-        XCTAssertTrue(threshold.label.contains("-45 dBFS") || threshold.staticTexts["-45 dBFS"].exists, threshold.debugDescription)
+        XCTAssertEqual(threshold.value as? String, "-45 dBFS")
         reveal(snooze)
-        XCTAssertTrue(snooze.label.contains("2 minutes") || snooze.staticTexts["2 minutes"].exists, snooze.debugDescription)
+        XCTAssertEqual(snooze.value as? String, "7 minutes")
         app.swipeUp()
         let diagnostics = app.buttons["Diagnostics & simulation"]
-        if !diagnostics.isHittable { app.swipeUp() }
+        for _ in 0..<6 where !(diagnostics.exists && diagnostics.isHittable) { app.swipeUp() }
         XCTAssertTrue(diagnostics.exists); diagnostics.tap()
         XCTAssertTrue(app.navigationBars["Diagnostics"].waitForExistence(timeout: 5))
         let form = app.descendants(matching: .any)["diagnosticsForm"]
@@ -752,6 +752,23 @@ final class OnboardingUITests: XCTestCase {
                 .press(forDuration: 0.05, thenDragTo: form.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.65)))
         }
         XCTAssertTrue(app.staticTexts["Generated events: 1"].waitForExistence(timeout: 5))
+    }
+    /// Drags a stepped slider's thumb from its current stop to `stop`. `labels`
+    /// are the spoken values of every stop; UISlider insets its track by half
+    /// the 28-point thumb. adjust(toNormalizedSliderPosition:) and fast drags
+    /// overshoot stops about 20–30 points apart, so drag slowly and hold.
+    @MainActor private func setSlider(_ slider: XCUIElement, stop: Int, in labels: [String]) {
+        func offset(_ index: Int) -> CGVector {
+            let width = slider.frame.width
+            return CGVector(dx: (14 + (width - 28) * CGFloat(index) / CGFloat(labels.count - 1)) / width, dy: 0.5)
+        }
+        for _ in 0..<3 {
+            guard let current = (slider.value as? String).flatMap(labels.firstIndex(of:)), current != stop else { break }
+            slider.coordinate(withNormalizedOffset: offset(current))
+                .press(forDuration: 0.1, thenDragTo: slider.coordinate(withNormalizedOffset: offset(stop)),
+                       withVelocity: 150, thenHoldForDuration: 0.3)
+        }
+        XCTAssertEqual(slider.value as? String, labels[stop], slider.debugDescription)
     }
     @MainActor private func scrollDown(in element: XCUIElement) {
         element.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.8))

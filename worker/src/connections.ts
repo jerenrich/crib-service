@@ -1,7 +1,7 @@
 import {sharedAccess} from './devices';
 import {dispatchEvent} from './alerts';
 import {scheduleReminders} from './reminders';
-import {stoppedMonitoringForSQL,coveringHeartbeatSQL,coveringHeartbeat} from './monitoring';
+import {stoppedMonitoringForSQL,coveringHeartbeatSQL,coveringHeartbeat,outageAlertCutoffSQL,outageOngoingCutoff,offlineAfterMs,connectionAlertDelays} from './monitoring';
 import {deliverToBoth} from './dual-delivery';
 import {timelineInsert,missingHeartbeat} from './timeline';
 import {APIError,requireRole,type Alert,type Device,type Env} from './types';
@@ -11,9 +11,16 @@ import {Latency} from './latency';
 
 export async function connectionPreferences(env:Env,device:Device,value:Record<string,unknown>) {
  requireRole(device,'parent');
- if(typeof value.enabled!=='boolean'||Object.keys(value).some(k=>k!=='enabled'))throw new APIError(400,'Choose whether to enable connection alerts.');
+ // Either field may be sent alone; older apps send only `enabled`.
+ const keys=Object.keys(value);
+ if(!keys.length||keys.some(k=>k!=='enabled'&&k!=='delaySeconds'))throw new APIError(400,'Send connection alert settings: enabled and/or delaySeconds.');
+ if('enabled' in value&&typeof value.enabled!=='boolean')throw new APIError(400,'Choose whether to enable connection alerts.');
+ if('delaySeconds' in value&&!(connectionAlertDelays as unknown[]).includes(value.delaySeconds))throw new APIError(400,'Choose a connection alert delay from 1 to 20 minutes.');
  const access=sharedAccess(device);
+ const delay=typeof value.delaySeconds==='number'?[env.DB.prepare(`UPDATE devices SET connection_alert_delay=? WHERE id=? AND ${access.sql}`).bind(value.delaySeconds,device.id,...access.args)]:[];
+ if(typeof value.enabled!=='boolean'){await env.DB.batch(delay);return {ok:true};}
  await env.DB.batch([
+  ...delay,
   env.DB.prepare(`UPDATE devices SET connection_alerts=? WHERE id=? AND ${access.sql}`).bind(Number(value.enabled),device.id,...access.args),
   env.DB.prepare(`UPDATE connection_notices SET status='cancelled' WHERE parent_id=? AND status IN ('pending','blocked','escalated') AND ?=0 AND ${access.sql}`).bind(device.id,Number(value.enabled),...access.args),
   env.DB.prepare(`DELETE FROM connection_notices WHERE parent_id=? AND state='offline' AND status='cancelled' AND ?=1 AND ${access.sql}`).bind(device.id,Number(value.enabled),...access.args),
@@ -26,19 +33,23 @@ export async function connectionPreferences(env:Env,device:Device,value:Record<s
 // Atomic transition + unique notice key prevents duplicate notices across cron runs.
 export async function flushConnections(env:Env,requestId=crypto.randomUUID()) {
  const now=Date.now();
- const rows=await env.DB.prepare(`SELECT p.parent_id,p.listener_id,h.received_at,h.metadata,s.state,p.created_at AS pair_created_at
- FROM pairs p JOIN heartbeats h ON h.listener_id=p.listener_id
- LEFT JOIN connection_states s ON s.listener_id=p.listener_id`).all<{parent_id:string;listener_id:string;received_at:string;metadata:string;state:string|null;pair_created_at:number}>();
+ const rows=await env.DB.prepare(`SELECT p.parent_id,p.listener_id,h.received_at,h.metadata,s.state,s.changed_at,p.created_at AS pair_created_at,d.connection_alert_delay
+ FROM pairs p JOIN heartbeats h ON h.listener_id=p.listener_id JOIN devices d ON d.id=p.parent_id
+ LEFT JOIN connection_states s ON s.listener_id=p.listener_id`).all<{parent_id:string;listener_id:string;received_at:string;metadata:string;state:string|null;changed_at:string|null;pair_created_at:number;connection_alert_delay:number}>();
  for(const row of rows.results){
   // A detection pause is not a stop: no stopped notice, but an outage still alerts.
   const active=coveringHeartbeat(row.metadata);
-  const state=active?(now-Date.parse(row.received_at)>180000?'offline':'online'):'stopped';
+  // A delay under 3 minutes detects the outage sooner; longer delays only postpone
+  // the alert. Only a new heartbeat ends an outage, not a change of delay.
+  const silence=now-Date.parse(row.received_at),offlineAfter=offlineAfterMs(row.connection_alert_delay);
+  const stillOffline=row.state==='offline'&&row.changed_at===row.received_at;
+  const state=active?(stillOffline||silence>offlineAfter?'offline':'online'):'stopped';
   // Never warn about a device which has not started monitoring.
   if(!row.state){
    if(active)await env.DB.prepare("INSERT INTO connection_states(listener_id,state,changed_at) SELECT ?,'online',? WHERE EXISTS(SELECT 1 FROM pairs p JOIN heartbeats h ON h.listener_id=p.listener_id WHERE p.parent_id=? AND p.listener_id=? AND h.received_at=?) ON CONFLICT DO NOTHING").bind(row.listener_id,row.received_at,row.parent_id,row.listener_id,row.received_at).run();
    continue;
   }
-  if(state==='offline')await timelineInsert(env,{parent_id:row.parent_id,listener_id:row.listener_id,created_at:row.pair_created_at},missingHeartbeat(row.received_at)).run();
+  if(state==='offline')await timelineInsert(env,{parent_id:row.parent_id,listener_id:row.listener_id,created_at:row.pair_created_at},missingHeartbeat(row.received_at,offlineAfter)).run();
   if(state===row.state&&state!=='offline')continue;
   await env.DB.batch([
    env.DB.prepare(`INSERT INTO connection_notices(id,listener_id,parent_id,state,observed_at,created_at)
@@ -55,20 +66,20 @@ export async function flushConnections(env:Env,requestId=crypto.randomUUID()) {
  // Promote each outage into the ordinary persistent alert pipeline. The notice
  // UUID is the episode/idempotency key; cron retries never create a new episode.
  // Include sent legacy notices so an existing outage gains persistent reminders.
- const outages=await env.DB.prepare(`SELECT n.* FROM connection_notices n
+ const outages=await env.DB.prepare(`SELECT n.*,d.connection_alert_delay FROM connection_notices n
   JOIN pairs p ON p.parent_id=n.parent_id AND p.listener_id=n.listener_id
   JOIN devices d ON d.id=p.parent_id JOIN heartbeats h ON h.listener_id=p.listener_id
   WHERE n.state='offline' AND n.status<>'cancelled' AND n.created_at>=p.created_at
    AND (n.status<>'escalated' OR NOT EXISTS(SELECT 1 FROM events e WHERE e.event_id=n.id))
    AND d.connection_alerts=1 AND ${coveringHeartbeatSQL()}
-   AND h.received_at=n.observed_at AND h.received_at<?
-  ORDER BY n.created_at LIMIT 25`).bind(new Date(now-180000).toISOString())
-  .all<{id:string;parent_id:string;listener_id:string;observed_at:string;created_at:number}>();
+   AND h.received_at=n.observed_at AND h.received_at<${outageAlertCutoffSQL()}
+  ORDER BY n.created_at LIMIT 25`).bind(now)
+  .all<{id:string;parent_id:string;listener_id:string;observed_at:string;created_at:number;connection_alert_delay:number}>();
  for(const outage of outages.results){
   // Retain the shared wire shape for older clients: for this type, the start
-  // is the last heartbeat and duration is the detection timeout, not crying.
+  // is the last heartbeat and duration is the Parent's alert delay, not crying.
   const event:Alert={eventId:outage.id,episodeId:outage.id,listenerId:outage.listener_id,
-   type:'listener_disconnected',cryStartedAt:outage.observed_at,durationSeconds:180,
+   type:'listener_disconnected',cryStartedAt:outage.observed_at,durationSeconds:outage.connection_alert_delay,
    createdAt:new Date(now).toISOString(),isRepeat:false};
   await env.DB.batch([
    env.DB.prepare(`INSERT INTO events(event_id,episode_id,listener_id,parent_id,is_repeat,payload,created_at)
@@ -90,13 +101,13 @@ export async function flushConnections(env:Env,requestId=crypto.randomUUID()) {
    SELECT 1 FROM pairs p JOIN devices d ON d.id=p.parent_id JOIN heartbeats h ON h.listener_id=p.listener_id
    WHERE p.parent_id=events.parent_id AND p.listener_id=events.listener_id AND d.connection_alerts=1
     AND ${coveringHeartbeatSQL()} AND h.received_at=json_extract(events.payload,'$.cryStartedAt')
-    AND h.received_at<?)`).bind(new Date(now).toISOString(),new Date(now-180000).toISOString()).run();
+    AND h.received_at<?)`).bind(new Date(now).toISOString(),outageOngoingCutoff(now)).run();
  await env.DB.prepare(`UPDATE connection_notices SET status='cancelled',lease_until=NULL WHERE state='offline'
   AND NOT EXISTS(SELECT 1 FROM pairs p JOIN devices d ON d.id=p.parent_id JOIN heartbeats h ON h.listener_id=p.listener_id
    WHERE p.parent_id=connection_notices.parent_id AND p.listener_id=connection_notices.listener_id
     AND d.connection_alerts=1 AND ${coveringHeartbeatSQL()}
     AND h.received_at=connection_notices.observed_at AND h.received_at<?)`)
-  .bind(new Date(now-180000).toISOString()).run();
+  .bind(outageOngoingCutoff(now)).run();
  // A person's Stop/Pause also cancels queued legacy notices before any retry.
  await env.DB.prepare(`UPDATE connection_notices SET status='cancelled',lease_until=NULL
   WHERE status IN ('pending','blocked') AND ${stoppedMonitoringForSQL('connection_notices.parent_id','connection_notices.listener_id')}`)

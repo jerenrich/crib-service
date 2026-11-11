@@ -83,6 +83,19 @@ export async function completeMonitoring(env:Env,device:Device,value:Record<stri
  return {ok:result.meta.changes>0};
 }
 
+// Connection-loss timing. A Listener counts as offline after 3 minutes without an
+// update, or after the Parent's alert delay when that is shorter. The alert waits
+// for the Parent's chosen delay (`outageAlertCutoffSQL`, ISO text comparable with
+// received_at, `?` bound to now in ms, `device` the Parent row). Once raised, an
+// outage stays current until the heartbeat changes: later checks use the shortest
+// delay, so changing the delay mid-outage can postpone an alert but never retire one.
+export const offlineDetectionMs=180000;
+export const connectionAlertDelays=Array.from({length:20},(_,i)=>(i+1)*60);
+export const outageAlertCutoffSQL=(device='d')=>`strftime('%Y-%m-%dT%H:%M:%fZ',(?-${device}.connection_alert_delay*1000)/1000.0,'unixepoch')`;
+/** ISO cutoff for an outage that has already been detected or alerted. */
+export const outageOngoingCutoff=(now:number)=>new Date(now-connectionAlertDelays[0]*1000).toISOString();
+/** Milliseconds of silence before a Listener counts as offline for this Parent. */
+export const offlineAfterMs=(delaySeconds:number)=>Math.min(offlineDetectionMs,delaySeconds*1000);
 /** A heartbeat that should be covered by connection-loss alerts: monitoring, or
  * detection paused for other audio. That pause is not a person's choice, so if
  * the Listener then goes silent, the Parent must still hear about it. */

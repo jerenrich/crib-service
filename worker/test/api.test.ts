@@ -25,6 +25,9 @@ async function paired(){
  const parent=device('parent'),listener=device('listener');await register(parent);await register(listener);
  const code=await (await call('pairing/create',parent)).json() as {code:string;expiresAt:string};
  expect((await call('pairing/claim',listener,{code:code.code})).status).toBe(200);
+ // Most outage tests predate the configurable delay and model the original
+ // 3-minute alert. Tests of the 10-minute default reset it explicitly.
+ await env.DB.prepare('UPDATE devices SET connection_alert_delay=180 WHERE id=?').bind(parent.deviceId).run();
  return {parent,listener,code};
 }
 function alert(listener:TestDevice):Alert {
@@ -257,6 +260,75 @@ describe('connection alerts, readiness and replacement',()=>{
   expect(content.aps.sound).toBe('default');
   expect(content.aps['interruption-level']).toBe('time-sensitive');
   expect((await env.DB.prepare("SELECT status FROM events ORDER BY created_at DESC LIMIT 1").first<{status:string}>())?.status).toBe('sent');
+ });
+ it('waits for the chosen connection alert delay, 10 minutes by default',async()=>{
+  const {parent,listener}=await paired();
+  await env.DB.prepare('UPDATE devices SET connection_alert_delay=600 WHERE id=?').bind(parent.deviceId).run();
+  // A newly registered Parent gets the 10-minute default from the migration.
+  const fresh=device('parent');await register(fresh);
+  expect((await env.DB.prepare('SELECT connection_alert_delay FROM devices WHERE id=?').bind(fresh.deviceId).first())?.connection_alert_delay).toBe(600);
+  await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  const status=async()=>(await (await call('listener/status',parent,undefined,'GET')).json() as {connectionAlertDelay:number;connectionAlertsEnabled:boolean});
+  expect((await status()).connectionAlertDelay).toBe(600);
+  const silent=(ms:number)=>env.DB.prepare('UPDATE heartbeats SET received_at=?').bind(new Date(Date.now()-ms).toISOString()).run();
+  await call('listener/heartbeat',listener,beat(listener));await flushConnections(testEnv);
+  // Offline after 3 minutes for status and history, but no wake-up yet.
+  await silent(240000);await flushConnections(testEnv);await flushConnections(testEnv);
+  expect(pushRequests).toHaveLength(0);
+  expect((await env.DB.prepare('SELECT state FROM connection_states WHERE listener_id=?').bind(listener.deviceId).first<{state:string}>())?.state).toBe('offline');
+  await silent(599000);await flushConnections(testEnv);expect(pushRequests).toHaveLength(0);
+  await silent(601000);mockPush();await flushConnections(testEnv);await flushConnections(testEnv);
+  expect(pushRequests).toHaveLength(1);
+  const content=JSON.parse(String(pushRequests[0].init?.body));
+  expect(content).toMatchObject({type:'listener_disconnected',durationSeconds:600});
+  expect(content.aps.alert.body).toContain('at least 10 minutes');
+ });
+ it('validates the delay, keeps the opt-in and detects outages sooner for short delays',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  for(const delaySeconds of [0,30,90,1260,60.5,'60',null])expect((await call('connection-alerts',parent,{delaySeconds})).status).toBe(400);
+  const empty=await call('connection-alerts',parent,{});expect(empty.status).toBe(400);
+  expect(JSON.stringify(await empty.json())).toContain('enabled and/or delaySeconds');
+  expect((await call('connection-alerts',listener,{delaySeconds:60})).status).toBe(403);
+  for(const delaySeconds of [1200,60])expect((await call('connection-alerts',parent,{delaySeconds})).status).toBe(200);
+  const status=await (await call('listener/status',parent,undefined,'GET')).json() as {connectionAlertDelay:number;connectionAlertsEnabled:boolean};
+  expect(status).toMatchObject({connectionAlertDelay:60,connectionAlertsEnabled:true});
+  expect((await call('connection-alerts',parent,{enabled:false,delaySeconds:300})).status).toBe(200);
+  expect(await (await call('listener/status',parent,undefined,'GET')).json()).toMatchObject({connectionAlertDelay:300,connectionAlertsEnabled:false});
+  await call('connection-alerts',parent,{enabled:true,delaySeconds:60});
+  await call('listener/heartbeat',listener,beat(listener));await flushConnections(testEnv);
+  await env.DB.prepare('UPDATE heartbeats SET received_at=?').bind(new Date(Date.now()-50000).toISOString()).run();
+  await flushConnections(testEnv);expect(pushRequests).toHaveLength(0);
+  await env.DB.prepare('UPDATE heartbeats SET received_at=?').bind(new Date(Date.now()-61000).toISOString()).run();
+  mockPush();await flushConnections(testEnv);await flushConnections(testEnv);
+  expect(pushRequests).toHaveLength(1);
+  expect(JSON.parse(String(pushRequests[0].init?.body)).aps.alert.body).toContain('at least 1 minute.');
+  // The alerted gap is in history from the delay, and closes when updates return.
+  const missing=await env.DB.prepare("SELECT payload FROM timeline_events WHERE kind='heartbeat_missing'").all<{payload:string}>();
+  expect(missing.results).toHaveLength(1);
+  const gap=JSON.parse(missing.results[0].payload) as {occurredAt:string;endAt:string};
+  expect(Date.parse(gap.occurredAt)-Date.parse(gap.endAt)).toBe(60000);
+  await call('listener/heartbeat',listener,beat(listener));
+  expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM timeline_events WHERE kind='connection_restored'").first()).toEqual({n:1});
+ });
+ it('keeps a raised outage alerting when the delay is lengthened mid-outage',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  expect((await call('connection-alerts',parent,{delaySeconds:60})).status).toBe(200);
+  await call('listener/heartbeat',listener,beat(listener));await flushConnections(testEnv);
+  await env.DB.prepare('UPDATE heartbeats SET received_at=?').bind(new Date(Date.now()-90000).toISOString()).run();
+  mockPush();await flushConnections(testEnv);await flushConnections(testEnv);
+  expect(pushRequests).toHaveLength(1);
+  const state=async()=>(await env.DB.prepare('SELECT state FROM connection_states WHERE listener_id=?').bind(listener.deviceId).first<{state:string}>())?.state;
+  expect(await state()).toBe('offline');
+  // Lengthening the delay neither retires the alert nor reports the Listener online.
+  expect((await call('connection-alerts',parent,{delaySeconds:1200})).status).toBe(200);
+  await flushConnections(testEnv);await flushConnections(testEnv);
+  expect(await state()).toBe('offline');
+  const event=await env.DB.prepare("SELECT resolved_at FROM events WHERE json_extract(payload,'$.type')='listener_disconnected'").first<{resolved_at:string|null}>();
+  expect(event?.resolved_at).toBeNull();
+  expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM connection_notices WHERE state='offline' AND status='cancelled'").first()).toEqual({n:0});
+  // A new heartbeat still ends it.
+  await call('listener/heartbeat',listener,beat(listener));
+  expect((await env.DB.prepare("SELECT resolved_at FROM events WHERE json_extract(payload,'$.type')='listener_disconnected'").first<{resolved_at:string|null}>())?.resolved_at).not.toBeNull();
  });
  it('sends no stopped notice for a detection pause, yet alerts when a paused Listener goes silent',async()=>{
   const {parent,listener}=await paired();await call('connection-alerts',parent,{enabled:true});
@@ -1458,7 +1530,8 @@ describe('configurable reminders and acknowledgement mute',()=>{
   await call('settings',parent,{...defaultConfiguration,snoozeDuration:60});
   const current=await env.DB.prepare('SELECT alerts_muted_until FROM devices WHERE id=?').bind(parent.deviceId).first<{alerts_muted_until:number}>();
   expect(current!.alerts_muted_until).toBe(first!.alerts_muted_until);
-  for(const snoozeDuration of [0,30,61,3600,'60'])expect((await call('settings',parent,{...defaultConfiguration,snoozeDuration})).status).toBe(400);
+  for(const snoozeDuration of [180,420,780])expect((await call('settings',parent,{...defaultConfiguration,snoozeDuration})).status).toBe(200);
+  for(const snoozeDuration of [0,30,61,90,960,3600,60.5,'60'])expect((await call('settings',parent,{...defaultConfiguration,snoozeDuration})).status).toBe(400);
  });
 
 });
@@ -1971,7 +2044,7 @@ describe('monitoring controls',()=>{
   const ready=new Promise<void>(r=>{entered=r;}),gate=new Promise<void>(r=>{release=r;});
   const db=interceptDB(async(sql,_args,method,execute)=>{
    const result=await execute();
-   if(sql.includes('SELECT n.* FROM connection_notices n')&&method==='all'){entered();await gate;}
+   if(sql.includes('SELECT n.*,d.connection_alert_delay FROM connection_notices n')&&method==='all'){entered();await gate;}
    return result;
   });
   const cron=flushConnections({...testEnv,DB:db});await ready;
