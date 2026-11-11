@@ -2732,12 +2732,31 @@ final class AppModelTests: XCTestCase {
             monitoring: true, configuration: MonitoringConfiguration()))
         fixture.model.selectRole(.parent); await fixture.model.refreshParent()
         XCTAssertNil(fixture.model.parentStatus?.connectionAlertDelay)
+        // A server that does not report a delay cannot change it: no slider.
+        XCTAssertNil(fixture.model.adjustableConnectionAlertDelay)
         await fixture.model.setConnectionAlertDelay(420)
         XCTAssertEqual(fixture.model.parentStatus?.connectionAlertDelay, 420)
+        XCTAssertEqual(fixture.model.adjustableConnectionAlertDelay, 420)
         for invalid in [0.0, 30, 90, 1260] { await fixture.model.setConnectionAlertDelay(invalid) }
         let sent = await fixture.backend.connectionAlertDelays
         XCTAssertEqual(sent, [420])
         XCTAssertEqual(fixture.model.parentStatus?.connectionAlertsEnabled, true)
+        // Alerts off hides the slider, keeping the saved delay.
+        await fixture.model.setConnectionAlerts(false)
+        XCTAssertEqual(fixture.model.parentStatus?.connectionAlertsEnabled, false)
+        XCTAssertNil(fixture.model.adjustableConnectionAlertDelay)
+    }
+
+    func testSliderKeepsChosenStopUntilLatestSaveEnds() {
+        var tracker = SliderSaveTracker()
+        let first = tracker.begin(4)
+        let second = tracker.begin(4)
+        tracker.end(first)
+        XCTAssertEqual(tracker.index, 4, "An earlier save finishing must not snap the thumb back")
+        tracker.end(second)
+        XCTAssertNil(tracker.index)
+        let third = tracker.begin(2); tracker.end(third)
+        XCTAssertNil(tracker.index)
     }
 
     @MainActor func testUpgradeClearsLegacyLocalWarningWithoutOptIn() async throws {

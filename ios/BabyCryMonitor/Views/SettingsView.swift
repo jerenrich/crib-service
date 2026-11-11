@@ -72,7 +72,7 @@ struct SettingsView: View {
                             Toggle("Server connection alerts", isOn: Binding(get: { model.parentStatus?.connectionAlertsEnabled ?? enabled }, set: { value in Task { await model.setConnectionAlerts(value) } }))
                                 .disabled(model.changingConnectionAlerts || !model.paired)
                                 .accessibilityIdentifier("serverConnectionAlerts")
-                            if let delay = connectionAlertDelay, model.parentStatus?.connectionAlertsEnabled ?? enabled {
+                            if let delay = model.adjustableConnectionAlertDelay {
                                 SteppedSlider(title: "Alert after no update for", stops: AppModel.connectionAlertDelays,
                                               value: delay, label: alertDurationText,
                                               lowLabel: "1 min", highLabel: "20 min",

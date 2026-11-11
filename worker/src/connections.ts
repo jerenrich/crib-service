@@ -1,7 +1,7 @@
 import {sharedAccess} from './devices';
 import {dispatchEvent} from './alerts';
 import {scheduleReminders} from './reminders';
-import {stoppedMonitoringForSQL,coveringHeartbeatSQL,coveringHeartbeat,outageAlertCutoffSQL,outageOngoingCutoff,offlineAfterMs,connectionAlertDelays} from './monitoring';
+import {stoppedMonitoringForSQL,coveringHeartbeatSQL,coveringHeartbeat,outageAlertCutoffSQL,offlineAfterMs,connectionAlertDelays} from './monitoring';
 import {deliverToBoth} from './dual-delivery';
 import {timelineInsert,missingHeartbeat} from './timeline';
 import {APIError,requireRole,type Alert,type Device,type Env} from './types';
@@ -100,14 +100,12 @@ export async function flushConnections(env:Env,requestId=crypto.randomUUID()) {
   WHERE resolved_at IS NULL AND json_extract(payload,'$.type')='listener_disconnected' AND NOT EXISTS(
    SELECT 1 FROM pairs p JOIN devices d ON d.id=p.parent_id JOIN heartbeats h ON h.listener_id=p.listener_id
    WHERE p.parent_id=events.parent_id AND p.listener_id=events.listener_id AND d.connection_alerts=1
-    AND ${coveringHeartbeatSQL()} AND h.received_at=json_extract(events.payload,'$.cryStartedAt')
-    AND h.received_at<?)`).bind(new Date(now).toISOString(),outageOngoingCutoff(now)).run();
+    AND ${coveringHeartbeatSQL()} AND h.received_at=json_extract(events.payload,'$.cryStartedAt'))`).bind(new Date(now).toISOString()).run();
  await env.DB.prepare(`UPDATE connection_notices SET status='cancelled',lease_until=NULL WHERE state='offline'
   AND NOT EXISTS(SELECT 1 FROM pairs p JOIN devices d ON d.id=p.parent_id JOIN heartbeats h ON h.listener_id=p.listener_id
    WHERE p.parent_id=connection_notices.parent_id AND p.listener_id=connection_notices.listener_id
     AND d.connection_alerts=1 AND ${coveringHeartbeatSQL()}
-    AND h.received_at=connection_notices.observed_at AND h.received_at<?)`)
-  .bind(outageOngoingCutoff(now)).run();
+    AND h.received_at=connection_notices.observed_at)`).run();
  // A person's Stop/Pause also cancels queued legacy notices before any retry.
  await env.DB.prepare(`UPDATE connection_notices SET status='cancelled',lease_until=NULL
   WHERE status IN ('pending','blocked') AND ${stoppedMonitoringForSQL('connection_notices.parent_id','connection_notices.listener_id')}`)

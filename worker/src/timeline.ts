@@ -1,3 +1,4 @@
+import {connectionAlertDelays} from './monitoring';
 import {APIError,type Device,type Env,type Heartbeat} from './types';
 import {pairFor} from './devices';
 
@@ -7,16 +8,13 @@ export interface TimelineEvent {
 }
 type Pair={parent_id:string;listener_id:string;created_at:number};
 const hour=3600000;
-export function timelineInsert(env:Env,pair:Pair,event:TimelineEvent) {
+/** With `requiredID`, inserts only when the timeline already holds that row. */
+export function timelineInsert(env:Env,pair:Pair,event:TimelineEvent,requiredID?:string) {
+ const required=requiredID?' AND EXISTS(SELECT 1 FROM timeline_events WHERE parent_id=? AND listener_id=? AND pair_created_at=? AND id=?)':'';
  return env.DB.prepare(`INSERT INTO timeline_events(id,parent_id,listener_id,pair_created_at,kind,occurred_at,payload)
- SELECT ?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?)
- ON CONFLICT DO NOTHING`).bind(event.id,pair.parent_id,pair.listener_id,pair.created_at,event.kind,Date.parse(event.occurredAt),JSON.stringify(event),pair.parent_id,pair.listener_id,pair.created_at);
-}
-/** Inserts `event` only when the timeline already holds the row `requiredID`. */
-function timelineInsertIf(env:Env,pair:Pair,event:TimelineEvent,requiredID:string) {
- return env.DB.prepare(`INSERT INTO timeline_events(id,parent_id,listener_id,pair_created_at,kind,occurred_at,payload)
- SELECT ?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM timeline_events WHERE parent_id=? AND listener_id=? AND pair_created_at=? AND id=?)
- ON CONFLICT DO NOTHING`).bind(event.id,pair.parent_id,pair.listener_id,pair.created_at,event.kind,Date.parse(event.occurredAt),JSON.stringify(event),pair.parent_id,pair.listener_id,pair.created_at,requiredID);
+ SELECT ?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?)${required}
+ ON CONFLICT DO NOTHING`).bind(event.id,pair.parent_id,pair.listener_id,pair.created_at,event.kind,Date.parse(event.occurredAt),JSON.stringify(event),pair.parent_id,pair.listener_id,pair.created_at,
+  ...(requiredID?[pair.parent_id,pair.listener_id,pair.created_at,requiredID]:[]));
 }
 /** `afterMs` is when the gap counted as missing: 3 minutes, or a shorter alert delay. */
 export function missingHeartbeat(last:string,afterMs=180000):TimelineEvent {
@@ -55,8 +53,8 @@ export function heartbeatTimeline(env:Env,pair:Pair,beat:Heartbeat,previous:{rec
  // A second detector can confirm an earlier onset after the first heartbeat.
  // Only move that episode's start earlier; retries and other events stay stable.
  // A gap shorter than 3 minutes is history only if the cron recorded it for a
- // short alert delay; then close it here too.
- const restored=previous&&!events.some(e=>e.kind==='heartbeat_missing')?[timelineInsertIf(env,pair,
+ // short alert delay (1 minute at least); then close it here too.
+ const restored=previous&&now-Date.parse(previous.received_at)>connectionAlertDelays[0]*1000&&!events.some(e=>e.kind==='heartbeat_missing')?[timelineInsert(env,pair,
   {id:`restored:${previous.received_at}`,kind:'connection_restored',occurredAt:stamp,endAt:previous.received_at},`missing:${previous.received_at}`)]:[];
  return [...restored,env.DB.prepare(`INSERT INTO timeline_events(id,parent_id,listener_id,pair_created_at,kind,occurred_at,payload)
   SELECT json_extract(value,'$.id'),?,?,?,json_extract(value,'$.kind'),
