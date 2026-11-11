@@ -344,7 +344,7 @@ final class CalibrationAudioWriter: @unchecked Sendable {
                         captureID identifies a microphone tap, NOT the separate capture IDs in the sound analysis CSV.
                         Join with the separately exported sound analysis CSV by UTC audio-window timestamps. Do not infer silence from gaps.
                         sourceStartFrame is the input sample clock when available; use frame continuity within a capture to check gaps. AAC encoder delay/padding may affect decoded alignment.
-                        voiceProcessing marks echo processing while nursery sound is playing (and until capture is rebuilt). This is the same processed microphone input used by the detectors, not unprocessed room audio.
+                        voiceProcessing marks echo processing: on while nursery sound plays, after it ends until capture is rebuilt, and throughout monitoring started with the nursery app open. This is the same processed microphone input used by the detectors, not unprocessed room audio.
                         AAC is lossy: use original logged dBFS for volume threshold/timer sweeps. Re-running a classifier on decoded audio is an approximation; validate final settings live.
                         Retention: 7 days / 1 GiB, oldest first. Export before expiry. Share only with intended recipients: audio may include private conversations. This export contains retained audio only; export sound analysis CSV alongside it for settings, scores, alerts and coverage.
                         """

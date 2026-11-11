@@ -16,6 +16,13 @@ struct NurseryAudioFailure: Error {
     enum Stage: String, Sendable { case session, voiceProcessing = "voice_processing", input, synthesis, player, engine }
     let stage: Stage
     let underlying: any Error
+    /// iOS refused to reconfigure the session while this app was in the
+    /// background ('!int'). Measurement capture cannot switch to voice
+    /// processing on a locked Listener; nursery sound must start on it instead.
+    var blockedInBackground: Bool {
+        let error = underlying as NSError
+        return error.domain == NSOSStatusErrorDomain && error.code == AVAudioSession.ErrorCode.cannotInterruptOthers.rawValue
+    }
 }
 
 /// Actor boundary is injectable so operation ordering and capture restoration can
@@ -23,12 +30,19 @@ struct NurseryAudioFailure: Error {
 protocol AudioCaptureDriving: Sendable {
     var isRunning: Bool { get async }
     var engineID: ObjectIdentifier { get async }
-    func activate(generation: Int, clearSound: Bool) async throws
+    /// Returns whether capture runs with voice processing (`.voiceChat`).
+    func activate(generation: Int, clearSound: Bool, idleVoiceProcessing: Bool) async throws -> Bool
     func recoverConfiguration(generation: Int) async throws
     func stopSoundKeepingCapture(generation: Int) async throws -> Bool
     func setSound(_ state: NurserySoundState, capture: Bool, generation: Int) async throws
     func pause(generation: Int) async
     func stop(generation: Int) async
+    func setCaptureTestMode(_ mode: AudioCaptureTestMode, generation: Int) async throws -> AudioCaptureTestResult
+}
+extension AudioCaptureDriving {
+    func setCaptureTestMode(_ mode: AudioCaptureTestMode, generation: Int) async throws -> AudioCaptureTestResult {
+        throw AudioError.unavailable
+    }
 }
 
 @MainActor protocol AudioLevelProviding: AnyObject {
@@ -43,17 +57,23 @@ protocol AudioCaptureDriving: Sendable {
     func setClassificationEnabled(_ enabled: Bool)
     func setClassificationAppActive(_ active: Bool)
     func requestPermission() async -> Bool
-    func start() async throws
+    /// `idleVoiceProcessing` keeps capture ready for a remote nursery sound
+    /// while locked. Calibration passes false to measure the unprocessed room.
+    func start(idleVoiceProcessing: Bool) async throws
     func stop()
     func setNurserySound(_ request: NurserySoundRequest, commandID: UUID?) async throws
+    /// Diagnostics A/B test only. nil restores the mode the last Start chose.
+    func setCaptureTestMode(_ mode: AudioCaptureTestMode?) async throws -> AudioCaptureTestResult
 }
 extension AudioLevelProviding {
+    func setCaptureTestMode(_ mode: AudioCaptureTestMode?) async throws -> AudioCaptureTestResult { throw AudioError.unavailable }
     var calibrationAudio: CalibrationAudioRecording? { nil }
     var onClassification: ((SoundClassificationEvent) -> Void)? { get { nil } set {} }
     var otherAudioPlayingNow: Bool { false }
     func setClassificationEnabled(_ enabled: Bool) {}
     func setClassificationAppActive(_ active: Bool) {}
     func setNurserySound(_ request: NurserySoundRequest) async throws { try await setNurserySound(request, commandID: nil) }
+    func start() async throws { try await start(idleVoiceProcessing: false) }
 }
 /// RMS levels feed the existing detector. Bounded transient buffer copies feed
 /// an independent classifier and optional, local calibration recorder.
@@ -83,6 +103,11 @@ extension AudioLevelProviding {
     private let otherAudioPollInterval: Duration
     private let otherAudioResumeDelay: Duration
     private let reactivationRetryDelays: [Duration]
+    private let isForeground: @MainActor () -> Bool
+    /// The last Start asked for voice-processing capture. Recovery keeps it
+    /// only in the foreground: a locked Listener reactivates in .measurement,
+    /// the configuration known to activate in the background.
+    private var wantsIdleVoiceProcessing = false
     private var otherAudioTask: Task<Void, Never>?
     /// When other audio was last seen while paused. Resume needs a quiet stretch,
     /// since sounds such as Find My pulse and would otherwise flap detection.
@@ -109,7 +134,8 @@ extension AudioLevelProviding {
     init(driver: (any AudioCaptureDriving)? = nil, currentTime: @escaping () -> ContinuousClock.Instant = { .now },
          sampleStream: AsyncStream<AudioLevelSample>? = nil, otherAudioPlaying: (@MainActor () -> Bool)? = nil,
          otherAudioPollInterval: Duration = .milliseconds(250), otherAudioResumeDelay: Duration = .seconds(5),
-         reactivationRetryDelays: [Duration] = [.seconds(1), .seconds(3), .seconds(10)]) {
+         reactivationRetryDelays: [Duration] = [.seconds(1), .seconds(3), .seconds(10)],
+         isForeground: (@MainActor () -> Bool)? = nil) {
         let pair = AsyncStream<AudioLevelSample>.makeStream(bufferingPolicy: .bufferingNewest(16))
         let classifications = AsyncStream<SoundClassificationEvent>.makeStream(bufferingPolicy: .bufferingNewest(64))
         levels = sampleStream ?? pair.stream
@@ -126,6 +152,10 @@ extension AudioLevelProviding {
         self.otherAudioPollInterval = otherAudioPollInterval
         self.otherAudioResumeDelay = otherAudioResumeDelay
         self.reactivationRetryDelays = reactivationRetryDelays
+        // An injected driver has no real session; tests opt in explicitly.
+        if let isForeground { self.isForeground = isForeground }
+        else if driver == nil { self.isForeground = { UIApplication.shared.applicationState == .active } }
+        else { self.isForeground = { false } }
         classificationTask = Task { [weak self] in
             for await event in classifications.stream {
                 guard !Task.isCancelled else { break }
@@ -145,8 +175,9 @@ extension AudioLevelProviding {
     }
     deinit { classificationTask?.cancel(); otherAudioTask?.cancel() }
     func requestPermission() async -> Bool { await AVAudioApplication.requestRecordPermission() }
-    func start() async throws {
+    func start(idleVoiceProcessing: Bool) async throws {
         try Task.checkCancellation()
+        wantsIdleVoiceProcessing = idleVoiceProcessing
         // iOS does not guarantee an interruption-ended notification. A person's
         // Start tries to reactivate; activation fails while the interruption lasts.
         configurationRecoveryAttempts = 0
@@ -155,7 +186,9 @@ extension AudioLevelProviding {
         configuringGeneration = expected
         defer { if configuringGeneration == expected { configuringGeneration = nil } }
         do {
-            try await driver.activate(generation: expected, clearSound: false)
+            let voiceProcessing = try await driver.activate(generation: expected, clearSound: false,
+                                                            idleVoiceProcessing: idleVoiceProcessing && isForeground())
+            logCaptureMode(voiceProcessing, requested: idleVoiceProcessing)
             guard generation == expected, wantsMonitoring else { throw CancellationError() }
             try Task.checkCancellation()
             // Any interruption that began during activation bumped the generation.
@@ -281,6 +314,25 @@ extension AudioLevelProviding {
             throw error
         }
     }
+    func setCaptureTestMode(_ mode: AudioCaptureTestMode?) async throws -> AudioCaptureTestResult {
+        // Never reconfigure under a sound, an interruption or another operation.
+        guard wantsMonitoring, !interrupted, !nurseryState.playing, configuringGeneration == nil else { throw AudioError.unavailable }
+        generation += 1; let expected = generation
+        configuringGeneration = expected
+        defer { if configuringGeneration == expected { configuringGeneration = nil } }
+        let target = mode ?? (wantsIdleVoiceProcessing ? .voiceProcessing : .measurement)
+        let result = try await driver.setCaptureTestMode(target, generation: expected)
+        guard generation == expected, wantsMonitoring else { throw CancellationError() }
+        return result
+    }
+    private var recoveryVoiceProcessing: Bool { wantsIdleVoiceProcessing && isForeground() }
+    /// Code 1: voice processing, ready for remote sound while locked.
+    /// 0 after asking for it: measurement, so remote Play needs the nursery
+    /// iPhone until sound is started there. Not recorded for calibration.
+    private func logCaptureMode(_ voiceProcessing: Bool, requested: Bool) {
+        guard requested else { return }
+        log?.record("audio_capture_mode", code: voiceProcessing ? 1 : 0)
+    }
     private func report(_ status: AudioCaptureStatus) {
         reported = .other
         onStatus?(status)
@@ -334,8 +386,10 @@ extension AudioLevelProviding {
             do { try await Task.sleep(for: delay) } catch { return false }
             guard generation == expected, wantsMonitoring else { return false }
             do {
-                try await driver.activate(generation: expected, clearSound: true)
+                let voiceProcessing = try await driver.activate(generation: expected, clearSound: true,
+                                                                idleVoiceProcessing: recoveryVoiceProcessing)
                 guard generation == expected, wantsMonitoring else { return false }
+                logCaptureMode(voiceProcessing, requested: wantsIdleVoiceProcessing)
                 log?.record("audio_reactivation_recovered", code: index + 1)
                 return true
             } catch {
@@ -527,8 +581,10 @@ extension AudioLevelProviding {
         report(.recovering("Audio route changed. Recovering microphone…"))
         guard expected == generation else { return }
         do {
-            try await driver.activate(generation: expected, clearSound: true)
+            let voiceProcessing = try await driver.activate(generation: expected, clearSound: true,
+                                                            idleVoiceProcessing: recoveryVoiceProcessing)
             guard generation == expected, wantsMonitoring else { return }
+            logCaptureMode(voiceProcessing, requested: wantsIdleVoiceProcessing)
             logStop(stopped, phase: "stopped", reason: stopReason)
             logSound(phase: "capture_restored")
             reportActive()
@@ -559,6 +615,12 @@ private actor AudioCaptureDriver: AudioCaptureDriving {
     private var sound: NurserySoundSettings?
     private var player: AVAudioPlayerNode?
     private var buffers: [NurserySound: AVAudioPCMBuffer] = [:]
+    /// Keep capture in voice processing (.voiceChat) with an idle player even
+    /// when no sound plays. iOS refuses to switch a locked Listener from
+    /// .measurement to .voiceChat ('!int'), but a remote Play into an existing
+    /// voice-processing graph only schedules a buffer and needs no session change.
+    private var idleVoiceProcessing = false
+    private var voiceProcessing: Bool { sound != nil || (captureEnabled && idleVoiceProcessing) }
     init(continuation: AsyncStream<AudioLevelSample>.Continuation,
          classificationControl: SoundClassificationControl,
          classificationEvents: AsyncStream<SoundClassificationEvent>.Continuation,
@@ -583,14 +645,24 @@ private actor AudioCaptureDriver: AudioCaptureDriving {
         player?.play()
     }
 
-    func activate(generation requested: Int, clearSound: Bool) throws {
+    func activate(generation requested: Int, clearSound: Bool, idleVoiceProcessing requestedVoiceProcessing: Bool) throws -> Bool {
         try Task.checkCancellation()
         guard requested >= generation else { throw CancellationError() }; generation = requested
         if clearSound { sound = nil }
-        captureEnabled = true
+        captureEnabled = true; idleVoiceProcessing = requestedVoiceProcessing
         try rebuild()
+        return voiceProcessing
     }
     private func rebuild(cancellable: Bool = true) throws {
+        do { try build(cancellable: cancellable) }
+        catch where sound == nil && captureEnabled && idleVoiceProcessing && !(error is CancellationError) {
+            // Measurement capture is the configuration known to activate while
+            // locked. Monitoring matters more than remote sound start.
+            idleVoiceProcessing = false
+            try build(cancellable: cancellable)
+        }
+    }
+    private func build(cancellable: Bool) throws {
         tearDown()
         // Release the old input/output graph before changing the session or
         // enabling voice processing on a new engine.
@@ -599,7 +671,7 @@ private actor AudioCaptureDriver: AudioCaptureDriving {
         var stage = NurseryAudioFailure.Stage.session
         do {
             if captureEnabled {
-                try session.setCategory(.playAndRecord, mode: sound == nil ? .measurement : .voiceChat,
+                try session.setCategory(.playAndRecord, mode: voiceProcessing ? .voiceChat : .measurement,
                                         options: AudioSessionPolicy.captureOptions)
             } else { try session.setCategory(.playback, mode: .default, options: AudioSessionPolicy.playbackOptions) }
             try session.setPreferredIOBufferDuration(0.02)
@@ -609,12 +681,12 @@ private actor AudioCaptureDriver: AudioCaptureDriving {
                 // Playback goes through this engine's output so Voice Processing
                 // receives its echo reference. Never connect the mic to the mixer.
                 stage = .voiceProcessing
-                if sound != nil { try input.setVoiceProcessingEnabled(true); input.isVoiceProcessingAGCEnabled = false }
+                if voiceProcessing { try input.setVoiceProcessingEnabled(true); input.isVoiceProcessingAGCEnabled = false }
                 stage = .input
                 try captureTap.replace(on: input)
             }
             stage = .player
-            if let sound { try preparePlayer(sound) }
+            if let sound { try preparePlayer(sound) } else if voiceProcessing { try preparePlayer(nil) }
             if cancellable { try Task.checkCancellation() }
             stage = .engine
             engine.prepare(); try engine.start(); player?.play()
@@ -645,6 +717,8 @@ private actor AudioCaptureDriver: AudioCaptureDriving {
                     }
                 } else { tearDown(); deactivateSession() }
             } else if !captureChanged, engine.isRunning, let player {
+                // A sound needs echo cancellation; end any A/B-test bypass.
+                if capture, engine.inputNode.isVoiceProcessingEnabled { engine.inputNode.isVoiceProcessingBypassed = false }
                 if previous?.sound != sound?.sound {
                     player.stop()
                     let buffer = try buffer(for: state.settings.sound)
@@ -661,6 +735,31 @@ private actor AudioCaptureDriver: AudioCaptureDriving {
         guard captureEnabled, sound != nil, engine.isRunning, let player else { return false }
         player.stop(); sound = nil
         return true
+    }
+    func setCaptureTestMode(_ mode: AudioCaptureTestMode, generation requested: Int) throws -> AudioCaptureTestResult {
+        guard requested >= generation else { throw CancellationError() }; generation = requested
+        guard captureEnabled, sound == nil else { throw AudioError.unavailable }
+        let processing = engine.isRunning && engine.inputNode.isVoiceProcessingEnabled
+        var rebuilt = false, failure: String?
+        switch mode {
+        case .measurement:
+            if processing || !engine.isRunning { idleVoiceProcessing = false; try build(cancellable: false); rebuilt = true }
+        case .voiceProcessing, .bypassed:
+            if !processing {
+                idleVoiceProcessing = true; rebuilt = true
+                do { try build(cancellable: false) } catch {
+                    // Expected while locked ('!int'). Keep monitoring in measurement.
+                    let underlying = ((error as? NurseryAudioFailure)?.underlying ?? error) as NSError
+                    failure = "\(underlying.domain):\(underlying.code)"
+                    idleVoiceProcessing = false; try build(cancellable: false)
+                }
+            }
+            if engine.inputNode.isVoiceProcessingEnabled { engine.inputNode.isVoiceProcessingBypassed = mode == .bypassed }
+        }
+        let input = engine.inputNode
+        return AudioCaptureTestResult(voiceProcessing: input.isVoiceProcessingEnabled,
+                                      bypassed: input.isVoiceProcessingEnabled && input.isVoiceProcessingBypassed,
+                                      rebuilt: rebuilt, failure: failure)
     }
     private func buffer(for sound: NurserySound) throws -> AVAudioPCMBuffer {
         if let buffer = buffers[sound] { return buffer }
@@ -693,12 +792,16 @@ private actor AudioCaptureDriver: AudioCaptureDriving {
         }
         buffers[sound] = buffer; return buffer
     }
-    private func preparePlayer(_ settings: NurserySoundSettings) throws {
-        let buffer = try buffer(for: settings.sound)
+    /// Without settings the player is connected but silent, ready for a later
+    /// Play to schedule a buffer without rebuilding the graph. Both sounds
+    /// share one format, so the white-noise format fits either.
+    private func preparePlayer(_ settings: NurserySoundSettings?) throws {
+        let buffer = try buffer(for: settings?.sound ?? .whiteNoise)
         let player = AVAudioPlayerNode(); engine.attach(player)
         engine.connect(player, to: engine.mainMixerNode, format: buffer.format)
         // The system volume is the only user-facing volume control.
-        player.volume = 1; player.scheduleBuffer(buffer, at: nil, options: .loops)
+        player.volume = 1
+        if settings != nil { player.scheduleBuffer(buffer, at: nil, options: .loops) }
         self.player = player
     }
     func pause(generation requested: Int) {
@@ -707,7 +810,7 @@ private actor AudioCaptureDriver: AudioCaptureDriving {
     }
     func stop(generation requested: Int) {
         guard requested >= generation else { return }; generation = requested
-        captureEnabled = false; sound = nil
+        captureEnabled = false; sound = nil; idleVoiceProcessing = false
         tearDown(); deactivateSession()
     }
     private func tearDown() {

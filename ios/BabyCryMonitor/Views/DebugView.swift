@@ -143,6 +143,18 @@ struct DebugView: View {
                 }
             }
             if model.role == .listener {
+                Section {
+                    if model.captureTestRunning {
+                        Button("Stop audio mode test", role: .destructive) { model.stopCaptureTest() }
+                    } else {
+                        Button("Start 2-minute audio mode test") { model.startCaptureTest() }
+                            .disabled(!model.monitoring)
+                            .accessibilityIdentifier("startCaptureTest")
+                    }
+                    if let status = model.captureTestStatus { Text(status).font(.footnote) }
+                } header: { Text("Audio mode A/B test") } footer: {
+                    Text("Requires monitoring. Every 15 seconds the microphone switches between measurement and voice processing, for 2 minutes. The screen stays on during the test. Play the same sounds near this iPhone throughout, some quiet and some loud. Alerts still go out. Export sound analysis afterwards.")
+                }
                 Section("Cry classifier observations") {
                     if let confidence = model.log.soundAnalysis.latestConfidence,
                        let at = model.log.soundAnalysis.latestScoreAt {

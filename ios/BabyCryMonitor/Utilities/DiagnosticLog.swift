@@ -39,7 +39,7 @@ import Observation
         "paired_successfully", "pairing_created", "pairing_failed", "credential_failed", "metadata_load_failed",
         "monitoring_started", "monitoring_stopped", "monitoring_paused", "monitoring_start_failed", "microphone_permission_denied",
         "test_push_queued", "audio_active", "audio_recovering", "audio_interrupted", "audio_stalled", "audio_recovery_limit",
-        "audio_interruption_began", "audio_interruption_ended", "audio_other_playing", "audio_other_stopped", "audio_reactivation_recovered", "audio_reactivation_failed", "audio_route_changed", "audio_services_reset", "audio_engine_changed",
+        "audio_interruption_began", "audio_interruption_ended", "audio_other_playing", "audio_other_stopped", "audio_reactivation_recovered", "audio_reactivation_failed", "audio_route_changed", "audio_services_reset", "audio_engine_changed", "audio_capture_mode", "audio_capture_test",
         "crying_started", "possible_cry", "crying_ended", "crying_resumed", "quiet_gap_started",
         "alert_threshold_reached", "classifier_alert_threshold_reached", "metadata_write_failed", "alert_apns_accepted", "alert_acknowledged",
         "alert_delivery_failed", "alert_uncertain", "alert_blocked", "alert_server_pending", "alert_retry_scheduled", "alert_retry_after_recovery",
@@ -180,7 +180,7 @@ import Observation
         }
         let reasons = ["user_stop", "timer_expired", "microphone_stop", "interruption", "route_change", "media_services_reset",
                        "engine_configuration_changed", "playback_failed", "start_failed", "replaced", "expired", "unavailable",
-                       "playbackFailed", "connection_lost", "context_changed", "confirmation_timeout", "transport", "superseded", "invalid_message"]
+                       "playbackFailed", "background_blocked", "backgroundBlocked", "connection_lost", "context_changed", "confirmation_timeout", "transport", "superseded", "invalid_message"]
         if let reason, reasons.contains(reason) { entry += " reason=\(reason)" }
         if let elapsedMS { entry += " elapsed_ms=\(min(3_600_000, max(0, elapsedMS))) elapsed_source=monotonic" }
         if let captureMode, ["measurement", "voiceChat", "playback", "inactive"].contains(captureMode) { entry += " capture_mode=\(captureMode)" }

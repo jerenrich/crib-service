@@ -4,6 +4,22 @@ import Observation
 import BackgroundTasks
 #endif
 
+/// Capture configurations compared by the Diagnostics A/B test. `bypassed`
+/// keeps the .voiceChat session and Voice Processing I/O but bypasses its
+/// microphone processing, so it toggles without a session change.
+enum AudioCaptureTestMode: String, CaseIterable, Sendable {
+    case measurement, voiceProcessing = "voice_processing", bypassed
+}
+struct AudioCaptureTestResult: Sendable, Equatable {
+    var voiceProcessing: Bool
+    var bypassed: Bool
+    /// The graph was rebuilt (session reconfigured), not toggled live.
+    var rebuilt: Bool
+    /// "domain:code" when the requested mode could not be applied. Capture
+    /// was restored in the previous working configuration.
+    var failure: String?
+}
+
 /// Continuous research telemetry has its own retention budget, independent of
 /// the short operational diagnostic ring. No audio or device credentials enter it.
 @MainActor @Observable final class SoundAnalysisLog {
@@ -163,6 +179,22 @@ import BackgroundTasks
         classifierStatus = enabled ? "Waiting for microphone audio" : "Monitoring paused or stopped"
         append(kind: enabled ? "monitoring_start" : "monitoring_stop", at: at)
         if !enabled { Task { await flush() } }
+    }
+    /// Diagnostics A/B test marker. Level and classification rows after it,
+    /// until the next marker, were captured in this mode.
+    func captureTest(phase: String, testID: UUID, mode: AudioCaptureTestMode?, result: AudioCaptureTestResult?,
+                     failure: String?, appActive: Bool, microphoneMode: String? = nil, at: Date = Date()) {
+        guard ["start", "segment", "end", "cancelled"].contains(phase) else { return }
+        var detail = "test_id=\(testID.uuidString.lowercased());phase=\(phase);app_active=\(appActive)"
+        if let mode { detail += ";mode=\(mode.rawValue)" }
+        if let result {
+            detail += ";voice_processing=\(result.voiceProcessing);bypassed=\(result.bypassed);rebuilt=\(result.rebuilt)"
+        }
+        if let failure = failure ?? result?.failure { detail += ";failure=\(failure)" }
+        if let microphoneMode, ["standard", "wide_spectrum", "voice_isolation", "unknown"].contains(microphoneMode) {
+            detail += ";mic_mode=\(microphoneMode)"
+        }
+        append(kind: "capture_test", at: at, detail: detail)
     }
     private func append(kind: String, at: Date, detail: String = "") {
         var row = emptyRow(kind: kind, at: at); row[18] = detail; enqueue(row)
