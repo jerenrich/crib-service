@@ -379,7 +379,7 @@ final class SoundAnalysisLogTests: XCTestCase {
         let data = try rows(in: export)
         let levels = data.filter { $0[2] == "level" }
         XCTAssertTrue(try XCTUnwrap(data.first { $0[2] == "capture_start" })[18]
-            .contains("window_s=4;overlap=0.75"))
+            .contains("window_s=4;overlap=0.75;confidence_threshold=0.60"))
         XCTAssertEqual(levels.count, 3)
         XCTAssertEqual(levels.map { $0[9] }, ["0", "1", "1"])
         XCTAssertEqual(levels.map { $0[10] }, ["quiet", "possibleCry", "crying"])

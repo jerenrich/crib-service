@@ -97,6 +97,9 @@ function send(e, msg) {
 }
 
 const owner = new Map();       // night id -> engine
+// Bumped when the run index changes: replays "as recorded" depend on it.
+let runsVersion = 0;
+const cacheKey = (id, settings) => `${runsVersion}|${id}|${settingsKey(settings)}`;
 const simCache = new Map();    // `${id}|${settingsKey}` -> result
 const simPending = new Map();  // same key -> job
 const shown = new Map();       // night id -> last result drawn (kept while the next one computes)
@@ -106,7 +109,7 @@ function remember(key, result) {
   simCache.set(key, result);
 }
 function simulateNight(id, settings, prio, isStale) {
-  const key = id + '|' + settingsKey(settings);
+  const key = cacheKey(id, settings);
   const hit = simCache.get(key);
   if (hit) return Promise.resolve(hit);
   let job = simPending.get(key);
@@ -141,11 +144,11 @@ function updateBusy() { $('busy').classList.toggle('on', simPending.size > 0 || 
 
 /// The result for a night with the current settings, or the last one shown while it computes.
 function resultFor(id) {
-  const r = simCache.get(id + '|' + settingsKey(state.settings));
+  const r = simCache.get(cacheKey(id, state.settings));
   if (r) { shown.set(id, r); return r; }
   return shown.get(id) ?? null;
 }
-const isFresh = (id) => simCache.has(id + '|' + settingsKey(state.settings));
+const isFresh = (id) => simCache.has(cacheKey(id, state.settings));
 
 // ---------- loading ----------
 const loadingNow = new Map();
@@ -161,6 +164,7 @@ function loadNight(id, { quiet = false } = {}) {
     .then(({ view }) => {
       owner.set(id, e); state.data.set(id, { ...view, id, night });
       setStatus(statusLine(), state.offline);
+      scheduleRunsSync();
       return true;
     }, (err) => {
       e.nights--;
@@ -178,6 +182,29 @@ async function loadRecentInBackground() {
   };
   await Promise.all(engines.map(next));
 }
+// Each load caches more logs, which can reveal markers for runs that earlier
+// nights belong to. When the server's run index changes, have the workers
+// re-resolve their nights' classifier thresholds and replay again.
+let lastRuns = null, runsTimer = null;
+function scheduleRunsSync() { clearTimeout(runsTimer); runsTimer = setTimeout(syncRuns, 400); }
+async function syncRuns() {
+  let runs;
+  try { runs = await (await api('/api/runs')).json(); } catch { return; }
+  const key = JSON.stringify(runs);
+  if (key === lastRuns) return;
+  const first = lastRuns === null;
+  lastRuns = key;
+  const replies = await Promise.all(engines.map((e) => send(e, { type: 'runs', runs }).catch(() => null)));
+  let changed = false;
+  for (const reply of replies) {
+    for (const [id, changes] of Object.entries(reply?.changes ?? {})) {
+      const data = state.data.get(id); if (!data) continue;
+      if (JSON.stringify(data.settingsChanges) !== JSON.stringify(changes)) { data.settingsChanges = changes; changed = true; }
+    }
+  }
+  if (changed || !first) { runsVersion++; refresh(); }
+}
+
 function statusLine() {
   const n = state.data.size;
   return `${state.offline ? 'Phone not reachable, using cached logs' : 'Connected to the Listener'} · ${n} night${n === 1 ? '' : 's'} loaded`;
@@ -207,32 +234,42 @@ function changeLabels(op) {
   store.set('labels', state.labels); store.set('pendingLabelOps', pendingOps);
   flushLabels();
 }
+const postOps = (ops) => fetch('/api/labels', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ops }) });
 function flushLabels() {
   if (flushing) return flushing;
   flushing = (async () => {
     let rejected = 0;
     try {
       while (pendingOps.length) {
+        // Send the queue in one batch; if the server refuses it, send the changes
+        // one at a time so only the ones it refuses are dropped.
         const batch = pendingOps.slice();
-        const res = await fetch('/api/labels', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ops: batch }) });
+        let res = await postOps(batch), sent = batch.length;
         if (res.status === 400) {
-          // The server will never accept these: drop them rather than block every later change.
-          pendingOps = pendingOps.slice(batch.length); store.set('pendingLabelOps', pendingOps);
-          rejected += batch.length;
-          state.labels = applyOps(await (await api('/api/labels')).json(), pendingOps); store.set('labels', state.labels);
-          renderAll();
-          continue;
+          sent = 1;
+          res = await postOps(batch.slice(0, 1));
+          if (res.status === 400) {  // this change can never be saved: drop it, keep the rest
+            pendingOps = pendingOps.slice(1); store.set('pendingLabelOps', pendingOps);
+            rejected++;
+            continue;
+          }
         }
         if (!res.ok) throw new Error(`saving labels failed: ${res.status}`);
         const saved = await res.json();
-        pendingOps = pendingOps.slice(batch.length);
+        pendingOps = pendingOps.slice(sent);
         store.set('pendingLabelOps', pendingOps);
         // The server's list, plus anything changed while this batch was in flight.
         state.labels = applyOps(saved, pendingOps); store.set('labels', state.labels);
       }
-      setStatus(rejected ? `${rejected} label change${rejected === 1 ? ' was' : 's were'} rejected by the lab server and dropped` : statusLine(), rejected > 0 || state.offline);
+      if (rejected) {
+        // Show the server's list again, without the refused changes.
+        try { state.labels = applyOps(await (await api('/api/labels')).json(), pendingOps); store.set('labels', state.labels); } catch { /* next load */ }
+        renderAll();
+      }
+      setStatus(rejected ? `${rejected} label change${rejected === 1 ? ' was' : 's were'} refused by the lab server and dropped` : statusLine(), rejected > 0 || state.offline);
     } catch {
-      setStatus(`Labels not saved to the lab server yet (${pendingOps.length} change${pendingOps.length === 1 ? '' : 's'} kept in this browser)`, true);
+      setStatus(`Labels not saved to the lab server yet (${pendingOps.length} change${pendingOps.length === 1 ? '' : 's'} kept in this browser)`
+        + (rejected ? `; ${rejected} refused and dropped` : ''), true);
     } finally { flushing = null; }
   })();
   return flushing;
@@ -302,7 +339,7 @@ function peakAround(data, from, to) {
 function score(ids, settings) {
   let alerts = 0, falseAlarms = 0, unlabeled = 0, cries = 0, caught = 0, missing = 0;
   for (const id of ids) {
-    const res = settings ? simCache.get(id + '|' + settingsKey(settings)) : resultFor(id);
+    const res = settings ? simCache.get(cacheKey(id, settings)) : resultFor(id);
     if (!res) { missing++; continue; }
     const night = state.data.get(id).night, windows = res.alerts.map(alertWindow);
     alerts += res.alerts.length;

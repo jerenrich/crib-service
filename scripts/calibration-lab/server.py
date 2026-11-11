@@ -165,48 +165,62 @@ class Device:
             self.refreshing.discard(target)
 
 
-_run_cache, _run_lock = {}, threading.Lock()
+_run_cache, _run_lock = {}, threading.Lock()  # file name -> (bytes scanned, {run: info})
+RUN_ID = re.compile(rb"^[^,]*,([0-9a-f-]{36}),")
+THRESHOLD = re.compile(rb"confidence_threshold=([0-9.]+)")
 
 
-def _scan_runs(data):
-    """Run ids with a run_start (and whether it named an alert policy) or a
-    confidence_threshold marker, found by searching for the markers directly."""
-    found = {}
-    def line_at(i):
-        start = data.rfind(b"\n", 0, i) + 1
-        end = data.find(b"\n", i)
-        return data[start:end if end >= 0 else len(data)]
-    i = data.find(b",run_start,")
-    while i >= 0:
-        line = line_at(i)
-        run = line.split(b",", 2)[1].decode()
-        found.setdefault(run, {})["policy"] = b"alert_policy=" in line
-        i = data.find(b",run_start,", i + 1)
-    i = data.find(b"confidence_threshold=")
-    while i >= 0:
-        line = line_at(i)
-        run = line.split(b",", 2)[1].decode()
-        value = re.match(rb"confidence_threshold=([0-9.]+)", data[i:i + 40])
-        if value:
-            found.setdefault(run, {}).setdefault("threshold", float(value.group(1)))
-        # one marker per run is enough: skip to the next line
-        nl = data.find(b"\n", i)
-        i = data.find(b"confidence_threshold=", nl) if nl >= 0 else -1
-    return found
+def _scan_runs(data, found):
+    """Add run markers from complete lines in `data` to `found`: whether a
+    run_start named an alert policy, and the first confidence_threshold seen.
+    Searches for the markers directly; lines that don't parse are skipped."""
+    lines = set()
+    for marker in (b",run_start,", b"confidence_threshold="):
+        i = data.find(marker)
+        while i >= 0:
+            lines.add(data.rfind(b"\n", 0, i) + 1)
+            nl = data.find(b"\n", i)
+            i = data.find(marker, nl) if nl >= 0 else -1
+    for start in sorted(lines):
+        end = data.find(b"\n", start)
+        line = data[start:end if end >= 0 else len(data)]
+        run = RUN_ID.match(line)
+        if not run:
+            continue
+        info = found.setdefault(run.group(1).decode("ascii"), {})
+        if b",run_start," in line:
+            info["policy"] = info.get("policy", False) or b"alert_policy=" in line
+        mark = THRESHOLD.search(line)
+        if mark and "threshold" not in info:
+            try:
+                info["threshold"] = float(mark.group(1))
+            except ValueError:
+                pass
 
 
 def run_index():
     """Per run id, from every cached sound log: its classifier threshold marker
     (if any row logged one) and whether its run_start carried an alert policy.
     A night's own files often don't include its run's start, so the replay asks
-    for this instead. Each file is scanned once per size."""
+    for this instead. Each file is scanned once; a growing log only from where
+    the last scan stopped."""
     runs = {}
     with _run_lock:
         for path in sorted((DATA / "sound").glob("sound-*.csv")):
-            key = (path.name, path.stat().st_size)
-            if key not in _run_cache:
-                _run_cache[key] = _scan_runs(path.read_bytes())
-            for run, info in _run_cache[key].items():
+            size = path.stat().st_size
+            scanned, found = _run_cache.get(path.name, (0, {}))
+            if size < scanned:  # replaced by a shorter copy: start again
+                scanned, found = 0, {}
+            if size > scanned:
+                with open(path, "rb") as f:
+                    f.seek(scanned)
+                    chunk = f.read(size - scanned)
+                end = chunk.rfind(b"\n") + 1  # only complete lines; the rest waits for more data
+                found = {k: dict(v) for k, v in found.items()}
+                _scan_runs(chunk[:end], found)
+                scanned += end
+                _run_cache[path.name] = (scanned, found)
+            for run, info in found.items():
                 merged = runs.setdefault(run, {"threshold": None, "policy": False})
                 if merged["threshold"] is None and info.get("threshold") is not None:
                     merged["threshold"] = info["threshold"]

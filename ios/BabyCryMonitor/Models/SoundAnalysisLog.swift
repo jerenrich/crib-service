@@ -95,7 +95,7 @@ import BackgroundTasks
                 latestConfidence = nil; latestScoreAt = nil; classifierStatus = "Listening for classifications"
             }
             var row = emptyRow(kind: "capture_start", at: at); row[3] = id.uuidString.lowercased()
-            row[18] = "classifier=version1;window_s=\(number(CryConfidenceDetector.windowDuration, digits: 0));overlap=\(number(CryConfidenceDetector.overlapFactor, digits: 2));sample_rate=\(number(rate, digits: 0));voice_processing=\(voiceProcessing);reason=\(reason.rawValue)"
+            row[18] = "classifier=version1;window_s=\(number(CryConfidenceDetector.windowDuration, digits: 0));overlap=\(number(CryConfidenceDetector.overlapFactor, digits: 2));confidence_threshold=\(CryConfidenceDetector.thresholdDescription);sample_rate=\(number(rate, digits: 0));voice_processing=\(voiceProcessing);reason=\(reason.rawValue)"
             enqueue(context(row))
         case .result(let score):
             guard score.confidence.isFinite, (0...1).contains(score.confidence), score.windowEnd >= score.windowStart else { return }

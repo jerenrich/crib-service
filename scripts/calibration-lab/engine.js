@@ -1,7 +1,7 @@
 // A background worker that owns some nights: it fetches and parses their logs,
 // keeps the parsed columns, and runs simulations on request, so the page never
 // blocks on either. The page gets a slim copy of each night for drawing.
-import { parseNight } from './parse.js';
+import { parseNight, resolveRunThresholds } from './parse.js';
 import { simulate } from './detector.js';
 
 const nights = new Map();
@@ -12,12 +12,10 @@ async function fetchText(name) {
   return res.text();
 }
 
-// Run markers from all cached logs (a night's own files often miss its run's start).
-let runsPromise = null;
-function fetchRuns() {
-  runsPromise ??= fetch('/api/runs').then((r) => (r.ok ? r.json() : {})).catch(() => ({}));
-  return runsPromise;
-}
+// Run markers from all cached logs (a night's own files often miss its run's
+// start). Fetched for each load, since the cache grows as nights load; the page
+// sends a newer index later with {type: 'runs'}.
+const fetchRuns = () => fetch('/api/runs').then((r) => (r.ok ? r.json() : {})).catch(() => ({}));
 
 self.onmessage = async ({ data: m }) => {
   try {
@@ -33,6 +31,11 @@ self.onmessage = async ({ data: m }) => {
       };
       self.postMessage({ req: m.req, view },
         [view.levels.t.buffer, view.levels.db.buffer, view.scores.at.buffer, view.scores.conf.buffer]);
+    } else if (m.type === 'runs') {
+      // Re-resolve each night's per-run classifier thresholds with a newer index.
+      const changes = {};
+      for (const [id, night] of nights) changes[id] = resolveRunThresholds(night.settingsChanges, night.runs, m.runs);
+      self.postMessage({ req: m.req, changes });
     } else if (m.type === 'sim') {
       const night = nights.get(m.id);
       if (!night) throw new Error('night not loaded');

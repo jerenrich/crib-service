@@ -20,7 +20,8 @@ const files = fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => /^sound-.*\
 if (!files.length) { console.error(`No cached logs in ${dir}. Open the lab once to fetch them.`); process.exit(2); }
 files.sort((a, b) => a.split('-')[4] - b.split('-')[4]);
 
-const night = parseNight(files.map((f) => fs.readFileSync(path.join(dir, f), 'utf8')));
+const texts = files.map((f) => fs.readFileSync(path.join(dir, f), 'utf8'));
+const night = parseNight(texts);
 const runStartBefore = (t) => {
   let best = -Infinity;
   for (const m of night.monitoring) if (m.kind === 'run_start' && m.t <= t && m.t > best) best = m.t;
@@ -61,17 +62,20 @@ report(r);
 
 // Night by night, as the page loads them: only that night's files, run markers
 // from the whole cache (as /api/runs serves them), and a deliberately wrong
-// classifier slider, so a run whose threshold isn't found shows up.
+// classifier slider, so a run whose threshold isn't found shows up. Each replay
+// starts WARMUP seconds early so an episode under way at 18:00 is replayed as
+// the phone saw it; alerts are compared from 18:00.
+const WARMUP = 1800;
 const starts = files.map((f) => +f.split('-')[4] / 1000);
 let nightMismatches = 0, nights = 0, nightAlerts = 0;
 const first = new Date(strictFrom * 1000); first.setHours(18, 0, 0, 0);  // nights run 18:00 to 11:00, local time
 if (first.getTime() / 1000 > strictFrom) first.setDate(first.getDate() - 1);
 for (const d = first; d.getTime() / 1000 < Date.now() / 1000; d.setDate(d.getDate() + 1)) {
   const f = d.getTime() / 1000, t = f + 17 * 3600;
-  const mine = files.filter((_, i) => starts[i] < t && (starts[i + 1] ?? Infinity) > f);
+  const mine = texts.filter((_, i) => starts[i] < t && (starts[i + 1] ?? Infinity) > f - WARMUP);
   nights++;
   if (!mine.length) continue;
-  const one = parseNight(mine.map((x) => fs.readFileSync(path.join(dir, x), 'utf8')), f, t, { runs: night.runs });
+  const one = parseNight(mine, f - WARMUP, t, { runs: night.runs });
   const lo = Math.max(f, strictFrom);
   const sentN = one.recordedAlerts.filter((a) => a.t >= lo).map((a) => a.t);
   const simN = simulate(one, { asRecorded: true, classifierThreshold: 0.3 }).alerts.map((a) => a.alertAt).filter((x) => x >= lo);

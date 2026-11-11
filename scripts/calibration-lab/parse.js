@@ -27,6 +27,21 @@ function detailValue(detail, key) {
 }
 
 /**
+ * Set each settings change's classifierThreshold from its run's markers: those
+ * in the night's own logs first, then `runs` (all cached logs). A run with an
+ * alert policy but no marker is an early time-coverage build: 0.80. null means
+ * unknown, and the replay uses the configured threshold.
+ */
+export function resolveRunThresholds(changes, localRuns, runs = {}) {
+  for (const ch of changes) {
+    const mine = localRuns[ch.run], known = runs[ch.run];
+    const threshold = mine?.threshold ?? known?.threshold ?? null;
+    ch.classifierThreshold = threshold ?? (mine?.policy || known?.policy ? 0.8 : null);
+  }
+  return changes;
+}
+
+/**
  * Parse one or more CSV texts (in chronological order) and keep rows in
  * [from, to) seconds. Rows are kept in packed columns (a week of nights is
  * millions of rows); `order`/`at` give the replay order as (kind, index) pairs.
@@ -121,13 +136,9 @@ export function parseNight(texts, from = -Infinity, to = Infinity, { runs = {} }
       }
     }
   }
-  for (const ch of changes) {
-    const known = runs[ch.run], threshold = runThreshold.get(ch.run) ?? known?.threshold ?? null;
-    const policy = policyRuns.has(ch.run) || !!known?.policy;
-    // null: the run's threshold is unknown, so the replay uses the configured one.
-    ch.classifierThreshold = threshold ?? (policy ? 0.8 : null);
-    delete ch.run;
-  }
+  const localRuns = Object.fromEntries([...new Set([...runThreshold.keys(), ...policyRuns])]
+    .map((r) => [r, { threshold: runThreshold.get(r) ?? null, policy: policyRuns.has(r) }]));
+  resolveRunThresholds(changes, localRuns, runs);
   let recordedSettings = null, best = 0;
   for (const [key, n] of settingsSeen) {
     if (n > best) {
@@ -143,8 +154,7 @@ export function parseNight(texts, from = -Infinity, to = Infinity, { runs = {} }
   return {
     recordedAlerts, recordedSettings, monitoring, otherSettings, caps, settingsChanges: changes,
     // Run markers seen in these texts, in the shape parseNight's `runs` option takes.
-    runs: Object.fromEntries([...new Set([...runThreshold.keys(), ...policyRuns])]
-      .map((r) => [r, { threshold: runThreshold.get(r) ?? null, policy: policyRuns.has(r) }])),
+    runs: localRuns,
     legacy: recordedAlerts.some((a) => a.legacy),
     order: Uint8Array.from(order), at: Uint32Array.from(at),
     levels: { t: f64(L.t), db: f64(L.db), cap: Int32Array.from(L.cap), sf: f64(L.sf), ef: f64(L.ef), sr: f64(L.sr) },
