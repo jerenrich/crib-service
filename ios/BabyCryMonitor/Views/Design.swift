@@ -69,13 +69,13 @@ struct SteppedSlider: View {
     var identifier: String
     let commit: (Double) async -> Void
     @State private var draft: Int?
-    @State private var saving: Int?
+    @State private var saving = SliderSaveTracker()
     @State private var editing = false
 
     private var nearest: Int {
         stops.indices.min { abs(stops[$0] - value) < abs(stops[$1] - value) } ?? 0
     }
-    private var shownIndex: Int? { draft ?? saving }
+    private var shownIndex: Int? { draft ?? saving.index }
     private var shown: Double { shownIndex.map { stops[$0] } ?? value }
 
     var body: some View {
@@ -111,10 +111,23 @@ struct SteppedSlider: View {
         let chosen = stops[draft]
         self.draft = nil
         guard chosen != value else { return }
-        saving = draft
+        let save = saving.begin(draft)
         Task {
             await commit(chosen)
-            if saving == draft { saving = nil }
+            saving.end(save)
         }
+    }
+}
+
+/// The stop a slider shows while saves run. Only the latest save's completion
+/// clears it, so an earlier save finishing cannot snap the thumb back.
+struct SliderSaveTracker: Equatable {
+    private(set) var index: Int?
+    private var latest = 0
+    mutating func begin(_ index: Int) -> Int {
+        latest += 1; self.index = index; return latest
+    }
+    mutating func end(_ save: Int) {
+        if save == latest { index = nil }
     }
 }
