@@ -12,8 +12,15 @@ export function timelineInsert(env:Env,pair:Pair,event:TimelineEvent) {
  SELECT ?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?)
  ON CONFLICT DO NOTHING`).bind(event.id,pair.parent_id,pair.listener_id,pair.created_at,event.kind,Date.parse(event.occurredAt),JSON.stringify(event),pair.parent_id,pair.listener_id,pair.created_at);
 }
-export function missingHeartbeat(last:string):TimelineEvent {
- return {id:`missing:${last}`,kind:'heartbeat_missing',occurredAt:new Date(Date.parse(last)+180000).toISOString(),endAt:last};
+/** Inserts `event` only when the timeline already holds the row `requiredID`. */
+function timelineInsertIf(env:Env,pair:Pair,event:TimelineEvent,requiredID:string) {
+ return env.DB.prepare(`INSERT INTO timeline_events(id,parent_id,listener_id,pair_created_at,kind,occurred_at,payload)
+ SELECT ?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM timeline_events WHERE parent_id=? AND listener_id=? AND pair_created_at=? AND id=?)
+ ON CONFLICT DO NOTHING`).bind(event.id,pair.parent_id,pair.listener_id,pair.created_at,event.kind,Date.parse(event.occurredAt),JSON.stringify(event),pair.parent_id,pair.listener_id,pair.created_at,requiredID);
+}
+/** `afterMs` is when the gap counted as missing: 3 minutes, or a shorter alert delay. */
+export function missingHeartbeat(last:string,afterMs=180000):TimelineEvent {
+ return {id:`missing:${last}`,kind:'heartbeat_missing',occurredAt:new Date(Date.parse(last)+afterMs).toISOString(),endAt:last};
 }
 // Local transitions survive offline stop/restart cycles. Server observations support
 // older Listeners and bound coverage without turning every heartbeat into a log row.
@@ -47,7 +54,11 @@ export function heartbeatTimeline(env:Env,pair:Pair,beat:Heartbeat,previous:{rec
   (!e.episodeID||!e.endAt||Date.parse(e.endAt)>=pair.created_at));
  // A second detector can confirm an earlier onset after the first heartbeat.
  // Only move that episode's start earlier; retries and other events stay stable.
- return [env.DB.prepare(`INSERT INTO timeline_events(id,parent_id,listener_id,pair_created_at,kind,occurred_at,payload)
+ // A gap shorter than 3 minutes is history only if the cron recorded it for a
+ // short alert delay; then close it here too.
+ const restored=previous&&!events.some(e=>e.kind==='heartbeat_missing')?[timelineInsertIf(env,pair,
+  {id:`restored:${previous.received_at}`,kind:'connection_restored',occurredAt:stamp,endAt:previous.received_at},`missing:${previous.received_at}`)]:[];
+ return [...restored,env.DB.prepare(`INSERT INTO timeline_events(id,parent_id,listener_id,pair_created_at,kind,occurred_at,payload)
   SELECT json_extract(value,'$.id'),?,?,?,json_extract(value,'$.kind'),
   CAST(ROUND((julianday(json_extract(value,'$.occurredAt'))-2440587.5)*86400000) AS INTEGER),value
   FROM json_each(?) WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?)

@@ -3,7 +3,7 @@ import {reserveAlarmRequest} from './alarm-scheduling';
 import {phoneHeadStartFor} from './notification-coordination';
 import {deliverToBoth} from './dual-delivery';
 import {acceptedDelivery,queueAcceptedDelivery,type AcceptedDelivery} from './accepted-delivery';
-import {stoppedMonitoringSQL,monitoringResumedSQL,lateUploadSuppressedSQL,coveringHeartbeatSQL,outageAlertCutoffSQL} from './monitoring';
+import {stoppedMonitoringSQL,monitoringResumedSQL,lateUploadSuppressedSQL,coveringHeartbeatSQL,outageOngoingCutoff} from './monitoring';
 import {scheduleReminders} from './reminders';
 import {Latency} from './latency';
 import {APIError,requireRole,type Alert,type Device,type Env,type StoredEvent} from './types';
@@ -105,11 +105,11 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
    SELECT 1 FROM pairs p JOIN devices d ON d.id=p.parent_id JOIN heartbeats h ON h.listener_id=p.listener_id
    WHERE p.parent_id=events.parent_id AND p.listener_id=events.listener_id AND d.connection_alerts=1
     AND ${coveringHeartbeatSQL()} AND h.received_at=json_extract(events.payload,'$.cryStartedAt')
-    AND h.received_at<${outageAlertCutoffSQL()}) THEN ? WHEN ${monitoringResumedSQL} THEN ? END,
+    AND h.received_at<?) THEN ? WHEN ${monitoringResumedSQL} THEN ? END,
   (SELECT r.resolved_at FROM resolved_episodes r
   JOIN pairs p ON p.parent_id=r.parent_id AND p.listener_id=r.listener_id AND p.created_at=r.pair_created_at
   WHERE r.parent_id=events.parent_id AND r.listener_id=events.listener_id AND r.episode_id=events.episode_id))
-  WHERE event_id=? AND COALESCE(json_extract(payload,'$.isTest'),0)=0`).bind(now,new Date(now).toISOString(),new Date(now).toISOString(),eventId),
+  WHERE event_id=? AND COALESCE(json_extract(payload,'$.isTest'),0)=0`).bind(outageOngoingCutoff(now),new Date(now).toISOString(),new Date(now).toISOString(),eventId),
  // Suppress uploads during a mute, including delayed offline outbox entries.
  env.DB.prepare(`UPDATE events SET acknowledged_at=COALESCE(acknowledged_at,?) WHERE event_id=? AND acknowledged_at IS NULL
  AND COALESCE(json_extract(payload,'$.isTest'),0)=0 AND ${lateUploadSuppressedSQL}`).bind(new Date(now).toISOString(),eventId,now,now),

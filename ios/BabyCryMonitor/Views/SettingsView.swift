@@ -17,14 +17,14 @@ struct SettingsView: View {
                     SteppedSlider(title: "Observation window", stops: MonitoringConfiguration.alertDurations,
                                   value: model.configuration.alertDuration, label: alertDurationText,
                                   lowLabel: "Faster alerts", highLabel: "Fewer false alarms",
-                                  identifier: "alertDurationSlider") { save(\.alertDuration, $0) }
+                                  identifier: "alertDurationSlider") { model.saveSetting(\.alertDuration, $0) }
                 } header: {
                     Text("Alert timing")
                 } footer: {
                     Text("Each detector observes the full selected window. An alert requires qualifying sound for at least 80% of that window and 80% of the latest 5 seconds, with a qualifying latest reading. Sound qualifies by reaching your volume threshold or, independently, an Apple baby-cry score of at least \(CryConfidenceDetector.thresholdDescription). The detectors share one alert episode.")
                 }
                 Section {
-                    Picker("Reset timer after quiet", selection: setting(\.quietResetDuration)) {
+                    Picker("Reset timer after quiet", selection: model.setting(\.quietResetDuration)) {
                         ForEach([10.0, 20, 30, 60], id: \.self) { Text("\(Int($0)) seconds").tag($0) }
                     }
                 } header: {
@@ -36,14 +36,14 @@ struct SettingsView: View {
                     SteppedSlider(title: "Sound threshold", stops: MonitoringConfiguration.soundThresholds,
                                   value: model.configuration.absoluteThreshold, label: { $0 == $0.rounded() ? "\(Int($0)) dBFS" : "\($0.formatted()) dBFS" },
                                   lowLabel: "Quieter sounds", highLabel: "Louder only",
-                                  identifier: "soundThresholdSlider") { save(\.absoluteThreshold, $0) }
+                                  identifier: "soundThresholdSlider") { model.saveSetting(\.absoluteThreshold, $0) }
                 } header: {
                     Text("Sound detection")
                 } footer: {
                     Text("A fixed microphone level. −60 dBFS detects quieter sounds; −10 dBFS requires louder sounds. The threshold stays fixed as room noise changes. dBFS is a microphone reading, not a calibrated room loudness measurement. Other loud noises can also trigger detection.")
                 }
                 Section {
-                    Picker("Repeat alerts", selection: setting(\.repeatInterval)) {
+                    Picker("Repeat alerts", selection: model.setting(\.repeatInterval)) {
                         Text("Standard · Every 5 seconds").tag(TimeInterval?.some(5))
                         Text("Frequent · Every 2 seconds").tag(TimeInterval?.some(2))
                     }
@@ -51,7 +51,7 @@ struct SettingsView: View {
                     SteppedSlider(title: "Snooze after acknowledgement", stops: MonitoringConfiguration.snoozeDurations,
                                   value: model.configuration.snoozeDuration, label: alertDurationText,
                                   lowLabel: "1 min", highLabel: "15 min",
-                                  identifier: "snoozeDurationSlider") { save(\.snoozeDuration, $0) }
+                                  identifier: "snoozeDurationSlider") { model.saveSetting(\.snoozeDuration, $0) }
                 } header: {
                     Text("Repeat alerts")
                 } footer: {
@@ -72,20 +72,18 @@ struct SettingsView: View {
                             Toggle("Server connection alerts", isOn: Binding(get: { model.parentStatus?.connectionAlertsEnabled ?? enabled }, set: { value in Task { await model.setConnectionAlerts(value) } }))
                                 .disabled(model.changingConnectionAlerts || !model.paired)
                                 .accessibilityIdentifier("serverConnectionAlerts")
-                            if model.parentStatus?.connectionAlertsEnabled ?? enabled {
+                            if let delay = connectionAlertDelay, model.parentStatus?.connectionAlertsEnabled ?? enabled {
                                 SteppedSlider(title: "Alert after no update for", stops: AppModel.connectionAlertDelays,
-                                              value: connectionAlertDelay, label: alertDurationText,
+                                              value: delay, label: alertDurationText,
                                               lowLabel: "1 min", highLabel: "20 min",
-                                              identifier: "connectionAlertDelaySlider") { value in
-                                    Task { await model.setConnectionAlertDelay(value) }
-                                }
+                                              identifier: "connectionAlertDelaySlider") { await model.setConnectionAlertDelay($0) }
                                 .disabled(model.changingConnectionAlerts || !model.paired)
                             }
                         } else {
                             LabeledContent("Server connection alerts", value: model.paired ? "Status unavailable" : "On by default")
                         }
                     } header: { Text("Monitoring connection") } footer: {
-                        Text("On by default for new registrations. The server alerts you when the Listener stops unexpectedly, or when it sends no update for \(alertDurationText(connectionAlertDelay)) (checked each minute, so up to a minute later), for example during an internet outage. This works even while Parent Mode is closed or the phone is locked. Missing-update alerts repeat at your chosen alert frequency until snoozed or the Listener reconnects, and use Silent Watch alarms when enabled. Snooze pauses crying and connection-loss alerts together. Receiving these alerts requires internet and allowed notifications.")
+                        Text("On by default for new registrations. The server alerts you when the Listener stops unexpectedly, or when it sends no update for \(connectionAlertDelay.map { "\(alertDurationText($0)) (checked each minute, so up to a minute later)" } ?? "about 3 minutes"), for example during an internet outage. This works even while Parent Mode is closed or the phone is locked. Missing-update alerts repeat at your chosen alert frequency until snoozed or the Listener reconnects, and use Silent Watch alarms when enabled. Snooze pauses crying and connection-loss alerts together. Receiving these alerts requires internet and allowed notifications.")
                     }
                     Section {
                         Toggle("Local overdue-check warning", isOn: Binding(get: { model.localConnectionWarningEnabled }, set: { model.setLocalConnectionWarning($0) }))
@@ -145,25 +143,9 @@ struct SettingsView: View {
         }.tint(Palette.mint)
     }
 
-    private func setting<Value>(_ keyPath: WritableKeyPath<MonitoringConfiguration, Value>) -> Binding<Value> {
-        Binding(
-            get: { model.configuration[keyPath: keyPath] },
-            set: { value in
-                var config = model.configuration
-                config[keyPath: keyPath] = value
-                model.saveSettings(config)
-            }
-        )
-    }
-
-    /// The server's saved delay; 10 minutes until a server reports one.
-    private var connectionAlertDelay: Double { model.parentStatus?.connectionAlertDelay ?? 600 }
-
-    private func save<Value>(_ keyPath: WritableKeyPath<MonitoringConfiguration, Value>, _ value: Value) {
-        var config = model.configuration
-        config[keyPath: keyPath] = value
-        model.saveSettings(config)
-    }
+    /// The server's saved delay, or nil for a server that predates the setting
+    /// (it alerts after 3 minutes and cannot change that).
+    private var connectionAlertDelay: Double? { model.parentStatus?.connectionAlertDelay }
 
     private func alertDurationText(_ seconds: Double) -> String {
         if seconds.truncatingRemainder(dividingBy: 60) == 0 {
@@ -185,9 +167,7 @@ struct AlertTimingView: View {
                     SteppedSlider(title: "Observation window", stops: MonitoringConfiguration.alertDurations,
                                   value: model.configuration.alertDuration, label: spokenDuration,
                                   lowLabel: "Faster alerts", highLabel: "Fewer false alarms",
-                                  identifier: "quickAlertDuration") { value in
-                        var settings = model.configuration; settings.alertDuration = value; model.saveSettings(settings)
-                    }
+                                  identifier: "quickAlertDuration") { model.saveSetting(\.alertDuration, $0) }
                 } footer: {
                     Text("After a full observation window, either detector can alert when at least 80% of that window qualifies, including 80% of the latest 5 seconds and a qualifying latest reading. Missing audio contributes no qualifying time. The detectors share one alert episode.")
                 }
@@ -205,16 +185,14 @@ struct AlertTimingView: View {
                     }
                 }
                 Section("Reminders & snooze") {
-                    Picker("Repeat unanswered alerts", selection: setting(\.repeatInterval)) {
+                    Picker("Repeat unanswered alerts", selection: model.setting(\.repeatInterval)) {
                         Text("Every 5 seconds").tag(TimeInterval?.some(5))
                         Text("Every 2 seconds").tag(TimeInterval?.some(2))
                     }.accessibilityIdentifier("quickRepeatInterval")
                     SteppedSlider(title: "Snooze duration", stops: MonitoringConfiguration.snoozeDurations,
                                   value: model.configuration.snoozeDuration, label: spokenDuration,
                                   lowLabel: "1 min", highLabel: "15 min",
-                                  identifier: "quickSnoozeDuration") { value in
-                        var settings = model.configuration; settings.snoozeDuration = value; model.saveSettings(settings)
-                    }
+                                  identifier: "quickSnoozeDuration") { model.saveSetting(\.snoozeDuration, $0) }
                 }
                 Section {
                     Text("Tap the orange circle on Monitor to snooze an active alert. Snooze clears current alert notifications and silences alerts for your chosen duration. While snoozed, tap Resume in the circle to end the snooze early. The nursery keeps listening.")
@@ -224,11 +202,16 @@ struct AlertTimingView: View {
                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
         }.tint(Palette.lavender).preferredColorScheme(.dark)
     }
-    private func setting<Value>(_ keyPath: WritableKeyPath<MonitoringConfiguration, Value>) -> Binding<Value> {
-        Binding(get: { model.configuration[keyPath: keyPath] }, set: { value in
-            var configuration = model.configuration
-            configuration[keyPath: keyPath] = value
-            model.saveSettings(configuration)
-        })
+}
+
+extension AppModel {
+    /// Saves one monitoring setting, keeping the rest of the configuration.
+    func saveSetting<Value>(_ keyPath: WritableKeyPath<MonitoringConfiguration, Value>, _ value: Value) {
+        var config = configuration
+        config[keyPath: keyPath] = value
+        saveSettings(config)
+    }
+    func setting<Value>(_ keyPath: WritableKeyPath<MonitoringConfiguration, Value>) -> Binding<Value> {
+        Binding(get: { self.configuration[keyPath: keyPath] }, set: { self.saveSetting(keyPath, $0) })
     }
 }

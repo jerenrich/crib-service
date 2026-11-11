@@ -56,8 +56,9 @@ struct NurseryMonitoringInstruction: View {
 
 /// A slider over fixed stops that saves once per gesture. Dragging only updates
 /// the displayed value; `commit` runs when the drag ends, or immediately for a
-/// VoiceOver adjustment, so settings sync is not flooded mid-drag. A saved value
-/// that is not a stop stays displayed until the slider is moved.
+/// VoiceOver adjustment, so settings sync is not flooded mid-drag. The chosen stop
+/// stays shown while `commit` runs; afterwards `value` (saved or not) is shown. A
+/// saved value that is not a stop stays displayed until the slider is moved.
 struct SteppedSlider: View {
     let title: String
     let stops: [Double]
@@ -66,14 +67,16 @@ struct SteppedSlider: View {
     var lowLabel: String? = nil
     var highLabel: String? = nil
     var identifier: String
-    let commit: (Double) -> Void
+    let commit: (Double) async -> Void
     @State private var draft: Int?
+    @State private var saving: Int?
     @State private var editing = false
 
     private var nearest: Int {
         stops.indices.min { abs(stops[$0] - value) < abs(stops[$1] - value) } ?? 0
     }
-    private var shown: Double { draft.map { stops[$0] } ?? value }
+    private var shownIndex: Int? { draft ?? saving }
+    private var shown: Double { shownIndex.map { stops[$0] } ?? value }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -82,7 +85,7 @@ struct SteppedSlider: View {
                 Spacer()
                 Text(label(shown)).monospacedDigit().foregroundStyle(.secondary)
             }.accessibilityHidden(true)
-            Slider(value: Binding(get: { Double(draft ?? nearest) }, set: { raw in
+            Slider(value: Binding(get: { Double(shownIndex ?? nearest) }, set: { raw in
                 let index = min(max(Int(raw.rounded()), 0), stops.count - 1)
                 draft = index
                 if !editing { finish() }
@@ -107,6 +110,11 @@ struct SteppedSlider: View {
         guard let draft else { return }
         let chosen = stops[draft]
         self.draft = nil
-        if chosen != value { commit(chosen) }
+        guard chosen != value else { return }
+        saving = draft
+        Task {
+            await commit(chosen)
+            if saving == draft { saving = nil }
+        }
     }
 }

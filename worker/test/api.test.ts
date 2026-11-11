@@ -286,7 +286,8 @@ describe('connection alerts, readiness and replacement',()=>{
  it('validates the delay, keeps the opt-in and detects outages sooner for short delays',async()=>{
   const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
   for(const delaySeconds of [0,30,90,1260,60.5,'60',null])expect((await call('connection-alerts',parent,{delaySeconds})).status).toBe(400);
-  expect((await call('connection-alerts',parent,{})).status).toBe(400);
+  const empty=await call('connection-alerts',parent,{});expect(empty.status).toBe(400);
+  expect(JSON.stringify(await empty.json())).toContain('enabled and/or delaySeconds');
   expect((await call('connection-alerts',listener,{delaySeconds:60})).status).toBe(403);
   for(const delaySeconds of [1200,60])expect((await call('connection-alerts',parent,{delaySeconds})).status).toBe(200);
   const status=await (await call('listener/status',parent,undefined,'GET')).json() as {connectionAlertDelay:number;connectionAlertsEnabled:boolean};
@@ -301,8 +302,33 @@ describe('connection alerts, readiness and replacement',()=>{
   mockPush();await flushConnections(testEnv);await flushConnections(testEnv);
   expect(pushRequests).toHaveLength(1);
   expect(JSON.parse(String(pushRequests[0].init?.body)).aps.alert.body).toContain('at least 1 minute.');
-  // A short outage is not written to the 3-minute missing-update history.
-  expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM timeline_events WHERE kind='heartbeat_missing'").first()).toEqual({n:0});
+  // The alerted gap is in history from the delay, and closes when updates return.
+  const missing=await env.DB.prepare("SELECT payload FROM timeline_events WHERE kind='heartbeat_missing'").all<{payload:string}>();
+  expect(missing.results).toHaveLength(1);
+  const gap=JSON.parse(missing.results[0].payload) as {occurredAt:string;endAt:string};
+  expect(Date.parse(gap.occurredAt)-Date.parse(gap.endAt)).toBe(60000);
+  await call('listener/heartbeat',listener,beat(listener));
+  expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM timeline_events WHERE kind='connection_restored'").first()).toEqual({n:1});
+ });
+ it('keeps a raised outage alerting when the delay is lengthened mid-outage',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  expect((await call('connection-alerts',parent,{delaySeconds:60})).status).toBe(200);
+  await call('listener/heartbeat',listener,beat(listener));await flushConnections(testEnv);
+  await env.DB.prepare('UPDATE heartbeats SET received_at=?').bind(new Date(Date.now()-90000).toISOString()).run();
+  mockPush();await flushConnections(testEnv);await flushConnections(testEnv);
+  expect(pushRequests).toHaveLength(1);
+  const state=async()=>(await env.DB.prepare('SELECT state FROM connection_states WHERE listener_id=?').bind(listener.deviceId).first<{state:string}>())?.state;
+  expect(await state()).toBe('offline');
+  // Lengthening the delay neither retires the alert nor reports the Listener online.
+  expect((await call('connection-alerts',parent,{delaySeconds:1200})).status).toBe(200);
+  await flushConnections(testEnv);await flushConnections(testEnv);
+  expect(await state()).toBe('offline');
+  const event=await env.DB.prepare("SELECT resolved_at FROM events WHERE json_extract(payload,'$.type')='listener_disconnected'").first<{resolved_at:string|null}>();
+  expect(event?.resolved_at).toBeNull();
+  expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM connection_notices WHERE state='offline' AND status='cancelled'").first()).toEqual({n:0});
+  // A new heartbeat still ends it.
+  await call('listener/heartbeat',listener,beat(listener));
+  expect((await env.DB.prepare("SELECT resolved_at FROM events WHERE json_extract(payload,'$.type')='listener_disconnected'").first<{resolved_at:string|null}>())?.resolved_at).not.toBeNull();
  });
  it('sends no stopped notice for a detection pause, yet alerts when a paused Listener goes silent',async()=>{
   const {parent,listener}=await paired();await call('connection-alerts',parent,{enabled:true});
