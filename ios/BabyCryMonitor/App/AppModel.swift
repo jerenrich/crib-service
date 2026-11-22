@@ -695,8 +695,15 @@ import UIKit
             environmentRevision += 1
             paired = true; defaults.set(true, forKey: pairingKey)
             log.record("paired_successfully"); pairingError = nil
-        } catch { self.pairingError = error.localizedDescription; log.record("pairing_failed", error: error) }
+        } catch {
+            // 409 means the server already holds a pair for this Listener. A second parent joins
+            // that pair's family instead, so point at the invitation rather than echo the server.
+            if case BackendError.response(409, _) = error { pairingError = Self.listenerAlreadyPairedMessage }
+            else { pairingError = error.localizedDescription }
+            log.record("pairing_failed", error: error)
+        }
     }
+    static let listenerAlreadyPairedMessage = "This nursery iPhone is already paired with a Parent iPhone. To add another parent, open Caregivers & duty on that Parent iPhone and create a partner invitation."
     func start(remote: Bool = false, deadline: Date? = nil, commandID: UUID? = nil) async {
         guard !starting, !monitoring, !recoveringAudio, !calibrationActive, !managingDevice, role == .listener else { return }
         if !remote { controlGeneration += 1 }
