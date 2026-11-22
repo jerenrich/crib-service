@@ -1132,7 +1132,7 @@ struct CaregiverConnectionView: View {
                                 .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                                 .accessibilityIdentifier("createCaregiverInvitation")
                         } else {
-                            Text("Enter the invitation created in Caregivers on the already paired Parent iPhone.")
+                            Text("Enter the invitation created in Caregivers & duty on the already paired Parent iPhone.")
                             TextField("Six-digit invitation code", text: $code).keyboardType(.numberPad).textContentType(.oneTimeCode)
                                 .onChange(of: code) { _, value in code = String(value.filter(\.isNumber).prefix(6)) }
                             Button("Join family") {

@@ -1908,7 +1908,9 @@ final class AppModelTests: XCTestCase {
         }
         func register() async throws {}
         func createPairing() async throws -> PairingCode { PairingCode(code: "123456", expiresAt: .distantFuture) }
-        func claim(_ code: String) async throws {}
+        private var claimError: Error?
+        func setClaimError(_ error: Error?) { claimError = error }
+        func claim(_ code: String) async throws { if let claimError { throw claimError } }
         private var nextStatusGate: RequestGate?
         func holdNextStatus(_ gate: RequestGate) { nextStatusGate = gate }
         func status() async throws -> ParentStatus {
@@ -2053,6 +2055,15 @@ final class AppModelTests: XCTestCase {
             UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite)
             try? FileManager.default.removeItem(at: directory)
         }
+    }
+    @MainActor func testClaimConflictPointsAtPartnerInvitation() async throws {
+        let fixture = try Fixture()
+        await fixture.backend.setClaimError(BackendError.response(409, "This Listener is already paired."))
+        await fixture.model.claimPairing("123456")
+        XCTAssertEqual(fixture.model.pairingError, AppModel.listenerAlreadyPairedMessage)
+        await fixture.backend.setClaimError(BackendError.response(400, "Code expired or already used."))
+        await fixture.model.claimPairing("123456")
+        XCTAssertEqual(fixture.model.pairingError, "Code expired or already used.")
     }
     @MainActor func testLiveSoundPublishesExactNurseryWindowAndStopsWithMicrophone() async throws {
         let fixture = try Fixture()
