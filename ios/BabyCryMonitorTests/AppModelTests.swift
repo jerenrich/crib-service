@@ -1926,6 +1926,16 @@ final class AppModelTests: XCTestCase {
         func setStatusFailure(_ fails: Bool) { statusFails = fails }
         func setStatusGate(_ gate: RequestGate?) { statusGate = gate }
         func setStatus(_ value: ParentStatus) { statusValue = value }
+        var timelineValue: TimelineResponse?
+        private var timelineGate: RequestGate?
+        private(set) var timelineCalls = 0
+        func setTimeline(_ value: TimelineResponse?, gate: RequestGate? = nil) { timelineValue = value; timelineGate = gate }
+        func timeline() async throws -> TimelineResponse {
+            timelineCalls += 1
+            if let gate = timelineGate { timelineGate = nil; await gate.wait() }
+            guard let timelineValue else { throw URLError(.notConnectedToInternet) }
+            return timelineValue
+        }
         func unpair() async throws { removedPair = true }
         func deleteDevice() async throws { deletedDevice = true }
         func setTestRequestFailure(_ fails: Bool) { testRequestFails = fails }
@@ -2104,6 +2114,64 @@ final class AppModelTests: XCTestCase {
         await fixture.model.removePairing(deleteDevice: false)
         XCTAssertNil(fixture.liveSound.connectedDevice)
         XCTAssertNil(fixture.model.remoteSound.frame)
+    }
+    private func standbyPage(pausedAt paused: Date, now: Date) -> TimelineResponse {
+        TimelineResponse(paired: true, serverTime: now, availableSince: now.addingTimeInterval(-13 * 3600), events: [
+            TimelineEvent(kind: "monitoring_started", occurredAt: paused.addingTimeInterval(-60)),
+            TimelineEvent(kind: "monitoring_paused", occurredAt: paused)], truncated: false)
+    }
+    @MainActor func testStandbyStartNeedsAPageRequestedAfterStandbyCouldHaveRestarted() async throws {
+        let fixture = try Fixture()
+        fixture.model.selectRole(.parent); fixture.model.paired = true
+        let firstPause = fixture.time.now.addingTimeInterval(-3600)
+        await fixture.backend.setTimeline(standbyPage(pausedAt: firstPause, now: fixture.time.now))
+        await fixture.model.refreshStandbyStart()
+        XCTAssertEqual(fixture.model.timelineStandbyStart, .at(firstPause))
+        XCTAssertTrue(fixture.model.standbyStartIsCurrent)
+
+        // Back from the background: a resume and re-pause may have happened meanwhile.
+        fixture.time.now = fixture.time.now.addingTimeInterval(600)
+        let secondPause = fixture.time.now.addingTimeInterval(-30)
+        let gate = RequestGate()
+        await fixture.backend.setTimeline(standbyPage(pausedAt: secondPause, now: fixture.time.now), gate: gate)
+        let refresh = Task { await fixture.model.refreshStandbyStart() }
+        let loading = await eventually { fixture.model.loadingTimeline }
+        XCTAssertTrue(loading)
+        XCTAssertTrue(fixture.model.standbyStartIsCurrent, "A covering request is in flight; keep the previous answer rather than blink")
+        await gate.open(); await refresh.value
+        XCTAssertEqual(fixture.model.timelineStandbyStart, .at(secondPause))
+
+        // If the covering fetch fails, the old page must not be presented as current.
+        fixture.time.now = fixture.time.now.addingTimeInterval(600)
+        await fixture.backend.setTimeline(nil)
+        await fixture.model.refreshStandbyStart()
+        XCTAssertFalse(fixture.model.standbyStartIsCurrent)
+    }
+    @MainActor func testOverlappingTimelineRefreshesFetchAgainOnlyForANewerNeed() async throws {
+        let fixture = try Fixture()
+        fixture.model.selectRole(.parent); fixture.model.paired = true
+        let page = standbyPage(pausedAt: fixture.time.now.addingTimeInterval(-60), now: fixture.time.now)
+        var gate = RequestGate()
+        await fixture.backend.setTimeline(page, gate: gate)
+        var first = Task { await fixture.model.refreshTimeline() }
+        _ = await eventually { fixture.model.loadingTimeline }
+        // Same moment, such as Activity and Monitor both refreshing on foreground.
+        await fixture.model.refreshTimeline()
+        await fixture.model.refreshStandbyStart()
+        await gate.open(); await first.value
+        let afterSameMoment = await fixture.backend.timelineCalls
+        XCTAssertEqual(afterSameMoment, 1, "A request already in flight covers callers from the same moment")
+
+        gate = RequestGate()
+        await fixture.backend.setTimeline(page, gate: gate)
+        first = Task { await fixture.model.refreshTimeline() }
+        _ = await eventually { fixture.model.loadingTimeline }
+        fixture.time.now = fixture.time.now.addingTimeInterval(5)
+        await fixture.model.refreshStandbyStart()
+        await gate.open(); await first.value
+        let afterNewerNeed = await fixture.backend.timelineCalls
+        XCTAssertEqual(afterNewerNeed, 3, "A request that started before the caller's moment is followed by one more")
+        XCTAssertTrue(fixture.model.standbyStartIsCurrent)
     }
     @MainActor func testParentTreatsAnOtherAudioPauseAsActiveNotStandby() async throws {
         let fixture = try Fixture(localWarnings: true)

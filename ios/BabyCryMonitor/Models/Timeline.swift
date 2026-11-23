@@ -47,6 +47,32 @@ public struct TimelineResponse: Codable, Sendable {
     public var truncated: Bool
     public var lastHeartbeat: Date? = nil
 }
+public enum StandbyStart: Equatable, Sendable {
+    /// Standby began at this server time.
+    case at(Date)
+    /// Standby was already under way at this server time, the oldest state the
+    /// fetched history knows (the server's window boundary, or where logging began).
+    case before(Date)
+}
+extension TimelineResponse {
+    /// When the current Standby run began, using the same coverage rules as
+    /// Activity. A connection gap or relaunch between two Standby stretches is
+    /// treated as one pause. Nil when the newest state is not Standby or the
+    /// history is truncated.
+    public func standbyStart() -> StandbyStart? {
+        let from = availableSince.addingTimeInterval(-1)
+        // End just after the response time so an event stamped exactly then still counts.
+        let segments = TimelineCoverage.segments(events: events, from: from, to: serverTime.addingTimeInterval(1),
+                                                 availableSince: availableSince, historyTruncated: truncated)
+        guard var index = segments.indices.last, segments[index].state == .standby else { return nil }
+        // segments merges equal neighbours, so the walk only needs to bridge gaps.
+        while index >= 2, [.updatesMissing, .unverified].contains(segments[index - 1].state), segments[index - 2].state == .standby {
+            index -= 2
+        }
+        let start = segments[index].start
+        return index > 0 && segments[index - 1].state == .noHistory ? .before(start) : .at(start)
+    }
+}
 public struct TimelineCoverage: Identifiable, Equatable, Sendable {
     public enum State: String, CaseIterable, Sendable {
         case monitoring, standby, stopped, noHistory, updatesMissing, unavailable, unverified
