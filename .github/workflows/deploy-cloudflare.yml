@@ -52,7 +52,6 @@ jobs:
     timeout-minutes: 15
     environment:
       name: cloudflare-production
-      url: https://baby-cry-monitor.jordan-erenrich.workers.dev
     defaults:
       run:
         working-directory: worker
@@ -61,11 +60,15 @@ jobs:
         working-directory: .
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
         run: |
-          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
-            echo '::error::Add the CLOUDFLARE_API_TOKEN Actions secret before deploying. See docs/developer-guide.md.'
-            exit 1
-          fi
+          for name in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID WORKER_URL; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Add the $name Actions secret before deploying. See docs/developer-guide.md."
+              exit 1
+            fi
+          done
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
@@ -78,14 +81,16 @@ jobs:
       - name: Apply pending D1 migrations
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: npm run db:remote
       - name: Deploy Worker and configured triggers
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: npm run deploy -- --message "$GITHUB_SHA"
       - name: Verify backend health
         env:
-          WORKER_URL: https://baby-cry-monitor.jordan-erenrich.workers.dev
+          WORKER_URL: ${{ secrets.WORKER_URL }}
         run: |
           node --input-type=module <<'NODE'
           import {setTimeout} from 'node:timers/promises';
@@ -110,7 +115,6 @@ jobs:
           {
             echo '### Cloudflare deployment'
             echo "Commit: \`$GITHUB_SHA\`"
-            echo 'Backend: https://baby-cry-monitor.jordan-erenrich.workers.dev'
             echo 'Pending D1 migrations applied; Worker, bindings, and triggers deployed; backend health check passed.'
             echo 'Phone/Watch notification delivery still requires a physical device check.'
           } >> "$GITHUB_STEP_SUMMARY"

@@ -4,7 +4,7 @@
     {
       "name": "calibration-lab",
       "runtimeExecutable": "python3",
-      "runtimeArgs": ["scripts/calibration-lab/server.py", "--device", "00008120-001E38612678C01E"],
+      "runtimeArgs": ["scripts/calibration-lab/server.py", "--device", "J14"],
       "port": 8787
     }
   ]

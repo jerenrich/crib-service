@@ -456,7 +456,7 @@ import UIKit
             if ProcessInfo.processInfo.arguments.contains("--uitesting-caregivers") {
                 let me = UUID(), partner = UUID()
                 status.caregiverDuty = CaregiverDuty(myId: me, primaryId: me, revision: 1, escalationSeconds: 120,
-                    caregivers: [.init(id: me, name: "Jordan", secondaryEnabled: true, phoneRegistered: true, watchRegistered: true),
+                    caregivers: [.init(id: me, name: "Sam", secondaryEnabled: true, phoneRegistered: true, watchRegistered: true),
                                  .init(id: partner, name: "Alex", secondaryEnabled: true, phoneRegistered: true, watchRegistered: true)])
             }
             if ProcessInfo.processInfo.arguments.contains("--uitesting-active-alert") || ProcessInfo.processInfo.arguments.contains("--uitesting-test-alert") {

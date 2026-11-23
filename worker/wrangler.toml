@@ -1,5 +1,4 @@
 name = "baby-cry-monitor"
-account_id = "994f60c144bd9dd9bc2333bd3abba832"
 main = "src/index.ts"
 compatibility_date = "2025-09-17"
 workers_dev = true

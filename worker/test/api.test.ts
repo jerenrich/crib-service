@@ -1814,7 +1814,7 @@ describe('live sound relay',()=>{
  });
  it('keeps both caregivers connected and replaces only the reconnecting phone',async()=>{
   const {parent,listener}=await paired(),partner=device('parent');await register(partner);
-  const {code}=await(await call('caregivers/invite',parent,{name:'Jordan'})).json() as {code:string};
+  const {code}=await(await call('caregivers/invite',parent,{name:'Sam'})).json() as {code:string};
   expect((await call('caregivers/join',partner,{code,name:'Alex'})).status).toBe(200);
   const source=await open(listener);await source.next();
   const first=await open(parent);await source.next();
@@ -1831,7 +1831,7 @@ describe('live sound relay',()=>{
  });
  it('revokes a departed caregiver on revalidation when immediate chart revocation fails',async()=>{
   const {parent,listener}=await paired(),partner=device('parent');await register(partner);
-  const {code}=await(await call('caregivers/invite',parent,{name:'Jordan'})).json() as {code:string};
+  const {code}=await(await call('caregivers/invite',parent,{name:'Sam'})).json() as {code:string};
   await call('caregivers/join',partner,{code,name:'Alex'});
   const source=await open(listener);await source.next();
   const owner=await open(parent);await source.next();const invited=await open(partner);await source.next();
@@ -1906,7 +1906,7 @@ describe('live sound relay',()=>{
  });
  it('keeps both caregivers connected and echoes their sound-state freshness challenges together',async()=>{
   const pair=await paired(),partner=device('parent');await register(partner);
-  const invitation=await(await call('caregivers/invite',pair.parent,{name:'Jordan'})).json() as {code:string};
+  const invitation=await(await call('caregivers/invite',pair.parent,{name:'Sam'})).json() as {code:string};
   expect((await call('caregivers/join',partner,{code:invitation.code,name:'Alex'})).status).toBe(200);
   const listener=await open(pair.listener);await listener.next();
   const parent=await open(pair.parent);await listener.next();
@@ -3987,7 +3987,7 @@ describe('two caregiver families',()=>{
   expect(rows.map(row=>row.operation)).toEqual(['caregiver_invite','caregiver_join','caregiver_duty','unpair']);
   expect(JSON.parse(rows[2].details!).caregiver).toMatchObject({phase:'duty_changed',member:'owner',primary:'partner',secondary_enabled:false,escalation_seconds:60});
   expect(JSON.parse(rows[3].details!).caregiver).toMatchObject({phase:'member_removed',member:'partner',repaired_events:1});
-  for(const row of rows){const text=JSON.stringify(row);for(const value of ['Jordan','Alex',parent.deviceId,partner.deviceId,listener.deviceId,parent.secret])expect(text).not.toContain(value);}
+  for(const row of rows){const text=JSON.stringify(row);for(const value of ['Sam','Alex',parent.deviceId,partner.deviceId,listener.deviceId,parent.secret])expect(text).not.toContain(value);}
  });
 
  it.each(['same phone','replacement phone','deleted phone'] as const)('keeps ongoing alerts on the owner after the primary leaves and rejoins with %s',async(mode)=>{
@@ -3998,7 +3998,7 @@ describe('two caregiver families',()=>{
   expect((await call(mode==='deleted phone'?'device/delete':'pairing/remove',partner)).status).toBe(200);
   const next=mode==='same phone'?partner:device('parent');if(next!==partner)await register(next);
   await tokens(next,'c');
-  const invitation=await(await call('caregivers/invite',parent,{name:'Jordan'})).json() as {code:string};
+  const invitation=await(await call('caregivers/invite',parent,{name:'Sam'})).json() as {code:string};
   expect((await call('caregivers/join',next,{code:invitation.code,name:'Alex'})).status).toBe(200);
   expect((await status(parent)).caregiverDuty.primaryId).toBe(parent.deviceId);
   expect((await status(parent)).notificationRelevance.cryEpisodeIDs).toContain(event.episodeId);
@@ -4022,7 +4022,7 @@ describe('two caregiver families',()=>{
    const result=await execute();
    if(!replaced&&sql.startsWith('SELECT caregiver_plan,created_at FROM events')&&method==='first'){
     replaced=true;expect((await call('pairing/remove',partner)).status).toBe(200);
-    const invitation=await(await call('caregivers/invite',parent,{name:'Jordan'})).json() as {code:string};
+    const invitation=await(await call('caregivers/invite',parent,{name:'Sam'})).json() as {code:string};
     expect((await call('caregivers/join',partner,{code:invitation.code,name:'Alex'})).status).toBe(200);
    }
    return result;
@@ -4079,7 +4079,7 @@ describe('two caregiver families',()=>{
 
  async function family(){
   const {parent,listener}=await paired(),partner=device('parent');await register(partner);
-  const invitation=await(await call('caregivers/invite',parent,{name:'Jordan'})).json() as {code:string};
+  const invitation=await(await call('caregivers/invite',parent,{name:'Sam'})).json() as {code:string};
   expect((await call('caregivers/join',partner,{code:invitation.code,name:'Alex'})).status).toBe(200);
   return {parent,listener,partner,invitation};
  }
@@ -4140,7 +4140,7 @@ describe('two caregiver families',()=>{
   expect(pushRequests.map(p=>p.url)).toEqual(expect.arrayContaining([expect.stringContaining('c'.repeat(64)),expect.stringContaining('d'.repeat(64))]));
   expect((await status(parent)).alerts).toHaveLength(0);
   const secondPartner=device('parent');await register(secondPartner);
-  expect((await call('caregivers/invite',parent,{name:'Jordan'})).status).toBe(409);
+  expect((await call('caregivers/invite',parent,{name:'Sam'})).status).toBe(409);
   expect((await call('pairing/remove',partner)).status).toBe(200);
   expect((await status(partner)).paired).toBe(false);expect((await status(parent)).paired).toBe(true);
   expect((await status(parent)).caregiverDuty.primaryId).toBe(parent.deviceId);
@@ -4275,7 +4275,7 @@ describe('two caregiver families',()=>{
   const replacement=device('listener');await register(replacement);
   const nursery=await(await call('pairing/create',parent)).json() as {code:string};
   expect((await call('pairing/claim',replacement,{code:nursery.code})).status).toBe(200);
-  const invite=await(await call('caregivers/invite',parent,{name:'Jordan'})).json() as {code:string};
+  const invite=await(await call('caregivers/invite',parent,{name:'Sam'})).json() as {code:string};
   expect((await call('caregivers/join',partner,{code:invite.code,name:'Alex'})).status).toBe(200);
  });
  it('does not send secondary notifications after an opt-out during primary delivery',async()=>{
@@ -4333,7 +4333,7 @@ describe('two caregiver families',()=>{
  it('repairs stale family records from an earlier nursery pairing when inviting again',async()=>{
   const {parent,partner}=await family();
   await env.DB.prepare('UPDATE caregiver_families SET pair_created_at=pair_created_at-1').run();
-  const response=await call('caregivers/invite',parent,{name:'Jordan'});expect(response.status).toBe(200);
+  const response=await call('caregivers/invite',parent,{name:'Sam'});expect(response.status).toBe(200);
   const {code}=await response.json() as {code:string};
   expect((await call('caregivers/join',partner,{code,name:'Alex'})).status).toBe(200);
   expect((await status(parent)).caregiverDuty.caregivers).toHaveLength(2);
@@ -4416,7 +4416,7 @@ describe('two caregiver families',()=>{
  it('invalidates an unused nursery pairing code when a caregiver joins a family',async()=>{
   const {parent,listener}=await paired(),partner=device('parent');await register(partner);
   const nurseryCode=await(await call('pairing/create',partner)).json() as {code:string};
-  const invitation=await(await call('caregivers/invite',parent,{name:'Jordan'})).json() as {code:string};
+  const invitation=await(await call('caregivers/invite',parent,{name:'Sam'})).json() as {code:string};
   expect((await call('caregivers/join',partner,{code:invitation.code,name:'Alex'})).status).toBe(200);
   const otherListener=device('listener');await register(otherListener);
   expect((await call('pairing/claim',otherListener,{code:nurseryCode.code})).status).toBe(400);
