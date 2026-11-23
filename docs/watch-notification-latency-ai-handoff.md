@@ -1,6 +1,6 @@
 # Apple Watch notification latency: independent analysis handoff
 
-Snapshot: 26 October 2026, after the 13:40–13:41 UTC experiments. All times below are UTC (also London local time on this date). This is a standalone summary for another AI; no repository access is needed. Account details, device identifiers, tokens and credentials are omitted.
+Snapshot: 26 October 2026, after the 13:40–13:41 UTC experiments. All times below are UTC. This is a standalone summary for another AI; no repository access is needed. Account details, device identifiers, tokens and credentials are omitted.
 
 Follow-up: [Standalone Watch and corrected phone-first experiments](watch-latency-probe.md)
 records the afternoon implementation and subsequent on-device results. The

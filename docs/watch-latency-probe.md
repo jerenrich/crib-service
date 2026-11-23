@@ -62,7 +62,7 @@ Example operator sequence (replace the paths with private local paths):
 
 ```sh
 python3 scripts/watch-latency-probe.py --credentials .local/probe.json register \
-  --backend https://baby-cry-monitor.jordan-erenrich.workers.dev
+  --backend https://baby-cry-monitor.<subdomain>.workers.dev
 # Deploy WATCH_LATENCY_PROBE_PARENT_ID using the returned temporary UUID.
 # Copy the token from the standalone app's container without printing it.
 python3 scripts/watch-latency-probe.py --credentials .local/probe.json token \
