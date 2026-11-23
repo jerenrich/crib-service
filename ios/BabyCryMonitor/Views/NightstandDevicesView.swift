@@ -19,7 +19,7 @@ extension AppModel {
             devices.append(NightstandDevice(id: "listener", name: "Nursery iPhone", icon: "iphone",
                 detail: "Listener · This iPhone\n\(Self.devicePower(batteryLevel, powerConnected))",
                 status: recoveringAudio ? "Recovering" : monitoring ? "Listening" : listenerDetectionPaused ? "Detection paused · Other sound playing"
-                    : standby ? "Standby · Microphone active" : "Stopped",
+                    : standby ? "Standby · Microphone on · Cry alerts off" : "Stopped",
                 tone: recoveringAudio || listenerDetectionPaused ? .warning : monitoring || standby ? .active : .unavailable))
         } else if paired {
             let fresh = parentStatus?.lastHeartbeat.map { (-5...150).contains(now.timeIntervalSince($0)) } == true

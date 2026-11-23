@@ -138,4 +138,65 @@ final class TimelineTests: XCTestCase {
         XCTAssertEqual(journal.last?.endAt, episode.startedAt)
         XCTAssertEqual(engine.snapshot.pendingTimelineIDs.count, 2)
     }
+
+    private func page(_ events: [TimelineEvent], now: Double, truncated: Bool = false, availableSince: Double = -100_000) -> TimelineResponse {
+        TimelineResponse(paired: true, serverTime: at(now), availableSince: at(availableSince), events: events, truncated: truncated)
+    }
+    func testStandbyStartIsTheOldestStandbyEventSinceTheLastOtherState() {
+        let events = [TimelineEvent(kind: "monitoring_started", occurredAt: at(0)),
+                      TimelineEvent(kind: "cry_started", occurredAt: at(50)),
+                      TimelineEvent(kind: "monitoring_paused", occurredAt: at(100)),
+                      TimelineEvent(kind: "standby_observed", occurredAt: at(118)),
+                      TimelineEvent(kind: "coverage_standby", occurredAt: at(3600))]
+        XCTAssertEqual(page(events, now: 4000).standbyStart(), .at(at(100)))
+    }
+    func testStandbyStartIsUnknownUnlessTheNewestStateIsStandby() {
+        let events = [TimelineEvent(kind: "monitoring_paused", occurredAt: at(100)),
+                      TimelineEvent(kind: "monitoring_started", occurredAt: at(200))]
+        XCTAssertNil(page(events, now: 300).standbyStart(), "Monitoring resumed; the old pause is not current")
+        XCTAssertNil(page([], now: 300).standbyStart())
+    }
+    func testStandbyOlderThanTheFetchedHistoryIsDatedFromItsOldestState() {
+        // The server adds the last state event before its window; hourly Standby
+        // observations make that boundary a Standby event too. The window length
+        // itself is the server's choice and is not assumed here.
+        let hour = 3600.0
+        let events = [TimelineEvent(kind: "coverage_standby", occurredAt: at(-hour)),
+                      TimelineEvent(kind: "coverage_standby", occurredAt: at(0)),
+                      TimelineEvent(kind: "coverage_standby", occurredAt: at(11 * hour))]
+        XCTAssertEqual(page(events, now: 11.5 * hour).standbyStart(), .before(at(-hour)))
+        XCTAssertNil(page(events, now: 11.5 * hour, truncated: true).standbyStart(), "Truncated history cannot place the start")
+    }
+    func testConnectionGapOrRelaunchInsideAPauseKeepsItsStart() {
+        let gap = [TimelineEvent(kind: "monitoring_started", occurredAt: at(0)),
+                   TimelineEvent(kind: "monitoring_paused", occurredAt: at(100)),
+                   TimelineEvent(kind: "heartbeat_missing", occurredAt: at(500), endAt: at(400)),
+                   TimelineEvent(kind: "standby_observed", occurredAt: at(600))]
+        XCTAssertEqual(page(gap, now: 700).standbyStart(), .at(at(100)), "A dropped connection is not a new pause")
+        let relaunch = [TimelineEvent(kind: "monitoring_started", occurredAt: at(0)),
+                        TimelineEvent(kind: "monitoring_paused", occurredAt: at(100)),
+                        TimelineEvent(kind: "monitoring_unverified", occurredAt: at(500)),
+                        TimelineEvent(kind: "standby_observed", occurredAt: at(510))]
+        XCTAssertEqual(page(relaunch, now: 600).standbyStart(), .at(at(100)))
+    }
+    func testMonitoringAfterAGapStartsANewPause() {
+        let events = [TimelineEvent(kind: "monitoring_paused", occurredAt: at(100)),
+                      TimelineEvent(kind: "heartbeat_missing", occurredAt: at(500), endAt: at(400)),
+                      TimelineEvent(kind: "monitoring_observed", occurredAt: at(600)),
+                      TimelineEvent(kind: "monitoring_paused", occurredAt: at(700))]
+        XCTAssertEqual(page(events, now: 800).standbyStart(), .at(at(700)))
+    }
+    func testSameTimestampTieIsDeterministicAndMatchesCoverage() {
+        let events = [TimelineEvent(id: "a", kind: "monitoring_started", occurredAt: at(0)),
+                      TimelineEvent(id: "b", kind: "monitoring_observed", occurredAt: at(100)),
+                      TimelineEvent(id: "c", kind: "monitoring_paused", occurredAt: at(100))]
+        XCTAssertEqual(page(events, now: 200).standbyStart(), .at(at(100)))
+        XCTAssertEqual(page(events.reversed(), now: 200).standbyStart(), .at(at(100)), "Event order must not change the answer")
+    }
+    func testHistoryThatBeginsMidPauseOnlyBoundsTheStart() {
+        let events = [TimelineEvent(kind: "monitoring_paused", occurredAt: at(20)),
+                      TimelineEvent(kind: "standby_observed", occurredAt: at(100))]
+        XCTAssertEqual(page(events, now: 200, availableSince: 50).standbyStart(), .before(at(100)),
+                       "Events before logging began cannot date the pause; it was already paused at the first known state")
+    }
 }

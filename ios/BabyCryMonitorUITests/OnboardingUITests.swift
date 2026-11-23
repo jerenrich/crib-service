@@ -134,13 +134,45 @@ final class OnboardingUITests: XCTestCase {
         let swap = app.buttons["swapCaregiverRoles"]
         XCTAssertTrue(swap.waitForExistence(timeout: 5))
         let window = app.windows.firstMatch.frame
-        for element in [swap, app.buttons["nightstandSnooze"], app.buttons["editAlertTiming"],
-                        app.buttons["nightstandMonitoringControl"], app.switches["secondaryCaregiverEnabled"]] {
+        let summary = app.buttons["caregiverDutySummary"]
+        for element in [swap, summary, app.buttons["nightstandSnooze"], app.buttons["editAlertTiming"],
+                        app.buttons["nightstandMonitoringControl"]] {
             XCTAssertTrue(element.isHittable, "Caregiver control is not visible: \(element)")
             XCTAssertTrue(window.contains(element.frame), "Caregiver control is outside the screen: \(element.frame)")
         }
+        XCTAssertEqual(app.buttons["nightstandMonitoringControl"].label, "Pause Monitoring")
+        XCTAssertGreaterThan(app.buttons["nightstandMonitoringControl"].frame.minY, app.buttons["nurserySoundControls"].frame.maxY,
+                             "Pause stays in the bottom action row with two caregivers")
         let shot = XCTAttachment(screenshot: app.screenshot())
         shot.name = "Compact caregiver alert screen"; shot.lifetime = .keepAlways; add(shot)
+        summary.tap()
+        let secondary = app.switches["secondaryCaregiverEnabled"]
+        XCTAssertTrue(secondary.waitForExistence(timeout: 3))
+        XCTAssertTrue(secondary.isHittable)
+    }
+
+    @MainActor func testCaregiverStandbyOffersLabeledStartInTheActionRow() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--uitesting-reset", "--uitesting-offline", "--uitesting-live-sound", "--uitesting-standby", "--uitesting-caregivers"]
+        app.launch()
+        let state = app.staticTexts["nightstandState"]
+        XCTAssertTrue(state.waitForExistence(timeout: 5))
+        XCTAssertEqual(state.label, "Standby")
+        XCTAssertEqual(app.scrollViews.count, 0, "Two caregivers in Standby should fit without scrolling")
+        let controls = app.buttons.matching(identifier: "nightstandMonitoringControl")
+        XCTAssertEqual(controls.count, 1, "One monitoring control, not a header icon as well")
+        let start = controls.firstMatch
+        XCTAssertEqual(start.label, "Start Monitoring")
+        XCTAssertTrue(start.isHittable)
+        XCTAssertTrue(app.windows.firstMatch.frame.contains(start.frame))
+        XCTAssertGreaterThan(start.frame.width, 200, "Start is the full-width action, not an icon")
+        XCTAssertGreaterThan(start.frame.minY, app.buttons["nurserySoundControls"].frame.maxY)
+        // The fixture's timeline paused 40 minutes ago; the ring's time is also spoken with the detail.
+        let since = app.staticTexts.containing(NSPredicate(format: "label BEGINSWITH %@", "Microphone on · Cry alerts off, Paused since ")).firstMatch
+        XCTAssertTrue(since.waitForExistence(timeout: 5), "The Standby start time should be shown")
+        XCTAssertGreaterThanOrEqual(app.buttons["swapCaregiverRoles"].frame.height, 44)
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = "Caregiver Standby"; shot.lifetime = .keepAlways; add(shot)
     }
 
     @MainActor func testCompactParentControlsFitWithoutScrolling() {
@@ -381,7 +413,7 @@ final class OnboardingUITests: XCTestCase {
                 control.tap()
                 XCTAssertEqual(app.staticTexts["nightstandState"].label, "Standby")
                 XCTAssertEqual(control.label, "Start Monitoring")
-                XCTAssertTrue(app.staticTexts["Microphone active · Detection paused"].exists)
+                XCTAssertTrue(app.staticTexts["Microphone on · Cry alerts off"].exists)
                 XCTAssertTrue(app.buttons["nightstandStopMicrophone"].exists)
             }
             app.terminate()
@@ -397,7 +429,8 @@ final class OnboardingUITests: XCTestCase {
             let state = app.staticTexts["nightstandState"]
             XCTAssertTrue(state.waitForExistence(timeout: 5))
             XCTAssertEqual(state.label, "Standby")
-            XCTAssertTrue(app.staticTexts["Microphone active · Detection paused"].exists)
+            XCTAssertTrue(app.staticTexts.containing(NSPredicate(format: "label BEGINSWITH %@", "Microphone on · Cry alerts off")).firstMatch.exists,
+                          "Both roles describe Standby the same way")
             let chart = app.descendants(matching: .any)["soundLevelChart"].firstMatch
             XCTAssertTrue((chart.value as? String)?.contains("Inactive") == true)
             let resume = app.buttons["Start Monitoring"]

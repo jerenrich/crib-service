@@ -17,6 +17,7 @@ struct NightstandView: View {
     @State private var confirmStopMicrophone = false
     @State private var nightDimmed = false
     @State private var soundsPresented = false
+    @State private var caregiversPresented = false
     @State private var lastInteraction = Date()
     @ScaledMetric(relativeTo: .caption) private var chartHeader: CGFloat = 40
     private var ringSize: CGFloat { listener ? 200 : hasTwoCaregivers ? 96 : 112 }
@@ -83,9 +84,26 @@ struct NightstandView: View {
         var timer: TimeInterval?
         /// Appends a live countdown to the detail line.
         var resumesAt: Date?
+        /// Short status inside the Parent's ring, such as how long Standby has lasted.
+        var ringTitle: String?
+        var ringDetail: String?
     }
 
     private var hero: Hero { hero(at: model.now) }
+
+    /// "since 07:58" from the shared timeline, "13+ hours" when the start is older
+    /// than the fetched history, or nothing until a current page confirms it.
+    private var standbySinceText: String? {
+        guard model.standbyStartIsCurrent else { return nil }
+        switch model.timelineStandbyStart {
+        case .at(let serverDate):
+            return "since " + serverDate.addingTimeInterval(-model.timelineClockOffset).formatted(date: .omitted, time: .shortened)
+        case .before(let serverDate):
+            let hours = Int(model.now.timeIntervalSince(serverDate.addingTimeInterval(-model.timelineClockOffset)) / 3600)
+            return hours >= 1 ? "\(hours)+ hours" : nil
+        case nil: return nil
+        }
+    }
 
     private func hero(at date: Date) -> Hero { listener ? listenerHero(at: date) : parentHero(at: date) }
 
@@ -128,7 +146,8 @@ struct NightstandView: View {
             return Hero(title: "Detection paused", detail: "Another sound is playing on the nursery iPhone.", tone: .caution, ring: .dashed, icon: "speaker.wave.2")
         }
         if standby {
-            return Hero(title: "Standby", detail: "Microphone active · Detection paused", tone: .inactive, icon: "pause.circle")
+            return Hero(title: "Standby", detail: "Microphone on · Cry alerts off", tone: .inactive, icon: "pause.circle",
+                        ringTitle: "Paused", ringDetail: standbySinceText)
         }
         if model.parentMonitoringDisplayState == .stopped {
             return Hero(title: "Stopped", detail: "Monitoring is off on the nursery iPhone.", tone: .inactive, icon: "stop.circle")
@@ -169,7 +188,7 @@ struct NightstandView: View {
                         ring: .progress(min(1, remaining)), icon: "bell.slash", resumesAt: until)
         }
         if standby {
-            return Hero(title: "Standby", detail: "Microphone active · Detection paused", tone: .inactive, icon: "pause.circle")
+            return Hero(title: "Standby", detail: "Microphone on · Cry alerts off", tone: .inactive, icon: "pause.circle")
         }
         if !model.monitoring {
             return model.needsRestart
@@ -220,7 +239,7 @@ struct NightstandView: View {
     /// With Keep screen awake on, the Parent dims after a minute untouched. Alerts and problems brighten it.
     private var parentCanDim: Bool {
         !listener && model.keepScreenAwake && (hero.tone == .calm || hero.tone == .inactive) && model.activeAlert == nil
-            && !pairing && !settingsPresented && !detailsPresented && !timing && !testConfigurationPresented && !soundsPresented
+            && !pairing && !settingsPresented && !detailsPresented && !timing && !testConfigurationPresented && !soundsPresented && !caregiversPresented
     }
 
     private func setNightDimmed(_ value: Bool) {
@@ -341,14 +360,21 @@ struct NightstandView: View {
             if parentCanDim && !nightDimmed && now.timeIntervalSince(lastInteraction) >= nightDimDelay { setNightDimmed(true) }
         }
         .onChange(of: parentCanDim) { _, canDim in if !canDim { setNightDimmed(false) } }
-        .onChange(of: scenePhase) { _, phase in if phase == .active { lastInteraction = Date() } }
+        // The ring's "since" time comes from the timeline; fetch it when Standby begins.
+        .onChange(of: standby) { _, now in if now && !listener { Task { await model.refreshStandbyStart() } } }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .active else { return }
+            lastInteraction = Date()
+            if !listener { Task { await model.refreshStandbyStart() } }
+        }
         .fullScreenCover(isPresented: $nightDimmed) { nightDimOverlay }
         .task {
             // Activity is otherwise loaded only on its own tab; the Listener uses its local history.
             guard !listener else { return }
+            await model.refreshStandbyStart()
             while !Task.isCancelled {
-                await model.refreshTimeline()
                 do { try await Task.sleep(for: .seconds(300)) } catch { break }
+                await model.refreshTimeline()
             }
         }
         .alert("Stop microphone?", isPresented: $confirmStopMicrophone) {
@@ -358,6 +384,21 @@ struct NightstandView: View {
             Text("This turns off the nursery microphone. To resume monitoring, you may need to reopen the app on this iPhone. Leave it in Standby to resume from the Parent.")
         }
         .sheet(isPresented: $testConfigurationPresented) { AlertTestView() }
+        // Owned here, not by the duty row, so a status refresh that briefly drops
+        // the caregiver list cannot tear the sheet down mid-change.
+        .sheet(isPresented: $caregiversPresented) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Caregivers").font(.headline)
+                    if model.caregiverDuty?.secondary != nil { CaregiverDutyCard() }
+                    else { Text("Caregiver roles are unavailable right now. Check the connection and try again.").font(.subheadline).foregroundStyle(Palette.muted) }
+                }
+                .padding(20)
+            }
+            .presentationDetents([.medium, .large])
+            .presentationBackground(Palette.background)
+            .preferredColorScheme(.dark)
+        }
         .sheet(isPresented: $timing) { AlertTimingView() }
         .sheet(isPresented: $pairing) { PairingView() }
         .sheet(isPresented: $settingsPresented) { SettingsView() }
@@ -371,15 +412,17 @@ struct NightstandView: View {
 
     /// Keep the Parent's essential controls near the top. On short screens and
     /// with larger text, the same content can scroll rather than being clipped.
+    /// Start and Pause stay in the bottom action row in every layout, so they
+    /// are always in the same place and always labeled.
     private var compactParentContents: some View {
         VStack(spacing: 8) {
             header
             timedHero
             soundPanel.frame(height: hasTwoCaregivers ? 80 : 84)
-            if hasTwoCaregivers { CaregiverDutyCard() }
+            if hasTwoCaregivers { CaregiverDutyRow { caregiversPresented = true } }
             timingSummary
             NurserySoundButton { soundsPresented = true }
-            if !hasTwoCaregivers || needsConnectionRecovery || parentStartUnavailable || !model.paired { actions }
+            actions
             if !hasTwoCaregivers { disclaimer }
         }
         .padding(.horizontal, 20)
@@ -414,12 +457,6 @@ struct NightstandView: View {
             Label(listener ? "Nursery iPhone" : "Parent iPhone", systemImage: listener ? "mic" : "bell")
                 .font(.subheadline).foregroundStyle(Palette.muted)
             Spacer(minLength: 8)
-            if !listener && hasTwoCaregivers && !parentStartUnavailable && model.paired {
-                Button(action: toggleMonitoring) {
-                    Image(systemName: monitoringActive ? "pause.fill" : "play.fill").frame(width: 44, height: 44)
-                }.disabled(busy || model.managingDevice)
-                    .accessibilityLabel(controlTitle).accessibilityIdentifier("nightstandMonitoringControl")
-            }
             Button { detailsPresented = true } label: {
                 Label("Details", systemImage: "info.circle").font(.subheadline)
                     .padding(.horizontal, 14).frame(minHeight: 44).background(Palette.panel, in: Capsule())
@@ -486,7 +523,7 @@ struct NightstandView: View {
             .accessibilityLabel("Snooze alerts for \(spokenDuration(model.configuration.snoozeDuration))")
             .accessibilityIdentifier("nightstandSnooze")
         } else {
-            parentCircle(hero, title: hero.timer.map(clock) ?? "", detail: "", icon: hero.icon ?? "waveform")
+            parentCircle(hero, title: hero.timer.map(clock) ?? hero.ringTitle ?? "", detail: hero.ringDetail ?? "", icon: hero.icon ?? "waveform")
                 .accessibilityHidden(true)
         }
     }
@@ -499,6 +536,8 @@ struct NightstandView: View {
                 if !title.isEmpty { Text(title).font(.headline).foregroundStyle(hero.tone.color) }
                 if !detail.isEmpty { Text(detail).font(.caption).foregroundStyle(Palette.muted) }
             }
+            // The two-caregiver ring is small; "since 9:55 PM" or larger text must shrink, not spill.
+            .lineLimit(1).minimumScaleFactor(0.6)
             .multilineTextAlignment(.center)
             .padding(10)
         }
@@ -590,7 +629,11 @@ struct NightstandView: View {
     }
 
     private func heroDetail(_ hero: Hero) -> Text {
-        guard let until = hero.resumesAt else { return Text(hero.detail) }
+        guard let until = hero.resumesAt else {
+            // The ring is hidden from VoiceOver, so speak its status with the detail.
+            guard let ring = hero.ringDetail else { return Text(hero.detail) }
+            return Text(hero.detail).accessibilityLabel("\(hero.detail), \(hero.ringTitle ?? "") \(ring)")
+        }
         return Text("\(hero.detail) ") + Text(timerInterval: model.now...max(model.now, until), countsDown: true).monospacedDigit()
     }
 
@@ -1094,6 +1137,62 @@ struct CaregiverDutyCard: View {
             .padding(10).background(Palette.panel, in: RoundedRectangle(cornerRadius: 18))
             .disabled(model.changingCaregiverDuty || model.managingDevice)
         }
+    }
+}
+
+/// One-line duty summary for the Parent's main screen, so the monitoring
+/// control keeps its row. Swap stays one tap; the rest opens the full card.
+struct CaregiverDutyRow: View {
+    @Environment(AppModel.self) private var model
+    /// Opens the full card; the Monitor owns that sheet.
+    var showDetails: () -> Void
+    var body: some View {
+        if let duty = model.caregiverDuty, let primary = duty.primary, let secondary = duty.secondary {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 8) {
+                    Button(action: showDetails) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("\(Text(primary.id == duty.myId ? "You" : primary.name).fontWeight(.semibold)) \(primary.id == duty.myId ? "are" : "is") on duty")
+                                .font(.subheadline)
+                            Text(secondaryLine(secondary, me: secondary.id == duty.myId, after: duty.escalationSeconds))
+                                .font(.caption).foregroundStyle(Palette.muted)
+                        }
+                        .lineLimit(1).minimumScaleFactor(0.8)
+                        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityHint("Shows caregiver roles")
+                    .accessibilityIdentifier("caregiverDutySummary")
+                    Button {
+                        Task { await model.updateCaregiverDuty(primaryId: secondary.id) }
+                    } label: {
+                        Label(model.changingCaregiverDuty ? "Swapping…" : "Swap", systemImage: "arrow.up.arrow.down")
+                            .font(.subheadline.weight(.medium)).padding(.horizontal, 12).frame(minHeight: 44)
+                            .background(Palette.background.opacity(0.5), in: Capsule())
+                    }
+                    .buttonStyle(.plain).tint(Palette.lavender)
+                    .accessibilityLabel("Swap caregiver roles")
+                    .accessibilityIdentifier("swapCaregiverRoles")
+                }
+                // The full card is off screen now, so a failed swap must say so here.
+                if let error = model.caregiverError {
+                    Text(error).font(.caption).foregroundStyle(Palette.amber)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.bottom, 6)
+                        .accessibilityIdentifier("caregiverDutyError")
+                }
+            }
+            .padding(.horizontal, 12).padding(.vertical, 4)
+            .background(Palette.panel, in: RoundedRectangle(cornerRadius: 16))
+            .disabled(model.changingCaregiverDuty || model.managingDevice)
+        }
+    }
+
+    private func secondaryLine(_ secondary: CaregiverDuty.Caregiver, me: Bool, after seconds: Int) -> String {
+        let delay = spokenDuration(Double(seconds))
+        if secondary.secondaryEnabled { return me ? "You back up after \(delay)" : "\(secondary.name) backs up after \(delay)" }
+        return me ? "You're off duty" : "\(secondary.name) is off duty"
     }
 }
 

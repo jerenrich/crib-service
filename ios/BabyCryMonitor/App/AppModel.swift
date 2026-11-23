@@ -66,10 +66,35 @@ import UIKit
     private(set) var listenerPairStatusReceivedAt: Date?
     @ObservationIgnored private var listenerAlertGeneration = 0
     var alertStatus: ParentStatus? { role == .listener ? listenerPairStatus : parentStatus }
-    var timeline: TimelineResponse?
+    var timeline: TimelineResponse? { didSet { timelineStandbyStart = timeline?.standbyStart() } }
+    /// Derived once per fetched timeline; the Monitor ring reads it every tick.
+    private(set) var timelineStandbyStart: StandbyStart?
+    /// Local time the request behind `timeline` started. Anything that happened
+    /// on the Listener after it may be missing from that page.
+    private(set) var timelineRequestedAt: Date?
+    @ObservationIgnored private var timelineInFlightRequestedAt: Date?
+    /// A page must have been requested at or after this local time to describe
+    /// the current Standby: a resume and re-pause may have happened before it.
+    private(set) var standbyFreshAfter = Date.distantPast
+    /// The ring may show `timelineStandbyStart`: its page postdates the last
+    /// moment Standby could have restarted unseen. While a sufficiently new
+    /// request is in flight the previous answer stays up, so the ring doesn't blink.
+    var standbyStartIsCurrent: Bool {
+        if let requested = timelineRequestedAt, requested >= standbyFreshAfter { return true }
+        return loadingTimeline && (timelineInFlightRequestedAt ?? .distantPast) >= standbyFreshAfter
+    }
+    /// Call when Standby may have restarted unseen (Standby began, the app
+    /// returned to the foreground, Monitor appeared), then fetch a page that covers it.
+    func refreshStandbyStart() async {
+        // One second of slack lets a refresh started by the same event (such as
+        // Activity's own foreground refresh) count, instead of fetching twice.
+        standbyFreshAfter = currentTime().addingTimeInterval(-1)
+        await refreshTimeline(notBefore: standbyFreshAfter)
+    }
     var timelineClockOffset: TimeInterval = 0
     var timelineError: String?
     var loadingTimeline = false
+    @ObservationIgnored private var timelineRefreshQueued = false
     var currentDBFS: Double = -100
     var meter: [Double] = Array(repeating: -100, count: SoundLevelFrame.barCount)
     var chartNotificationTimes: [Date] = []
@@ -440,6 +465,13 @@ import UIKit
             if ProcessInfo.processInfo.arguments.contains("--uitesting-snoozed") { status.alertsMutedUntil = now.addingTimeInterval(60) }
             if role == .parent { parentStatus = status }
             else { listenerPairStatus = status; listenerPairStatusReceivedAt = now }
+            if paused && role == .parent {
+                // Lets the Monitor ring show when Standby began.
+                timeline = TimelineResponse(paired: true, serverTime: now, availableSince: now.addingTimeInterval(-13 * 3600), events: [
+                    TimelineEvent(kind: "monitoring_started", occurredAt: now.addingTimeInterval(-3 * 3600)),
+                    TimelineEvent(kind: "monitoring_paused", occurredAt: now.addingTimeInterval(-40 * 60))], truncated: false)
+                timelineRequestedAt = now
+            }
             seedLiveSoundFrameForUITest()
             if ProcessInfo.processInfo.arguments.contains("--uitesting-chart-paused") { remoteSound.disconnected() }
             if ProcessInfo.processInfo.arguments.contains("--uitesting-keep-awake") { keepScreenAwake = true }
@@ -792,7 +824,7 @@ import UIKit
         if wasMonitoring { engine.recordTimeline("monitoring_paused", at: currentTime()) }
         meter = Array(repeating: -100, count: SoundLevelFrame.barCount); currentDBFS = -100
         chartNotificationTimes.removeAll(); chartSampledAt = nil
-        if standby { audioStatus = "Standby · Microphone active" }
+        if standby { audioStatus = "Standby · Microphone on · Cry alerts off" }
         persist(); synchronizeLiveSound(); queueHeartbeat(); recordBatterySample()
         log.record("monitoring_paused")
     }
@@ -1058,7 +1090,7 @@ import UIKit
             chartNotificationTimes.removeAll(); chartSampledAt = nil
             microphoneActive = true; monitoring = !detectionPaused
             detectionStartedAt = monitoring ? currentTime() : nil
-            audioStatus = standby ? "Standby · Microphone active" : "Microphone active"
+            audioStatus = standby ? "Standby · Microphone on · Cry alerts off" : "Microphone active"
             engine.markMonitoring(monitoring); lastSampleAt = currentTime(); lastHeartbeatAt = .distantPast
             needsRestart = false; error = nil
             if !wasActive || wasRecovering || monitoring != wasMonitoring {
@@ -1096,7 +1128,7 @@ import UIKit
             if !wasOtherAudio { otherAudioSince = currentTime() }
             meter = Array(repeating: -100, count: SoundLevelFrame.barCount); currentDBFS = -100
             chartNotificationTimes.removeAll(); chartSampledAt = nil
-            audioStatus = standby ? "Standby · Microphone active" : AudioLevelMonitor.otherAudioMessage
+            audioStatus = standby ? "Standby · Microphone on · Cry alerts off" : AudioLevelMonitor.otherAudioMessage
             lastSampleAt = currentTime(); needsRestart = false
             if wasMonitoring, !detectionPaused { engine.recordTimeline("detection_paused", at: currentTime()) }
             engine.suspend(); persist()
@@ -1871,18 +1903,37 @@ import UIKit
             publishWatch()
         }
     }
-    func refreshTimeline() async {
+    /// With `notBefore`, a caller arriving mid-fetch gets a follow-up fetch only
+    /// if the request in flight started earlier; other overlapping calls are dropped.
+    func refreshTimeline(notBefore: Date? = nil) async {
         #if DEBUG
         if ProcessInfo.processInfo.arguments.contains("--uitesting-timeline") { return }
+        // The offline live-sound fixture seeds its timeline; treat it as freshly fetched.
+        if ProcessInfo.processInfo.arguments.contains("--uitesting-live-sound") {
+            if timeline != nil { timelineRequestedAt = currentTime() }
+            return
+        }
         #endif
-        guard !loadingTimeline, paired else { return }
+        guard paired else { return }
+        if loadingTimeline {
+            if let notBefore, (timelineInFlightRequestedAt ?? .distantPast) < notBefore { timelineRefreshQueued = true }
+            return
+        }
         loadingTimeline = true; defer { loadingTimeline = false }
-        let revision = environmentRevision
+        repeat {
+            timelineRefreshQueued = false
+            await fetchTimelinePage()
+        } while timelineRefreshQueued && paired
+    }
+    private func fetchTimelinePage() async {
+        let revision = environmentRevision, requestedAt = currentTime()
+        timelineInFlightRequestedAt = requestedAt
         do {
             let client = try await registeredClient()
             let page = try await client.timeline()
             guard revision == environmentRevision, paired else { return }
-            timeline = page; timelineClockOffset = page.serverTime.timeIntervalSince(currentTime()); timelineError = nil
+            timeline = page; timelineRequestedAt = requestedAt
+            timelineClockOffset = page.serverTime.timeIntervalSince(currentTime()); timelineError = nil
         } catch {
             guard revision == environmentRevision else { return }
             timelineError = "Could not refresh timeline. \(error.localizedDescription)"
