@@ -182,12 +182,16 @@ private final class RejectionURLProtocol: URLProtocol, @unchecked Sendable {
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
-        // "/worker" answers like the Worker's validator; "/edge" like a proxy or portal.
-        let worker = request.url!.path.hasPrefix("/worker")
+        // "/worker" answers like the Worker's validator; "/legacy" like a Worker
+        // without rejection codes (before 25 Nov 2026, or rolled back); "/edge"
+        // like a proxy or portal.
+        let path = request.url!.path, worker = !path.hasPrefix("/edge")
         let headers = worker ? ["x-request-id": "6705ae24-2863-49df-8dc5-5fa15b2d0418", "content-type": "application/json"] : ["content-type": "text/html"]
         let response = HTTPURLResponse(url: request.url!, statusCode: 400, httpVersion: nil, headerFields: headers)!
+        let body = path.hasPrefix("/worker") ? "{\"error\":\"Invalid alert.\",\"code\":\"alert_invalid\"}"
+            : worker ? "{\"error\":\"Inconsistent alert duration.\"}" : "<html>Bad Request</html>"
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: Data((worker ? "{\"error\":\"Invalid alert.\"}" : "<html>Bad Request</html>").utf8))
+        client?.urlProtocol(self, didLoad: Data(body.utf8))
         client?.urlProtocolDidFinishLoading(self)
     }
     override func stopLoading() {}
@@ -213,6 +217,12 @@ final class DiagnosticsTests: XCTestCase {
         } catch BackendError.response(400, _) {
             // Retryable: nothing proves the Worker saw this upload.
         }
+        // A Worker 400 without the explicit code stays retryable: a deploy or the
+        // next attempt's feature flags may make the same alert acceptable.
+        do {
+            _ = try await BackendClient(baseURL: URL(string: "https://private-host/legacy")!, credential: credential, log: log, session: session).send(alert)
+            XCTFail("Expected a failure")
+        } catch BackendError.response(400, let message) { XCTAssertEqual(message, "Inconsistent alert duration.") }
         // Other endpoints keep their existing 400 handling.
         do {
             try await BackendClient(baseURL: URL(string: "https://private-host/worker")!, credential: credential, log: log, session: session).register()

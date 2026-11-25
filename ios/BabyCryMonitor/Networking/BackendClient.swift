@@ -362,10 +362,12 @@ struct BackendClient: BackendServing {
             await log?.network(operation: operation, outcome: "http_error", status: response.statusCode, requestID: requestID,
                                elapsedMS: DiagnosticTiming.elapsedMS(since: started), storageUnavailable: storageUnavailable, eventID: eventID, benchmarkAttempt: benchmarkAttempt, serverDiagnosticMS: serverDiagnosticMS, diagnosticState: diagnosticState, metrics: metricsCollector.snapshot, clock: clock, monotonic: true, clientRequestID: clientRequestID)
             let decoded = try? JSONDecoder().decode(ErrorBody.self, from: data)
-            // Only the Worker's own validator proves an alert can never be accepted:
-            // its responses carry a request ID and a JSON error. A 400 from a captive
-            // portal, proxy or CDN edge stays a retryable BackendError.response.
-            if path == "/v1/listener/event", response.statusCode == 400, requestID != nil, let decoded {
+            // Retire an alert only on the Worker's explicit "alert_invalid" code: no
+            // later attempt can succeed. Any other 400 (an older or rolled-back Worker,
+            // version skew that the next attempt's feature flags may heal, a captive
+            // portal or proxy) stays a retryable BackendError.response.
+            if path == "/v1/listener/event", response.statusCode == 400, requestID != nil,
+               let decoded, decoded.code == AlertRejection.code {
                 throw AlertRejection(message: decoded.error)
             }
             throw BackendError.response(response.statusCode, decoded?.error ?? "Backend request failed (\(response.statusCode)).")
@@ -399,14 +401,16 @@ enum BackendError: LocalizedError {
     var errorDescription: String? { switch self { case .message(let text), .response(_, let text): text } }
 }
 
-/// The Worker rejected an alert upload as invalid (HTTP 400). Resending the same
-/// bytes can never succeed, so the outbox retires it instead of retrying.
+/// The Worker rejected an alert upload as invalid (HTTP 400, code "alert_invalid").
+/// No later attempt can succeed, so the outbox retires it instead of retrying.
 struct AlertRejection: LocalizedError, Equatable {
+    /// The Worker's error code for an alert no later attempt can make acceptable.
+    static let code = "alert_invalid"
     let message: String
     var errorDescription: String? { message }
 }
 
-private struct ErrorBody: Decodable { let error: String }
+private struct ErrorBody: Decodable { let error: String; let code: String? }
 
 
 /// Per-task delegate keeps the shared session and its connection pool unchanged.

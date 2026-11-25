@@ -312,7 +312,7 @@ import Observation
     /// The server's decision for this event. "acknowledged" includes uploads silenced
     /// by a snooze or Stop, which then leave the outbox; keep that tied to the event.
     func alertReceipt(_ alert: CryAlert, status: String, at now: Date) {
-        let known: Set<String> = ["sent", "resolved", "acknowledged", "failed", "uncertain", "blocked", "pending", "sending", "request_failed"]
+        let known: Set<String> = ["sent", "resolved", "acknowledged", "failed", "uncertain", "blocked", "pending", "sending", "request_failed", "rejected"]
         alertOutbox(alert, phase: "receipt", at: now, extra: " status=\(known.contains(status) ? status : "other")")
     }
     private func alertOutbox(_ alert: CryAlert, phase: String, at now: Date, extra: String) {

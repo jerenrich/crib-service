@@ -9,7 +9,6 @@ import {Latency} from './latency';
 import {APIError,requireRole,type Alert,type Device,type Env,type StoredEvent} from './types';
 import {alert as validateAlert,uuid,configuration,date} from './security';
 import {pairFor,sharedAccess} from './devices';
-import {timelineInsert} from './timeline';
 import {sendPush,sendSilentCryAlarmPush,type PushIdentityOptions,type PushResult} from './apns';
 import {eventReference,recordDiagnostic,observeLateWrites,PushPreparationError,type Outcome,type Stage} from './diagnostics';
 export async function receiveAlert(env:Env,device:Device,value:Record<string,unknown>,requestId=crypto.randomUUID(),latency=new Latency(),background?:Pick<ExecutionContext,'waitUntil'>) {
@@ -18,13 +17,29 @@ export async function receiveAlert(env:Env,device:Device,value:Record<string,unk
  requireRole(device,'listener');let validated:ReturnType<typeof validateAlert>;
  try{validated=validateAlert(value);}
  catch(error){
-  // Off the response path: the rejection must not wait for a timeline write.
-  if(error instanceof APIError&&error.status===400){const write=recordRejectedAlert(env,device,value);if(background)background.waitUntil(write);else await write;}
+  if(error instanceof APIError&&error.status===400){
+   // Off the response path: the rejection must not wait for a timeline write.
+   const write=recordRejectedAlert(env,device,value);if(background)background.waitUntil(write);else await write;
+   // Listeners stop retrying only on this explicit code. Any other 400 (an
+   // older Worker, a proxy) keeps the alert queued for a later attempt.
+   error.code??='alert_invalid';
+  }
   throw error;
  }
- const {alert}=validated;
- if(validated.durationCorrection!==undefined)latency.details.alert_duration_corrected_s=validated.durationCorrection;
+ const {alert,corrections}=validated;
+ if(corrections){
+  const d=latency.details;
+  if(corrections.duration_s!==undefined)d.alert_duration_corrected_s=corrections.duration_s;
+  if(corrections.start_s!==undefined)d.alert_start_corrected_s=corrections.start_s;
+  if(corrections.ignored_fields!==undefined)d.alert_ignored_fields=corrections.ignored_fields;
+  if(corrections.reason_ignored)d.alert_reason_ignored=true;
+ }
  if(alert.listenerId!==device.id)throw new APIError(403,'Listener identity mismatch.');
+ // Only builds before 25 Nov 2026 send a duration that needs correcting, and
+ // those retried each rejected alert for days. Deliver a fresh one; store an
+ // old one as expired so a cry that ended long ago never rings the Parent.
+ const stale=!alert.isTest&&corrections?.duration_s!==undefined&&Date.now()-Date.parse(alert.createdAt)>correctedAlertMaxAgeMs;
+ if(stale)latency.details.alert_stale=true;
  try{latency.eventRef=await eventReference(env,alert.eventId);}catch{/* Best effort. */}
  // Both reads share one consistent snapshot and one remote call. The bounded
  // fallback is read-only; insertion and delivery claims are never hedged.
@@ -45,9 +60,12 @@ export async function receiveAlert(env:Env,device:Device,value:Record<string,unk
   const inserted=await latency.db<StoredEvent>('event_insert_ms',()=>env.DB.batch<StoredEvent>([
    env.DB.prepare('INSERT INTO events(event_id,episode_id,listener_id,parent_id,is_repeat,payload,created_at) SELECT ?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?) ON CONFLICT DO NOTHING')
     .bind(alert.eventId,alert.episodeId,device.id,pair.parent_id,Number(alert.isRepeat),JSON.stringify(alert),Date.now(),pair.parent_id,pair.listener_id,pair.created_at),
+   ...(stale?[env.DB.prepare("UPDATE events SET status='failed',last_error='expired_event' WHERE event_id=? AND status='pending'").bind(alert.eventId)]:[]),
+   // An accepted alert supersedes an earlier rejection of the same episode.
+   env.DB.prepare("DELETE FROM timeline_events WHERE parent_id=? AND listener_id=? AND pair_created_at=? AND id=?").bind(pair.parent_id,pair.listener_id,pair.created_at,`rejected:${alert.episodeId}`),
    env.DB.prepare('SELECT * FROM events WHERE event_id=?').bind(alert.eventId)
   ]));
-  record=inserted[1].results[0]??null;
+  record=inserted[inserted.length-1].results[0]??null;
  }
  if(record && (record.listener_id!==device.id || record.payload!==JSON.stringify(alert)))throw new APIError(409,'Event UUID already used for different metadata.');
  if(!record){
@@ -71,17 +89,29 @@ export async function receiveAlert(env:Env,device:Device,value:Record<string,unk
  return {status:result?.acknowledged_at?'acknowledged':result?.resolved_at?'resolved':
   result?.status==='sending'&&latency.details.push_outcome==='sent'?'sent':result?.status??'pending'};
 }
+/** A corrected alert older than this is stored as expired instead of notifying. */
+export const correctedAlertMaxAgeMs=10*60000;
 // A rejected upload never becomes an event, so without this the Parent has no
-// trace that the Listener raised an alert. One row per event ID; best effort.
-// Stored as a failed alert/connection_alert (the kinds timeline groups use for
-// crying and monitoring_failed) so older Parent apps show "Alert delivery failed".
+// trace that the Listener raised an alert. Stored as a failed alert/connection_alert
+// (the kinds timeline groups use for crying and monitoring_failed) so older
+// Parent apps show "Alert delivery failed". One row per episode, at the
+// Listener's createdAt, so retries and re-alerts never refresh it; an accepted
+// alert for the episode deletes it. One statement: the pair lookup, the pairing
+// and age checks and the insert.
 async function recordRejectedAlert(env:Env,device:Device,value:Record<string,unknown>):Promise<void> {
  try{
-  if(value.isTest===true||value.listenerId!==device.id)return;
-  const eventId=uuid(value.eventId);let episodeID:string|undefined;try{episodeID=uuid(value.episodeId);}catch{/* Omit an invalid episode. */}
-  const pair=await pairFor(env,device);if(!pair)return;
-  await timelineInsert(env,pair,{id:`rejected:${eventId}`,kind:value.type==='monitoring_failed'?'connection_alert':'alert',
-   occurredAt:new Date().toISOString(),status:'failed',count:1,...(episodeID?{episodeID}:{})}).run();
+  if(value.isTest===true||uuid(value.listenerId)!==device.id)return;
+  let episodeID:string|undefined;try{episodeID=uuid(value.episodeId);}catch{/* Fall back to the event. */}
+  const id=`rejected:${episodeID??uuid(value.eventId)}`;
+  let occurredAt=Date.now();try{occurredAt=Math.min(occurredAt,Date.parse(date(value.createdAt)));}catch{/* Server time. */}
+  // Older rows are pruned at 24 hours; re-inserting one would only flicker.
+  if(Date.now()-occurredAt>86400000)return;
+  const event={id,kind:value.type==='monitoring_failed'?'connection_alert':'alert',occurredAt:new Date(occurredAt).toISOString(),status:'failed',count:1,...(episodeID?{episodeID}:{})};
+  // Same pairing guard as accepted uploads: an alert from an earlier pairing
+  // never reaches the new Parent's timeline.
+  await env.DB.prepare(`INSERT INTO timeline_events(id,parent_id,listener_id,pair_created_at,kind,occurred_at,payload)
+   SELECT ?,parent_id,listener_id,created_at,?,?,? FROM pairs WHERE listener_id=? AND created_at<=?+2000
+   ON CONFLICT DO NOTHING`).bind(id,event.kind,occurredAt,JSON.stringify(event),device.id,occurredAt).run();
  }catch{/* Never mask the original rejection. */}
 }
 async function scheduleRemindersSafely(env:Env,parentId:string,requestId:string):Promise<void> {

@@ -145,7 +145,8 @@ export async function dispatchFamilyEvent(env:Env,eventId:string,requestId=crypt
   env.DB.prepare(`UPDATE events SET resolved_at=(SELECT r.resolved_at FROM resolved_episodes r JOIN pairs p ON p.parent_id=r.parent_id AND p.listener_id=r.listener_id AND p.created_at=r.pair_created_at WHERE r.parent_id=events.parent_id AND r.listener_id=events.listener_id AND r.episode_id=events.episode_id) WHERE event_id=? AND resolved_at IS NULL`).bind(eventId),
   // Same late-upload rules as the single-parent path: judge by recorded createdAt.
   env.DB.prepare(`UPDATE events SET acknowledged_at=? WHERE event_id=? AND acknowledged_at IS NULL AND ${lateUploadSuppressedSQL}`).bind(new Date(now).toISOString(),eventId,now,now),
-  env.DB.prepare("UPDATE events SET status='failed',last_error='expired_event' WHERE event_id=? AND created_at<?").bind(eventId,now-86400000),
+  // Judge age by the Listener's createdAt too: a long-retried upload is inserted late.
+  env.DB.prepare("UPDATE events SET status='failed',last_error='expired_event' WHERE event_id=? AND (created_at<? OR json_extract(payload,'$.createdAt')<?)").bind(eventId,now-86400000,new Date(now-86400000).toISOString()),
   env.DB.prepare("UPDATE caregiver_deliveries SET state='uncertain',lease_until=NULL WHERE event_id=? AND state='sending' AND lease_until<=?").bind(eventId,now)
  ]);
  const claimed=await env.DB.prepare(`UPDATE events SET status='sending',claim_id=?,lease_until=?,attempts=attempts+1 WHERE event_id=?

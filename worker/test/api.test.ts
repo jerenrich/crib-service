@@ -653,20 +653,74 @@ describe('devices and secure pairing',()=>{
   const stored=JSON.parse((await env.DB.prepare('SELECT payload FROM events WHERE event_id=?').bind(event.eventId).first<{payload:string}>())!.payload);
   expect(stored).toMatchObject({cryStartedAt:createdAt.toISOString(),durationSeconds:0});
  });
- it('shows the Parent a rejected alert on its timeline as a failed alert, once per event',async()=>{
-  const {parent,listener}=await paired();const event={...alert(listener),isRepeat:'no'};
+ it('shows the Parent a rejected alert on its timeline as a failed alert, once per episode',async()=>{
+  const {parent,listener}=await paired();
+  // iOS encodes UUIDs in uppercase; the stored device ID is lowercase.
+  const upper=(id:string)=>id.toUpperCase();
+  const event={...alert(listener),listenerId:upper(listener.deviceId),eventId:upper(crypto.randomUUID()),isRepeat:'no'};
+  const first=await call('listener/event',listener,event);
+  expect(first.status).toBe(400);expect(await first.json()).toMatchObject({code:'alert_invalid'});
   expect((await call('listener/event',listener,event)).status).toBe(400);
-  expect((await call('listener/event',listener,event)).status).toBe(400);
-  const stopped={...alert(listener),type:'monitoring_failed',reason:'not-a-reason',durationSeconds:0};
+  // A re-alert for the same episode with a new event ID adds no second row.
+  expect((await call('listener/event',listener,{...event,eventId:crypto.randomUUID()})).status).toBe(400);
+  const stopped={...alert(listener),type:'monitoring_failed',durationSeconds:0,isRepeat:'no'};
   expect((await call('listener/event',listener,stopped)).status).toBe(400);
   expect((await call('listener/event',listener,{...alert(listener),isTest:true,isRepeat:'no'})).status).toBe(400);
-  const timeline=await (await call('timeline',parent,undefined,'GET')).json() as {events:{id:string;kind:string;status?:string;episodeID?:string}[]};
+  const timeline=await (await call('timeline',parent,undefined,'GET')).json() as {events:{id:string;kind:string;status?:string;episodeID?:string;occurredAt:string}[]};
   const rejected=timeline.events.filter(e=>e.id.startsWith('rejected:'));
   // Kinds and status that Parent apps without rejection support still label "Alert delivery failed".
   expect(rejected).toHaveLength(2);
   expect(rejected).toEqual(expect.arrayContaining([
-   expect.objectContaining({id:`rejected:${event.eventId}`,kind:'alert',status:'failed',episodeID:event.episodeId}),
-   expect.objectContaining({id:`rejected:${stopped.eventId}`,kind:'connection_alert',status:'failed'})]));
+   expect.objectContaining({id:`rejected:${event.episodeId}`,kind:'alert',status:'failed',episodeID:event.episodeId,occurredAt:event.createdAt}),
+   expect.objectContaining({id:`rejected:${stopped.episodeId}`,kind:'connection_alert',status:'failed'})]));
+ });
+ it('removes the rejected row once an alert for that episode is accepted',async()=>{
+  const {parent,listener}=await paired();const event=alert(listener);
+  expect((await call('listener/event',listener,{...event,isRepeat:'no'})).status).toBe(400);
+  expect((await call('listener/event',listener,{...event,eventId:crypto.randomUUID()})).status).toBe(200);
+  const timeline=await (await call('timeline',parent,undefined,'GET')).json() as {events:{id:string}[]};
+  expect(timeline.events.filter(e=>e.id.startsWith('rejected:'))).toHaveLength(0);
+ });
+ it('keeps a rejected alert from an earlier pairing or older than a day off the timeline',async()=>{
+  const {listener}=await paired();
+  const pairedAt=(await env.DB.prepare('SELECT created_at FROM pairs WHERE listener_id=?').bind(listener.deviceId).first<{created_at:number}>())!.created_at;
+  const earlier={...alert(listener),createdAt:new Date(pairedAt-60000).toISOString(),isRepeat:'no'};
+  expect((await call('listener/event',listener,earlier)).status).toBe(400);
+  await env.DB.prepare('UPDATE pairs SET created_at=0 WHERE listener_id=?').bind(listener.deviceId).run();
+  const old={...alert(listener),createdAt:new Date(Date.now()-25*3600000).toISOString(),isRepeat:'no'};
+  expect((await call('listener/event',listener,old)).status).toBe(400);
+  expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM timeline_events WHERE id LIKE 'rejected:%'").first('n')).toBe(0);
+ });
+ it('rejects an unsupported alert type without the terminal code',async()=>{
+  const {listener}=await paired();
+  const response=await call('listener/event',listener,{...alert(listener),type:'future_type'});
+  expect(response.status).toBe(400);expect(await response.json()).toMatchObject({code:'alert_unsupported'});
+ });
+ it('accepts an alert with an unknown field or reason from a newer Listener and records the coercion',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  const stopped={...alert(listener),type:'monitoring_failed',durationSeconds:0,reason:'future_reason',futureField:1};
+  stopped.cryStartedAt=stopped.createdAt;
+  mockPush();expect((await call('listener/event',listener,stopped)).status).toBe(200);
+  const stored=JSON.parse((await env.DB.prepare('SELECT payload FROM events WHERE event_id=?').bind(stopped.eventId).first<{payload:string}>())!.payload);
+  expect(stored).not.toHaveProperty('reason');expect(stored).not.toHaveProperty('futureField');
+  const diagnostic=await env.DB.prepare("SELECT details FROM diagnostics WHERE operation='alert' AND outcome='ok' ORDER BY sequence LIMIT 1").first<{details:string}>();
+  expect(JSON.parse(diagnostic!.details)).toMatchObject({alert_ignored_fields:1,alert_reason_ignored:true});
+ });
+ it('stores an old corrected alert as expired instead of ringing the Parent',async()=>{
+  // Builds before 25 Nov retried rejected alerts for days. The cry is long over.
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});const createdAt=new Date(Date.now()-3600000);
+  await env.DB.prepare('UPDATE pairs SET created_at=0 WHERE listener_id=?').bind(listener.deviceId).run();
+  const event={...alert(listener),cryStartedAt:new Date(createdAt.getTime()-20000).toISOString(),createdAt:createdAt.toISOString(),durationSeconds:30};
+  const response=await call('listener/event',listener,event);
+  expect(response.status).toBe(200);expect(await response.json()).toEqual({status:'failed'});expect(pushRequests).toHaveLength(0);
+  expect(await env.DB.prepare('SELECT last_error FROM events WHERE event_id=?').bind(event.eventId).first('last_error')).toBe('expired_event');
+ });
+ it('records when correcting a clamped duration moved the start time',async()=>{
+  const {listener}=await paired();const createdAt=new Date();
+  const event={...alert(listener),cryStartedAt:new Date(createdAt.getTime()+10000).toISOString(),createdAt:createdAt.toISOString(),durationSeconds:0};
+  expect((await call('listener/event',listener,event)).status).toBe(200);
+  const diagnostic=await env.DB.prepare("SELECT details FROM diagnostics WHERE operation='alert' AND outcome='ok' ORDER BY sequence LIMIT 1").first<{details:string}>();
+  expect(JSON.parse(diagnostic!.details)).toMatchObject({alert_duration_corrected_s:0,alert_start_corrected_s:-10});
  });
  it('keeps a clamped week-long alert duration consistent with its timestamps',async()=>{
   const {listener}=await paired();const createdAt=new Date();
@@ -2588,7 +2642,9 @@ describe('initial upload admission and batching',()=>{
   expect(await response.json()).toEqual({status:'sent'});expect(beforeApple).toBe(4);
   const row=await env.DB.prepare("SELECT details FROM diagnostics WHERE operation='alert' AND request_id=?").bind(response.headers.get('x-request-id')).first<{details:string}>(),details=JSON.parse(row!.details);
   expect(details.client_request_id).toBe(clientID);
-  for(const stage of ['alert_admission_ms','alert_snapshot_ms','event_insert_ms'])expect(details.db_stages[stage]).toMatchObject({calls:1,statements:2});
+  for(const stage of ['alert_admission_ms','alert_snapshot_ms'])expect(details.db_stages[stage]).toMatchObject({calls:1,statements:2});
+  // The insert batch also clears any earlier rejection row for the episode.
+  expect(details.db_stages.event_insert_ms).toMatchObject({calls:1,statements:3});
  });
  it('does not let invalid or revoked credentials consume the real alert budget',async()=>{
   const {listener}=await paired(),value=alert(listener),key=await sha256(`${testEnv.PAIRING_PEPPER}|alert|${listener.deviceId}`);
@@ -3864,9 +3920,12 @@ describe('unexpected Listener monitoring stops',()=>{
    {...beat(listener,false),detectionPaused:'other_audio'},
    {...beat(listener,false),microphoneActive:true,detectionPaused:'music'}
   ])expect((await call('listener/heartbeat',listener,invalid)).status).toBe(400);
-  const cry={...failure(listener),type:'sustained_cry',reason:'other_audio'};
-  expect((await call('listener/event',listener,cry)).status).toBe(400);
-  expect((await call('listener/event',listener,{...failure(listener),reason:'microphone'})).status).toBe(400);
+  // A reason the Worker does not support is discarded, never a reason to drop the alert.
+  const cry={...failure(listener),type:'sustained_cry',reason:'other_audio'},stop={...failure(listener),reason:'microphone'};
+  for(const value of [cry,stop]){
+   expect((await call('listener/event',listener,value)).status).toBe(200);
+   expect(JSON.parse((await env.DB.prepare('SELECT payload FROM events WHERE event_id=?').bind(value.eventId).first<{payload:string}>())!.payload)).not.toHaveProperty('reason');
+  }
  });
  it('is not retired by a monitoring heartbeat sent before the stop, and stays quiet once monitoring resumed',async()=>{
   const {parent,listener}=await ready();
@@ -4252,6 +4311,14 @@ describe('two caregiver families',()=>{
   expect((await status(parent)).alerts).toHaveLength(0);expect((await status(partner)).alerts).toHaveLength(1);
  });
 
+ it('expires a family alert by its createdAt even when the upload arrives late',async()=>{
+  const {parent,partner,listener}=await family();await tokens(parent,'a');await tokens(partner,'c');
+  const pairedAt=Date.now()-30*3600000,createdAt=Date.now()-25*3600000;
+  await env.DB.batch([env.DB.prepare('UPDATE pairs SET created_at=? WHERE parent_id=?').bind(pairedAt,parent.deviceId),env.DB.prepare('UPDATE caregiver_families SET pair_created_at=? WHERE owner_id=?').bind(pairedAt,parent.deviceId)]);
+  const event={...alert(listener),createdAt:new Date(createdAt).toISOString(),cryStartedAt:new Date(createdAt-300000).toISOString()};
+  expect((await call('listener/event',listener,event)).status).toBe(200);expect(pushRequests).toHaveLength(0);
+  expect(await env.DB.prepare('SELECT last_error FROM events WHERE event_id=?').bind(event.eventId).first('last_error')).toBe('expired_event');
+ });
  it('starts escalation from server dispatch rather than a delayed upload’s client timestamp',async()=>{
   const {parent,partner,listener}=await family();await tokens(parent,'a');await tokens(partner,'c');
   const began=Date.now(),pairedAt=began-3600000;

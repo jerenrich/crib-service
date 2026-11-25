@@ -24,6 +24,9 @@ public struct CrySessionManager: Sendable {
         guard !sources.isEmpty, sources.allSatisfy({ $0.1 != nil }) else { return nil }
         return sources.compactMap { $0.1 }.max()
     }
+    /// After the Worker rejects an episode's alert, a still-crying episode may queue
+    /// a fresh one (new event ID and timing) at most this often.
+    static let rejectedAlertRetryInterval: TimeInterval = 60
     private let clock: any ClockProviding
     private var lastVolumeInputAt: Date?
     public init(snapshot: SessionSnapshot = SessionSnapshot(), clock: any ClockProviding = SystemClock()) {
@@ -135,13 +138,16 @@ public struct CrySessionManager: Sendable {
         // becomes a full reset, a baby that settled before the threshold sends none.
         // The server repeats until acknowledgement or a confirmed quiet reset.
         var alerts: [CryAlert] = []
-        if episode.alertQueuedAt == nil && (volumeReady || classifierReady) {
-            // The duration must equal createdAt - cryStartedAt: the server checks
-            // that relation. The qualifying detector may measure the threshold
-            // from an onset earlier than the episode start, so reporting the
-            // configured threshold here produced alerts the server rejected.
-            let alert = CryAlert(episodeId: episode.id, listenerId: listenerId, cryStartedAt: episode.startedAt,
-                                 durationSeconds: episode.duration(at: now),
+        let rejectionSettled = episode.alertRejectedAt.map { now.timeIntervalSince($0) >= Self.rejectedAlertRetryInterval } ?? true
+        if episode.alertQueuedAt == nil && rejectionSettled && (volumeReady || classifierReady) {
+            // Report the window the gate verified: at least the configured threshold
+            // ending now. The detector's onset (the latest sustained run) can be later
+            // than that window's start, which would understate crying in the
+            // notification. durationSeconds must equal createdAt - cryStartedAt: the
+            // server checks that relation.
+            let cryStartedAt = min(episode.startedAt, now.addingTimeInterval(-snapshot.configuration.alertDuration))
+            let alert = CryAlert(episodeId: episode.id, listenerId: listenerId, cryStartedAt: cryStartedAt,
+                                 durationSeconds: now.timeIntervalSince(cryStartedAt),
                                  createdAt: now, isRepeat: false)
             episode.alertQueuedAt = now
             episode.lastAlertQueuedAt = now
@@ -193,6 +199,7 @@ public struct CrySessionManager: Sendable {
             if snapshot.current?.id == item.alert.episodeId { snapshot.current?.alertSentAt = date }
             if let index = snapshot.history.firstIndex(where: { $0.id == item.alert.episodeId }) { snapshot.history[index].alertSentAt = date }
         }
+        snapshot.lastAlertDeliveredAt = max(snapshot.lastAlertDeliveredAt ?? date, date)
         snapshot.pending.removeAll { $0.id == id }
     }
     public mutating func failed(_ id: UUID, at date: Date) {
@@ -207,7 +214,11 @@ public struct CrySessionManager: Sendable {
         }
         return changed
     }
+    /// The server accepted the alert and then retired it (acknowledged or settled).
     public mutating func acknowledged(_ id: UUID) {
+        guard snapshot.pending.contains(where: { $0.id == id }) else { return }
+        let now = clock.now
+        snapshot.lastAlertDeliveredAt = max(snapshot.lastAlertDeliveredAt ?? now, now)
         snapshot.pending.removeAll { $0.id == id }
     }
     public mutating func permanentlyFailed(_ id: UUID, at date: Date) {
@@ -215,6 +226,15 @@ public struct CrySessionManager: Sendable {
         snapshot.failedAlerts.insert(FailedAlert(alert: item.alert, failedAt: date), at: 0)
         snapshot.failedAlerts = Array(snapshot.failedAlerts.prefix(100))
         snapshot.pending.removeAll { $0.id == id }
+    }
+    /// The Worker rejected the alert as invalid and stored nothing, so it sends no
+    /// reminders. Retire it, and let a still-crying episode queue a fresh alert
+    /// after `rejectedAlertRetryInterval` instead of staying silent until it ends.
+    public mutating func rejected(_ id: UUID, at date: Date) {
+        guard let item = snapshot.pending.first(where: { $0.id == id }) else { return }
+        permanentlyFailed(id, at: date)
+        guard !item.alert.isRepeat, item.alert.isTest != true, snapshot.current?.id == item.alert.episodeId else { return }
+        snapshot.current?.alertQueuedAt = nil; snapshot.current?.alertRejectedAt = date
     }
 }
 private extension PendingAlert { var id: UUID { alert.eventId } }

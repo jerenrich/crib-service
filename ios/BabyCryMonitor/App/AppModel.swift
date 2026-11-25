@@ -30,6 +30,8 @@ import UIKit
     var error: String?
     var audioStatus = "Stopped"
     var deliveryStatus = "Not connected"
+    /// The Worker's message for the latest rejected alert, until an alert is accepted.
+    private var lastAlertRejection: String?
     var stoppingAlerts = false
     var resumingAlerts = false
     var acknowledgingAlert = false
@@ -1634,8 +1636,10 @@ import UIKit
             guard revision == environmentRevision else { return }
             switch result {
             case .success(let receipt): log.alertReceipt(alert, status: receipt.status, at: currentTime())
-            case .failure: log.alertReceipt(alert, status: "request_failed", at: currentTime())
+            // A rejection retires the event; tie that to it in the per-event trace.
+            case .failure(let failure): log.alertReceipt(alert, status: failure is AlertRejection ? "rejected" : "request_failed", at: currentTime())
             }
+            if case .success(let receipt) = result, ["sent", "resolved", "acknowledged"].contains(receipt.status) { lastAlertRejection = nil }
             switch result {
             case .success(let receipt) where receipt.status == "sent":
                 engine.delivered(alert.eventId, at: Date()); log.record("alert_apns_accepted")
@@ -1660,9 +1664,10 @@ import UIKit
                 default: deliveryStatus = "Alert queued on server (\(receipt.status))."; log.record("alert_server_pending")
                 }
             case .failure(let rejection as AlertRejection):
-                // The Worker judged these exact bytes invalid; resending them can
-                // never succeed and would retry for days. Surface it instead.
-                engine.permanentlyFailed(alert.eventId, at: currentTime())
+                // The Worker marked this alert invalid; no later attempt can succeed.
+                // Surface it, and let a still-crying episode queue a fresh alert.
+                engine.rejected(alert.eventId, at: currentTime())
+                lastAlertRejection = rejection.message
                 deliveryStatus = "Alert rejected by server: \(rejection.message)"
                 log.record("alert_rejected", error: rejection)
             case .failure(let failure):
@@ -1785,7 +1790,9 @@ import UIKit
                 }
                 if self.pendingHeartbeats[key]?.id == attempt.id { self.pendingHeartbeats.removeValue(forKey: key) }
                 if attempt.revision == self.environmentRevision, attempt.observation == self.monitoringGeneration {
-                    self.lastHeartbeatAt = self.currentTime(); self.deliveryStatus = "Connected"
+                    self.lastHeartbeatAt = self.currentTime()
+                    // Keep a rejection visible until a later alert is accepted.
+                    self.deliveryStatus = self.lastAlertRejection.map { "Connected · Last alert rejected by server: \($0)" } ?? "Connected"
                     if !self.settingsDirty, attempt.settingsGeneration == self.settingsGeneration {
                         self.applyRemote(config)
                         if attempt.value.appliedConfiguration != config { self.queueHeartbeat() }
