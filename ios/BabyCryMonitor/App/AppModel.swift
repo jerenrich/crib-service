@@ -132,6 +132,15 @@ import UIKit
     @ObservationIgnored private var localMonitoringReport: (id: UUID, enabled: Bool)?
     @ObservationIgnored private var reportingLocalMonitoring = false
     @ObservationIgnored private var nextLocalReportAt = Date.distantPast
+    /// When the unsent local report was queued (or restored at launch).
+    @ObservationIgnored private var localMonitoringReportQueuedAt: Date?
+    /// The latest monitoring command the server reported, and when it was requested.
+    @ObservationIgnored private var observedServerCommand: (command: MonitoringCommand?, requestedAt: Date)?
+    /// Listener time of the newest monitoring heartbeat the server accepted.
+    @ObservationIgnored private var monitoringHeartbeatAcceptedAt: Date?
+    @ObservationIgnored private var holdReleaseLogged: UUID?
+    /// Set while re-registering a credential the Worker rejected; the next attempt.
+    @ObservationIgnored private var reregistrationRetryAt: Date?
     @ObservationIgnored private var monitoringFailureQueued = false
     @ObservationIgnored private var recoveringSince: Date?
     var managingDevice = false
@@ -400,6 +409,7 @@ import UIKit
         // reporting one would retire unacknowledged crying alerts and end reminders.
         if role == .listener, paired, let id = defaults.string(forKey: localMonitoringReportKey).flatMap(UUID.init(uuidString:)) {
             localMonitoringReport = (id, defaults.object(forKey: localMonitoringReportKey + "|enabled") as? Bool ?? false)
+            localMonitoringReportQueuedAt = currentTime()
         }
         if role == .parent { monitoringControlError = defaults.string(forKey: monitoringControlPendingKey + "|error") }
         if role == .parent, let data = defaults.data(forKey: monitoringControlPendingKey),
@@ -685,6 +695,8 @@ import UIKit
                 try keychain.save(created, environment: backendURL); credential = created
             }
             if let credential { engine.scopeTimeline(to: "\(backendURL)|\(credential.deviceId)"); persist() }
+            // A paired, unregistered credential was rejected before a relaunch.
+            reregistrationRetryAt = paired && credential?.registered == false ? .distantPast : nil
         } catch { self.error = error.localizedDescription; log.record("credential_failed", error: error) }
     }
     private func client() throws -> any BackendServing {
@@ -701,14 +713,34 @@ import UIKit
         if var backend = value as? BackendClient { backend.log = log; return backend }
         return value
     }
+    /// The Worker no longer recognizes this credential (its registration was lost):
+    /// register the same credential again on the next request instead of failing
+    /// every heartbeat and alert upload until someone reinstalls the app.
+    private func noteAuthenticationFailure(_ error: Error, client: any BackendServing) {
+        guard error is DeviceAuthenticationRejected, var saved = credential, saved.registered,
+              saved.deviceId == client.credential.deviceId else { return }
+        saved.registered = false
+        do { try keychain.save(saved, environment: backendURL) } catch { log.record("credential_save_failed", error: error) }
+        credential = saved; reregistrationRetryAt = .distantPast
+        log.record("device_registration_rejected")
+    }
     private func registeredClient() async throws -> any BackendServing {
         let client = try client()
         if credential?.registered != true {
+            // Re-registering after a rejection must never hold back an alert: if it
+            // fails (registration is rate limited), send with this credential anyway.
+            if let retry = reregistrationRetryAt, currentTime() < retry { return client }
             let revision = environmentRevision
-            try await client.register()
+            do { try await client.register() } catch {
+                guard reregistrationRetryAt != nil else { throw error }
+                reregistrationRetryAt = currentTime().addingTimeInterval(60)
+                log.record("device_reregistration_failed", error: error)
+                return client
+            }
             guard revision == environmentRevision, credential?.deviceId == client.credential.deviceId else { throw CancellationError() }
             var saved = client.credential; saved.registered = true
             try keychain.save(saved, environment: backendURL); credential = saved
+            if reregistrationRetryAt != nil { reregistrationRetryAt = nil; log.record("device_reregistered") }
         }
         return client
     }
@@ -867,13 +899,13 @@ import UIKit
         defaults.set(monitoringControlError, forKey: monitoringControlPendingKey + "|error")
     }
     private func queueLocalMonitoringReport(_ enabled: Bool) {
-        localMonitoringReport = (UUID(), enabled)
+        localMonitoringReport = (UUID(), enabled); localMonitoringReportQueuedAt = currentTime()
         defaults.set(localMonitoringReport?.id.uuidString, forKey: localMonitoringReportKey)
         defaults.set(enabled, forKey: localMonitoringReportKey + "|enabled")
         lastRefreshAt = .distantPast; nextLocalReportAt = .distantPast
     }
     private func clearLocalMonitoringReport() {
-        localMonitoringReport = nil
+        localMonitoringReport = nil; localMonitoringReportQueuedAt = nil
         defaults.removeObject(forKey: localMonitoringReportKey)
         defaults.removeObject(forKey: localMonitoringReportKey + "|enabled")
     }
@@ -891,6 +923,7 @@ import UIKit
         } catch {
             nextLocalReportAt = currentTime().addingTimeInterval(3)
             log.record("monitoring_control_failed", error: error)
+            noteAuthenticationFailure(error, client: client)
         }
     }
     /// A role or backend change discards the in-memory report. Send it first with
@@ -912,7 +945,8 @@ import UIKit
     }
     private func resetMonitoringControl() {
         controlGeneration += 1
-        localMonitoringReport = nil; pendingMonitoringCommand = nil
+        localMonitoringReport = nil; localMonitoringReportQueuedAt = nil; pendingMonitoringCommand = nil
+        observedServerCommand = nil; monitoringHeartbeatAcceptedAt = nil
         monitoringControlDeadline = nil; monitoringControlError = nil; monitoringControlMessage = nil
     }
     func requestMonitoring(_ enabled: Bool) async {
@@ -1455,8 +1489,11 @@ import UIKit
         powerConnected = powered
         if microphoneActive, let lastSampleAt, now.timeIntervalSince(lastSampleAt) > 3 {
             let wasCovering = monitoring || (otherAudioPaused && !detectionPaused)
-            haltMonitoring(); error = "Monitoring stopped: microphone samples stopped arriving."; needsRestart = true; log.record("audio_stalled")
+            log.record("audio_stalled")
+            // Queue the stop alert and begin its upload (under background time)
+            // before releasing audio: without capture, iOS soon suspends the app.
             if wasCovering { reportUnexpectedStop() }
+            haltMonitoring(); error = "Monitoring stopped: microphone samples stopped arriving."; needsRestart = true
         }
         // Detection has been off for a minute without anyone pausing it. Once the
         // sound has stopped, detection is only waiting out its resume delay; an
@@ -1582,7 +1619,10 @@ import UIKit
                 guard revision == environmentRevision, role == .listener, storageHealthy else { return }
                 await deliverAlerts(using: client, revision: revision)
             }
-        } catch { deliveryStatus = "Backend unavailable: \(error.localizedDescription)"; log.record("backend_unavailable", error: error) }
+        } catch {
+            deliveryStatus = "Backend unavailable: \(error.localizedDescription)"; log.record("backend_unavailable", error: error)
+            if let current = try? self.client() { noteAuthenticationFailure(error, client: current) }
+        }
     }
     private func retryBackedOffAlerts() {
         guard role == .listener, paired, engine.retryBackedOffAlerts(at: currentTime()) else { return }
@@ -1592,7 +1632,11 @@ import UIKit
     private func requestImmediateAlertDelivery() {
         alertDeliveryRequested = true
         guard immediateAlertTask == nil else { return }
+        // Alerts are often queued as capture ends (an interruption, a stall), when
+        // iOS is about to suspend a locked Listener. Hold background time from now.
+        let grant = BackgroundTimeGrant.begin("alert-delivery") { [weak self] in self?.log.record("background_time_expired") }
         immediateAlertTask = Task { [weak self] in
+            defer { grant.end() }
             guard let self else { return }
             defer { self.immediateAlertTask = nil }
             let revision = self.environmentRevision
@@ -1607,7 +1651,9 @@ import UIKit
     private func deliverAlerts(using client: any BackendServing, revision: Int) async {
         alertDeliveryRequested = true
         if let alertDeliveryTask { await alertDeliveryTask.value; return }
+        let grant = BackgroundTimeGrant.begin("alert-delivery") { [weak self] in self?.log.record("background_time_expired") }
         let task = Task { [weak self] in
+            defer { grant.end() }
             guard let self else { return }
             defer { self.alertDeliveryTask = nil }
             while self.alertDeliveryRequested {
@@ -1617,16 +1663,35 @@ import UIKit
                 // The server acknowledges (and the Listener then drops) an upload judged
                 // against an older applied Stop. Hold the outbox until this Start is
                 // recorded; the one-second tick retries the report and then the alerts.
+                // The hold ends early once the server shows no such Stop applies, as
+                // after it records a Start from this Listener's monitoring heartbeats.
                 await self.flushLocalMonitoringReport(using: client)
                 guard revision == self.environmentRevision else { return }
-                if self.localMonitoringReport?.enabled == true, !self.snapshot.pending.isEmpty {
-                    self.log.record("alert_held_for_monitoring_report"); return
+                if let report = self.localMonitoringReport, report.enabled, !self.snapshot.pending.isEmpty {
+                    guard self.serverIgnoresEarlierStop else { self.log.record("alert_held_for_monitoring_report"); return }
+                    if self.holdReleaseLogged != report.id { self.holdReleaseLogged = report.id; self.log.record("alert_hold_released_server_started") }
                 }
                 await self.flushAlerts(using: client, revision: revision)
             }
         }
         alertDeliveryTask = task
         await task.value
+    }
+    /// Whether the server would judge a new alert without an older Stop, although
+    /// this Listener's Start report has not been recorded. Either the server's
+    /// latest command, requested after that Start, suppresses nothing; or a server
+    /// that records a Start from monitoring heartbeats accepted one sent after the
+    /// Stop could have expired (30 seconds after it, plus margin).
+    private var serverIgnoresEarlierStop: Bool {
+        guard let queuedAt = localMonitoringReportQueuedAt else { return false }
+        if let observed = observedServerCommand, observed.requestedAt >= queuedAt,
+           !(observed.command.map(Self.suppressesAlerts) ?? false) { return true }
+        guard ServerFeatures.shared.heartbeatStart, let accepted = monitoringHeartbeatAcceptedAt else { return false }
+        return accepted >= queuedAt.addingTimeInterval(35)
+    }
+    /// Mirrors the Worker: an applied Stop, or a pending one, silences new alerts.
+    private static func suppressesAlerts(_ command: MonitoringCommand) -> Bool {
+        !command.enabled && (command.status == "applied" || command.status == "pending")
     }
     private func flushAlerts(using client: any BackendServing, revision: Int) async {
         await alerts.deliverReady(snapshot.pending, listenerId: client.credential.deviceId, now: currentTime(), sender: client,
@@ -1668,6 +1733,7 @@ import UIKit
             case .failure(let failure):
                 engine.failed(alert.eventId, at: Date()); deliveryStatus = "Alert pending: \(failure.localizedDescription)"
                 log.record("alert_retry_scheduled", error: failure)
+                noteAuthenticationFailure(failure, client: client)
             }
             if alert.eventId == latestTestEventID {
                 if case .success(let receipt) = result, receipt.status == "sent" {
@@ -1722,7 +1788,16 @@ import UIKit
                          currentEpisode: snapshot.current.map(remote), episodes: Array(snapshot.history.prefix(100)).map(remote), appliedConfiguration: configuration,
                          timelineEvents: Array(snapshot.timelineEvents.filter { snapshot.pendingTimelineIDs.contains($0.id) }.prefix(100)),
                          microphoneActive: microphoneActive,
-                         detectionPaused: otherAudioPaused && !detectionPaused ? CryAlert.otherAudioReason : nil)
+                         detectionPaused: otherAudioPaused && !detectionPaused ? CryAlert.otherAudioReason
+                            : interruptedCoverage ? CryAlert.audioInterruptedReason : nil)
+    }
+    /// Capture stopped without a person's Stop or Pause: audio is still recovering
+    /// (an interruption on a locked Listener), or capture failed and its stop alert
+    /// has not been uploaded. Report it so the server keeps covering the nursery:
+    /// iOS usually suspends such a Listener, and its silence must reach the Parent.
+    private var interruptedCoverage: Bool {
+        guard role == .listener, !monitoring, !microphoneActive, !detectionPaused else { return false }
+        return recoveringAudio || snapshot.pending.contains { $0.alert.isMonitoringFailure }
     }
     private func scheduleHeartbeatIfDue() {
         guard !managingDevice else { return }
@@ -1739,7 +1814,7 @@ import UIKit
             retryBackedOffAlerts()
         }
         lastConnectivityAvailable = available
-        if (microphoneActive || monitoring || !snapshot.pendingTimelineIDs.isEmpty), let key = heartbeatKey, pendingHeartbeats[key] == nil,
+        if (microphoneActive || monitoring || interruptedCoverage || !snapshot.pendingTimelineIDs.isEmpty), let key = heartbeatKey, pendingHeartbeats[key] == nil,
            currentTime().timeIntervalSince(lastHeartbeatAt) >= 15 {
             queueHeartbeat()
         }
@@ -1766,7 +1841,11 @@ import UIKit
             request.settingsGeneration = settingsGeneration
         }
         let attempt = request
+        // A status change (an interruption, a stall) often comes just before iOS
+        // suspends the Listener; hold background time until the server has it.
+        let grant = BackgroundTimeGrant.begin("heartbeat") {}
         heartbeatTask = Task { [weak self] in
+            defer { grant.end() }
             guard let self else { return }
             // A stop/restart may have superseded this task before it even ran.
             guard self.pendingHeartbeats[key]?.id == attempt.id else {
@@ -1776,6 +1855,9 @@ import UIKit
                 let config = try await attempt.client.heartbeat(attempt.value)
                 if attempt.revision == self.environmentRevision {
                     self.engine.uploadedTimeline(Set((attempt.value.timelineEvents ?? []).map(\.id))); self.persist()
+                    if attempt.value.monitoring, attempt.value.timestamp > (self.monitoringHeartbeatAcceptedAt ?? .distantPast) {
+                        self.monitoringHeartbeatAcceptedAt = attempt.value.timestamp
+                    }
                 }
                 if attempt.failures > 0 {
                     self.log.record("heartbeat_recovered")
@@ -1800,6 +1882,7 @@ import UIKit
                     self.pendingHeartbeats[key] = pending
                     self.log.record("heartbeat_retry_scheduled", error: error)
                 }
+                if attempt.revision == self.environmentRevision { self.noteAuthenticationFailure(error, client: attempt.client) }
                 if attempt.revision == self.environmentRevision, attempt.observation == self.monitoringGeneration {
                     self.deliveryStatus = "Monitoring status update pending: \(error.localizedDescription)"
                 }
@@ -1880,6 +1963,7 @@ import UIKit
             nextParentRefreshAt = currentTime().addingTimeInterval(pendingMonitoringCommand == nil ? 15 : 1)
             checkMonitoringControlDeadline()
             log.record("parent_status_failed", error: error)
+            if let current = try? client() { noteAuthenticationFailure(error, client: current) }
             publishWatch()
         }
     }
@@ -1914,6 +1998,7 @@ import UIKit
                 let status = try await client.status()
                 guard revision == self.environmentRevision, control == self.controlGeneration, alerts == self.listenerAlertGeneration, self.role == .listener else { return }
                 self.observePairing(status)
+                if status.paired { self.observedServerCommand = (status.monitoringCommand, fetchedAt) }
                 // An idle Listener sends no heartbeats, so this poll is its only
                 // source of Parent settings. Report a change once so the Parent
                 // can confirm it was applied.
@@ -1930,6 +2015,7 @@ import UIKit
             } catch {
                 guard let self, revision == self.environmentRevision else { return }
                 self.log.record("listener_status_failed", error: error)
+                self.noteAuthenticationFailure(error, client: client)
             }
         }
     }

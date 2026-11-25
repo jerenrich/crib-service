@@ -349,6 +349,30 @@ describe('connection alerts, readiness and replacement',()=>{
   await call('listener/heartbeat',listener,beat(listener,false));mockPush();await flushConnections(testEnv);await flushConnections(testEnv);
   expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM connection_notices WHERE state='stopped'").first()).toEqual({n:1});
  });
+ it('keeps covering an interrupted Listener that is recovering audio, so its silence still alerts',async()=>{
+  const {parent,listener}=await paired();await call('connection-alerts',parent,{enabled:true});
+  await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  const features=(await call('listener/heartbeat',listener,beat(listener))).headers.get('x-crib-features')?.split(',');
+  expect(features).toEqual(expect.arrayContaining(['detection-pause','audio-interruption','heartbeat-start']));
+  await flushConnections(testEnv);
+  // A phone call on a locked Listener: the microphone is lost while it recovers.
+  const interrupted={...beat(listener,false),microphoneActive:false,detectionPaused:'audio_interrupted'};
+  expect((await call('listener/heartbeat',listener,{...interrupted,microphoneActive:true})).status).toBe(400);
+  expect((await call('listener/heartbeat',listener,{...interrupted,monitoring:true})).status).toBe(400);
+  expect((await call('listener/heartbeat',listener,{...interrupted,microphoneActive:undefined})).status).toBe(400);
+  expect((await call('listener/heartbeat',listener,{...interrupted,detectionPaused:'phone_call'})).status).toBe(400);
+  expect((await call('listener/heartbeat',listener,interrupted)).status).toBe(200);
+  const observed=await (await call('listener/status',parent,undefined,'GET')).json() as {monitoring:boolean;detectionPaused:string|null};
+  expect(observed).toMatchObject({monitoring:false,detectionPaused:'audio_interrupted'});
+  // Not a person's Stop: no stopped notice, and the Listener stays covered.
+  await flushConnections(testEnv);await flushConnections(testEnv);
+  expect(pushRequests).toHaveLength(0);
+  expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM connection_notices WHERE state='stopped'").first()).toEqual({n:0});
+  // iOS suspends the interrupted Listener; its silence is a connection loss.
+  await stale();mockPush();await flushConnections(testEnv);await flushConnections(testEnv);
+  expect(pushRequests).toHaveLength(1);
+  expect(JSON.parse(String(pushRequests[0].init?.body))).toMatchObject({type:'listener_disconnected',connectionState:'offline'});
+ });
  it('does not replay ambiguous health delivery and cancels obsolete outages',async()=>{
   const {parent,listener}=await paired();await call('connection-alerts',parent,{enabled:true});
   await call('device/push-token',parent,{token:'ab'.repeat(32)});await call('listener/heartbeat',listener,beat(listener));await stale();
@@ -2134,6 +2158,49 @@ describe('monitoring controls',()=>{
   expect((await (await call('listener/event',listener,next)).json() as {status:string}).status).toBe('sent');
   expect(pushRequests).toHaveLength(2);
  });
+ it('lets a monitoring heartbeat after an applied Stop end its suppression when the Start report is lost',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  const beat=(monitoring=true)=>({listenerId:listener.deviceId,timestamp:new Date().toISOString(),monitoring,powerConnected:true,state:'quiet',episodes:[]});
+  const beforeStop=alert(listener);beforeStop.createdAt=new Date(Date.now()-1000).toISOString();
+  const stop=await command(listener,false);
+  // Within the Stop's lifetime a monitoring heartbeat may predate the Stop.
+  await call('listener/heartbeat',listener,beat());
+  expect((await status(parent)).monitoringCommand?.id).toBe(stop.id);
+  const early=alert(listener);early.createdAt=new Date(Date.now()+10).toISOString();
+  expect((await (await call('listener/event',listener,early)).json() as {status:string}).status).toBe('acknowledged');
+  await env.DB.prepare('UPDATE monitoring_commands SET expires_at=? WHERE id=?').bind(Date.now()-1,stop.id).run();
+  // A non-monitoring heartbeat proves nothing.
+  await call('listener/heartbeat',listener,beat(false));
+  expect((await status(parent)).monitoringCommand?.id).toBe(stop.id);
+  // The Listener restarted locally, but its Start report never arrived.
+  await call('listener/heartbeat',listener,beat());
+  const started=(await status(parent)).monitoringCommand as {id:string;status:string;enabled?:boolean};
+  expect(started).toMatchObject({status:'applied',enabled:true});expect(started.id).not.toBe(stop.id);
+  await call('listener/heartbeat',listener,beat()); // Idempotent: one Start per Stop.
+  expect((await env.DB.prepare('SELECT COUNT(*) AS n FROM monitoring_commands WHERE enabled=1').first<{n:number}>())?.n).toBe(1);
+  const cry=alert(listener);cry.createdAt=new Date(Date.now()+10).toISOString();mockPush();
+  expect((await (await call('listener/event',listener,cry)).json() as {status:string}).status).toBe('sent');
+  // An outbox alert recorded before the Stop stays silent.
+  expect((await (await call('listener/event',listener,beforeStop)).json() as {status:string}).status).toBe('acknowledged');
+  expect(pushRequests).toHaveLength(1);
+  // The Listener's own Start report still lands after the implicit one.
+  expect((await command(listener,true)).status).toBe('applied');
+ });
+ it('never lets a monitoring heartbeat override a pending Stop or record a Start for an old pairing',async()=>{
+  const {parent,listener}=await paired();
+  const beat={listenerId:listener.deviceId,timestamp:new Date().toISOString(),monitoring:true,powerConnected:true,state:'quiet',episodes:[]};
+  const pending=await command(parent,false);
+  await call('listener/heartbeat',listener,beat);
+  expect((await status(parent)).monitoringCommand).toMatchObject({id:pending.id,status:'pending'});
+  // Even once expired, an unconfirmed Stop is not an applied one to undo.
+  await env.DB.prepare('UPDATE monitoring_commands SET expires_at=? WHERE id=?').bind(Date.now()-1,pending.id).run();
+  await call('listener/heartbeat',listener,beat);
+  expect((await status(parent)).monitoringCommand?.id).toBe(pending.id);
+  // A Start is never recorded for a Listener that has no applied Stop at all.
+  await env.DB.prepare('DELETE FROM monitoring_commands').run();
+  await call('listener/heartbeat',listener,beat);
+  expect((await status(parent)).monitoringCommand).toBeNull();
+ });
  it('removes monitoring commands on unpair and deletion',async()=>{
   const {parent,listener}=await paired();await command(parent,true);
   expect((await call('pairing/remove',listener)).status).toBe(200);
@@ -3074,7 +3141,8 @@ describe('heartbeat binding wait recovery',()=>{
   const d=JSON.parse(row!.details);expect(d.db_calls).toBe(4);
   expect(d.db_stages.heartbeat_admission_ms).toMatchObject({calls:1,statements:3});
   expect(d.db_stages.heartbeat_snapshot_ms).toMatchObject({calls:1,statements:1});
-  expect(d.db_stages.heartbeat_storage_ms).toMatchObject({calls:1,statements:6});
+  // Includes the guarded Start a monitoring heartbeat records after an applied Stop.
+  expect(d.db_stages.heartbeat_storage_ms).toMatchObject({calls:1,statements:7});
  });
  it('recovers a stalled credential reply with one fresh SELECT and charges quotas once',async()=>{
   const {listener}=await paired();let reads=0,release!:()=>void,entered!:()=>void;
@@ -3837,7 +3905,7 @@ describe('unexpected Listener monitoring stops',()=>{
  it('explains a pause for other audio on the Listener in the push, its repeats and status',async()=>{
   const {parent,listener}=await ready();
   const advertised=await call('listener/heartbeat',listener,beat(listener,true));
-  expect(advertised.headers.get('x-crib-features')).toBe('detection-pause');
+  expect(advertised.headers.get('x-crib-features')?.split(',')).toContain('detection-pause');
   const paused={...beat(listener,false),microphoneActive:true,detectionPaused:'other_audio',
    timelineEvents:[{id:crypto.randomUUID(),kind:'detection_paused',occurredAt:new Date().toISOString()}]};
   expect((await call('listener/heartbeat',listener,paused)).status).toBe(200);
