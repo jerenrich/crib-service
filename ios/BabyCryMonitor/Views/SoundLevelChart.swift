@@ -16,10 +16,11 @@ struct SoundLevelChart: View {
                 let triggerHeight = levelHeight(trigger, in: geometry.size.height)
                 ZStack(alignment: .bottom) {
                     HStack(alignment: .bottom, spacing: levels.count > 60 ? 1 : 4) {
-                        ForEach(Array(levels.enumerated()), id: \.offset) { _, level in
+                        ForEach(Array(levels.enumerated()), id: \.offset) { index, level in
                             let barHeight = max(3, levelHeight(level, in: geometry.size.height))
+                            // The newest reading is brightest, so new sound is easy to spot.
                             Capsule()
-                                .fill(color.opacity(monitoring ? 0.65 : 0.2))
+                                .fill(color.opacity(monitoring ? (index == levels.count - 1 ? 1 : 0.65) : 0.2))
                                 .overlay(alignment: .top) {
                                     if monitoring, level >= trigger {
                                         Rectangle()

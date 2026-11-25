@@ -18,7 +18,10 @@ struct NightstandView: View {
     @State private var nightDimmed = false
     @State private var soundsPresented = false
     @State private var lastInteraction = Date()
-    @ScaledMetric(relativeTo: .caption) private var chartHeader: CGFloat = 40
+    /// Everything on the Parent screen except the sound panel, at standard text
+    /// size, with room for two-line status text. An iPhone SE keeps the 84 pt panel.
+    @ScaledMetric(relativeTo: .body) private var parentReservedHeight: CGFloat = 514
+    @ScaledMetric(relativeTo: .body) private var parentReservedHeightTwoCaregivers: CGFloat = 590
     private var ringSize: CGFloat { listener ? 200 : hasTwoCaregivers ? 96 : 112 }
     private var hasTwoCaregivers: Bool { model.caregiverDuty?.caregivers.count == 2 }
 
@@ -293,11 +296,14 @@ struct NightstandView: View {
     var body: some View {
         Group {
             if !listener {
-                ViewThatFits(in: .vertical) {
-                    compactParentContents
-                    ScrollView { compactParentContents }
+                GeometryReader { geometry in
+                    let panel = parentSoundPanelHeight(available: geometry.size.height)
+                    ViewThatFits(in: .vertical) {
+                        compactParentContents(soundPanelHeight: panel)
+                        ScrollView { compactParentContents(soundPanelHeight: panel) }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             } else if typeSize.isAccessibilitySize {
                 // Large accessibility text needs its full reading height.
                 ScrollView {
@@ -306,7 +312,7 @@ struct NightstandView: View {
                         timedHero
                         activitySummary
                         chips
-                        soundPanel.frame(height: 100 + chartHeader)
+                        soundPanel(chartHeight: 100)
                         NurserySoundButton { soundsPresented = true }
                         actions
                         disclaimer
@@ -320,7 +326,7 @@ struct NightstandView: View {
                     timedHero.padding(.top, 4)
                     activitySummary.padding(.top, -10)
                     chips
-                    soundPanel.frame(minHeight: 60, maxHeight: .infinity)
+                    soundPanel().frame(minHeight: 60, maxHeight: .infinity)
                     NurserySoundButton { soundsPresented = true }
                     actions
                     disclaimer
@@ -369,13 +375,21 @@ struct NightstandView: View {
         .sheet(isPresented: $detailsPresented) { detailsSheet }
     }
 
+    /// The live chart takes the height the rest of the Parent screen leaves free.
+    /// It follows the screen size rather than the content, so the chart keeps
+    /// its place while the status text above it changes.
+    private func parentSoundPanelHeight(available: CGFloat) -> CGFloat {
+        let reserved = hasTwoCaregivers ? parentReservedHeightTwoCaregivers : parentReservedHeight
+        return min(260, max(hasTwoCaregivers ? 80 : 84, available - reserved))
+    }
+
     /// Keep the Parent's essential controls near the top. On short screens and
     /// with larger text, the same content can scroll rather than being clipped.
-    private var compactParentContents: some View {
+    private func compactParentContents(soundPanelHeight: CGFloat) -> some View {
         VStack(spacing: 8) {
             header
             timedHero
-            soundPanel.frame(height: hasTwoCaregivers ? 80 : 84)
+            soundPanel().frame(height: soundPanelHeight)
             if hasTwoCaregivers { CaregiverDutyCard() }
             timingSummary
             NurserySoundButton { soundsPresented = true }
@@ -682,7 +696,30 @@ struct NightstandView: View {
 
     // MARK: Sound
 
-    private var soundPanel: some View {
+    private var currentLevel: Double { listener ? model.currentDBFS : levels.last ?? -100 }
+
+    /// A fixed `chartHeight` sizes the panel to its content (large text);
+    /// otherwise the chart fills whatever height the panel is given. A short
+    /// panel keeps the single compact header so the chart itself keeps its height.
+    private func soundPanel(chartHeight: CGFloat? = nil) -> some View {
+        Group {
+            if let chartHeight {
+                soundPanelContents(compact: false) { chart(height: chartHeight) }
+                    .padding(12)
+            } else {
+                GeometryReader { panel in
+                    soundPanelContents(compact: panel.size.height < 150) {
+                        GeometryReader { geometry in chart(height: max(8, geometry.size.height)) }
+                    }
+                    .padding(12)
+                    .frame(width: panel.size.width, height: panel.size.height)
+                }
+            }
+        }
+        .background(Palette.panel, in: RoundedRectangle(cornerRadius: 20))
+    }
+
+    private func soundPanelContents(compact: Bool, @ViewBuilder chart: () -> some View) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             let legend = HStack(spacing: 6) {
                 Path { path in
@@ -694,24 +731,57 @@ struct NightstandView: View {
                 Text("Alert level").font(.caption).foregroundStyle(Palette.amber).fixedSize()
             }.accessibilityHidden(true)
             if typeSize.isAccessibilitySize {
-                liveStatus
-                legend
-            } else {
-                HStack(alignment: .firstTextBaseline) {
-                    liveStatus
-                    Spacer(minLength: 8)
+                liveStatus(compact: false)
+                levelReadout(compact: false)
+            } else if compact {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    liveStatus(compact: true)
+                    Spacer(minLength: 4)
                     legend
+                    levelReadout(compact: true)
+                }
+            } else {
+                HStack(alignment: .center) {
+                    liveStatus(compact: false)
+                    Spacer(minLength: 8)
+                    levelReadout(compact: false)
                 }
             }
-            GeometryReader { geometry in
-                SoundLevelChart(levels: levels, trigger: threshold,
-                    currentLevel: listener ? model.currentDBFS : levels.last ?? -100,
-                    monitoring: soundLive, height: max(8, geometry.size.height), color: Palette.lavender,
-                    notificationPositions: notificationPositions)
+            chart()
+            if typeSize.isAccessibilitySize {
+                legend
+            } else if !compact {
+                HStack(spacing: 8) {
+                    Text("30 s ago")
+                    Spacer(minLength: 8)
+                    legend
+                    Spacer(minLength: 8)
+                    Text(soundLive ? "Now" : "Last reading")
+                }
+                .font(.caption2).foregroundStyle(Palette.muted).lineLimit(1)
+                .accessibilityHidden(true)
             }
         }
-        .padding(12)
-        .background(Palette.panel, in: RoundedRectangle(cornerRadius: 20))
+    }
+
+    private func chart(height: CGFloat) -> some View {
+        SoundLevelChart(levels: levels, trigger: threshold, currentLevel: currentLevel,
+            monitoring: soundLive, height: height, color: Palette.lavender,
+            notificationPositions: notificationPositions)
+    }
+
+    /// The newest reading as a number. VoiceOver reads it from the chart's value instead.
+    private func levelReadout(compact: Bool) -> some View {
+        let loud = soundLive && currentLevel >= threshold
+        return HStack(alignment: .firstTextBaseline, spacing: 3) {
+            Text(soundLive ? "\u{2212}\(Int(abs(currentLevel.rounded())))" : "\u{2014}")
+                .font(.system(compact ? .subheadline : .title3, design: .rounded).weight(.semibold)).monospacedDigit()
+                .foregroundStyle(loud ? Palette.amber : soundLive ? Palette.lavender : Palette.muted)
+                .contentTransition(.numericText())
+            Text("dB").font(.caption).foregroundStyle(Palette.muted)
+        }
+        .fixedSize()
+        .accessibilityHidden(true)
     }
 
     // MARK: Actions
@@ -952,10 +1022,10 @@ struct NightstandView: View {
         }.buttonStyle(.plain).accessibilityIdentifier("deviceSummary")
     }
 
-    private var liveStatus: some View {
-        HStack(spacing: 6) {
-            Circle().fill(soundLive ? Palette.lavender : Palette.muted).frame(width: 6, height: 6).accessibilityHidden(true)
-            Text(liveLabel).font(.caption).foregroundStyle(soundLive ? Palette.lavender : Palette.muted)
+    private func liveStatus(compact: Bool) -> some View {
+        HStack(spacing: compact ? 6 : 7) {
+            LiveDot(live: soundLive).accessibilityHidden(true)
+            Text(liveLabel).font(compact ? .caption : .footnote.weight(.semibold)).foregroundStyle(soundLive ? Palette.lavender : Palette.muted)
                 .modifier(NightstandStatusLines(lines: 1))
         }.accessibilityIdentifier("nightstandSoundStatus")
     }
@@ -1012,6 +1082,27 @@ struct NightstandView: View {
                 Task { await model.acknowledge(alert.eventId) }
             }.disabled(model.acknowledgingAlert).accessibilityIdentifier("activeAlertAction")
         }
+    }
+}
+
+/// A dot that sends out a slow ripple while readings are live.
+private struct LiveDot: View {
+    let live: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        Circle().fill(live ? Palette.lavender : Palette.muted)
+            .frame(width: 8, height: 8)
+            .background {
+                if live && !reduceMotion {
+                    Circle().stroke(Palette.lavender, lineWidth: 1.5)
+                        .phaseAnimator([false, true]) { ripple, expanded in
+                            ripple.scaleEffect(expanded ? 2.6 : 1).opacity(expanded ? 0 : 0.8)
+                        } animation: { expanded in
+                            expanded ? .easeOut(duration: 1.6) : nil
+                        }
+                }
+            }
     }
 }
 
