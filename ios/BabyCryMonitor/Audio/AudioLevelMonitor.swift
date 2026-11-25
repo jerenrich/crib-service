@@ -104,6 +104,7 @@ extension AudioLevelProviding {
     private let otherAudioResumeDelay: Duration
     private let reactivationRetryDelays: [Duration]
     private let isForeground: @MainActor () -> Bool
+    private let recordPermission: @MainActor () async -> Bool
     /// The last Start asked for voice-processing capture. Recovery keeps it
     /// only in the foreground: a locked Listener reactivates in .measurement,
     /// the configuration known to activate in the background.
@@ -135,7 +136,7 @@ extension AudioLevelProviding {
          sampleStream: AsyncStream<AudioLevelSample>? = nil, otherAudioPlaying: (@MainActor () -> Bool)? = nil,
          otherAudioPollInterval: Duration = .milliseconds(250), otherAudioResumeDelay: Duration = .seconds(5),
          reactivationRetryDelays: [Duration] = [.seconds(1), .seconds(3), .seconds(10)],
-         isForeground: (@MainActor () -> Bool)? = nil) {
+         isForeground: (@MainActor () -> Bool)? = nil, recordPermission: (@MainActor () async -> Bool)? = nil) {
         let pair = AsyncStream<AudioLevelSample>.makeStream(bufferingPolicy: .bufferingNewest(16))
         let classifications = AsyncStream<SoundClassificationEvent>.makeStream(bufferingPolicy: .bufferingNewest(64))
         levels = sampleStream ?? pair.stream
@@ -156,6 +157,11 @@ extension AudioLevelProviding {
         if let isForeground { self.isForeground = isForeground }
         else if driver == nil { self.isForeground = { UIApplication.shared.applicationState == .active } }
         else { self.isForeground = { false } }
+        // An injected driver never opens the microphone. Asking iOS would show
+        // a permission alert that nobody answers in a test host.
+        if let recordPermission { self.recordPermission = recordPermission }
+        else if driver == nil { self.recordPermission = { await AVAudioApplication.requestRecordPermission() } }
+        else { self.recordPermission = { true } }
         classificationTask = Task { [weak self] in
             for await event in classifications.stream {
                 guard !Task.isCancelled else { break }
@@ -174,7 +180,7 @@ extension AudioLevelProviding {
         })
     }
     deinit { classificationTask?.cancel(); otherAudioTask?.cancel() }
-    func requestPermission() async -> Bool { await AVAudioApplication.requestRecordPermission() }
+    func requestPermission() async -> Bool { await recordPermission() }
     func start(idleVoiceProcessing: Bool) async throws {
         try Task.checkCancellation()
         wantsIdleVoiceProcessing = idleVoiceProcessing
