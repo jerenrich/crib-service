@@ -103,7 +103,7 @@ final class NotificationService: UNNotificationServiceExtension, @unchecked Send
             if try AlarmManager.shared.alarms.contains(where: { $0.id == request.episodeID }) { return result(.duplicate) }
             let fireAt = Date().addingTimeInterval(SilentAlarmScheduling.delay)
             _ = try await AlarmManager.shared.schedule(id: request.episodeID,
-                                                       configuration: SilentAlarmScheduling.configuration(for: request, at: fireAt))
+                                                       configuration: SilentAlarmScheduling.configuration(for: request, at: fireAt, snoozeDuration: snapshot.snoozeDuration))
             // Stop can race a suspended schedule call in another process.
             let latest = AlarmSnapshot.load() ?? snapshot
             if let reason = latest.ineligibilityReason(for: request, now: Date()) ??

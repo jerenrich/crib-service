@@ -139,7 +139,12 @@ export async function dispatchEvent(env:Env,eventId:string,requestId=crypto.rand
   delivery_mode=COALESCE(delivery_mode,CASE WHEN ${watchOnlySQL} THEN 'watch_only' END),
   delivery_state=CASE WHEN delivery_mode='watch_only' OR (${watchOnlySQL}) OR (${phoneOnlySQL}) THEN NULL
    ELSE COALESCE(delivery_state,CASE WHEN push_target IS NULL AND EXISTS(SELECT 1 FROM devices WHERE id=events.parent_id AND push_token IS NOT NULL AND watch_push_token IS NOT NULL)
-    THEN '{"phone":"pending","watch":"pending"}' ELSE NULL END) END,
+    THEN '{"phone":"pending","watch":"pending"}'
+    -- A Watch on its charger wakes no one. Without a phone token, still send to
+    -- the Watch, but keep the phone blocked so the event is never reported as
+    -- fully sent and a later phone token upload revives it.
+    WHEN push_target IS NULL AND EXISTS(SELECT 1 FROM devices WHERE id=events.parent_id AND push_token IS NULL AND watch_push_token IS NOT NULL)
+    THEN '{"phone":"blocked","watch":"pending"}' ELSE NULL END) END,
   push_target=COALESCE(push_target,CASE WHEN ${phoneOnlySQL} THEN 'phone' WHEN (SELECT watch_push_token FROM devices WHERE id=events.parent_id) IS NOT NULL THEN 'watch' ELSE 'phone' END)
   WHERE event_id=? AND status='pending' AND acknowledged_at IS NULL AND resolved_at IS NULL AND next_attempt<=? RETURNING *`).bind(now+30000,claimId,env.WATCH_ONLY_PARENT_ID??'',env.WATCH_ONLY_PARENT_ID??'',phoneOnlyParent,phoneOnlyParent,eventId,now),
  // Read the selected token in the claim transaction, avoiding another remote

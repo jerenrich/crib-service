@@ -265,7 +265,10 @@ export async function runReminder(env:Env,parentId:string,latency=new Latency(),
  // Preserve ordinary retry/backoff for an event not yet submitted. Once either
  // destination accepted it, the other destination's retry (cron) or missing token
  // must not hold back reminders: repeat on schedule, as for a fully sent event.
- if(previous.acknowledged_at===null&&(previous.status==='sending'
+ // A 'sending' row whose lease expired belongs to a dispatch that died mid-send:
+ // like 'uncertain', it must not hold back repeats until the cron sweeps it.
+ const abandoned=previous.status==='sending'&&previous.lease_until!=null&&previous.lease_until<now;
+ if(previous.acknowledged_at===null&&(previous.status==='sending'&&!abandoned
   ||['pending','blocked'].includes(previous.status)&&!partiallyAccepted(previous))) {
   await send(previous.event_id);
   return true;

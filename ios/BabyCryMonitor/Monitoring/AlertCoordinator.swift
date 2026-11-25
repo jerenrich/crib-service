@@ -16,7 +16,10 @@ public protocol AlertSending: Sendable {
                              receive: (CryAlert, Result<AlertReceipt, Error>) -> Void) async {
         guard !sending else { return }
         sending = true; defer { sending = false }
-        for item in pending where item.nextAttemptAt <= now && item.alert.listenerId == listenerId {
+        // Send fresh alerts before retries, so a new cry never waits behind older
+        // entries that keep failing. Order within each group is unchanged.
+        let ordered = pending.filter { $0.attempts == 0 } + pending.filter { $0.attempts > 0 }
+        for item in ordered where item.nextAttemptAt <= now && item.alert.listenerId == listenerId {
             guard !Task.isCancelled else { return }
             willSend?(item.alert, item.attempts + 1)
             do { receive(item.alert, .success(try await sender.send(item.alert))) }

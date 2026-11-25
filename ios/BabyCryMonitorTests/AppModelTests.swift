@@ -1499,7 +1499,7 @@ final class AppModelTests: XCTestCase {
         fixture.model.stop()
     }
 
-    @MainActor func testFailedDurableSavePreventsImmediateAlertUpload() async throws {
+    @MainActor func testFailedDurableSaveStillUploadsTheCryAndReportsTheStop() async throws {
         let fixture = try Fixture()
         let gate = RequestGate()
         await fixture.backend.configure(heartbeatGate: gate)
@@ -1523,12 +1523,100 @@ final class AppModelTests: XCTestCase {
         fixture.audio.emit(AudioLevelSample(timestamp: fixture.time.now, dbFS: -10))
         let failed = await eventually { fixture.model.log.export.contains("metadata_write_failed") }
         XCTAssertTrue(failed)
+        XCTAssertFalse(fixture.model.monitoring)
+        // The cry queued by the failing save is delivered from memory, and the
+        // Parent is told monitoring stopped, instead of both being held forever.
         await fixture.model.tick()
-        let requests = await fixture.backend.sent
-        XCTAssertTrue(requests.isEmpty)
-        XCTAssertFalse(fixture.model.log.export.contains("alert_outbox phase=upload_started"))
+        let uploaded = await eventually {
+            let sent = await fixture.backend.sent
+            return sent.contains { $0.type == "sustained_cry" } && sent.contains { $0.isMonitoringFailure }
+        }
+        XCTAssertTrue(uploaded)
         await gate.open()
         fixture.model.stop()
+    }
+
+    @MainActor func testParentPushTokenUploadsAtRegistrationInTheBackgroundAndPersists() async throws {
+        let fixture = try Fixture()
+        fixture.model.role = .parent; fixture.model.paired = true
+        fixture.model.setAppActive(false)
+        // A background launch: iOS returns the token while the app is not active.
+        fixture.notifications.onToken?("ab12")
+        let uploaded = await eventually { await fixture.backend.pushTokens == ["ab12"] }
+        XCTAssertTrue(uploaded)
+        XCTAssertEqual(fixture.defaults.string(forKey: "parentPushToken"), "ab12")
+        XCTAssertEqual(fixture.defaults.string(forKey: "parentPushTokenUploaded|https://monitor.test"), "ab12")
+        // Already accepted: a refresh does not upload it again.
+        await fixture.backend.setStatus(ParentStatus(paired: true, phonePushRegistered: true, configuration: MonitoringConfiguration()))
+        await fixture.model.refreshParent()
+        let tokens = await fixture.backend.pushTokens
+        XCTAssertEqual(tokens, ["ab12"])
+    }
+
+    @MainActor func testFailedParentPushTokenUploadIsRetriedOnTheNextRefresh() async throws {
+        let fixture = try Fixture()
+        fixture.model.role = .parent; fixture.model.paired = true
+        await fixture.backend.setPushTokenFailure(true)
+        fixture.notifications.onToken?("cd34")
+        let attempted = await eventually { fixture.model.log.lines.contains { $0.contains("push_token_upload_failed") } }
+        XCTAssertTrue(attempted)
+        XCTAssertNil(fixture.defaults.string(forKey: "parentPushTokenUploaded|https://monitor.test"))
+        await fixture.backend.setPushTokenFailure(false)
+        await fixture.backend.setStatus(ParentStatus(paired: true, phonePushRegistered: true, configuration: MonitoringConfiguration()))
+        await fixture.model.refreshParent()
+        let tokens = await fixture.backend.pushTokens
+        XCTAssertEqual(tokens, ["cd34"])
+        XCTAssertEqual(fixture.defaults.string(forKey: "parentPushTokenUploaded|https://monitor.test"), "cd34")
+    }
+
+    @MainActor func testServerWithoutThePhoneTokenWarnsAndReregisters() async throws {
+        let fixture = try Fixture(configureDefaults: { defaults, _ in
+            defaults.set("ef56", forKey: "parentPushToken")
+            defaults.set("ef56", forKey: "parentPushTokenUploaded|https://monitor.test")
+        })
+        fixture.model.role = .parent; fixture.model.paired = true
+        fixture.notifications.tokenOnRegister = "ef56"
+        // The Worker deleted the token after Apple rejected it.
+        await fixture.backend.setStatus(ParentStatus(paired: true, watchPushRegistered: true, phonePushRegistered: false, configuration: MonitoringConfiguration()))
+        await fixture.model.refreshParent()
+        XCTAssertEqual(AppModel.parentPhoneRegistrationTitle, "Parent iPhone not registered for alerts")
+        XCTAssertEqual(fixture.model.parentPhoneRegistrationWarning?.contains("only your Apple Watch"), true)
+        let reuploaded = await eventually { await fixture.backend.pushTokens == ["ef56"] }
+        XCTAssertTrue(reuploaded)
+        XCTAssertGreaterThanOrEqual(fixture.notifications.registrations, 1)
+        await fixture.backend.setStatus(ParentStatus(paired: true, watchPushRegistered: true, phonePushRegistered: true, configuration: MonitoringConfiguration()))
+        await fixture.model.refreshParent()
+        XCTAssertNil(fixture.model.parentPhoneRegistrationWarning)
+    }
+
+    @MainActor func testPhoneRegistrationWarningUsesThisCaregiversOwnEntry() async throws {
+        let fixture = try Fixture()
+        fixture.model.role = .parent; fixture.model.paired = true
+        let me = UUID(), owner = UUID()
+        let duty = CaregiverDuty(myId: me, primaryId: owner, revision: 1, escalationSeconds: 60, caregivers: [
+            .init(id: owner, name: "Owner", secondaryEnabled: true, phoneRegistered: false, watchRegistered: false),
+            .init(id: me, name: "Partner", secondaryEnabled: true, phoneRegistered: true, watchRegistered: false)])
+        // The pair-level flag describes the owner's phone, not this partner's.
+        fixture.model.parentStatus = ParentStatus(paired: true, caregiverDuty: duty, phonePushRegistered: false, configuration: MonitoringConfiguration())
+        XCTAssertNil(fixture.model.parentPhoneRegistrationWarning)
+        // Without a duty list, the pairing ID says whose phone the flag describes.
+        // The fixture keeps the credential it loaded at launch.
+        let mine = fixture.listener.deviceId.uuidString.lowercased()
+        fixture.model.parentStatus = ParentStatus(paired: true, pairingID: "\(owner.uuidString.lowercased())|l|1", phonePushRegistered: false, configuration: MonitoringConfiguration())
+        XCTAssertNil(fixture.model.parentPhoneRegistrationWarning)
+        fixture.model.parentStatus = ParentStatus(paired: true, pairingID: "\(mine)|l|1", phonePushRegistered: false, configuration: MonitoringConfiguration())
+        XCTAssertNotNil(fixture.model.parentPhoneRegistrationWarning)
+    }
+
+    @MainActor func testListenerWarnsWhenTheParentPhoneIsNotRegistered() async throws {
+        let fixture = try Fixture()
+        await fixture.backend.setStatus(ParentStatus(paired: true, watchPushRegistered: false, phonePushRegistered: false, configuration: MonitoringConfiguration()))
+        await fixture.model.tick()
+        let loaded = await eventually { fixture.model.listenerPairStatus != nil }
+        XCTAssertTrue(loaded)
+        fixture.model.now = fixture.time.now
+        XCTAssertEqual(fixture.model.parentPhoneRegistrationWarning?.contains("cannot reach the parent"), true)
+        XCTAssertEqual(fixture.model.nightstandDevices.first { $0.id == "parent" }?.status, "Alerts not registered")
     }
 
     @MainActor func testCleanupUsesSuccessfulCompleteStatusAndFailureLeavesNotificationsAlone() async throws {
@@ -1845,7 +1933,10 @@ final class AppModelTests: XCTestCase {
         var scheduledConnectionDeadline: Date?
         var connectionWarningFails = false
         var connectionWarningGate: RequestGate?
-        func register() async {}
+        private(set) var registrations = 0
+        /// Returned by the next registration, as iOS repeats the token each time.
+        var tokenOnRegister: String?
+        func register() async { registrations += 1; if let tokenOnRegister { onToken?(tokenOnRegister) } }
         func registered(_ token: Data) {}
         func failed() {}
         func simulate(_ alert: CryAlert) async throws {}
@@ -2021,7 +2112,13 @@ final class AppModelTests: XCTestCase {
                 }
             }
         }
-        func pushToken(_ token: String) async throws {}
+        private(set) var pushTokens: [String] = []
+        var pushTokenFails = false
+        func setPushTokenFailure(_ value: Bool) { pushTokenFails = value }
+        func pushToken(_ token: String) async throws {
+            if pushTokenFails { throw URLError(.notConnectedToInternet) }
+            pushTokens.append(token)
+        }
         func watchPushToken(_ token: String?) async throws {}
     }
     @MainActor final class Fixture {

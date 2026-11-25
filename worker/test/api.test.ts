@@ -48,7 +48,9 @@ beforeEach(async()=>{
  await env.DB.batch(['resolved_episodes','monitoring_commands','alert_snoozes','timeline_events','diagnostics','connection_notices','connection_states','events','heartbeats','pairs','pairing_codes','devices','rate_limits'].map(table=>env.DB.prepare(`DELETE FROM ${table}`)));
  pushResponses=[];pushRequests=[];
  vi.stubGlobal('fetch',vi.fn(async(input:string|URL|Request,init?:RequestInit)=>{
-  const url=String(input);expect(url).toMatch(/^https:\/\/api\.sandbox\.push\.apple\.com\/3\/device\//);
+  // The configured (development) host, or production once after BadDeviceToken.
+  const url=String(input);expect(url).toMatch(/^https:\/\/api\.(sandbox\.)?push\.apple\.com\/3\/device\//);
+  if(!url.includes('sandbox'))expect(pushRequests.at(-1)?.url).toBe(url.replace('api.push','api.sandbox.push'));
   pushRequests.push({url,init});
   const response=pushResponses.shift();if(!response)throw new Error('Unexpected external request');
   if(response instanceof Error)throw response;return response instanceof Response?response:new Response(response.body,{status:response.status,headers:response.headers});
@@ -403,7 +405,8 @@ describe('connection alerts, readiness and replacement',()=>{
   });
   await flushConnections(testEnv);
   await env.DB.prepare('UPDATE events SET next_attempt=0').run();await flushPending(testEnv);
-  expect(pushRequests).toHaveLength(2);
+  // The rejected Watch token is also tried once on the other APNs host.
+  expect(pushRequests).toHaveLength(3);
   expect(await env.DB.prepare('SELECT watch_push_token FROM devices WHERE id=?').bind(parent.deviceId).first()).toMatchObject({watch_push_token:null});
   const saved=await env.DB.prepare('SELECT delivery_state FROM events').first<{delivery_state:string}>();
   expect(JSON.parse(saved!.delivery_state)).toEqual({phone:'sent',watch:'blocked'});
@@ -852,6 +855,46 @@ describe('direct Apple Watch alerts',()=>{
   const status=await (await call('listener/status',parent,undefined,'GET')).json() as {alerts:{deliveryTarget:string;deliveryState:unknown}[]};
   expect(status.alerts[0]).toMatchObject({deliveryTarget:'both',deliveryState:{phone:'sent',watch:'sent'}});
  });
+ it('keeps an unregistered phone blocked after a Watch-only cry and delivers once the phone registers',async()=>{
+  const {parent,listener}=await paired();await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
+  const event=alert(listener);mockPush();
+  // The Watch push is accepted, but a Watch alone may wake no one: not 'sent'.
+  expect(await (await call('listener/event',listener,event)).json()).toEqual({status:'blocked'});
+  expect(pushRequests).toHaveLength(1);expect(pushRequests[0].url).toContain('cd'.repeat(32));
+  expect(await env.DB.prepare('SELECT status,sent_at,last_error,delivery_state FROM events WHERE event_id=?').bind(event.eventId).first())
+   .toEqual({status:'blocked',sent_at:null,last_error:'partial_delivery',delivery_state:JSON.stringify({phone:'blocked',watch:'sent'})});
+  for(const device of [parent,listener]){
+   const status=await (await call('listener/status',device,undefined,'GET')).json() as {phonePushRegistered:boolean;watchPushRegistered:boolean;alerts:{status:string;deliveryTarget:string;deliveryState:unknown}[]};
+   expect(status).toMatchObject({phonePushRegistered:false,watchPushRegistered:true});
+   expect(status.alerts[0]).toMatchObject({status:'blocked',deliveryTarget:'both',deliveryState:{phone:'blocked',watch:'sent'}});
+  }
+  // Blocked events wait for a token rather than polling every cron tick.
+  await flushPending(testEnv);expect(pushRequests).toHaveLength(1);
+  await call('device/push-token',parent,{token:'ab'.repeat(32)});mockPush();await flushPending(testEnv);
+  expect(pushRequests).toHaveLength(2);expect(pushRequests[1].url).toContain('ab'.repeat(32));
+  expect(await env.DB.prepare('SELECT status,delivery_state FROM events WHERE event_id=?').bind(event.eventId).first())
+   .toEqual({status:'sent',delivery_state:JSON.stringify({phone:'sent',watch:'sent'})});
+ });
+ it('blocks the phone on the next reminder after Apple unregisters the phone token',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
+  vi.mocked(fetch).mockImplementation(async(input,init)=>{
+   pushRequests.push({url:String(input),init});
+   return String(input).includes('ab'.repeat(32))?new Response(JSON.stringify({reason:'Unregistered'}),{status:410}):new Response(null,{status:200});
+  });
+  const event=alert(listener);expect(await (await call('listener/event',listener,event)).json()).toEqual({status:'blocked'});
+  expect(await env.DB.prepare('SELECT push_token FROM devices WHERE id=?').bind(parent.deviceId).first()).toEqual({push_token:null});
+  vi.spyOn(Date,'now').mockReturnValue(Date.now()+10000);await runReminder(testEnv,parent.deviceId);
+  const repeat=await env.DB.prepare('SELECT status,delivery_state FROM events WHERE reminder_of=?').bind(event.eventId).first();
+  expect(repeat).toEqual({status:'blocked',delivery_state:JSON.stringify({phone:'blocked',watch:'sent'})});
+  expect(pushRequests.filter(r=>r.url.includes('ab'.repeat(32)))).toHaveLength(1);
+ });
+ it('keeps a phone-only Parent on the single-target path',async()=>{
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  const event=alert(listener);mockPush();
+  expect(await (await call('listener/event',listener,event)).json()).toEqual({status:'sent'});
+  expect(await env.DB.prepare('SELECT push_target,delivery_state FROM events WHERE event_id=?').bind(event.eventId).first()).toEqual({push_target:'phone',delivery_state:null});
+ });
  it('keeps an accepted phone alert on the phone when a Watch registers later',async()=>{
   const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
   const event=alert(listener);mockPush();await call('listener/event',listener,event);
@@ -1190,15 +1233,45 @@ describe('APNs and durable idempotent alerts',()=>{
   const {parent,listener}=await paired();
   await call('device/push-token',parent,{token:'ab'.repeat(32)});
   const event=alert(listener);
-  pushResponses.push(new Response(JSON.stringify({reason:'BadDeviceToken'}),{status:400}));
+  // Both APNs environments reject it, so the token really is invalid.
+  for(let i=0;i<2;i++)pushResponses.push(new Response(JSON.stringify({reason:'BadDeviceToken'}),{status:400}));
   expect(await (await call('listener/event',listener,event)).json()).toEqual({status:'blocked'});
   const saved=await env.DB.prepare('SELECT push_token FROM devices WHERE id=?').bind(parent.deviceId).first<{push_token:string|null}>();
   expect(saved?.push_token).toBeNull();
-  await flushPending(testEnv);expect(pushRequests).toHaveLength(1);
+  await flushPending(testEnv);expect(pushRequests).toHaveLength(2);
   await call('device/push-token',parent,{token:'cd'.repeat(32)});mockPush();
   await flushPending(testEnv);
-  expect(pushRequests).toHaveLength(2);
-  expect(pushRequests[1].url).toContain('cd'.repeat(32));
+  expect(pushRequests).toHaveLength(3);
+  expect(pushRequests[2].url).toContain('cd'.repeat(32));
+ });
+ it('delivers on the other APNs environment instead of deleting a mismatched token',async()=>{
+  const {parent,listener}=await paired();
+  await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  const event=alert(listener);
+  // A production-signed app's token sent to the configured development host.
+  pushResponses.push(new Response(JSON.stringify({reason:'BadDeviceToken'}),{status:400}));mockPush();
+  expect(await (await call('listener/event',listener,event)).json()).toEqual({status:'sent'});
+  expect(pushRequests.map(r=>new URL(r.url).host)).toEqual(['api.sandbox.push.apple.com','api.push.apple.com']);
+  // Same request identity on both hosts.
+  expect(new Headers(pushRequests[0].init?.headers).get('apns-id')).toBe(new Headers(pushRequests[1].init?.headers).get('apns-id'));
+  expect(pushRequests[0].init?.body).toBe(pushRequests[1].init?.body);
+  expect((await env.DB.prepare('SELECT push_token FROM devices WHERE id=?').bind(parent.deviceId).first<{push_token:string|null}>())?.push_token).not.toBeNull();
+  const row=await env.DB.prepare("SELECT outcome,details FROM diagnostics WHERE operation='dispatch'").first<{outcome:string;details:string}>();
+  expect(row?.outcome).toBe('sent');
+  const details=JSON.parse(row!.details);
+  expect(details).toMatchObject({apns_environment:'production',apns_environment_fallback:true});expect(details.apns_reason).toBeUndefined();
+ });
+ it.each([
+  ['Unregistered',410,1,'blocked'],
+  ['other host refuses the signing key',400,2,'blocked'],
+ ] as const)('does not use the other APNs environment to override %s',async(reason,status,requests,result)=>{
+  const {parent,listener}=await paired();
+  await call('device/push-token',parent,{token:'ab'.repeat(32)});
+  pushResponses.push(new Response(JSON.stringify({reason:reason==='Unregistered'?'Unregistered':'BadDeviceToken'}),{status}));
+  if(requests===2)pushResponses.push(new Response(JSON.stringify({reason:'InvalidProviderToken'}),{status:403}));
+  expect(await (await call('listener/event',listener,alert(listener))).json()).toEqual({status:result});
+  expect(pushRequests).toHaveLength(requests);
+  expect((await env.DB.prepare('SELECT push_token FROM devices WHERE id=?').bind(parent.deviceId).first<{push_token:string|null}>())?.push_token).toBeNull();
  });
  it('does not dispatch acknowledged blocked alerts after a token upload or client retry',async()=>{
   const {parent,listener}=await paired();const event=alert(listener);
@@ -1404,6 +1477,26 @@ describe('configurable reminders and acknowledgement mute',()=>{
   const next=await runInDurableObject(stub,async(_instance,state)=>state.storage.getAlarm());
   expect(next).toBeGreaterThan(Date.now());expect(next).toBeLessThanOrEqual(Date.now()+5000);
  });
+ it('shows a new cry silenced by a snooze on the timeline instead of hiding it',async()=>{
+  const {parent,listener,event}=await ready();
+  expect((await call('alert/acknowledge',parent,{eventId:event.eventId})).status).toBe(200);
+  advance(30);const next={...alert(listener),cryStartedAt:new Date(Date.now()-30000).toISOString(),createdAt:new Date(Date.now()).toISOString(),durationSeconds:30};
+  expect((await call('listener/event',listener,next)).status).toBe(200);expect(pushRequests).toHaveLength(1);
+  const timeline=await (await call('timeline',parent,undefined,'GET')).json() as {events:{kind:string;episodeID?:string;status?:string}[]};
+  expect(timeline.events.filter(e=>e.kind==='alert').map(e=>[e.episodeID,e.status])).toEqual(expect.arrayContaining([[event.episodeId,'sent'],[next.episodeId,'silenced']]));
+ });
+ it('repeats on schedule when the previous send died mid-dispatch with an expired lease',async()=>{
+  const {parent,listener,event}=await ready();await heartbeat(listener,event,'crying');
+  // A worker that crashed after claiming leaves the row 'sending' until the cron sweep.
+  await env.DB.prepare("UPDATE events SET status='sending',lease_until=? WHERE event_id=?").bind(Date.now()-1,event.eventId).run();
+  advance(5);mockPush();await runReminder(testEnv,parent.deviceId);
+  expect(pushRequests).toHaveLength(2);
+  expect(JSON.parse(String(pushRequests[1].init?.body)).episodeId).toBe(event.episodeId);
+  // A live lease still holds repeats back, so a send in progress is never doubled.
+  const latest=await env.DB.prepare('SELECT event_id FROM events WHERE reminder_of IS NOT NULL ORDER BY created_at DESC LIMIT 1').first<{event_id:string}>();
+  await env.DB.prepare("UPDATE events SET status='sending',lease_until=? WHERE event_id=?").bind(Date.now()+30000,latest!.event_id).run();
+  advance(5);await runReminder(testEnv,parent.deviceId);expect(pushRequests).toHaveLength(2);
+ });
  it('sends nothing before 5 seconds, then repeats even when the Listener is quiet',async()=>{
   const {parent,listener,event}=await ready();await heartbeat(listener,event,'quiet');
   advance(4);await runReminder(testEnv,parent.deviceId);expect(pushRequests).toHaveLength(1);
@@ -1412,7 +1505,7 @@ describe('configurable reminders and acknowledgement mute',()=>{
   expect(reminder.eventId).not.toBe(event.eventId);expect(reminder.episodeId).toBe(event.episodeId);
   expect(reminder.aps.alert.title).toBe('Repeat alert · Check on baby');expect(reminder.aps.alert.body).toContain('Settings');
   const headers=pushRequests[1].init?.headers as Record<string,string>;
-  expect(Number(headers['apns-expiration'])).toBe(Math.floor(Date.now()/1000)+15);
+  expect(Number(headers['apns-expiration'])).toBe(Math.floor(Date.now()/1000)+3600);
   expect(headers['apns-collapse-id']).toBe(reminder.eventId);
   advance(5);mockPush();await runReminder(testEnv,parent.deviceId);expect(pushRequests).toHaveLength(3);
   const later=JSON.parse(String(pushRequests[2].init?.body));
@@ -1647,7 +1740,9 @@ describe('12-hour event timeline',()=>{
   expect((await call('listener/event',listener,suppressed)).status).toBe(200);
   const page=await history(parent);
   expect(page.events.filter(e=>e.kind==='alert_acknowledged')).toHaveLength(1);
-  const sent=page.events.filter(e=>e.kind==='alert');expect(sent).toHaveLength(1);expect(sent[0].count).toBe(3);expect(sent[0].status).toBe('sent');
+  const sent=page.events.filter(e=>e.kind==='alert'&&e.status==='sent');expect(sent).toHaveLength(1);expect(sent[0].count).toBe(3);
+  // The cry the snooze kept silent is shown, not hidden.
+  expect(page.events.filter(e=>e.kind==='alert'&&e.status==='silenced').map(e=>e.episodeID)).toEqual([suppressed.episodeId]);
   expect(page.events.find(e=>e.kind==='alert_acknowledged')?.endAt).toBeDefined();
  });
  it('records outages with connection alerts disabled and detects gaps before cron',async()=>{
@@ -2350,7 +2445,7 @@ function interceptDB(work:(sql:string,args:unknown[],method:string,execute:()=>P
 
 describe('diagnostic gap regressions',()=>{
  it('carries exact diagnostic references and attempt numbers through rejected and retried pushes',async()=>{
-  const {parent,listener}=await paired();await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'cd'.repeat(32)});
   const event=alert(listener);mockPush(503);await call('listener/event',listener,event);
   await env.DB.prepare('UPDATE events SET next_attempt=0').run();mockPush();await flushPending(testEnv);
   const ref=await eventReference(testEnv,event.eventId);
@@ -2373,12 +2468,14 @@ describe('diagnostic gap regressions',()=>{
   const next=crypto.randomUUID();await recordDiagnostic(testEnv,{requestId:next,started:Date.now(),operation:'maintenance',stage:'handler',outcome:'ok'});
   expect((await env.DB.prepare('SELECT details FROM diagnostics WHERE request_id=?').bind(next).first<{details:string|null}>())?.details).toBeNull();
  });
- it('uses two binding calls before reminder delivery and includes the current Watch token in the claim',async()=>{
-  const {parent,listener}=await paired();await call('device/watch-push-token',parent,{token:'cd'.repeat(32)});mockPush();await call('listener/event',listener,alert(listener));
+ it('uses two binding calls before reminder delivery and includes the current push token in the claim',async()=>{
+  // A phone-only Parent keeps this on the single-target path; Watch-only
+  // Parents now use dual delivery with the unregistered phone blocked.
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'cd'.repeat(32)});mockPush();await call('listener/event',listener,alert(listener));
   vi.spyOn(Date,'now').mockReturnValue(Date.now()+10000);let replaced=false;
   const db=interceptDB(async(sql,_args,method,execute)=>{
    if(method==='batch'&&sql.startsWith('INSERT INTO events(')){
-    replaced=true;await env.DB.prepare('UPDATE devices SET watch_push_token=? WHERE id=?').bind(await encryptToken(testEnv,'ef'.repeat(32)),parent.deviceId).run();
+    replaced=true;await env.DB.prepare('UPDATE devices SET push_token=? WHERE id=?').bind(await encryptToken(testEnv,'ef'.repeat(32)),parent.deviceId).run();
    }
    return execute();
   });

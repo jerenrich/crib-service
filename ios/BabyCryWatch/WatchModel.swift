@@ -110,9 +110,9 @@ import UserNotifications
         log.record("watch_alert_permission", code: settings.alertSetting.rawValue)
         log.record("watch_sound_permission", code: settings.soundSetting.rawValue)
         log.record("watch_time_sensitive_permission", code: settings.timeSensitiveSetting.rawValue)
-        notificationWarning = settings.alertSetting == .disabled || settings.soundSetting == .disabled
-            ? "Check Crib Service in your iPhone's Watch → Notifications settings. Allow notifications and check its sound/haptic options. Global Prominent Haptics does not change this app's notification permissions."
-            : nil
+        // Mirrors the Parent iPhone's wake-readiness banner, including Time Sensitive.
+        notificationWarning = WakeReadiness.watchWarning(alertsOff: settings.alertSetting == .disabled,
+            soundsOff: settings.soundSetting == .disabled, timeSensitiveOff: settings.timeSensitiveSetting == .disabled)
         return settings
     }
     func enableAlerts() async {

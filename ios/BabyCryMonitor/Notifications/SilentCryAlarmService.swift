@@ -323,7 +323,7 @@ import UIKit
             saved.append(Record(episodeID: request.episodeID, eventID: request.eventID, snoozeDuration: snoozeDuration, scheduledAt: Date(),
                                 isTest: request.isTest ? true : nil, alarmAt: fireAt))
             records = Array(saved.suffix(64))
-            let configuration = SilentAlarmScheduling.configuration(for: request, at: fireAt)
+            let configuration = SilentAlarmScheduling.configuration(for: request, at: fireAt, snoozeDuration: snoozeDuration)
             stage = .schedule; record("started")
             // Local processing can also stall. Discard expired validation and
             // fall back to the push, still honoring all newer negative evidence.

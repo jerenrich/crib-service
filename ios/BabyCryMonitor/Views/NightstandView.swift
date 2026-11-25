@@ -341,6 +341,7 @@ struct NightstandView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
                         header
+                        registrationWarning
                         timedHero
                         activitySummary
                         chips
@@ -436,6 +437,7 @@ struct NightstandView: View {
     private var listenerContents: some View {
         VStack(spacing: listenerSpacing) {
             header
+            registrationWarning
             timedHero.padding(.top, listenerShort ? 0 : 4)
             activitySummary.padding(.top, -listenerSpacing + 4)
             chips
@@ -455,6 +457,8 @@ struct NightstandView: View {
     private func compactParentContents(soundPanelHeight: CGFloat) -> some View {
         VStack(spacing: 8) {
             header
+            wakeWarning
+            registrationWarning
             timedHero
             soundPanel().frame(height: soundPanelHeight)
             if hasTwoCaregivers { CaregiverDutyRow { caregiversPresented = true } }
@@ -466,6 +470,31 @@ struct NightstandView: View {
         .padding(.horizontal, 20)
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity, alignment: .top)
+    }
+
+    /// Shown when this iPhone's own settings would keep a crying alert silent.
+    @ViewBuilder private var wakeWarning: some View {
+        let problems = model.notifications.wakeProblems
+        if !problems.isEmpty { warningBanner("Alerts may not wake you", systemImage: "bell.slash.fill", lines: problems) }
+    }
+
+    /// Shown on both iPhones while the server cannot push to the Parent iPhone.
+    @ViewBuilder private var registrationWarning: some View {
+        if let warning = model.parentPhoneRegistrationWarning {
+            warningBanner(AppModel.parentPhoneRegistrationTitle, systemImage: "iphone.slash", lines: [warning])
+        }
+    }
+
+    private func warningBanner(_ title: String, systemImage: String, lines: [String]) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label(title, systemImage: systemImage).font(.headline)
+            ForEach(lines, id: \.self) { Text($0).font(.footnote) }
+        }
+        .foregroundStyle(.white)
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.red.opacity(0.85), in: RoundedRectangle(cornerRadius: 12))
+        .accessibilityElement(children: .combine)
     }
 
     private var timingSummary: some View {
