@@ -43,5 +43,6 @@ export const heartbeatPauseReasons:readonly HeartbeatPauseReason[]=[...detection
  * `heartbeat-start`: a monitoring heartbeat after an applied Stop records a Start. */
 export const serverFeatures='detection-pause,audio-interruption,heartbeat-start';
 export interface StoredEvent {event_id:string; episode_id:string; listener_id:string; parent_id:string; payload:string; status:string; attempts:number; next_attempt:number; lease_until:number|null; created_at:number; acknowledged_at:string|null; resolved_at:string|null; push_target:'phone'|'watch'|null; last_error:string|null;claim_id?:string|null;delivery_state?:string|null;delivery_mode?:'watch_only'|null}
-export class APIError extends Error { constructor(public status:number, message:string) {super(message)} }
+/** `code` is a stable machine-readable reason returned with the error message. */
+export class APIError extends Error { constructor(public status:number, message:string, public code?:string) {super(message)} }
 export function requireRole(device:Device, role:Device['role']) {if (device.role !== role) throw new APIError(403,'This device role cannot use this endpoint.');}

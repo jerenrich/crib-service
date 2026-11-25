@@ -58,28 +58,55 @@ export function heartbeat(value:Record<string,unknown>):Heartbeat {
  }
  return result;
 }
-/** Validates an alert upload. `durationCorrection` is reported minus accepted
- * seconds, present only when inconsistent timing metadata was corrected. */
-export function alert(value:Record<string,unknown>):{alert:Alert;durationCorrection?:number} {
- onlyKeys(value,['eventId','episodeId','listenerId','type','cryStartedAt','durationSeconds','createdAt','isRepeat','isTest','reason']);
- if(value.reason!==undefined&&(value.type!=='monitoring_failed'||!detectionPauseReasons.includes(value.reason as DetectionPauseReason)))throw new APIError(400,'Invalid alert reason.');
+/** Corrections applied while accepting an alert, for diagnostics only. */
+export interface AlertCorrections {
+ /** Reported minus accepted duration, in seconds. */
+ duration_s?:number;
+ /** Accepted minus reported cryStartedAt, in seconds; set only when it moved. */
+ start_s?:number;
+ /** Unknown fields discarded (never stored). */
+ ignored_fields?:number;
+ /** An unsupported monitoring_failed reason was discarded. */
+ reason_ignored?:boolean;
+}
+const alertKeys=['eventId','episodeId','listenerId','type','cryStartedAt','durationSeconds','createdAt','isRepeat','isTest','reason'];
+/** Validates an alert upload. Version skew between a Listener and a manually
+ * deployed Worker (an unknown field or pause reason) is corrected, never
+ * rejected: a rejected cry alert is never heard. Only values no correct client
+ * can send are rejected, with code `alert_invalid` so the Listener stops
+ * retrying. An unsupported type is rejected without it, so it stays queued for
+ * a Worker that supports it. */
+export function alert(value:Record<string,unknown>):{alert:Alert;corrections?:AlertCorrections} {
+ const corrections:AlertCorrections={};
+ // Unknown fields are discarded: the stored payload is built from known fields only.
+ const ignored=Object.keys(value).filter(key=>!alertKeys.includes(key)).length;
+ if(ignored)corrections.ignored_fields=ignored;
+ if(!['sustained_cry','monitoring_failed'].includes(String(value.type)))throw new APIError(400,'Unsupported alert type.','alert_unsupported');
+ let reason=value.reason;
+ if(reason!==undefined&&(value.type!=='monitoring_failed'||!detectionPauseReasons.includes(reason as DetectionPauseReason))){reason=undefined;corrections.reason_ignored=true;}
  if(value.isTest!==undefined&&typeof value.isTest!=='boolean')throw new APIError(400,'Invalid test flag.');
  // monitoring_failed: the Listener stopped listening without a person's Stop
  // (microphone failure/stall, termination). Its "start" is the stop time.
- if(!['sustained_cry','monitoring_failed'].includes(String(value.type))||value.type==='monitoring_failed'&&value.isTest===true||typeof value.isRepeat!=='boolean'||typeof value.durationSeconds!=='number'||!Number.isFinite(value.durationSeconds)||value.durationSeconds<0||value.durationSeconds>604800)throw new APIError(400,'Invalid alert.');
+ if(value.type==='monitoring_failed'&&value.isTest===true||typeof value.isRepeat!=='boolean'||typeof value.durationSeconds!=='number'||!Number.isFinite(value.durationSeconds)||value.durationSeconds<0||value.durationSeconds>604800)throw new APIError(400,'Invalid alert.');
  const result:Alert={eventId:uuid(value.eventId),episodeId:uuid(value.episodeId),listenerId:uuid(value.listenerId),type:value.type as Alert['type'],cryStartedAt:date(value.cryStartedAt),durationSeconds:value.durationSeconds,createdAt:date(value.createdAt),isRepeat:value.isRepeat};
  if(value.isTest!==undefined)result.isTest=value.isTest;
- if(value.reason!==undefined)result.reason=value.reason as DetectionPauseReason;
+ if(reason!==undefined)result.reason=reason as DetectionPauseReason;
  // Never drop a cry alert over inconsistent timing metadata: a rejected upload
- // is retried forever and the Parent never hears it. Both timestamps come from
- // the Listener's clock, so the elapsed time between them is authoritative.
+ // is never heard. Both timestamps come from the Listener's clock, so the
+ // elapsed time between them is authoritative.
  const elapsed=(Date.parse(result.createdAt)-Date.parse(result.cryStartedAt))/1000;
- if(Math.abs(elapsed-result.durationSeconds)<=2)return {alert:result};
- const reported=result.durationSeconds,duration=Math.min(604800,Math.max(0,elapsed));
- // Keep createdAt - cryStartedAt = durationSeconds even when clamping.
- if(duration!==elapsed)result.cryStartedAt=new Date(Date.parse(result.createdAt)-duration*1000).toISOString();
- result.durationSeconds=duration;
- return {alert:result,durationCorrection:reported-duration};
+ if(Math.abs(elapsed-result.durationSeconds)>2){
+  const reported=result.durationSeconds,duration=Math.min(604800,Math.max(0,elapsed));
+  // Keep createdAt - cryStartedAt = durationSeconds even when clamping.
+  if(duration!==elapsed){
+   const start=Date.parse(result.createdAt)-duration*1000;
+   corrections.start_s=(start-Date.parse(result.cryStartedAt))/1000;
+   result.cryStartedAt=new Date(start).toISOString();
+  }
+  result.durationSeconds=duration;
+  corrections.duration_s=reported-duration;
+ }
+ return Object.keys(corrections).length?{alert:result,corrections}:{alert:result};
 }
 // Parameterized admission write. A supplied credential gate keeps unauthenticated
 // requests from consuming another device's budget when batched with authentication.

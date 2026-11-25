@@ -74,6 +74,8 @@ public struct CryEpisode: Identifiable, Codable, Sendable {
     public var alertQueuedAt: Date?
     public var alertSentAt: Date?
     public var lastAlertQueuedAt: Date?
+    /// When the Worker last rejected this episode's alert; spaces out re-alerts.
+    public var alertRejectedAt: Date?
     public var maximumDBFS: Double?
     public var averageDBFS: Double?
     public var sampleCount: Int = 0
@@ -154,6 +156,8 @@ public struct SessionSnapshot: Codable, Sendable {
     public var current: CryEpisode?
     public var pending: [PendingAlert] = []
     public var failedAlerts: [FailedAlert] = []
+    /// The latest alert the server accepted, so an older failure stops being shown.
+    public var lastAlertDeliveredAt: Date?
     public var lastObservedAt: Date?
     /// Latest validated audio evidence from either detector. Keep RMS continuity
     /// in lastObservedAt so classifier callbacks cannot disguise missing levels.
@@ -170,8 +174,14 @@ public struct SessionSnapshot: Codable, Sendable {
         if episode.alertSentAt != nil { return .sent }
         return episode.alertQueuedAt == nil ? .notQueued : .acknowledged
     }
+    /// The newest failure, unless a later alert has since been accepted.
+    public var unresolvedFailure: FailedAlert? {
+        guard let failure = failedAlerts.first else { return nil }
+        if let delivered = lastAlertDeliveredAt, delivered >= failure.failedAt { return nil }
+        return failure
+    }
     private enum CodingKeys: String, CodingKey {
-        case configuration, history, current, pending, failedAlerts, lastObservedAt, lastDetectionAt, wasMonitoring, timelineEvents, pendingTimelineIDs, timelineScope
+        case configuration, history, current, pending, failedAlerts, lastAlertDeliveredAt, lastObservedAt, lastDetectionAt, wasMonitoring, timelineEvents, pendingTimelineIDs, timelineScope
     }
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -180,6 +190,7 @@ public struct SessionSnapshot: Codable, Sendable {
         current = try values.decodeIfPresent(CryEpisode.self, forKey: .current)
         pending = try values.decode([PendingAlert].self, forKey: .pending)
         failedAlerts = try values.decodeIfPresent([FailedAlert].self, forKey: .failedAlerts) ?? []
+        lastAlertDeliveredAt = try values.decodeIfPresent(Date.self, forKey: .lastAlertDeliveredAt)
         lastObservedAt = try values.decodeIfPresent(Date.self, forKey: .lastObservedAt)
         lastDetectionAt = try values.decodeIfPresent(Date.self, forKey: .lastDetectionAt)
         wasMonitoring = try values.decode(Bool.self, forKey: .wasMonitoring)

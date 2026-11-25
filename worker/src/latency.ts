@@ -36,6 +36,14 @@ export interface TimingDetails {
  };
  /** Reported minus accepted alert duration, when validation corrected it. */
  alert_duration_corrected_s?:number;
+ /** Seconds validation moved cryStartedAt to keep a clamped duration consistent. */
+ alert_start_corrected_s?:number;
+ /** Unknown alert fields discarded by validation. */
+ alert_ignored_fields?:number;
+ /** An unsupported alert reason was discarded by validation. */
+ alert_reason_ignored?:boolean;
+ /** A corrected alert was too old to notify anyone; it was stored as expired. */
+ alert_stale?:boolean;
  alarm_wake_requested?:boolean;alarm_extension_requested?:boolean;alarm_attempt?:AlarmAttemptDetails;
  spans?:Partial<Record<Span,number>>;
  db_stages?:Partial<Record<Span,DatabaseMetrics>>;
@@ -279,8 +287,12 @@ export function safeTimingDetails(value:TimingDetails|undefined):string|null {
   safe.live_sound=detail;
  }
  if(typeof value.alarm_wake_requested==='boolean')safe.alarm_wake_requested=value.alarm_wake_requested;
- const corrected=value.alert_duration_corrected_s;
- if(typeof corrected==='number'&&Number.isFinite(corrected)&&Math.abs(corrected)<=604800)safe.alert_duration_corrected_s=Math.round(corrected*1000)/1000;
+ const seconds=(n:unknown)=>typeof n==='number'&&Number.isFinite(n)&&Math.abs(n)<=1e9?Math.round(n*1000)/1000:undefined;
+ const corrected=seconds(value.alert_duration_corrected_s);if(corrected!==undefined&&Math.abs(corrected)<=604800)safe.alert_duration_corrected_s=corrected;
+ const moved=seconds(value.alert_start_corrected_s);if(moved!==undefined)safe.alert_start_corrected_s=moved;
+ const ignored=value.alert_ignored_fields;if(typeof ignored==='number'&&Number.isInteger(ignored)&&ignored>0&&ignored<=1000)safe.alert_ignored_fields=ignored;
+ if(value.alert_reason_ignored===true)safe.alert_reason_ignored=true;
+ if(value.alert_stale===true)safe.alert_stale=true;
  if(typeof value.alarm_extension_requested==='boolean')safe.alarm_extension_requested=value.alarm_extension_requested;
  if(value.alarm_attempt)safe.alarm_attempt=safeAlarmAttempt(value.alarm_attempt);
  const number=(n:unknown)=>typeof n==='number'&&Number.isFinite(n)&&n>=0&&n<=1e15;

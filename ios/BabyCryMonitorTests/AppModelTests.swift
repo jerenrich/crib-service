@@ -4083,6 +4083,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(fixture.model.snapshot.failedAlerts.map(\.alert), [original])
         XCTAssertEqual(fixture.model.deliveryStatus, "Alert rejected by server: Invalid alert.")
         XCTAssertTrue(fixture.model.log.lines.contains { $0.contains("alert_rejected") })
+        XCTAssertTrue(fixture.model.log.lines.contains { $0.contains("phase=receipt") && $0.contains("status=rejected") })
         fixture.time.now = fixture.time.now.addingTimeInterval(301)
         await fixture.model.tick()
         let requests = await fixture.backend.sent
@@ -4096,6 +4097,28 @@ final class AppModelTests: XCTestCase {
             XCTAssertEqual(retrying.model.snapshot.pending.first?.attempts, 1, "\(status)")
             XCTAssertTrue(retrying.model.snapshot.failedAlerts.isEmpty, "\(status)")
         }
+    }
+    @MainActor func testServerRejectionStaysVisibleAfterLaterHeartbeats() async throws {
+        let fixture = try Fixture()
+        await fixture.backend.setSendError(AlertRejection(message: "Invalid alert."))
+        await fixture.model.start()
+        let start = fixture.time.now, capture = UUID()
+        fixture.audio.onClassification?(.started(id: capture, at: start, sampleRate: 48_000, voiceProcessing: false))
+        for second in 4...5 {
+            fixture.time.now = start.addingTimeInterval(Double(second))
+            fixture.audio.onClassification?(.result(.init(captureID: capture,
+                windowStart: fixture.time.now.addingTimeInterval(-4), windowEnd: fixture.time.now,
+                confidence: 0.95, observedAt: fixture.time.now)))
+        }
+        let rejected = await eventually { fixture.model.snapshot.failedAlerts.count == 1 }
+        XCTAssertTrue(rejected)
+        // Without the fix the next successful heartbeat replaced this with "Connected".
+        let heartbeat = await eventually {
+            fixture.time.now = fixture.time.now.addingTimeInterval(16); await fixture.model.tick()
+            return fixture.model.deliveryStatus.hasPrefix("Connected")
+        }
+        XCTAssertTrue(heartbeat)
+        XCTAssertEqual(fixture.model.deliveryStatus, "Connected · Last alert rejected by server: Invalid alert.")
     }
     @MainActor func testRetryableReceiptsAndTransportFailuresRemainQueued() async throws {
         for status in ["pending", "blocked", "uncertain"] {

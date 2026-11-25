@@ -507,6 +507,40 @@ final class CrySessionTests: XCTestCase {
         XCTAssertEqual(restored.snapshot.failedAlerts.map(\.alert), [alert])
         XCTAssertEqual(restored.snapshot.pending.map { $0.alert.eventId }, [other.eventId])
     }
+    func testRejectedAlertLetsAStillCryingEpisodeAlertAgainAfterAMinute() throws {
+        var s = Simulation(); s.run(306)
+        let first = try XCTUnwrap(s.emitted.first)
+        s.engine.rejected(first.eventId, at: s.time)
+        XCTAssertTrue(s.engine.snapshot.pending.isEmpty)
+        XCTAssertEqual(s.engine.snapshot.failedAlerts.map(\.alert), [first])
+        s.run(30)
+        XCTAssertEqual(s.emitted.count, 1, "Re-alerts after a rejection are spaced out")
+        s.run(31)
+        XCTAssertEqual(s.emitted.count, 2)
+        let second = try XCTUnwrap(s.emitted.last)
+        XCTAssertNotEqual(second.eventId, first.eventId)
+        XCTAssertEqual(second.episodeId, first.episodeId)
+        XCTAssertFalse(second.isRepeat)
+        XCTAssertEqual(second.durationSeconds, second.createdAt.timeIntervalSince(second.cryStartedAt), accuracy: 0.001)
+        // A failure the server stored (its own reminders apply) never re-alerts.
+        var stored = Simulation(); stored.run(306)
+        stored.engine.permanentlyFailed(try XCTUnwrap(stored.emitted.first).eventId, at: stored.time)
+        stored.run(120)
+        XCTAssertEqual(stored.emitted.count, 1)
+    }
+    func testLaterAcceptedAlertClearsTheShownFailureButKeepsItsHistory() throws {
+        var s = Simulation(); s.run(306)
+        let first = try XCTUnwrap(s.emitted.first)
+        s.engine.rejected(first.eventId, at: s.time)
+        XCTAssertEqual(s.engine.snapshot.unresolvedFailure?.id, first.eventId)
+        s.run(61)
+        let second = try XCTUnwrap(s.emitted.last)
+        s.engine.delivered(second.eventId, at: s.time)
+        XCTAssertNil(s.engine.snapshot.unresolvedFailure)
+        XCTAssertEqual(s.engine.snapshot.failedAlerts.map(\.alert), [first])
+        let restored = try JSONDecoder().decode(SessionSnapshot.self, from: JSONEncoder().encode(s.engine.snapshot))
+        XCTAssertNil(restored.unresolvedFailure)
+    }
     func testPermanentFailureHistoryIsBoundedAndKeepsNewestFailures() {
         var engine = CrySessionManager()
         let listener = UUID()

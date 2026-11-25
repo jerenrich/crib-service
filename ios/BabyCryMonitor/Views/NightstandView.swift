@@ -293,7 +293,8 @@ struct NightstandView: View {
         if listener { for event in model.snapshot.timelineEvents { byID[event.id] = event } }
         let events = byID.values.filter { $0.occurredAt >= start && $0.occurredAt <= end }
         let episodes = Set(events.filter { $0.category == .crying }.compactMap(\.episodeID)).count
-        let alerts = events.filter { $0.kind == "alert" }.count
+        // A rejected upload notified nobody, so it is not counted as an alert.
+        let alerts = events.filter { $0.kind == "alert" && !$0.isServerRejection }.count
         let gaps = events.filter { $0.kind == "heartbeat_missing" }.count
         func count(_ value: Int, _ noun: String) -> String { "\(value) \(noun)\(value == 1 ? "" : "s")" }
         var parts = [episodes == 0 ? "No sound episodes" : count(episodes, "sound episode")]
@@ -1153,7 +1154,7 @@ struct NightstandView: View {
             }
             if listener {
                 if !model.snapshot.pending.isEmpty { Text("\(model.snapshot.pending.count) pending alert(s)").foregroundStyle(Palette.amber) }
-                if let failure = model.snapshot.failedAlerts.first {
+                if let failure = model.snapshot.unresolvedFailure {
                     Text("Last alert delivery failed \(failure.failedAt.formatted(date: .abbreviated, time: .shortened)).").foregroundStyle(Palette.amber)
                 }
                 Text("You may lock the screen while monitoring or in Standby. Pause Monitoring on either iPhone keeps the microphone active and discards samples for remote resume. Stop microphone on this iPhone releases the microphone after confirmation.")

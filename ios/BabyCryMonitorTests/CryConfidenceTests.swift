@@ -297,8 +297,12 @@ final class CryConfidenceTests: XCTestCase {
         for end in 5...9 { s.score(0, end: Double(end)) }
         for end in 10...40 where s.alerts.isEmpty { s.score(0.99, end: Double(end)) }
         let alert = try XCTUnwrap(s.alerts.first)
+        let episode = try XCTUnwrap(s.engine.snapshot.current)
+        XCTAssertLessThan(alert.createdAt.timeIntervalSince(episode.startedAt), 28, "The scenario must start the episode after the alert gate's onset")
+        // The alert reports the full window the gate verified, never less than the
+        // configured threshold, and stays consistent with its own timestamps.
         let elapsed = alert.createdAt.timeIntervalSince(alert.cryStartedAt)
-        XCTAssertLessThan(elapsed, 28, "The scenario must start the episode after the alert gate's onset")
+        XCTAssertEqual(elapsed, 30, accuracy: 0.001)
         XCTAssertEqual(alert.durationSeconds, elapsed, accuracy: 0.001)
     }
 

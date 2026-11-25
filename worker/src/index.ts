@@ -154,7 +154,7 @@ export default {
   }catch(error){
    latency.failure(error);
    const expected=error instanceof APIError;
-   return await respond({error:expected?error.message:'Server configuration or storage unavailable.'},expected?error.status:503,expected?'rejected':'internal_error');
+   return await respond(expected?{error:error.message,...(error.code?{code:error.code}:{})}:{error:'Server configuration or storage unavailable.'},expected?error.status:503,expected?'rejected':'internal_error');
   }finally{stopProgress?.();}
  },
  async scheduled(_controller:ScheduledController,env:Env,ctx?:ExecutionContext):Promise<void> {
