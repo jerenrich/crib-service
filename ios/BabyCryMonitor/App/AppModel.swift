@@ -201,8 +201,19 @@ import UIKit
     /// After an upload, the Parent polls quickly until the Listener confirms it.
     @ObservationIgnored private var settingsConfirmationDeadline = Date.distantPast
     @ObservationIgnored private var parentRefreshTask: Task<Void, Never>?
-    @ObservationIgnored private var uploadedToken: String?
-    @ObservationIgnored private var pushToken: String?
+    /// The Parent's APNs token and the token last accepted by this backend. Both
+    /// persist, so a token that arrived during a background launch, or an upload
+    /// that the system cut short, is still uploaded after a relaunch.
+    private var uploadedToken: String? {
+        get { defaults.string(forKey: uploadedPushTokenKey) }
+        set { defaults.set(newValue, forKey: uploadedPushTokenKey) }
+    }
+    private var pushToken: String? {
+        get { defaults.string(forKey: "parentPushToken") }
+        set { defaults.set(newValue, forKey: "parentPushToken") }
+    }
+    private var uploadedPushTokenKey: String { "parentPushTokenUploaded|\(backendURL)" }
+    @ObservationIgnored private var pushTokenUploadTask: Task<(any Error)?, Never>?
     @ObservationIgnored private var pendingWatchToken: String?
     @ObservationIgnored private var hasPendingWatchToken = false
     @ObservationIgnored private var lastWatchRetryAt = Date.distantPast
@@ -363,6 +374,10 @@ import UIKit
             // iOS repeats the token on every registration; log only a new one. It is still re-uploaded.
             if token != self?.pushToken { self?.log.record("push_token_received") }
             self?.pushToken = token; self?.uploadedToken = nil
+            // Registration also runs during background launches. Upload now, under
+            // background time, instead of waiting for the app to be opened: until
+            // then the Worker cannot reach this iPhone.
+            Task { [weak self] in await self?.uploadPushTokenIfNeeded() }
         }
         notifications.onAlert = { [weak self] in self?.log.record("push_received"); Task { await self?.refreshParent() } }
         notifications.onAcknowledge = { [weak self] id in await self?.acknowledge(id) }
@@ -1573,8 +1588,10 @@ import UIKit
             if role == .parent {
                 // iOS freezes requests when it suspends the app, leaving them to time out
                 // minutes later. In the background only Watch acknowledgements, which must
-                // not wait, are uploaded; polling and token upload resume in the foreground.
-                if appActive, let pushToken, pushToken != uploadedToken { try await client.pushToken(pushToken); uploadedToken = pushToken; log.record("push_token_uploaded") }
+                // not wait, are uploaded; polling resumes in the foreground. A new push
+                // token is uploaded from registration and refresh, under background time;
+                // this foreground pass retries one whose upload failed.
+                if appActive, let pushToken, pushToken != uploadedToken { try await uploadPushToken(pushToken) }
                 if now.timeIntervalSince(lastWatchRetryAt) >= 15 {
                     lastWatchRetryAt = now
                     if watch.activated, !watch.installed, parentStatus?.watchPushRegistered == true {
@@ -1831,11 +1848,86 @@ import UIKit
         let task = Task { [weak self] in
             defer { grant.end() }
             guard let self else { return }
+            // A background refresh is also a chance to repair a missed upload.
+            await self.uploadPushTokenIfNeeded()
             await self.fetchParentStatus()
         }
         parentRefreshTask = task
         await task.value
         parentRefreshTask = nil
+    }
+    /// Whether the server holds an APNs token for this Parent iPhone. In a
+    /// family the pair's flag describes the owner's phone, so use this
+    /// caregiver's own entry.
+    private func serverHasPhoneToken(_ status: ParentStatus) -> Bool? {
+        if let duty = status.caregiverDuty { return duty.caregivers.first { $0.id == duty.myId }?.phoneRegistered }
+        // pairingID begins with the owner's ID: never apply the owner's flag to a partner.
+        if let pairing = status.pairingID, let credential,
+           !pairing.lowercased().hasPrefix(credential.deviceId.uuidString.lowercased() + "|") { return nil }
+        return status.phonePushRegistered
+    }
+    /// The Worker drops a token Apple rejects. An upload this iPhone believes
+    /// succeeded is then stale: register again and upload whatever iOS returns.
+    private func repairMissingPushToken(_ status: ParentStatus) {
+        guard status.paired, serverHasPhoneToken(status) == false, uploadedToken != nil else { return }
+        uploadedToken = nil; log.record("push_token_missing_on_server")
+        Task { [weak self] in
+            guard let self else { return }
+            await self.notifications.register()
+            await self.uploadPushTokenIfNeeded()
+        }
+    }
+    static let parentPhoneRegistrationTitle = "Parent iPhone not registered for alerts"
+    /// Shown on both iPhones while the server has no push token for the Parent
+    /// iPhone. A cry then reaches the Watch alone, if any, which may not wake anyone.
+    var parentPhoneRegistrationWarning: String? {
+        switch role {
+        case .parent:
+            guard paired, let status = parentStatus, status.paired, serverHasPhoneToken(status) == false else { return nil }
+            let watch = status.watchPushRegistered == true ? " Crying alerts reach only your Apple Watch, which may not wake you." : " Crying alerts cannot reach you."
+            return "The server has no push token for this iPhone.\(watch) Keep Crib Service open with internet and notifications allowed for a moment so it can register again."
+        case .listener:
+            let fresh = listenerPairStatusReceivedAt.map { (-5...30).contains(now.timeIntervalSince($0)) } == true && connectivity.available
+            guard paired, fresh, let status = listenerPairStatus, status.phonePushRegistered == false else { return nil }
+            let watch = status.watchPushRegistered == true ? " Crying alerts go only to the Apple Watch, which may not wake anyone." : " Crying alerts cannot reach the parent."
+            return "The server has no push token for the Parent iPhone.\(watch) Open Crib Service on the Parent iPhone, with notifications allowed, to register it again."
+        case nil:
+            return nil
+        }
+    }
+    /// Uploads a Parent push token the backend has not yet accepted, holding
+    /// background time so a suspension cannot freeze the request.
+    func uploadPushTokenIfNeeded() async {
+        guard role == .parent, connectivity.available, !backendURL.isEmpty, let token = pushToken, token != uploadedToken else { return }
+        do { try await uploadPushToken(token) } catch { log.record("push_token_upload_failed", error: error) }
+    }
+    private func uploadPushToken(_ token: String) async throws {
+        // Clear a finished upload here too: awaiting a completed task does not
+        // suspend, so leaving it set would spin the main actor before its owner
+        // could resume and clear it.
+        while let running = pushTokenUploadTask {
+            _ = await running.value
+            if pushTokenUploadTask == running { pushTokenUploadTask = nil }
+        }
+        guard role == .parent, token == pushToken, token != uploadedToken else { return }
+        let revision = environmentRevision
+        let grant = BackgroundTimeGrant.begin("push-token-upload") { [weak self] in self?.log.record("background_time_expired") }
+        let task = Task { [weak self] () -> (any Error)? in
+            defer { grant.end() }
+            guard let self else { return nil }
+            do {
+                let client = try await self.registeredClient()
+                guard revision == self.environmentRevision, self.role == .parent else { return nil }
+                try await client.pushToken(token)
+                guard revision == self.environmentRevision, self.pushToken == token else { return nil }
+                self.uploadedToken = token; self.log.record("push_token_uploaded")
+                return nil
+            } catch { return error }
+        }
+        pushTokenUploadTask = task
+        let failure = await task.value
+        if pushTokenUploadTask == task { pushTokenUploadTask = nil }
+        if let failure { throw failure }
     }
     private func fetchParentStatus() async {
         let revision = environmentRevision, generation = settingsGeneration, alerts = listenerAlertGeneration
@@ -1859,6 +1951,7 @@ import UIKit
             }
             parentStatus = status; paired = status.paired; defaults.set(paired, forKey: pairingKey)
             notificationsCheckedAt = checkedAt
+            repairMissingPushToken(status)
             // Only fresh Listener evidence may renew a hypothetical quiet deadline.
             if status.paired, status.monitoring == true, status.state == .quiet,
                let serverTime = status.serverTime, let heartbeat = status.lastHeartbeat,

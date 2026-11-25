@@ -204,3 +204,13 @@ struct SilentAlarmRecord: Codable, Equatable {
         return Array((records.filter { $0.episodeID != episodeID } + [record]).suffix(64))
     }
 }
+
+/// The AlarmKit alarm has a single button, and for a real alert it snoozes every
+/// alert for the chosen duration. Say so, so a half-asleep tap is understood.
+enum AlarmStopButton {
+    static func title(isTest: Bool, snoozeDuration: TimeInterval) -> String {
+        guard !isTest else { return "Stop test" }
+        return "Snooze \(max(1, Int((snoozeDuration / 60).rounded()))) min"
+    }
+    static func systemImageName(isTest: Bool) -> String { isTest ? "stop.circle" : "zzz" }
+}

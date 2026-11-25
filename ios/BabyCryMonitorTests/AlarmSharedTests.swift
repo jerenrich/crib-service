@@ -198,6 +198,14 @@ final class AlarmSharedTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: journal.url), Data([0xFF, 0xFE]))
     }
 
+    func testAlarmButtonSaysItSnoozesForTheConfiguredDuration() {
+        XCTAssertEqual(AlarmStopButton.title(isTest: false, snoozeDuration: 60), "Snooze 1 min")
+        XCTAssertEqual(AlarmStopButton.title(isTest: false, snoozeDuration: 900), "Snooze 15 min")
+        XCTAssertEqual(AlarmStopButton.title(isTest: false, snoozeDuration: 10), "Snooze 1 min")
+        XCTAssertEqual(AlarmStopButton.title(isTest: true, snoozeDuration: 300), "Stop test")
+        XCTAssertEqual(AlarmStopButton.systemImageName(isTest: false), "zzz")
+    }
+
     #if !canImport(MonitorCore)
     func testStatusDecodesAlarmMethods() throws {
         let decoder = JSONDecoder()

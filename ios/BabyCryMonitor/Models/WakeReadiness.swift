@@ -20,4 +20,17 @@ public enum WakeReadiness {
             return result
         }
     }
+    /// The Watch's version: one banner, naming each setting that is off. Watch
+    /// notification options are set from the iPhone's Watch app, or mirror the
+    /// iPhone's own Crib Service settings.
+    public static func watchWarning(alertsOff: Bool, soundsOff: Bool, timeSensitiveOff: Bool) -> String? {
+        var off: [String] = []
+        if alertsOff { off.append("notifications") }
+        if soundsOff { off.append("sound/haptics") }
+        if timeSensitiveOff { off.append("Time Sensitive") }
+        guard !off.isEmpty else { return nil }
+        let list = off.count == 1 ? off[0] : off.dropLast().joined(separator: ", ") + " and " + off[off.count - 1]
+        let focus = timeSensitiveOff ? " Without Time Sensitive, Sleep Focus can silence crying alerts." : ""
+        return "Crib Service \(list) \(off.count == 1 ? "is" : "are") off on this Watch.\(focus) Turn \(off.count == 1 ? "it" : "them") on in the iPhone's Settings › Notifications › Crib Service and its Watch app › Notifications. Global Prominent Haptics does not change this app's notification permissions."
+    }
 }

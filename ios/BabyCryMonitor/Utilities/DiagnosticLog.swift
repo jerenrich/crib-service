@@ -46,7 +46,7 @@ import Observation
         "alert_resolved", "alert_held_for_monitoring_report", "monitoring_failure_alert_queued", "monitoring_failure_alert_cleared",
         "test_push_apns_accepted", "heartbeat_retry_scheduled", "heartbeat_recovered", "settings_synced",
         "settings_sync_failed", "parent_status_failed", "parent_status_recovered", "backend_unavailable",
-        "network_available", "network_unavailable", "push_token_received", "push_token_uploaded", "push_received",
+        "network_available", "network_unavailable", "push_token_received", "push_token_uploaded", "push_token_upload_failed", "push_token_missing_on_server", "push_received",
         "notification_permission_allowed", "notification_permission_denied", "notification_permission_failed",
         "notification_sound_permission_before_request", "notification_alert_permission", "notification_sound_permission", "notification_time_sensitive_permission", "notification_wake_problems",
         "parent_connection_warning_armed", "parent_connection_warning_cancelled", "parent_connection_warning_failed",
@@ -90,7 +90,7 @@ import Observation
         guard Self.events.contains(event) else { return }
         let repetitive: Set<String> = ["alert_retry_scheduled", "alert_uncertain", "alert_blocked", "alert_server_pending",
                                       "heartbeat_retry_scheduled", "settings_sync_failed", "parent_status_failed",
-                                      "backend_unavailable", "watch_sync_failed", "watch_snapshot_failed", "watch_snapshot_received",
+                                      "backend_unavailable", "push_token_upload_failed", "watch_sync_failed", "watch_snapshot_failed", "watch_snapshot_received",
                                       "listener_status_failed", "monitoring_start_blocked_storage", "monitoring_start_blocked_safety",
                                       "parent_connection_warning_armed", "parent_connection_warning_failed", "watch_payload_unrecognized",
                                       "alert_held_for_monitoring_report"]
