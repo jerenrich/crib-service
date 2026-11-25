@@ -608,10 +608,10 @@ struct NightstandView: View {
     private func listenerAlertCircle(_ hero: Hero, title: String, icon: String) -> some View {
         ZStack {
             StatusRing(fill: snoozedUntil == nil ? .full : hero.ring, color: Palette.amber, glow: snoozedUntil == nil)
-            VStack(spacing: 6) {
-                Image(systemName: icon).font(.title2).accessibilityHidden(true)
-                heroTitle(hero).font(.subheadline.weight(.medium))
-                Text(title).font(.system(.title, design: .rounded).weight(.semibold))
+            VStack(spacing: ringSize >= 200 ? 6 : 3) {
+                Image(systemName: icon).font(ringSize >= 200 ? .title2 : .title3).accessibilityHidden(true)
+                heroTitle(hero).font(.subheadline.weight(.medium)).lineLimit(2).minimumScaleFactor(0.85)
+                Text(title).font(.system(ringSize >= 200 ? .title : .title2, design: .rounded).weight(.semibold))
                 if snoozedUntil != nil {
                     heroDetail(hero).font(.footnote).foregroundStyle(Palette.muted)
                 } else {
