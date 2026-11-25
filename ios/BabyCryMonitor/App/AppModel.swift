@@ -66,10 +66,35 @@ import UIKit
     private(set) var listenerPairStatusReceivedAt: Date?
     @ObservationIgnored private var listenerAlertGeneration = 0
     var alertStatus: ParentStatus? { role == .listener ? listenerPairStatus : parentStatus }
-    var timeline: TimelineResponse?
+    var timeline: TimelineResponse? { didSet { timelineStandbyStart = timeline?.standbyStart() } }
+    /// Derived once per fetched timeline; the Monitor ring reads it every tick.
+    private(set) var timelineStandbyStart: StandbyStart?
+    /// Local time the request behind `timeline` started. Anything that happened
+    /// on the Listener after it may be missing from that page.
+    private(set) var timelineRequestedAt: Date?
+    @ObservationIgnored private var timelineInFlightRequestedAt: Date?
+    /// A page must have been requested at or after this local time to describe
+    /// the current Standby: a resume and re-pause may have happened before it.
+    private(set) var standbyFreshAfter = Date.distantPast
+    /// The ring may show `timelineStandbyStart`: its page postdates the last
+    /// moment Standby could have restarted unseen. While a sufficiently new
+    /// request is in flight the previous answer stays up, so the ring doesn't blink.
+    var standbyStartIsCurrent: Bool {
+        if let requested = timelineRequestedAt, requested >= standbyFreshAfter { return true }
+        return loadingTimeline && (timelineInFlightRequestedAt ?? .distantPast) >= standbyFreshAfter
+    }
+    /// Call when Standby may have restarted unseen (Standby began, the app
+    /// returned to the foreground, Monitor appeared), then fetch a page that covers it.
+    func refreshStandbyStart() async {
+        // One second of slack lets a refresh started by the same event (such as
+        // Activity's own foreground refresh) count, instead of fetching twice.
+        standbyFreshAfter = currentTime().addingTimeInterval(-1)
+        await refreshTimeline(notBefore: standbyFreshAfter)
+    }
     var timelineClockOffset: TimeInterval = 0
     var timelineError: String?
     var loadingTimeline = false
+    @ObservationIgnored private var timelineRefreshQueued = false
     var currentDBFS: Double = -100
     var meter: [Double] = Array(repeating: -100, count: SoundLevelFrame.barCount)
     var chartNotificationTimes: [Date] = []
@@ -173,6 +198,8 @@ import UIKit
     @ObservationIgnored private var lastHeartbeatAt = Date.distantPast
     @ObservationIgnored private var lastRefreshAt = Date.distantPast
     @ObservationIgnored private var nextParentRefreshAt = Date.distantPast
+    /// After an upload, the Parent polls quickly until the Listener confirms it.
+    @ObservationIgnored private var settingsConfirmationDeadline = Date.distantPast
     @ObservationIgnored private var parentRefreshTask: Task<Void, Never>?
     @ObservationIgnored private var uploadedToken: String?
     @ObservationIgnored private var pushToken: String?
@@ -429,7 +456,7 @@ import UIKit
             if ProcessInfo.processInfo.arguments.contains("--uitesting-caregivers") {
                 let me = UUID(), partner = UUID()
                 status.caregiverDuty = CaregiverDuty(myId: me, primaryId: me, revision: 1, escalationSeconds: 120,
-                    caregivers: [.init(id: me, name: "Jordan", secondaryEnabled: true, phoneRegistered: true, watchRegistered: true),
+                    caregivers: [.init(id: me, name: "Sam", secondaryEnabled: true, phoneRegistered: true, watchRegistered: true),
                                  .init(id: partner, name: "Alex", secondaryEnabled: true, phoneRegistered: true, watchRegistered: true)])
             }
             if ProcessInfo.processInfo.arguments.contains("--uitesting-active-alert") || ProcessInfo.processInfo.arguments.contains("--uitesting-test-alert") {
@@ -440,6 +467,13 @@ import UIKit
             if ProcessInfo.processInfo.arguments.contains("--uitesting-snoozed") { status.alertsMutedUntil = now.addingTimeInterval(60) }
             if role == .parent { parentStatus = status }
             else { listenerPairStatus = status; listenerPairStatusReceivedAt = now }
+            if paused && role == .parent {
+                // Lets the Monitor ring show when Standby began.
+                timeline = TimelineResponse(paired: true, serverTime: now, availableSince: now.addingTimeInterval(-13 * 3600), events: [
+                    TimelineEvent(kind: "monitoring_started", occurredAt: now.addingTimeInterval(-3 * 3600)),
+                    TimelineEvent(kind: "monitoring_paused", occurredAt: now.addingTimeInterval(-40 * 60))], truncated: false)
+                timelineRequestedAt = now
+            }
             seedLiveSoundFrameForUITest()
             if ProcessInfo.processInfo.arguments.contains("--uitesting-chart-paused") { remoteSound.disconnected() }
             if ProcessInfo.processInfo.arguments.contains("--uitesting-keep-awake") { keepScreenAwake = true }
@@ -792,7 +826,7 @@ import UIKit
         if wasMonitoring { engine.recordTimeline("monitoring_paused", at: currentTime()) }
         meter = Array(repeating: -100, count: SoundLevelFrame.barCount); currentDBFS = -100
         chartNotificationTimes.removeAll(); chartSampledAt = nil
-        if standby { audioStatus = "Standby · Microphone active" }
+        if standby { audioStatus = "Standby · Microphone on · Cry alerts off" }
         persist(); synchronizeLiveSound(); queueHeartbeat(); recordBatterySample()
         log.record("monitoring_paused")
     }
@@ -1058,7 +1092,7 @@ import UIKit
             chartNotificationTimes.removeAll(); chartSampledAt = nil
             microphoneActive = true; monitoring = !detectionPaused
             detectionStartedAt = monitoring ? currentTime() : nil
-            audioStatus = standby ? "Standby · Microphone active" : "Microphone active"
+            audioStatus = standby ? "Standby · Microphone on · Cry alerts off" : "Microphone active"
             engine.markMonitoring(monitoring); lastSampleAt = currentTime(); lastHeartbeatAt = .distantPast
             needsRestart = false; error = nil
             if !wasActive || wasRecovering || monitoring != wasMonitoring {
@@ -1096,7 +1130,7 @@ import UIKit
             if !wasOtherAudio { otherAudioSince = currentTime() }
             meter = Array(repeating: -100, count: SoundLevelFrame.barCount); currentDBFS = -100
             chartNotificationTimes.removeAll(); chartSampledAt = nil
-            audioStatus = standby ? "Standby · Microphone active" : AudioLevelMonitor.otherAudioMessage
+            audioStatus = standby ? "Standby · Microphone on · Cry alerts off" : AudioLevelMonitor.otherAudioMessage
             lastSampleAt = currentTime(); needsRestart = false
             if wasMonitoring, !detectionPaused { engine.recordTimeline("detection_paused", at: currentTime()) }
             engine.suspend(); persist()
@@ -1388,6 +1422,18 @@ import UIKit
         configuration = config; engine.configure(config); persist()
         settingsGeneration += 1
         settingsDirty = true; defaults.set(true, forKey: "settingsDirty")
+        requestSettingsUpload()
+    }
+    /// Uploads now rather than on the next network loop pass, which can be held
+    /// up by a slow status refresh or Watch sync.
+    private func requestSettingsUpload() {
+        guard settingsDirty, paired, settingsTask == nil, !managingDevice, connectivity.available else { return }
+        let revision = environmentRevision
+        Task { [weak self] in
+            guard let self, let client = try? await self.registeredClient(),
+                  revision == self.environmentRevision else { return }
+            self.synchronizeSettings(using: client)
+        }
     }
     private func applyRemote(_ config: MonitoringConfiguration) {
         guard config.isValid else { return }
@@ -1631,17 +1677,27 @@ import UIKit
         let revision = environmentRevision, generation = settingsGeneration
         let config = configuration
         settingsTask = Task { [weak self] in
-            defer { self?.settingsTask = nil }
             do {
                 try await client.settings(config)
-                guard let self, revision == self.environmentRevision,
-                      generation == self.settingsGeneration else { return }
+                guard let self else { return }
+                self.settingsTask = nil
+                guard revision == self.environmentRevision else { return }
+                guard generation == self.settingsGeneration else {
+                    // A newer edit arrived mid-upload: send it now.
+                    self.requestSettingsUpload(); return
+                }
                 self.settingsDirty = false; self.defaults.set(false, forKey: "settingsDirty")
                 self.log.record("settings_synced")
                 // Invalidate remote reads begun before this upload finished.
                 self.settingsGeneration += 1
+                if self.role == .parent {
+                    self.settingsConfirmationDeadline = self.currentTime().addingTimeInterval(20)
+                    self.nextParentRefreshAt = min(self.nextParentRefreshAt, self.currentTime().addingTimeInterval(2))
+                }
             } catch {
-                guard let self, revision == self.environmentRevision else { return }
+                guard let self else { return }
+                self.settingsTask = nil
+                guard revision == self.environmentRevision else { return }
                 self.deliveryStatus = "Settings sync pending: \(error.localizedDescription)"
                 self.log.record("settings_sync_failed", error: error)
             }
@@ -1783,6 +1839,7 @@ import UIKit
             }
             if !status.paired || (parentStatus?.pairingID != nil && parentStatus?.pairingID != status.pairingID) {
                 timeline = nil; timelineError = nil; clearLiveSound()
+                settingsConfirmationDeadline = .distantPast
             }
             parentStatus = status; paired = status.paired; defaults.set(paired, forKey: pairingKey)
             notificationsCheckedAt = checkedAt
@@ -1803,7 +1860,12 @@ import UIKit
             let warn = localConnectionWarningEnabled && status.paired && status.monitoring == true
             setParentConnectionDeadline(warn ? currentTime().addingTimeInterval(ConnectionWarningNotification.timeout) : nil)
             if !settingsDirty, generation == settingsGeneration { applyRemote(status.configuration) }
-            nextParentRefreshAt = currentTime().addingTimeInterval(pendingMonitoringCommand != nil ? 1 : status.refreshDelay())
+            var delay = pendingMonitoringCommand != nil ? 1 : status.refreshDelay()
+            if status.paired, currentTime() < settingsConfirmationDeadline {
+                if status.listenerConfiguration == configuration { settingsConfirmationDeadline = .distantPast }
+                else { delay = min(delay, 2) }
+            }
+            nextParentRefreshAt = currentTime().addingTimeInterval(delay)
             deliveryStatus = "Connected"; error = nil
             publishWatch()
         } catch {
@@ -1837,6 +1899,7 @@ import UIKit
         guard listenerStatusTask == nil, currentTime().timeIntervalSince(lastRefreshAt) >= 3 else { return }
         lastRefreshAt = currentTime()
         let revision = environmentRevision, control = controlGeneration, alerts = listenerAlertGeneration
+        let generation = settingsGeneration
         listenerStatusTask = Task { [weak self] in
             defer { self?.listenerStatusTask = nil }
             do {
@@ -1845,6 +1908,18 @@ import UIKit
                 let status = try await client.status()
                 guard revision == self.environmentRevision, control == self.controlGeneration, alerts == self.listenerAlertGeneration, self.role == .listener else { return }
                 self.observePairing(status)
+                // An idle Listener sends no heartbeats, so this poll is its only
+                // source of Parent settings. Report a change once so the Parent
+                // can confirm it was applied.
+                // Skip while a heartbeat is queued, in flight, or answered during this
+                // poll: its reply may be newer, and replacing it would reset backoff.
+                let heartbeatIdle = self.heartbeatTask == nil && self.lastHeartbeatAt < fetchedAt
+                    && self.heartbeatKey.map { self.pendingHeartbeats[$0] == nil } ?? true
+                if status.paired, heartbeatIdle, !self.settingsDirty, generation == self.settingsGeneration,
+                   status.configuration.isValid, status.configuration != self.configuration {
+                    self.applyRemote(status.configuration)
+                    self.queueHeartbeat()
+                }
                 if status.paired { await self.applyMonitoringCommand(status.monitoringCommand, serverTime: status.serverTime, fetchedAt: fetchedAt, using: client) }
             } catch {
                 guard let self, revision == self.environmentRevision else { return }
@@ -1871,18 +1946,37 @@ import UIKit
             publishWatch()
         }
     }
-    func refreshTimeline() async {
+    /// With `notBefore`, a caller arriving mid-fetch gets a follow-up fetch only
+    /// if the request in flight started earlier; other overlapping calls are dropped.
+    func refreshTimeline(notBefore: Date? = nil) async {
         #if DEBUG
         if ProcessInfo.processInfo.arguments.contains("--uitesting-timeline") { return }
+        // The offline live-sound fixture seeds its timeline; treat it as freshly fetched.
+        if ProcessInfo.processInfo.arguments.contains("--uitesting-live-sound") {
+            if timeline != nil { timelineRequestedAt = currentTime() }
+            return
+        }
         #endif
-        guard !loadingTimeline, paired else { return }
+        guard paired else { return }
+        if loadingTimeline {
+            if let notBefore, (timelineInFlightRequestedAt ?? .distantPast) < notBefore { timelineRefreshQueued = true }
+            return
+        }
         loadingTimeline = true; defer { loadingTimeline = false }
-        let revision = environmentRevision
+        repeat {
+            timelineRefreshQueued = false
+            await fetchTimelinePage()
+        } while timelineRefreshQueued && paired
+    }
+    private func fetchTimelinePage() async {
+        let revision = environmentRevision, requestedAt = currentTime()
+        timelineInFlightRequestedAt = requestedAt
         do {
             let client = try await registeredClient()
             let page = try await client.timeline()
             guard revision == environmentRevision, paired else { return }
-            timeline = page; timelineClockOffset = page.serverTime.timeIntervalSince(currentTime()); timelineError = nil
+            timeline = page; timelineRequestedAt = requestedAt
+            timelineClockOffset = page.serverTime.timeIntervalSince(currentTime()); timelineError = nil
         } catch {
             guard revision == environmentRevision else { return }
             timelineError = "Could not refresh timeline. \(error.localizedDescription)"
