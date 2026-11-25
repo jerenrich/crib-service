@@ -26,14 +26,22 @@ export interface Device { id: string; role: 'parent' | 'listener'; secret_hash: 
 export interface Configuration { alertDuration: number; quietResetDuration: number; repeatInterval?: number | null; absoluteThreshold: number; snoozeDuration: number }
 export const defaultConfiguration: Configuration = {alertDuration:5, quietResetDuration:20, repeatInterval:5, absoluteThreshold:-35, snoozeDuration:60};
 export interface Episode {id:string; startedAt:string; endedAt?:string|null; alertSentAt?:string|null; quietConfirmed?:boolean}
-export interface Heartbeat {listenerId:string; timestamp:string; monitoring:boolean; microphoneActive?:boolean; batteryLevel?:number|null; powerConnected:boolean; state:'quiet'|'possibleCry'|'crying'; currentEpisode?:Episode|null; episodes:Episode[]; appliedConfiguration?:Configuration;timelineEvents?:TimelineEvent[];detectionPaused?:DetectionPauseReason}
+export interface Heartbeat {listenerId:string; timestamp:string; monitoring:boolean; microphoneActive?:boolean; batteryLevel?:number|null; powerConnected:boolean; state:'quiet'|'possibleCry'|'crying'; currentEpisode?:Episode|null; episodes:Episode[]; appliedConfiguration?:Configuration;timelineEvents?:TimelineEvent[];detectionPaused?:HeartbeatPauseReason}
 export interface Alert { eventId:string; episodeId:string; listenerId:string; type:'sustained_cry'|'listener_disconnected'|'monitoring_failed'; cryStartedAt:string; durationSeconds:number; createdAt:string; isRepeat:boolean; isTest?:boolean;targetCaregiverId?:string;reason?:DetectionPauseReason }
 /** Why a microphone-on Listener is not detecting: another app or system sound is
  playing on it, so its own speaker output would be scored as crying. */
 export type DetectionPauseReason='other_audio';
 export const detectionPauseReasons:readonly DetectionPauseReason[]=['other_audio'];
-/** Advertised on every response; Listeners send pause fields only when present. */
-export const serverFeatures='detection-pause';
+/** Heartbeat-only reason: the audio session was interrupted (a call, Siri, Find
+ my) or capture stopped without a person's Stop, and the Listener is recovering.
+ The microphone is off, but the nursery still counts as covered, so a Listener
+ that then goes silent raises a connection-loss alert. */
+export type HeartbeatPauseReason=DetectionPauseReason|'audio_interrupted';
+export const heartbeatPauseReasons:readonly HeartbeatPauseReason[]=[...detectionPauseReasons,'audio_interrupted'];
+/** Advertised on every response; Listeners send pause fields only when present.
+ * `audio-interruption`: heartbeats may report `detectionPaused:'audio_interrupted'`.
+ * `heartbeat-start`: a monitoring heartbeat after an applied Stop records a Start. */
+export const serverFeatures='detection-pause,audio-interruption,heartbeat-start';
 export interface StoredEvent {event_id:string; episode_id:string; listener_id:string; parent_id:string; payload:string; status:string; attempts:number; next_attempt:number; lease_until:number|null; created_at:number; acknowledged_at:string|null; resolved_at:string|null; push_target:'phone'|'watch'|null; last_error:string|null;claim_id?:string|null;delivery_state?:string|null;delivery_mode?:'watch_only'|null}
 /** `code` is a stable machine-readable reason returned with the error message. */
 export class APIError extends Error { constructor(public status:number, message:string, public code?:string) {super(message)} }

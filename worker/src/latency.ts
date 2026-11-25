@@ -49,6 +49,8 @@ export interface TimingDetails {
  db_stages?:Partial<Record<Span,DatabaseMetrics>>;
  db_calls?:number; db_sql_ms?:number; db_rows_read?:number; db_rows_written?:number; db_attempts?:number;
  apns_reason?:AppleReason; apns_environment?:'development'|'production';
+ /** The configured APNs host rejected the token as BadDeviceToken; the other host was tried once. */
+ apns_environment_fallback?:boolean;
  transport?:'timeout'|'network'; provider_token_cached?:boolean; provider_token_age_s?:number;
  provider_token_source?:'memory'|'in_flight'|'coordinator_reused'|'coordinator_created';provider_token_ref?:string;
  apns_started_at_ms?:number; apns_response_at_ms?:number; apns_unique_id?:string; colo?:string;
@@ -338,6 +340,7 @@ export function safeTimingDetails(value:TimingDetails|undefined):string|null {
  if(spans.includes(value.in_flight_span!))safe.in_flight_span=value.in_flight_span;
  if(appleReasons.includes(value.apns_reason!))safe.apns_reason=value.apns_reason;
  if(['development','production'].includes(value.apns_environment!))safe.apns_environment=value.apns_environment;
+ if(value.apns_environment_fallback===true)safe.apns_environment_fallback=true;
  if(['timeout','network'].includes(value.transport!))safe.transport=value.transport;
  if(typeof value.apns_unique_id==='string'&&/^(?:[0-9a-f]{32,64}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$/i.test(value.apns_unique_id))safe.apns_unique_id=value.apns_unique_id.toLowerCase();
  if(value.apns_id_mode==='distinct_request')safe.apns_id_mode=value.apns_id_mode;

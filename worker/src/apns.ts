@@ -50,7 +50,11 @@ export async function sendPush(env:Env,encryptedToken:string,alert:Alert,target:
   ...(silentCryAlarm&&!alert.isTest?{silentCryAlarm:true,...(alarmCycle?{alarmCycleId:alarmCycle}:{}),aps:{...content.aps,'content-available':1}}:{}),
   // The Parent's notification extension schedules the same alarm without an app wake.
   ...(alarmExtension?{alarmExtension:true,aps:{...content.aps,...(silentCryAlarm?{'content-available':1}:{}),'mutable-content':1}}:{})
- },target,identity.configuredTest?60:alert.isRepeat?15:3600,collapseID,latency,schedule);
+ // Real repeats keep the first alert's lifetime. While a device is offline APNs
+ // stores only its newest notification, so a short-lived repeat would replace the
+ // stored first alert and then expire, leaving nothing to deliver on reconnect.
+ // Test repeats (Watch tests) stay short so a late test never reaches a parent.
+ },target,identity.configuredTest?60:alert.isTest&&alert.isRepeat?15:3600,collapseID,latency,schedule);
 }
 // The single AlarmKit wake request for real and configured-test alerts. A test
 // carries the same marker and takes the same Parent path; it is labelled and
@@ -86,35 +90,53 @@ async function sendNotification(env:Env,encryptedToken:string,id:string,content:
  try {deviceToken=await latency.measure('token_decrypt_ms',()=>decryptToken(env,encryptedToken));}catch{throw new PushPreparationError('token_decryption');}
  try {jwt=await latency.measure('provider_sign_ms',()=>apnsToken(env,latency));}catch{throw new PushPreparationError('provider_signing');}
  if(!['development','production'].includes(env.APNS_ENVIRONMENT))throw new PushPreparationError('apns_environment');
- const host=env.APNS_ENVIRONMENT==='production'?'api.push.apple.com':'api.sandbox.push.apple.com';
+ const configured=env.APNS_ENVIRONMENT as 'development'|'production';
  if(schedule?.beforeRequest)await schedule.beforeRequest();
+ schedule?.requestStarted?.();
+ const headers={authorization:`bearer ${jwt}`,'apns-topic':topic??env.APNS_BUNDLE_ID+(target==='watch'?'.watchkitapp':''),'apns-push-type':'alert','apns-priority':'10','apns-id':id,'apns-collapse-id':collapseId,'apns-expiration':String(Math.floor(Date.now()/1000)+expiration),'content-type':'application/json'};
+ const body=JSON.stringify(content);
+ const first=await post(configured,deviceToken,headers,body,latency);
+ if(first.appleReason!=='BadDeviceToken')return first.result;
+ // Apple also answers BadDeviceToken when the token belongs to the other APNs
+ // environment (a production-signed build against a development Worker, or
+ // the reverse). That rejection is definite, so one attempt on the other host
+ // cannot duplicate a notification, and it keeps a valid token from deletion.
+ latency.details.apns_environment_fallback=true;
+ const other=await post(configured==='production'?'development':'production',deviceToken,headers,body,latency);
+ // A signing key limited to one environment is refused by the other host. The
+ // token is then genuinely bad for this Worker: keep the original rejection.
+ return other.result.reason==='provider_configuration'?first.result:other.result;
+}
+async function post(environment:'development'|'production',deviceToken:string,headers:Record<string,string>,body:string,latency:Latency):Promise<{result:PushResult;appleReason?:AppleReason}> {
+ const host=environment==='production'?'api.push.apple.com':'api.sandbox.push.apple.com';
  let response:Response;
  const signal=AbortSignal.timeout(10000);
- latency.details.apns_environment=env.APNS_ENVIRONMENT as 'development'|'production';
- schedule?.requestStarted?.();
+ latency.details.apns_environment=environment;
+ latency.details.apns_reason=undefined;
  latency.details.apns_started_at_ms=Date.now();
  try {
-  response=await latency.measure('apns_fetch_ms',()=>fetch(`https://${host}/3/device/${deviceToken}`,{method:'POST',headers:{authorization:`bearer ${jwt}`,'apns-topic':topic??env.APNS_BUNDLE_ID+(target==='watch'?'.watchkitapp':''),'apns-push-type':'alert','apns-priority':'10','apns-id':id,'apns-collapse-id':collapseId,'apns-expiration':String(Math.floor(Date.now()/1000)+expiration),'content-type':'application/json'},body:JSON.stringify(content),signal}));
+  response=await latency.measure('apns_fetch_ms',()=>fetch(`https://${host}/3/device/${deviceToken}`,{method:'POST',headers,body,signal}));
   latency.details.apns_response_at_ms=Date.now();
   latency.details.apns_unique_id=response.headers.get('apns-unique-id')??undefined;
- }catch{latency.details.transport=signal.aborted?'timeout':'network';return {status:'uncertain',reason:'transport_unknown'};}
+ }catch{latency.details.transport=signal.aborted?'timeout':'network';return {result:{status:'uncertain',reason:'transport_unknown'}};}
  const httpStatus=response.status;
  if(response.status===200){
   // Acceptance is final. Release an unused response stream without letting
   // cleanup failure/delay change it into an ambiguous send or hold the alarm.
   try{void response.body?.cancel().catch(()=>{});}catch{/* Cleanup is best effort. */}
-  return {status:'sent',httpStatus};
+  return {result:{status:'sent',httpStatus}};
  }
  const reason=await latency.measure('apns_body_ms',()=>appleReason(response));
  latency.details.apns_reason=reason;
- if(response.status===429)return {status:'retry',reason:'apns_429',httpStatus};
- if(response.status===500)return {status:'retry',reason:'apns_500',httpStatus};
- if(response.status===503)return {status:'retry',reason:'apns_503',httpStatus};
- if(['BadDeviceToken','DeviceTokenNotForTopic','Unregistered','ExpiredToken'].includes(reason))return {status:'blocked',reason:'invalid_device_token',httpStatus};
- if(['ExpiredProviderToken','InvalidProviderToken','Forbidden','TopicDisallowed'].includes(reason))return {status:'retry',reason:'provider_configuration',httpStatus};
+ const result=(value:PushResult)=>({result:value,appleReason:reason});
+ if(response.status===429)return result({status:'retry',reason:'apns_429',httpStatus});
+ if(response.status===500)return result({status:'retry',reason:'apns_500',httpStatus});
+ if(response.status===503)return result({status:'retry',reason:'apns_503',httpStatus});
+ if(['BadDeviceToken','DeviceTokenNotForTopic','Unregistered','ExpiredToken'].includes(reason))return result({status:'blocked',reason:'invalid_device_token',httpStatus});
+ if(['ExpiredProviderToken','InvalidProviderToken','Forbidden','TopicDisallowed'].includes(reason))return result({status:'retry',reason:'provider_configuration',httpStatus});
  const reasons:Record<string,Outcome>={BadTopic:'bad_topic',MissingTopic:'missing_topic',BadPriority:'bad_priority',BadExpirationDate:'bad_expiration',PayloadEmpty:'bad_payload',PayloadTooLarge:'payload_too_large'};
  const safeReason=Object.hasOwn(reasons,reason)?reasons[reason]:'apns_rejected';
- return {status:'failed',reason:safeReason,httpStatus};
+ return result({status:'failed',reason:safeReason,httpStatus});
 }
 
 // Rejection bodies are untrusted. Bound reads and keep only Apple's fixed codes.

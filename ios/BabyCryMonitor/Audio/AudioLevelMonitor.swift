@@ -376,12 +376,10 @@ extension AudioLevelProviding {
         }
     }
     /// When an interruption ends, the other session may not have released
-    /// audio yet. Retry briefly under background time instead of giving up,
-    /// since a locked Listener otherwise stays deaf until someone opens it.
+    /// audio yet. Retry briefly instead of giving up, since a locked Listener
+    /// otherwise stays deaf until someone opens it. The caller holds background time.
     private func retryReactivation(generation expected: Int) async -> Bool {
         guard !reactivationRetryDelays.isEmpty else { return false }
-        let grant = BackgroundTimeGrant.begin("AudioReactivation") {}
-        defer { grant.end() }
         for (index, delay) in reactivationRetryDelays.enumerated() {
             do { try await Task.sleep(for: delay) } catch { return false }
             guard generation == expected, wantsMonitoring else { return false }
@@ -591,6 +589,12 @@ extension AudioLevelProviding {
         } catch {
             guard generation == expected, wantsMonitoring else { return }
             log?.record("audio_interrupted", code: unprompted ? 1 : 0, error: error)
+            // Hold background time through the retries and the failure report. That
+            // report queues the monitoring-stopped alert and begins its upload under
+            // the app's own grant; ending this one first could suspend a locked
+            // Listener before the Parent hears that monitoring stopped.
+            let grant = BackgroundTimeGrant.begin("AudioReactivation") {}
+            defer { grant.end() }
             if await retryReactivation(generation: expected) {
                 logStop(stopped, phase: "stopped", reason: stopReason)
                 logSound(phase: "capture_restored")

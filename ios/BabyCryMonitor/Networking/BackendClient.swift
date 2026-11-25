@@ -117,8 +117,9 @@ struct Heartbeat: Codable, Sendable {
     var detectionPaused: String? = nil
     /// The same check-in without fields an older server would reject outright.
     func compatible(with features: ServerFeatures) -> Heartbeat {
-        guard !features.detectionPause else { return self }
         var value = self
+        if detectionPaused == CryAlert.audioInterruptedReason, !features.audioInterruption { value.detectionPaused = nil }
+        guard !features.detectionPause else { return value }
         value.detectionPaused = nil
         value.timelineEvents = timelineEvents?.map { event in
             var event = event
@@ -137,6 +138,10 @@ final class ServerFeatures: @unchecked Sendable {
     private let lock = NSLock()
     private var advertised: Set<String> = []
     var detectionPause: Bool { lock.withLock { advertised.contains("detection-pause") } }
+    /// Heartbeats may report `detectionPaused: "audio_interrupted"`.
+    var audioInterruption: Bool { lock.withLock { advertised.contains("audio-interruption") } }
+    /// A monitoring heartbeat received after an applied Stop expires records a Start.
+    var heartbeatStart: Bool { lock.withLock { advertised.contains("heartbeat-start") } }
     func observe(_ header: String?) {
         let values = Set((header ?? "").split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty })
         lock.withLock { advertised = values }
@@ -297,6 +302,7 @@ struct BackendClient: BackendServing {
         // A lost success response leaves a revoked credential. Retrying deletion is safe.
         do { let _: EmptyResponse = try await request("/v1/device/delete", body: [String:String]()) }
         catch BackendError.response(401, _) { return }
+        catch is DeviceAuthenticationRejected { return }
     }
     func watchPushToken(_ token: String?) async throws {
         struct Token: Encodable { let token: String?; enum CodingKeys: String, CodingKey { case token }
@@ -370,6 +376,10 @@ struct BackendClient: BackendServing {
                let decoded, decoded.code == AlertRejection.code {
                 throw AlertRejection(message: decoded.error)
             }
+            // Likewise only the Worker can say it does not know this credential.
+            if response.statusCode == 401, requestID != nil, let decoded {
+                throw DeviceAuthenticationRejected(message: decoded.error)
+            }
             throw BackendError.response(response.statusCode, decoded?.error ?? "Backend request failed (\(response.statusCode)).")
         }
         let decoder = JSONDecoder()
@@ -406,6 +416,14 @@ enum BackendError: LocalizedError {
 struct AlertRejection: LocalizedError, Equatable {
     /// The Worker's error code for an alert no later attempt can make acceptable.
     static let code = "alert_invalid"
+    let message: String
+    var errorDescription: String? { message }
+}
+
+/// The Worker rejected this device's credential (HTTP 401), for example after its
+/// registration was lost. The app registers the same credential again; the server
+/// never lets registration replace an existing secret.
+struct DeviceAuthenticationRejected: LocalizedError, Equatable {
     let message: String
     var errorDescription: String? { message }
 }

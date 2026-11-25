@@ -31,9 +31,9 @@ struct MetadataStoreError: LocalizedError {
         catch { throw MetadataStoreError(operation: .encode, underlyingError: error) }
         do { try data.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication]) }
         catch { throw MetadataStoreError(operation: .write, underlyingError: error) }
-        do {
-            var resource = URLResourceValues(); resource.isExcludedFromBackup = true
-            var file = url; try file.setResourceValues(resource)
-        } catch { throw MetadataStoreError(operation: .backup_exclusion, underlyingError: error) }
+        // Best effort: the data is already written. Failing the save here would stop
+        // monitoring and alert delivery over a backup preference.
+        var resource = URLResourceValues(); resource.isExcludedFromBackup = true
+        var file = url; try? file.setResourceValues(resource)
     }
 }

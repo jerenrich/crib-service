@@ -1,6 +1,6 @@
 import {Latency,type Span} from './latency';
 import {validateTimelineEvents} from './timeline';
-import {APIError, type Env, type Configuration, type Episode, type Alert, type Heartbeat, type DetectionPauseReason, detectionPauseReasons} from './types';
+import {APIError, type Env, type Configuration, type Episode, type Alert, type Heartbeat, type DetectionPauseReason, detectionPauseReasons, type HeartbeatPauseReason, heartbeatPauseReasons} from './types';
 export const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 export function uuid(value:unknown):string { if(typeof value!=='string'||!uuidPattern.test(value)) throw new APIError(400,'Invalid UUID.'); return value.toLowerCase(); }
 export async function sha256(value:string):Promise<string> {const result = await crypto.subtle.digest('SHA-256',new TextEncoder().encode(value));return [...new Uint8Array(result)].map(b=>b.toString(16).padStart(2,'0')).join('');}
@@ -40,15 +40,17 @@ function episode(value:unknown):Episode {
 }
 export function heartbeat(value:Record<string,unknown>):Heartbeat {
  onlyKeys(value,['listenerId','timestamp','monitoring','microphoneActive','batteryLevel','powerConnected','state','currentEpisode','episodes','appliedConfiguration','timelineEvents','detectionPaused']);
- // A pause keeps the microphone on with detection off, exactly like Standby.
- if(value.detectionPaused!==undefined&&(!detectionPauseReasons.includes(value.detectionPaused as DetectionPauseReason)||value.monitoring!==false||value.microphoneActive!==true))throw new APIError(400,'Invalid detection pause.');
+ // A pause for other audio keeps the microphone on with detection off, exactly
+ // like Standby. An audio interruption has lost the microphone while recovering.
+ if(value.detectionPaused!==undefined&&(!heartbeatPauseReasons.includes(value.detectionPaused as HeartbeatPauseReason)||value.monitoring!==false
+  ||value.microphoneActive!==(value.detectionPaused!=='audio_interrupted')))throw new APIError(400,'Invalid detection pause.');
  if(typeof value.monitoring!=='boolean'||typeof value.powerConnected!=='boolean'||!['quiet','possibleCry','crying'].includes(String(value.state))||!Array.isArray(value.episodes)||value.episodes.length>100||(value.batteryLevel!=null&&(typeof value.batteryLevel!=='number'||value.batteryLevel<0||value.batteryLevel>1)))throw new APIError(400,'Invalid heartbeat.');
  if(value.microphoneActive!==undefined&&(typeof value.microphoneActive!=='boolean'||value.monitoring===true&&value.microphoneActive===false))throw new APIError(400,'Invalid microphone state.');
  if(value.microphoneActive===true&&value.monitoring===false&&(value.state!=='quiet'||value.currentEpisode!=null))throw new APIError(400,'Standby cannot report active detection.');
  const timelineEvents=value.timelineEvents===undefined?undefined:validateTimelineEvents(value.timelineEvents);
  const result:Heartbeat={listenerId:uuid(value.listenerId), timestamp:date(value.timestamp),monitoring:value.monitoring,powerConnected:value.powerConnected,batteryLevel:value.batteryLevel as number|null|undefined,state:value.state as Heartbeat['state'],currentEpisode:value.currentEpisode==null?null:episode(value.currentEpisode),episodes:value.episodes.map(episode)};
  if(value.microphoneActive!==undefined)result.microphoneActive=value.microphoneActive as boolean;
- if(value.detectionPaused!==undefined)result.detectionPaused=value.detectionPaused as DetectionPauseReason;
+ if(value.detectionPaused!==undefined)result.detectionPaused=value.detectionPaused as HeartbeatPauseReason;
  if(timelineEvents)result.timelineEvents=timelineEvents;
  if(value.appliedConfiguration!=null){
   if(typeof value.appliedConfiguration!=='object'||Array.isArray(value.appliedConfiguration))throw new APIError(400,'Invalid applied configuration.');

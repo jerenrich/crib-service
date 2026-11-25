@@ -7,6 +7,7 @@ export interface TimelineEvent {
 }
 type Pair={parent_id:string;listener_id:string;created_at:number};
 const hour=3600000;
+const silencedStatusSQL="CASE WHEN sent_at IS NULL AND acknowledged_at IS NOT NULL AND COALESCE(json_extract(payload,'$.isTest'),0)=0 THEN 'silenced' ELSE status END";
 export function timelineInsert(env:Env,pair:Pair,event:TimelineEvent) {
  return env.DB.prepare(`INSERT INTO timeline_events(id,parent_id,listener_id,pair_created_at,kind,occurred_at,payload)
  SELECT ?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?)
@@ -79,13 +80,15 @@ export async function timeline(env:Env,device:Device) {
   env.DB.prepare(`SELECT payload FROM timeline_events WHERE parent_id=? AND listener_id=? AND pair_created_at=? AND occurred_at<?
    AND kind IN ('monitoring_started','monitoring_stopped','monitoring_paused','audio_interrupted','audio_resumed','monitoring_unverified','monitoring_observed','stopped_observed','standby_observed','detection_paused','detection_resumed','detection_paused_observed','heartbeat_missing','connection_restored','coverage_active','coverage_stopped','coverage_standby') ORDER BY occurred_at DESC,id DESC LIMIT 1`)
    .bind(pair.parent_id,pair.listener_id,pair.created_at,cutoff).first<{payload:string}>(),
-  env.DB.prepare(`SELECT episode_id,CASE WHEN delivery_state IS NOT NULL THEN 'both' ELSE push_target END AS push_target,status,COALESCE(json_extract(payload,'$.isTest'),0) AS test,
+  // A real alert acknowledged without ever being sent was silenced by a snooze,
+  // a Stop or a settled episode. Show it as 'silenced' rather than hiding it.
+  env.DB.prepare(`SELECT episode_id,CASE WHEN delivery_state IS NOT NULL THEN 'both' ELSE push_target END AS push_target,${silencedStatusSQL} AS status,COALESCE(json_extract(payload,'$.isTest'),0) AS test,
    COALESCE(json_extract(payload,'$.type') IN ('listener_disconnected','monitoring_failed'),0) AS disconnected,COUNT(*) AS count,MIN(COALESCE(sent_at,json_extract(payload,'$.createdAt'))) AS first_at,
    MAX(COALESCE(sent_at,json_extract(payload,'$.createdAt'))) AS last_at
    FROM events WHERE parent_id=? AND listener_id=? AND created_at>=? AND
    COALESCE(sent_at,json_extract(payload,'$.createdAt'))>=? AND COALESCE(sent_at,json_extract(payload,'$.createdAt'))<=?
-   AND (acknowledged_at IS NULL OR sent_at IS NOT NULL)
-   GROUP BY episode_id,CASE WHEN delivery_state IS NOT NULL THEN 'both' ELSE push_target END,status,test,disconnected ORDER BY first_at DESC LIMIT 401`)
+   AND (acknowledged_at IS NULL OR sent_at IS NOT NULL OR COALESCE(json_extract(payload,'$.isTest'),0)=0)
+   GROUP BY episode_id,CASE WHEN delivery_state IS NOT NULL THEN 'both' ELSE push_target END,${silencedStatusSQL},test,disconnected ORDER BY first_at DESC LIMIT 401`)
    .bind(pair.parent_id,pair.listener_id,pair.created_at,new Date(cutoff).toISOString(),new Date(now).toISOString())
    .all<{episode_id:string;push_target:string|null;status:string;test:number;disconnected:number;count:number;first_at:string;last_at:string}>(),
   env.DB.prepare(`SELECT id,state,status,sent_at,created_at FROM connection_notices WHERE parent_id=? AND listener_id=? AND created_at>=? ORDER BY created_at DESC LIMIT 201`)

@@ -518,10 +518,9 @@ final class OnboardingUITests: XCTestCase {
             if listener {
                 XCTAssertEqual(value, parentValue)
                 if let parentSize {
+                    // Each phone sizes the chart to its own free space; both
+                    // retain identical readings, scale, width, and accessible content.
                     XCTAssertEqual(chart.frame.width, parentSize.width, accuracy: 0.5)
-                    // Parent intentionally uses a compact chart; both retain
-                    // identical readings, scale, width, and accessible content.
-                    XCTAssertGreaterThanOrEqual(chart.frame.height, parentSize.height)
                 } else { XCTFail("Parent chart was not measured") }
             } else { parentValue = value; parentSize = chart.frame.size }
             let image = XCTAttachment(screenshot: app.screenshot())

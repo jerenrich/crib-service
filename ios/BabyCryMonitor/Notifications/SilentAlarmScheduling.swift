@@ -18,10 +18,13 @@ enum SilentAlarmScheduling {
             : request.isMonitoringFailure ? "Nursery monitoring stopped" : "Check on baby"
     }
 
-    static func configuration(for request: SilentCryAlarmRequest, at date: Date) -> AlarmManager.AlarmConfiguration<Metadata> {
+    /// `snoozeDuration` is the Snooze this alarm's button applies, shown on the button.
+    static func configuration(for request: SilentCryAlarmRequest, at date: Date, snoozeDuration: TimeInterval) -> AlarmManager.AlarmConfiguration<Metadata> {
+        let button = AlarmStopButton.title(isTest: request.isTest, snoozeDuration: snoozeDuration)
         let attributes = AlarmAttributes<Metadata>(presentation: AlarmPresentation(alert: .init(
             title: LocalizedStringResource(stringLiteral: title(for: request)),
-            stopButton: AlarmButton(text: "Stop", textColor: .white, systemImageName: "stop.circle")
+            stopButton: AlarmButton(text: LocalizedStringResource(stringLiteral: button), textColor: .white,
+                                    systemImageName: AlarmStopButton.systemImageName(isTest: request.isTest))
         )), metadata: Metadata(), tintColor: .mint)
         return .alarm(schedule: .fixed(date), attributes: attributes,
                       stopIntent: SnoozeSilentCryAlarmIntent(episodeID: request.episodeID.uuidString, eventID: request.eventID.uuidString, isTest: request.isTest),
