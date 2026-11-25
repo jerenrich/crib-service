@@ -22,7 +22,20 @@ struct NightstandView: View {
     /// size, with room for two-line status text. An iPhone SE keeps the 84 pt panel.
     @ScaledMetric(relativeTo: .body) private var parentReservedHeight: CGFloat = 514
     @ScaledMetric(relativeTo: .body) private var parentReservedHeightTwoCaregivers: CGFloat = 590
-    private var ringSize: CGFloat { listener ? 200 : hasTwoCaregivers ? 96 : 112 }
+    /// Everything on the Listener screen except the status ring, at standard text
+    /// size, with an 84 pt sound panel and the regular 14 pt spacing.
+    @ScaledMetric(relativeTo: .body) private var listenerReservedHeight: CGFloat = 443
+    @State private var listenerHeight: CGFloat = .infinity
+    private var ringSize: CGFloat { listener ? listenerRingSize : hasTwoCaregivers ? 96 : 112 }
+    /// A short screen, such as an iPhone SE, tightens the spacing and then shrinks
+    /// the ring so the live chart keeps its room. Like the Parent's panel, this
+    /// follows the screen size, not the content.
+    private var listenerShort: Bool { listenerHeight < listenerReservedHeight + 200 }
+    private var listenerSpacing: CGFloat { listenerShort ? 10 : 14 }
+    private var listenerRingSize: CGFloat {
+        guard listenerShort else { return 200 }
+        return min(200, max(140, listenerHeight - listenerReservedHeight + 7 * 4))
+    }
     private var hasTwoCaregivers: Bool { model.caregiverDuty?.caregivers.count == 2 }
 
 
@@ -321,18 +334,14 @@ struct NightstandView: View {
                     .padding(.vertical, 8)
                 }
             } else {
-                VStack(spacing: 14) {
-                    header
-                    timedHero.padding(.top, 4)
-                    activitySummary.padding(.top, -10)
-                    chips
-                    soundPanel().frame(minHeight: 60, maxHeight: .infinity)
-                    NurserySoundButton { soundsPresented = true }
-                    actions
-                    disclaimer
+                // Larger text can still overflow; then the screen scrolls
+                // instead of pushing the header under the status bar.
+                ViewThatFits(in: .vertical) {
+                    listenerContents
+                    ScrollView { listenerContents }
                 }
-                .padding(.horizontal, 20)
-                .padding(.vertical, 8)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { listenerHeight = $0 }
             }
         }
         .background {
@@ -381,6 +390,21 @@ struct NightstandView: View {
     private func parentSoundPanelHeight(available: CGFloat) -> CGFloat {
         let reserved = hasTwoCaregivers ? parentReservedHeightTwoCaregivers : parentReservedHeight
         return min(260, max(hasTwoCaregivers ? 80 : 84, available - reserved))
+    }
+
+    private var listenerContents: some View {
+        VStack(spacing: listenerSpacing) {
+            header
+            timedHero.padding(.top, listenerShort ? 0 : 4)
+            activitySummary.padding(.top, -listenerSpacing + 4)
+            chips
+            soundPanel().frame(minHeight: 60, maxHeight: .infinity)
+            NurserySoundButton { soundsPresented = true }
+            actions
+            disclaimer
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 8)
     }
 
     /// Keep the Parent's essential controls near the top. On short screens and
@@ -553,7 +577,9 @@ struct NightstandView: View {
                     heroDetail(hero).font(.footnote).foregroundStyle(Palette.muted)
                 } else {
                     Text(spokenDuration(model.configuration.snoozeDuration)).font(.subheadline)
-                    Text(model.monitoring ? "Nursery keeps listening" : model.microphoneActive ? "Detection paused" : "Microphone inactive").font(.caption).foregroundStyle(Palette.muted)
+                    if ringSize >= 200 {
+                        Text(model.monitoring ? "Nursery keeps listening" : model.microphoneActive ? "Detection paused" : "Microphone inactive").font(.caption).foregroundStyle(Palette.muted)
+                    }
                 }
             }
             .foregroundStyle(Palette.amber).multilineTextAlignment(.center)
@@ -574,7 +600,7 @@ struct NightstandView: View {
                     .font(.system(hero.timer == nil ? .title : .title3, design: .rounded).weight(.semibold))
                     .lineLimit(2).minimumScaleFactor(0.75)
                 if let timer = hero.timer {
-                    Text(clock(timer)).font(.system(size: 44, weight: .medium, design: .rounded)).monospacedDigit()
+                    Text(clock(timer)).font(.system(size: ringSize >= 200 ? 44 : 34, weight: .medium, design: .rounded)).monospacedDigit()
                         .contentTransition(.numericText())
                 }
                 heroDetail(hero).font(.footnote).foregroundStyle(Palette.muted).lineLimit(2).minimumScaleFactor(0.85)
