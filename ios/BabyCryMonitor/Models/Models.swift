@@ -104,6 +104,10 @@ public struct CryAlert: Identifiable, Codable, Equatable, Sendable {
     public var isMonitoringFailure: Bool { type == Self.monitoringFailedType }
     /// Another app or system sound is playing on the Listener, so detection is paused.
     public static let otherAudioReason = "other_audio"
+    /// Heartbeat-only: capture was interrupted (a call, Siri, Find My) or stopped
+    /// without a person's Stop and its stop alert is not yet uploaded. The server
+    /// keeps covering the Listener, so its silence still raises a connection alert.
+    public static let audioInterruptedReason = "audio_interrupted"
     public init(eventId: UUID = UUID(), episodeId: UUID, listenerId: UUID, cryStartedAt: Date, durationSeconds: Double, createdAt: Date, isRepeat: Bool, isTest: Bool? = nil, type: String = "sustained_cry", reason: String? = nil) {
         self.eventId = eventId; self.episodeId = episodeId; self.listenerId = listenerId
         self.type = type; self.cryStartedAt = cryStartedAt; self.durationSeconds = durationSeconds

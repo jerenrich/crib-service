@@ -1471,8 +1471,17 @@ final class AppModelTests: XCTestCase {
         fixture.model.stop()
     }
 
+    private func status(latest command: MonitoringCommand?) -> ParentStatus {
+        var status = ParentStatus(paired: true, configuration: MonitoringConfiguration())
+        status.monitoringCommand = command
+        return status
+    }
+    private func appliedStop(at date: Date) -> MonitoringCommand {
+        MonitoringCommand(id: UUID(), enabled: false, status: "applied", createdAt: date, expiresAt: date.addingTimeInterval(30))
+    }
     @MainActor func testAlertWaitsForUnsentLocalStartSoAnOlderStopCannotSilenceIt() async throws {
         let fixture = try Fixture()
+        await fixture.backend.setStatus(status(latest: appliedStop(at: fixture.time.now.addingTimeInterval(-60))))
         await fixture.backend.setMonitoringFailure(true)
         await fixture.model.start()
         let start = fixture.time.now
@@ -1846,6 +1855,197 @@ final class AppModelTests: XCTestCase {
         fixture.model.stop()
     }
 
+    @MainActor func testAlertHoldEndsOnceTheServerShowsNoStopApplies() async throws {
+        let fixture = try Fixture(pending: true)
+        let stop = appliedStop(at: fixture.time.now.addingTimeInterval(-60))
+        await fixture.backend.setStatus(status(latest: stop))
+        await fixture.backend.setMonitoringFailure(true)
+        await fixture.model.start()
+        // The Start report keeps failing, and the server still applies the Stop.
+        for _ in 0..<3 {
+            fixture.time.now = fixture.time.now.addingTimeInterval(4)
+            fixture.audio.emit(AudioLevelSample(timestamp: fixture.time.now, dbFS: -80))
+            await fixture.model.tick()
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        var sent = await fixture.backend.sent
+        XCTAssertTrue(sent.isEmpty)
+        XCTAssertTrue(fixture.model.log.export.contains("alert_held_for_monitoring_report"))
+        // The server recorded a Start (from monitoring heartbeats): send at once,
+        // although the Listener's own Start report has still not landed.
+        await fixture.backend.setStatus(status(latest: MonitoringCommand(id: UUID(), enabled: true, status: "applied",
+            createdAt: fixture.time.now, expiresAt: fixture.time.now)))
+        let delivered = await eventually {
+            fixture.time.now = fixture.time.now.addingTimeInterval(4)
+            fixture.audio.emit(AudioLevelSample(timestamp: fixture.time.now, dbFS: -80))
+            await fixture.model.tick()
+            return fixture.model.snapshot.pending.isEmpty
+        }
+        XCTAssertTrue(delivered)
+        sent = await fixture.backend.sent
+        XCTAssertEqual(sent.count, 1)
+        XCTAssertTrue(fixture.model.log.export.contains("alert_hold_released_server_started"))
+        let requests = await fixture.backend.monitoringRequests
+        XCTAssertTrue(requests.allSatisfy(\.0), "Only the unsent Start is retried")
+        fixture.model.stop()
+    }
+    @MainActor func testAlertHoldEndsAfterAHeartbeatTheServerCountsAsStart() async throws {
+        ServerFeatures.shared.observe("detection-pause,audio-interruption,heartbeat-start")
+        defer { ServerFeatures.shared.observe(nil) }
+        let fixture = try Fixture(pending: true)
+        // The server's status read keeps failing, so only heartbeats show the Start.
+        await fixture.backend.setStatusFailure(true)
+        await fixture.backend.setMonitoringFailure(true)
+        await fixture.model.start()
+        let started = fixture.time.now
+        func advance(to seconds: Double) async {
+            while fixture.time.now < started.addingTimeInterval(seconds) {
+                fixture.time.now = fixture.time.now.addingTimeInterval(1)
+                fixture.audio.emit(AudioLevelSample(timestamp: fixture.time.now, dbFS: -80))
+                await fixture.model.tick()
+                try? await Task.sleep(for: .milliseconds(5))
+            }
+        }
+        // Before the Stop could have expired, a monitoring heartbeat proves nothing.
+        await advance(to: 32)
+        var sent = await fixture.backend.sent
+        XCTAssertTrue(sent.isEmpty)
+        let beats = await fixture.backend.beats
+        XCTAssertTrue(beats.contains { $0.monitoring })
+        let delivered = await eventually(timeout: .seconds(10)) {
+            await advance(to: fixture.time.now.timeIntervalSince(started) + 1)
+            return fixture.model.snapshot.pending.isEmpty
+        }
+        XCTAssertTrue(delivered)
+        let accepted = await fixture.backend.beats.filter { $0.monitoring && $0.timestamp >= started.addingTimeInterval(35) }
+        XCTAssertFalse(accepted.isEmpty)
+        sent = await fixture.backend.sent
+        XCTAssertEqual(sent.count, 1)
+        fixture.model.stop()
+    }
+    @MainActor func testWithoutHeartbeatStartSupportTheHoldWaitsForTheStartReport() async throws {
+        ServerFeatures.shared.observe("detection-pause")
+        defer { ServerFeatures.shared.observe(nil) }
+        let fixture = try Fixture(pending: true)
+        await fixture.backend.setStatusFailure(true)
+        await fixture.backend.setMonitoringFailure(true)
+        await fixture.model.start()
+        for _ in 0..<60 {
+            fixture.time.now = fixture.time.now.addingTimeInterval(1)
+            fixture.audio.emit(AudioLevelSample(timestamp: fixture.time.now, dbFS: -80))
+            await fixture.model.tick()
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let sent = await fixture.backend.sent
+        XCTAssertTrue(sent.isEmpty, "An older server would acknowledge and retire this alert against the Stop")
+        fixture.model.stop()
+    }
+    @MainActor func testInterruptedListenerReportsCoveredRecoveryInItsHeartbeat() async throws {
+        let fixture = try Fixture()
+        await fixture.model.start(); await fixture.model.tick()
+        fixture.audio.onStatus?(.recovering("Audio interrupted. Waiting for microphone…"))
+        let reported = await eventually {
+            await fixture.backend.beats.last.map {
+                $0.detectionPaused == CryAlert.audioInterruptedReason && !$0.monitoring && $0.microphoneActive == false
+            } ?? false
+        }
+        XCTAssertTrue(reported, "A recovering Listener stays covered by connection-loss alerts")
+        // Recovery keeps checking in while the app runs.
+        let before = await fixture.backend.beats.count
+        fixture.time.now = fixture.time.now.addingTimeInterval(16)
+        await fixture.model.tick()
+        let continued = await eventually { await fixture.backend.beats.count > before }
+        XCTAssertTrue(continued)
+        // Capture resumes: an ordinary monitoring heartbeat again.
+        fixture.audio.onStatus?(.active)
+        let resumed = await eventually { await fixture.backend.beats.last.map { $0.monitoring && $0.detectionPaused == nil } ?? false }
+        XCTAssertTrue(resumed)
+        // A person's Standby is not covered, even while its audio recovers.
+        fixture.model.pauseMonitoring()
+        fixture.audio.onStatus?(.recovering("Audio interrupted. Waiting for microphone…"))
+        let standby = await eventually { await fixture.backend.beats.last.map { !$0.monitoring && $0.detectionPaused == nil } ?? false }
+        XCTAssertTrue(standby)
+        fixture.model.stop()
+        let stopped = await eventually { await fixture.backend.beats.last.map { !$0.monitoring && $0.detectionPaused == nil && $0.microphoneActive == false } ?? false }
+        XCTAssertTrue(stopped, "A person's Stop is reported as stopped")
+    }
+    @MainActor func testFailedCaptureStaysCoveredUntilItsStopAlertUploads() async throws {
+        let fixture = try Fixture()
+        await fixture.backend.configure(sendFail: true)
+        await fixture.model.start(); await fixture.model.tick()
+        fixture.audio.onStatus?(.recovering("Recovering microphone…"))
+        fixture.audio.onStatus?(.failed("Microphone unavailable. Open the app to restart monitoring."))
+        XCTAssertTrue(fixture.model.snapshot.pending.contains { $0.alert.isMonitoringFailure })
+        let covered = await eventually {
+            await fixture.backend.beats.last.map { $0.detectionPaused == CryAlert.audioInterruptedReason && !$0.monitoring } ?? false
+        }
+        XCTAssertTrue(covered, "Until the Parent has the stop alert, the server must not treat this as a Stop")
+        await fixture.backend.configure(sendFail: false)
+        let uploaded = await eventually(timeout: .seconds(5)) {
+            fixture.time.now = fixture.time.now.addingTimeInterval(30)
+            await fixture.model.tick()
+            return !fixture.model.snapshot.pending.contains { $0.alert.isMonitoringFailure }
+        }
+        XCTAssertTrue(uploaded)
+        XCTAssertFalse(fixture.model.log.export.contains("alert_held_for_monitoring_report"))
+    }
+    func testOlderServersNeverReceiveTheInterruptionReason() {
+        let beat = Heartbeat(listenerId: UUID(), timestamp: Date(), monitoring: false, batteryLevel: nil, powerConnected: true, state: .quiet,
+                             currentEpisode: nil, episodes: [], microphoneActive: false, detectionPaused: CryAlert.audioInterruptedReason)
+        let features = ServerFeatures()
+        XCTAssertNil(beat.compatible(with: features).detectionPaused)
+        features.observe("detection-pause")
+        XCTAssertNil(beat.compatible(with: features).detectionPaused, "A pause-aware server without the reason would reject the heartbeat")
+        features.observe("detection-pause,audio-interruption")
+        XCTAssertEqual(beat.compatible(with: features).detectionPaused, CryAlert.audioInterruptedReason)
+    }
+    @MainActor func testMicrophoneStallQueuesItsStopAlertBeforeReleasingAudio() async throws {
+        let fixture = try Fixture(automaticallyStart: true)
+        await fixture.model.start()
+        fixture.time.now = fixture.time.now.addingTimeInterval(4)
+        let sent = await eventually(timeout: .seconds(5)) { await fixture.backend.sent.contains { $0.isMonitoringFailure } }
+        XCTAssertTrue(sent)
+        let log = fixture.model.log.export
+        let queued = try XCTUnwrap(log.range(of: "monitoring_failure_alert_queued"))
+        let released = try XCTUnwrap(log.range(of: "monitoring_stopped", range: queued.upperBound..<log.endIndex))
+        XCTAssertLessThan(queued.lowerBound, released.lowerBound, "The upload starts before iOS can suspend the Listener")
+    }
+    @MainActor func testWorkerRejectedCredentialIsRegisteredAgainWithoutHoldingAlerts() async throws {
+        let fixture = try Fixture(pending: true)
+        await fixture.backend.setSendError(DeviceAuthenticationRejected(message: "Device authentication failed."))
+        await fixture.model.tick()
+        var registrations = await fixture.backend.registrations
+        XCTAssertEqual(registrations, 0)
+        XCTAssertTrue(fixture.model.log.export.contains("device_registration_rejected"))
+        XCTAssertEqual(fixture.model.snapshot.pending.count, 1, "The alert stays queued")
+        // Registration itself is rate limited: a failure never blocks the upload.
+        await fixture.backend.setRegisterError(BackendError.response(429, "Too many requests."))
+        await fixture.backend.setSendError(nil)
+        fixture.time.now = fixture.time.now.addingTimeInterval(300)
+        await fixture.model.tick()
+        let delivered = await eventually { fixture.model.snapshot.pending.isEmpty }
+        XCTAssertTrue(delivered)
+        registrations = await fixture.backend.registrations
+        XCTAssertEqual(registrations, 1)
+        await fixture.model.tick()
+        registrations = await fixture.backend.registrations
+        XCTAssertEqual(registrations, 1, "Retries wait a minute")
+        await fixture.backend.setRegisterError(nil)
+        fixture.time.now = fixture.time.now.addingTimeInterval(61)
+        await fixture.model.tick()
+        registrations = await fixture.backend.registrations
+        XCTAssertEqual(registrations, 2)
+        XCTAssertTrue(fixture.model.log.export.contains("device_reregistered"))
+        await fixture.model.tick()
+        registrations = await fixture.backend.registrations
+        XCTAssertEqual(registrations, 2)
+        // Only the Worker's own 401 means the credential is unknown.
+        let proxy = try Fixture(pending: true)
+        await proxy.backend.setSendError(BackendError.response(401, "Unauthorized"))
+        await proxy.model.tick(); await proxy.model.tick()
+        let proxied = await proxy.backend.registrations
+        XCTAssertEqual(proxied, 0)
+    }
     @MainActor final class Audio: AudioLevelProviding {
         var onClassification: ((SoundClassificationEvent) -> Void)?
         private(set) var classificationEnabled = false
@@ -1999,7 +2199,13 @@ final class AppModelTests: XCTestCase {
             self.heartbeatGate = heartbeatGate; self.receipt = receipt
             self.sendGate = sendGate; self.heartbeatFail = heartbeatFail; self.sendFail = sendFail
         }
-        func register() async throws {}
+        private(set) var registrations = 0
+        private var registerError: Error?
+        func setRegisterError(_ error: Error?) { registerError = error }
+        func register() async throws {
+            registrations += 1
+            if let registerError { throw registerError }
+        }
         func createPairing() async throws -> PairingCode { PairingCode(code: "123456", expiresAt: .distantFuture) }
         private var claimError: Error?
         func setClaimError(_ error: Error?) { claimError = error }

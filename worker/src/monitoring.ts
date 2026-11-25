@@ -96,9 +96,11 @@ export const outageAlertCutoffSQL=(device='d')=>`strftime('%Y-%m-%dT%H:%M:%fZ',(
 export const outageOngoingCutoff=(now:number)=>new Date(now-connectionAlertDelays[0]*1000).toISOString();
 /** Milliseconds of silence before a Listener counts as offline for this Parent. */
 export const offlineAfterMs=(delaySeconds:number)=>Math.min(offlineDetectionMs,delaySeconds*1000);
-/** A heartbeat that should be covered by connection-loss alerts: monitoring, or
- * detection paused for other audio. That pause is not a person's choice, so if
- * the Listener then goes silent, the Parent must still hear about it. */
+/** A heartbeat that should be covered by connection-loss alerts: monitoring,
+ * detection paused for other audio, or an audio interruption the Listener is
+ * recovering from. Neither pause is a person's choice, so if the Listener then
+ * goes silent (iOS usually suspends an interrupted Listener), the Parent must
+ * still hear about it. */
 export const coveringHeartbeatSQL=(alias='h')=>`(json_extract(${alias}.metadata,'$.monitoring')=1 OR json_extract(${alias}.metadata,'$.detectionPaused') IS NOT NULL)`;
 export function coveringHeartbeat(metadata:string):boolean {
  const beat=JSON.parse(metadata) as {monitoring?:boolean;detectionPaused?:string};
@@ -111,8 +113,24 @@ export function coveringHeartbeat(metadata:string):boolean {
 export const monitoringResumedSQL=`json_extract(events.payload,'$.type')='monitoring_failed' AND EXISTS(SELECT 1 FROM heartbeats h
  WHERE h.listener_id=events.listener_id AND json_extract(h.metadata,'$.monitoring')=1
  AND julianday(json_extract(h.metadata,'$.timestamp'))>julianday(json_extract(events.payload,'$.cryStartedAt')))`;
+// A monitoring heartbeat proves the Listener started again after an applied Stop,
+// even when its own Start report is delayed or keeps failing. Record that Start,
+// so the Stop stops suppressing new alerts (and reminders) and the Listener need
+// not hold its outbox indefinitely. A Parent's Stop may be applied any time
+// before it expires, and a heartbeat sent before that could arrive after it, so
+// only a heartbeat received after the Stop's expiry counts. A pending Stop or any
+// newer command is left alone. Alerts recorded before the Stop stay suppressed.
+export function heartbeatStartStatement(env:Env,pair:Pair,now:number) {
+ return env.DB.prepare(`INSERT INTO monitoring_commands(id,claim_id,parent_id,listener_id,pair_created_at,enabled,status,created_at,expires_at)
+  SELECT ?,?,m.parent_id,m.listener_id,m.pair_created_at,1,'applied',?,? FROM monitoring_commands m JOIN pairs p
+  ON p.parent_id=m.parent_id AND p.listener_id=m.listener_id AND p.created_at=m.pair_created_at
+  WHERE m.parent_id=? AND m.listener_id=? AND m.pair_created_at=? AND m.enabled=0 AND m.status='applied' AND m.expires_at<?
+  AND m.sequence=(SELECT MAX(sequence) FROM monitoring_commands WHERE parent_id=m.parent_id AND listener_id=m.listener_id AND pair_created_at=m.pair_created_at)`)
+  .bind(crypto.randomUUID(),crypto.randomUUID(),now,now,pair.parent_id,pair.listener_id,pair.created_at,now);
+}
 // A pending Stop suppresses late uploads; an applied Stop remains in force until
-// either phone starts again. Never claim that this proves the microphone stopped.
+// either phone starts again, or a later monitoring heartbeat records a Start
+// (`heartbeatStartStatement`). Never claim that this proves the microphone stopped.
 export function stoppedMonitoringForSQL(parentID:string,listenerID:string) {
  return `EXISTS(SELECT 1 FROM monitoring_commands m JOIN pairs p
  ON p.parent_id=m.parent_id AND p.listener_id=m.listener_id AND p.created_at=m.pair_created_at

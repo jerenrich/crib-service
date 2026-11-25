@@ -44,6 +44,7 @@ import Observation
         "alert_threshold_reached", "classifier_alert_threshold_reached", "metadata_write_failed", "alert_apns_accepted", "alert_acknowledged",
         "alert_delivery_failed", "alert_rejected", "alert_uncertain", "alert_blocked", "alert_server_pending", "alert_retry_scheduled", "alert_retry_after_recovery",
         "alert_resolved", "alert_held_for_monitoring_report", "monitoring_failure_alert_queued", "monitoring_failure_alert_cleared",
+        "alert_hold_released_server_started", "device_registration_rejected", "device_reregistration_failed", "device_reregistered", "credential_save_failed",
         "test_push_apns_accepted", "heartbeat_retry_scheduled", "heartbeat_recovered", "settings_synced",
         "settings_sync_failed", "parent_status_failed", "parent_status_recovered", "backend_unavailable",
         "network_available", "network_unavailable", "push_token_received", "push_token_uploaded", "push_token_upload_failed", "push_token_missing_on_server", "push_received",
