@@ -9,6 +9,16 @@ import XCTest
 final class TimelineTests: XCTestCase {
     private let zero = Date(timeIntervalSince1970: 1_700_000_000)
     private func at(_ seconds: Double) -> Date { zero.addingTimeInterval(seconds) }
+    func testServerRejectionRowsAreFailedAlertsAndNotCoverageChanges() {
+        for kind in ["alert", "connection_alert"] {
+            let event = TimelineEvent(id: "rejected:x", kind: kind, occurredAt: Date(), count: 1, status: "failed")
+            XCTAssertTrue(event.isServerRejection, kind)
+            XCTAssertEqual(event.category, .alerts)
+            XCTAssertNil(event.coverageState)
+        }
+        XCTAssertFalse(TimelineEvent(id: "alerts:x", kind: "alert", occurredAt: Date(), status: "failed").isServerRejection)
+        XCTAssertFalse(TimelineEvent(id: "rejected:x", kind: "cry_started", occurredAt: Date()).isServerRejection)
+    }
     func testStandbyCoverageSeparatesDiscardedCaptureFromMonitoringAndOff() {
         let events = [TimelineEvent(kind: "monitoring_started", occurredAt: at(0)),
                       TimelineEvent(kind: "monitoring_paused", occurredAt: at(100)),

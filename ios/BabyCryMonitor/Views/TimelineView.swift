@@ -358,6 +358,8 @@ private extension TimelineEvent {
         case "power_connected": "Listener connected to power"
         case "power_disconnected": "Listener unplugged"
         case "battery_low": "Listener battery low"
+        case "alert" where isServerRejection: "Crying alert rejected by server"
+        case "connection_alert" where isServerRejection: "Monitoring alert rejected by server"
         case "alert", "test_alert", "connection_alert":
             switch status {
             case "sent": kind == "test_alert" ? "Test notification sent" : kind == "connection_alert" ? "Connection alert sent" : "Alert sent · \(destination)"
@@ -374,6 +376,7 @@ private extension TimelineEvent {
         switch kind {
         case "monitoring_observed", "stopped_observed", "standby_observed", "detection_paused_observed": "Backend observation · Exact transition time unknown"
         case "cry_ended": endAt.map { "Episode lasted \(durationText(occurredAt.timeIntervalSince($0)))" } ?? "Quiet period confirmed"
+        case "alert" where isServerRejection, "connection_alert" where isServerRejection: "No notification was sent · Recorded by backend"
         case "alert", "test_alert", "connection_alert": "\(count ?? 1) \((count ?? 1) == 1 ? "alert" : "alerts, including reminders") · \(destination)"
         case "alert_acknowledged": endAt.map { "Alerts snoozed until \($0.formatted(date: .omitted, time: .standard))" } ?? "Confirmed by parent"
         case "heartbeat_missing": "Expected heartbeats stopped arriving"
@@ -388,6 +391,10 @@ private extension TimelineEvent {
     }
     var timelineDetail: String {
         switch kind {
+        case "alert" where isServerRejection:
+            return "The Listener detected crying and uploaded an alert, but the backend rejected it as invalid, so no notification was sent. The Listener shows the failure and stops retrying. Check Worker diagnostics for the rejection."
+        case "connection_alert" where isServerRejection:
+            return "The Listener reported that monitoring stopped, but the backend rejected that alert as invalid, so no notification was sent. The Listener shows the failure and stops retrying. Check Worker diagnostics for the rejection."
         case "alert", "test_alert", "connection_alert":
             if status == "sent" { return "Apple accepted this notification for delivery. Acceptance does not confirm receipt or a wrist tap. Repeated notifications with the same episode, destination and status are grouped. Tests are labelled separately." }
             return "Current delivery status: \(status ?? "pending"). The timestamp is when the alert was created; it is not a confirmed delivery time. A queued, blocked, failed or uncertain notification is not shown as sent."
@@ -416,6 +423,7 @@ private extension TimelineEvent {
         case "detection_paused", "detection_paused_observed": "speaker.wave.2"
         case "cry_started", "cry_ended": "waveform"
         case "alert_acknowledged", "test_acknowledged": "checkmark.circle"
+        case "alert" where isServerRejection, "connection_alert" where isServerRejection: "exclamationmark.triangle"
         case "heartbeat_missing", "network_lost": "wifi.slash"
         case "connection_restored", "network_restored": "wifi"
         case "power_connected": "powerplug"

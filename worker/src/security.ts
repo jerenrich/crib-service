@@ -56,7 +56,9 @@ export function heartbeat(value:Record<string,unknown>):Heartbeat {
  }
  return result;
 }
-export function alert(value:Record<string,unknown>):Alert {
+/** Validates an alert upload. `durationCorrection` is reported minus accepted
+ * seconds, present only when inconsistent timing metadata was corrected. */
+export function alert(value:Record<string,unknown>):{alert:Alert;durationCorrection?:number} {
  onlyKeys(value,['eventId','episodeId','listenerId','type','cryStartedAt','durationSeconds','createdAt','isRepeat','isTest','reason']);
  if(value.reason!==undefined&&(value.type!=='monitoring_failed'||!detectionPauseReasons.includes(value.reason as DetectionPauseReason)))throw new APIError(400,'Invalid alert reason.');
  if(value.isTest!==undefined&&typeof value.isTest!=='boolean')throw new APIError(400,'Invalid test flag.');
@@ -66,8 +68,16 @@ export function alert(value:Record<string,unknown>):Alert {
  const result:Alert={eventId:uuid(value.eventId),episodeId:uuid(value.episodeId),listenerId:uuid(value.listenerId),type:value.type as Alert['type'],cryStartedAt:date(value.cryStartedAt),durationSeconds:value.durationSeconds,createdAt:date(value.createdAt),isRepeat:value.isRepeat};
  if(value.isTest!==undefined)result.isTest=value.isTest;
  if(value.reason!==undefined)result.reason=value.reason as DetectionPauseReason;
- if(Math.abs((Date.parse(result.createdAt)-Date.parse(result.cryStartedAt))/1000-result.durationSeconds)>2)throw new APIError(400,'Inconsistent alert duration.');
- return result;
+ // Never drop a cry alert over inconsistent timing metadata: a rejected upload
+ // is retried forever and the Parent never hears it. Both timestamps come from
+ // the Listener's clock, so the elapsed time between them is authoritative.
+ const elapsed=(Date.parse(result.createdAt)-Date.parse(result.cryStartedAt))/1000;
+ if(Math.abs(elapsed-result.durationSeconds)<=2)return {alert:result};
+ const reported=result.durationSeconds,duration=Math.min(604800,Math.max(0,elapsed));
+ // Keep createdAt - cryStartedAt = durationSeconds even when clamping.
+ if(duration!==elapsed)result.cryStartedAt=new Date(Date.parse(result.createdAt)-duration*1000).toISOString();
+ result.durationSeconds=duration;
+ return {alert:result,durationCorrection:reported-duration};
 }
 // Parameterized admission write. A supplied credential gate keeps unauthenticated
 // requests from consuming another device's budget when batched with authentication.

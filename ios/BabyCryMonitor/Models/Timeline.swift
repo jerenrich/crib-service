@@ -23,6 +23,10 @@ public struct TimelineEvent: Codable, Identifiable, Equatable, Sendable {
         default: .monitoring
         }
     }
+    /// The backend rejected this alert upload, so no notification was sent. Stored
+    /// as a failed `alert` (crying) or `connection_alert` (monitoring stopped) so
+    /// Parent apps that predate this row still show "Alert delivery failed".
+    public var isServerRejection: Bool { id.hasPrefix("rejected:") && (kind == "alert" || kind == "connection_alert") }
     public var isObservation: Bool { kind == "coverage_active" || kind == "coverage_stopped" || kind == "coverage_standby" }
     public var coverageState: TimelineCoverage.State? {
         switch kind {

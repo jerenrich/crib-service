@@ -361,8 +361,14 @@ struct BackendClient: BackendServing {
         guard (200..<300).contains(response.statusCode) else {
             await log?.network(operation: operation, outcome: "http_error", status: response.statusCode, requestID: requestID,
                                elapsedMS: DiagnosticTiming.elapsedMS(since: started), storageUnavailable: storageUnavailable, eventID: eventID, benchmarkAttempt: benchmarkAttempt, serverDiagnosticMS: serverDiagnosticMS, diagnosticState: diagnosticState, metrics: metricsCollector.snapshot, clock: clock, monotonic: true, clientRequestID: clientRequestID)
-            let reason = (try? JSONDecoder().decode(ErrorBody.self, from: data).error) ?? "Backend request failed (\(response.statusCode))."
-            throw BackendError.response(response.statusCode, reason)
+            let decoded = try? JSONDecoder().decode(ErrorBody.self, from: data)
+            // Only the Worker's own validator proves an alert can never be accepted:
+            // its responses carry a request ID and a JSON error. A 400 from a captive
+            // portal, proxy or CDN edge stays a retryable BackendError.response.
+            if path == "/v1/listener/event", response.statusCode == 400, requestID != nil, let decoded {
+                throw AlertRejection(message: decoded.error)
+            }
+            throw BackendError.response(response.statusCode, decoded?.error ?? "Backend request failed (\(response.statusCode)).")
         }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .custom { decoder in
@@ -391,6 +397,13 @@ enum BackendError: LocalizedError {
     case message(String)
     case response(Int, String)
     var errorDescription: String? { switch self { case .message(let text), .response(_, let text): text } }
+}
+
+/// The Worker rejected an alert upload as invalid (HTTP 400). Resending the same
+/// bytes can never succeed, so the outbox retires it instead of retrying.
+struct AlertRejection: LocalizedError, Equatable {
+    let message: String
+    var errorDescription: String? { message }
 }
 
 private struct ErrorBody: Decodable { let error: String }

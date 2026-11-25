@@ -1980,8 +1980,11 @@ final class AppModelTests: XCTestCase {
             sent.append(alert)
             await sendGate?.wait()
             if sendFail { throw URLError(.notConnectedToInternet) }
+            if let sendError { throw sendError }
             return AlertReceipt(status: receipt)
         }
+        private var sendError: Error?
+        func setSendError(_ error: Error?) { sendError = error }
         private(set) var stoppedAlertIDs: [[UUID]] = []
         func stopAlerts(eventIDs: [UUID]) async throws {
             if snoozeFails { throw URLError(.notConnectedToInternet) }
@@ -3766,6 +3769,30 @@ final class AppModelTests: XCTestCase {
         XCTAssertNotEqual(delivered.last?.eventId, original.eventId)
         XCTAssertTrue(fixture.model.snapshot.pending.isEmpty)
         XCTAssertEqual(fixture.model.snapshot.failedAlerts.count, 1)
+    }
+    @MainActor func testServerRejectionIsSurfacedAndNeverRetried() async throws {
+        // 20-24 Nov 2026: a 400 rejection was retried for days without any visible failure.
+        let fixture = try Fixture(pending: true)
+        let original = try XCTUnwrap(fixture.model.snapshot.pending.first?.alert)
+        await fixture.backend.setSendError(AlertRejection(message: "Invalid alert."))
+        await fixture.model.tick()
+        XCTAssertTrue(fixture.model.snapshot.pending.isEmpty)
+        XCTAssertEqual(fixture.model.snapshot.failedAlerts.map(\.alert), [original])
+        XCTAssertEqual(fixture.model.deliveryStatus, "Alert rejected by server: Invalid alert.")
+        XCTAssertTrue(fixture.model.log.lines.contains { $0.contains("alert_rejected") })
+        fixture.time.now = fixture.time.now.addingTimeInterval(301)
+        await fixture.model.tick()
+        let requests = await fixture.backend.sent
+        XCTAssertEqual(requests.count, 1)
+        // Other HTTP failures keep retrying, including a 400 that the Worker did not
+        // produce (captive portal, proxy or CDN edge), as do rate limits and outages.
+        for status in [400, 401, 409, 429, 503] {
+            let retrying = try Fixture(pending: true)
+            await retrying.backend.setSendError(BackendError.response(status, "Try again."))
+            await retrying.model.tick()
+            XCTAssertEqual(retrying.model.snapshot.pending.first?.attempts, 1, "\(status)")
+            XCTAssertTrue(retrying.model.snapshot.failedAlerts.isEmpty, "\(status)")
+        }
     }
     @MainActor func testRetryableReceiptsAndTransportFailuresRemainQueued() async throws {
         for status in ["pending", "blocked", "uncertain"] {

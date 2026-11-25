@@ -9,12 +9,21 @@ import {Latency} from './latency';
 import {APIError,requireRole,type Alert,type Device,type Env,type StoredEvent} from './types';
 import {alert as validateAlert,uuid,configuration,date} from './security';
 import {pairFor,sharedAccess} from './devices';
+import {timelineInsert} from './timeline';
 import {sendPush,sendSilentCryAlarmPush,type PushIdentityOptions,type PushResult} from './apns';
 import {eventReference,recordDiagnostic,observeLateWrites,PushPreparationError,type Outcome,type Stage} from './diagnostics';
 export async function receiveAlert(env:Env,device:Device,value:Record<string,unknown>,requestId=crypto.randomUUID(),latency=new Latency(),background?:Pick<ExecutionContext,'waitUntil'>) {
  latency.details.dispatch_source='upload';
  const {alert,pair,record}=await latency.measure('alert_prepare_ms',async()=>{
- requireRole(device,'listener');const alert=validateAlert(value);
+ requireRole(device,'listener');let validated:ReturnType<typeof validateAlert>;
+ try{validated=validateAlert(value);}
+ catch(error){
+  // Off the response path: the rejection must not wait for a timeline write.
+  if(error instanceof APIError&&error.status===400){const write=recordRejectedAlert(env,device,value);if(background)background.waitUntil(write);else await write;}
+  throw error;
+ }
+ const {alert}=validated;
+ if(validated.durationCorrection!==undefined)latency.details.alert_duration_corrected_s=validated.durationCorrection;
  if(alert.listenerId!==device.id)throw new APIError(403,'Listener identity mismatch.');
  try{latency.eventRef=await eventReference(env,alert.eventId);}catch{/* Best effort. */}
  // Both reads share one consistent snapshot and one remote call. The bounded
@@ -61,6 +70,19 @@ export async function receiveAlert(env:Env,device:Device,value:Record<string,unk
  const result=await latency.read<{status:string;acknowledged_at:string|null;resolved_at:string|null}>('response_read_ms',env.DB.prepare('SELECT status,acknowledged_at,resolved_at FROM events WHERE event_id=?').bind(record.event_id));
  return {status:result?.acknowledged_at?'acknowledged':result?.resolved_at?'resolved':
   result?.status==='sending'&&latency.details.push_outcome==='sent'?'sent':result?.status??'pending'};
+}
+// A rejected upload never becomes an event, so without this the Parent has no
+// trace that the Listener raised an alert. One row per event ID; best effort.
+// Stored as a failed alert/connection_alert (the kinds timeline groups use for
+// crying and monitoring_failed) so older Parent apps show "Alert delivery failed".
+async function recordRejectedAlert(env:Env,device:Device,value:Record<string,unknown>):Promise<void> {
+ try{
+  if(value.isTest===true||value.listenerId!==device.id)return;
+  const eventId=uuid(value.eventId);let episodeID:string|undefined;try{episodeID=uuid(value.episodeId);}catch{/* Omit an invalid episode. */}
+  const pair=await pairFor(env,device);if(!pair)return;
+  await timelineInsert(env,pair,{id:`rejected:${eventId}`,kind:value.type==='monitoring_failed'?'connection_alert':'alert',
+   occurredAt:new Date().toISOString(),status:'failed',count:1,...(episodeID?{episodeID}:{})}).run();
+ }catch{/* Never mask the original rejection. */}
 }
 async function scheduleRemindersSafely(env:Env,parentId:string,requestId:string):Promise<void> {
  const started=Date.now(),latency=new Latency();

@@ -34,6 +34,8 @@ export interface TimingDetails {
   role?:'parent'|'listener';reason?:'invalid_message'|'rate_limit'|'wrong_role'|'pairing_store'|'internal_error'|'transport'|'pairing_ended'|'peer_closed'|'playbackFailed'|'expired'|'unavailable';
   close_code?:number;recipients?:number;connection_id?:string;
  };
+ /** Reported minus accepted alert duration, when validation corrected it. */
+ alert_duration_corrected_s?:number;
  alarm_wake_requested?:boolean;alarm_extension_requested?:boolean;alarm_attempt?:AlarmAttemptDetails;
  spans?:Partial<Record<Span,number>>;
  db_stages?:Partial<Record<Span,DatabaseMetrics>>;
@@ -275,6 +277,8 @@ export function safeTimingDetails(value:TimingDetails|undefined):string|null {
   safe.live_sound=detail;
  }
  if(typeof value.alarm_wake_requested==='boolean')safe.alarm_wake_requested=value.alarm_wake_requested;
+ const corrected=value.alert_duration_corrected_s;
+ if(typeof corrected==='number'&&Number.isFinite(corrected)&&Math.abs(corrected)<=604800)safe.alert_duration_corrected_s=Math.round(corrected*1000)/1000;
  if(typeof value.alarm_extension_requested==='boolean')safe.alarm_extension_requested=value.alarm_extension_requested;
  if(value.alarm_attempt)safe.alarm_attempt=safeAlarmAttempt(value.alarm_attempt);
  const number=(n:unknown)=>typeof n==='number'&&Number.isFinite(n)&&n>=0&&n<=1e15;

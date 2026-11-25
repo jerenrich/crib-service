@@ -136,8 +136,12 @@ public struct CrySessionManager: Sendable {
         // The server repeats until acknowledgement or a confirmed quiet reset.
         var alerts: [CryAlert] = []
         if episode.alertQueuedAt == nil && (volumeReady || classifierReady) {
+            // The duration must equal createdAt - cryStartedAt: the server checks
+            // that relation. The qualifying detector may measure the threshold
+            // from an onset earlier than the episode start, so reporting the
+            // configured threshold here produced alerts the server rejected.
             let alert = CryAlert(episodeId: episode.id, listenerId: listenerId, cryStartedAt: episode.startedAt,
-                                 durationSeconds: max(snapshot.configuration.alertDuration, episode.duration(at: now)),
+                                 durationSeconds: episode.duration(at: now),
                                  createdAt: now, isRepeat: false)
             episode.alertQueuedAt = now
             episode.lastAlertQueuedAt = now

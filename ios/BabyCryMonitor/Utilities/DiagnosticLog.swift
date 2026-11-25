@@ -42,7 +42,7 @@ import Observation
         "audio_interruption_began", "audio_interruption_ended", "audio_other_playing", "audio_other_stopped", "audio_reactivation_recovered", "audio_reactivation_failed", "audio_route_changed", "audio_services_reset", "audio_engine_changed", "audio_capture_mode", "audio_capture_test",
         "crying_started", "possible_cry", "crying_ended", "crying_resumed", "quiet_gap_started",
         "alert_threshold_reached", "classifier_alert_threshold_reached", "metadata_write_failed", "alert_apns_accepted", "alert_acknowledged",
-        "alert_delivery_failed", "alert_uncertain", "alert_blocked", "alert_server_pending", "alert_retry_scheduled", "alert_retry_after_recovery",
+        "alert_delivery_failed", "alert_rejected", "alert_uncertain", "alert_blocked", "alert_server_pending", "alert_retry_scheduled", "alert_retry_after_recovery",
         "alert_resolved", "alert_held_for_monitoring_report", "monitoring_failure_alert_queued", "monitoring_failure_alert_cleared",
         "test_push_apns_accepted", "heartbeat_retry_scheduled", "heartbeat_recovered", "settings_synced",
         "settings_sync_failed", "parent_status_failed", "parent_status_recovered", "backend_unavailable",
@@ -439,6 +439,7 @@ import Observation
         if let failure = error as? KeychainError {
             return "error=keychain domain=NSOSStatusErrorDomain code=\(failure.status)"
         }
+        if error is AlertRejection { return "error=backend_http status=400 rejection=worker_validation" }
         if let failure = error as? BackendError {
             switch failure {
             case .message: return "error=backend_configuration_or_response"
