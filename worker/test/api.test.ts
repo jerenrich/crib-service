@@ -632,6 +632,62 @@ describe('devices and secure pairing',()=>{
   mockPush();
   expect(await (await call('listener/event',listener,alert(listener))).json()).toEqual({status:'sent'});
  });
+ it('delivers a cry alert whose reported duration disagrees with its timestamps',async()=>{
+  // 24 Nov 2026: the Listener reported the 30-second alert threshold while the
+  // episode had started 20.8 seconds earlier. Rejecting it dropped the alarm.
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});const createdAt=new Date();
+  const event={...alert(listener),cryStartedAt:new Date(createdAt.getTime()-20843).toISOString(),createdAt:createdAt.toISOString(),durationSeconds:30};
+  mockPush();const response=await call('listener/event',listener,event);
+  expect(response.status).toBe(200);expect(await response.json()).toEqual({status:'sent'});expect(pushRequests).toHaveLength(1);
+  const stored=await env.DB.prepare('SELECT payload FROM events WHERE event_id=?').bind(event.eventId).first<{payload:string}>();
+  expect(JSON.parse(stored!.payload).durationSeconds).toBeCloseTo(20.843,3);
+  // A retry of the identical upload is idempotent rather than a metadata conflict.
+  expect((await call('listener/event',listener,event)).status).toBe(200);expect(pushRequests).toHaveLength(1);
+  const diagnostic=await env.DB.prepare("SELECT details FROM diagnostics WHERE operation='alert' AND outcome='ok' ORDER BY sequence LIMIT 1").first<{details:string}>();
+  expect(JSON.parse(diagnostic!.details).alert_duration_corrected_s).toBeCloseTo(9.157,3);
+ });
+ it('accepts an inconsistent alert whose start follows its creation, without backdating it',async()=>{
+  const {listener}=await paired();const createdAt=new Date();
+  const event={...alert(listener),cryStartedAt:new Date(createdAt.getTime()+10000).toISOString(),createdAt:createdAt.toISOString(),durationSeconds:30};
+  expect((await call('listener/event',listener,event)).status).toBe(200);
+  const stored=JSON.parse((await env.DB.prepare('SELECT payload FROM events WHERE event_id=?').bind(event.eventId).first<{payload:string}>())!.payload);
+  expect(stored).toMatchObject({cryStartedAt:createdAt.toISOString(),durationSeconds:0});
+ });
+ it('shows the Parent a rejected alert on its timeline as a failed alert, once per event',async()=>{
+  const {parent,listener}=await paired();const event={...alert(listener),isRepeat:'no'};
+  expect((await call('listener/event',listener,event)).status).toBe(400);
+  expect((await call('listener/event',listener,event)).status).toBe(400);
+  const stopped={...alert(listener),type:'monitoring_failed',reason:'not-a-reason',durationSeconds:0};
+  expect((await call('listener/event',listener,stopped)).status).toBe(400);
+  expect((await call('listener/event',listener,{...alert(listener),isTest:true,isRepeat:'no'})).status).toBe(400);
+  const timeline=await (await call('timeline',parent,undefined,'GET')).json() as {events:{id:string;kind:string;status?:string;episodeID?:string}[]};
+  const rejected=timeline.events.filter(e=>e.id.startsWith('rejected:'));
+  // Kinds and status that Parent apps without rejection support still label "Alert delivery failed".
+  expect(rejected).toHaveLength(2);
+  expect(rejected).toEqual(expect.arrayContaining([
+   expect.objectContaining({id:`rejected:${event.eventId}`,kind:'alert',status:'failed',episodeID:event.episodeId}),
+   expect.objectContaining({id:`rejected:${stopped.eventId}`,kind:'connection_alert',status:'failed'})]));
+ });
+ it('keeps a clamped week-long alert duration consistent with its timestamps',async()=>{
+  const {listener}=await paired();const createdAt=new Date();
+  await env.DB.prepare('UPDATE pairs SET created_at=0 WHERE listener_id=?').bind(listener.deviceId).run();
+  const event={...alert(listener),cryStartedAt:new Date(createdAt.getTime()-8*86400000).toISOString(),createdAt:createdAt.toISOString(),durationSeconds:30};
+  expect((await call('listener/event',listener,event)).status).toBe(200);
+  const stored=JSON.parse((await env.DB.prepare('SELECT payload FROM events WHERE event_id=?').bind(event.eventId).first<{payload:string}>())!.payload);
+  expect(stored.durationSeconds).toBe(604800);
+  expect((Date.parse(stored.createdAt)-Date.parse(stored.cryStartedAt))/1000).toBe(604800);
+ });
+ it('settles a previously rejected outbox alert for a quiet-confirmed episode without notifying',async()=>{
+  // Listeners retried 400-rejected alerts for days. Once accepted, the episode's
+  // quiet tombstone must keep a stale cry from ringing the Parent.
+  // Under 24 hours old, so the expiry guard cannot be what keeps it silent.
+  const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});const createdAt=new Date(Date.now()-2*3600000);
+  const event={...alert(listener),cryStartedAt:new Date(createdAt.getTime()-15000).toISOString(),createdAt:createdAt.toISOString(),durationSeconds:30};
+  await env.DB.prepare('UPDATE pairs SET created_at=? WHERE parent_id=?').bind(createdAt.getTime()-60000,parent.deviceId).run();
+  await env.DB.prepare('INSERT INTO resolved_episodes(parent_id,listener_id,pair_created_at,episode_id,resolved_at) VALUES(?,?,?,?,?)').bind(parent.deviceId,listener.deviceId,createdAt.getTime()-60000,event.episodeId,new Date(createdAt.getTime()+20000).toISOString()).run();
+  const response=await call('listener/event',listener,event);expect(response.status).toBe(200);
+  expect((await response.json() as {status:string}).status).toBe('resolved');expect(pushRequests).toHaveLength(0);
+ });
  it('encrypts APNs tokens at rest and uses distinct random IVs',async()=>{
   const {parent}=await paired();const token='ab'.repeat(32);
   expect((await call('device/push-token',parent,{token})).status).toBe(200);

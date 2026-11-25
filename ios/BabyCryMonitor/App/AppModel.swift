@@ -1659,6 +1659,12 @@ import UIKit
                 case "blocked": deliveryStatus = "Alert blocked. Open Parent Mode and enable notifications."; log.record("alert_blocked")
                 default: deliveryStatus = "Alert queued on server (\(receipt.status))."; log.record("alert_server_pending")
                 }
+            case .failure(let rejection as AlertRejection):
+                // The Worker judged these exact bytes invalid; resending them can
+                // never succeed and would retry for days. Surface it instead.
+                engine.permanentlyFailed(alert.eventId, at: currentTime())
+                deliveryStatus = "Alert rejected by server: \(rejection.message)"
+                log.record("alert_rejected", error: rejection)
             case .failure(let failure):
                 engine.failed(alert.eventId, at: Date()); deliveryStatus = "Alert pending: \(failure.localizedDescription)"
                 log.record("alert_retry_scheduled", error: failure)

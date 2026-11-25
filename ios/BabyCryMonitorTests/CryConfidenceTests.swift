@@ -288,6 +288,20 @@ final class CryConfidenceTests: XCTestCase {
         XCTAssertEqual(s.alerts.first?.durationSeconds, 30)
     }
 
+    func testAlertDurationMatchesItsTimestampsWhenTheSustainedRunStartsAfterTheCandidate() throws {
+        // 24 Nov 2026: the alert gate measured 30 s from an earlier candidate while
+        // the episode started at the later sustained run. Reporting the configured
+        // 30 s made createdAt - cryStartedAt disagree, and the server rejected it.
+        var s = Simulation(duration: 30)
+        s.score(0.99, end: 4)
+        for end in 5...9 { s.score(0, end: Double(end)) }
+        for end in 10...40 where s.alerts.isEmpty { s.score(0.99, end: Double(end)) }
+        let alert = try XCTUnwrap(s.alerts.first)
+        let elapsed = alert.createdAt.timeIntervalSince(alert.cryStartedAt)
+        XCTAssertLessThan(elapsed, 28, "The scenario must start the episode after the alert gate's onset")
+        XCTAssertEqual(alert.durationSeconds, elapsed, accuracy: 0.001)
+    }
+
     func testOneLowSecondUsesToleranceInsteadOfRestartingTheWindow() {
         var s = Simulation()
         s.score(end: 4); s.score(0.6.nextDown, end: 5)

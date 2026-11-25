@@ -178,7 +178,47 @@ private final class DiagnosticsURLProtocol: URLProtocol, @unchecked Sendable {
     override func stopLoading() {}
 }
 
+private final class RejectionURLProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        // "/worker" answers like the Worker's validator; "/edge" like a proxy or portal.
+        let worker = request.url!.path.hasPrefix("/worker")
+        let headers = worker ? ["x-request-id": "6705ae24-2863-49df-8dc5-5fa15b2d0418", "content-type": "application/json"] : ["content-type": "text/html"]
+        let response = HTTPURLResponse(url: request.url!, statusCode: 400, httpVersion: nil, headerFields: headers)!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data((worker ? "{\"error\":\"Invalid alert.\"}" : "<html>Bad Request</html>").utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() {}
+}
+
 final class DiagnosticsTests: XCTestCase {
+    @MainActor func testOnlyTheWorkersOwnAlertRejectionIsTerminal() async throws {
+        let config = URLSessionConfiguration.ephemeral; config.protocolClasses = [RejectionURLProtocol.self]
+        let session = URLSession(configuration: config); defer { session.invalidateAndCancel() }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let log = DiagnosticLog(directory: directory)
+        let credential = DeviceCredential(deviceId: UUID(), secret: "private-credential", role: .listener, registered: true)
+        let alert = CryAlert(episodeId: UUID(), listenerId: credential.deviceId, cryStartedAt: Date(),
+                             durationSeconds: 0, createdAt: Date(), isRepeat: false)
+        do {
+            _ = try await BackendClient(baseURL: URL(string: "https://private-host/worker")!, credential: credential, log: log, session: session).send(alert)
+            XCTFail("Expected a rejection")
+        } catch let rejection as AlertRejection { XCTAssertEqual(rejection.message, "Invalid alert.") }
+        do {
+            _ = try await BackendClient(baseURL: URL(string: "https://private-host/edge")!, credential: credential, log: log, session: session).send(alert)
+            XCTFail("Expected a failure")
+        } catch BackendError.response(400, _) {
+            // Retryable: nothing proves the Worker saw this upload.
+        }
+        // Other endpoints keep their existing 400 handling.
+        do {
+            try await BackendClient(baseURL: URL(string: "https://private-host/worker")!, credential: credential, log: log, session: session).register()
+            XCTFail("Expected a failure")
+        } catch BackendError.response(400, let message) { XCTAssertEqual(message, "Invalid alert.") }
+    }
     @MainActor func testAlarmCallbackCanDrainOnePendingSnoozeWithoutDrainingTheQueue() async throws {
         guard #available(iOS 26.0, *) else { return }
         let suite = "AlarmAcknowledgementBudgetTests.\(UUID())"
