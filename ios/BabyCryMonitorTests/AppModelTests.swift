@@ -1499,7 +1499,7 @@ final class AppModelTests: XCTestCase {
         fixture.model.stop()
     }
 
-    @MainActor func testFailedDurableSavePreventsImmediateAlertUpload() async throws {
+    @MainActor func testFailedDurableSaveStillUploadsTheCryAndReportsTheStop() async throws {
         let fixture = try Fixture()
         let gate = RequestGate()
         await fixture.backend.configure(heartbeatGate: gate)
@@ -1523,10 +1523,15 @@ final class AppModelTests: XCTestCase {
         fixture.audio.emit(AudioLevelSample(timestamp: fixture.time.now, dbFS: -10))
         let failed = await eventually { fixture.model.log.export.contains("metadata_write_failed") }
         XCTAssertTrue(failed)
+        XCTAssertFalse(fixture.model.monitoring)
+        // The cry queued by the failing save is delivered from memory, and the
+        // Parent is told monitoring stopped, instead of both being held forever.
         await fixture.model.tick()
-        let requests = await fixture.backend.sent
-        XCTAssertTrue(requests.isEmpty)
-        XCTAssertFalse(fixture.model.log.export.contains("alert_outbox phase=upload_started"))
+        let uploaded = await eventually {
+            let sent = await fixture.backend.sent
+            return sent.contains { $0.type == "sustained_cry" } && sent.contains { $0.isMonitoringFailure }
+        }
+        XCTAssertTrue(uploaded)
         await gate.open()
         fixture.model.stop()
     }

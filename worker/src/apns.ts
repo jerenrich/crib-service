@@ -50,7 +50,11 @@ export async function sendPush(env:Env,encryptedToken:string,alert:Alert,target:
   ...(silentCryAlarm&&!alert.isTest?{silentCryAlarm:true,...(alarmCycle?{alarmCycleId:alarmCycle}:{}),aps:{...content.aps,'content-available':1}}:{}),
   // The Parent's notification extension schedules the same alarm without an app wake.
   ...(alarmExtension?{alarmExtension:true,aps:{...content.aps,...(silentCryAlarm?{'content-available':1}:{}),'mutable-content':1}}:{})
- },target,identity.configuredTest?60:alert.isRepeat?15:3600,collapseID,latency,schedule);
+ // Real repeats keep the first alert's lifetime. While a device is offline APNs
+ // stores only its newest notification, so a short-lived repeat would replace the
+ // stored first alert and then expire, leaving nothing to deliver on reconnect.
+ // Test repeats (Watch tests) stay short so a late test never reaches a parent.
+ },target,identity.configuredTest?60:alert.isTest&&alert.isRepeat?15:3600,collapseID,latency,schedule);
 }
 // The single AlarmKit wake request for real and configured-test alerts. A test
 // carries the same marker and takes the same Parent path; it is labelled and

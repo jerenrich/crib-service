@@ -1404,6 +1404,26 @@ describe('configurable reminders and acknowledgement mute',()=>{
   const next=await runInDurableObject(stub,async(_instance,state)=>state.storage.getAlarm());
   expect(next).toBeGreaterThan(Date.now());expect(next).toBeLessThanOrEqual(Date.now()+5000);
  });
+ it('shows a new cry silenced by a snooze on the timeline instead of hiding it',async()=>{
+  const {parent,listener,event}=await ready();
+  expect((await call('alert/acknowledge',parent,{eventId:event.eventId})).status).toBe(200);
+  advance(30);const next={...alert(listener),cryStartedAt:new Date(Date.now()-30000).toISOString(),createdAt:new Date(Date.now()).toISOString(),durationSeconds:30};
+  expect((await call('listener/event',listener,next)).status).toBe(200);expect(pushRequests).toHaveLength(1);
+  const timeline=await (await call('timeline',parent,undefined,'GET')).json() as {events:{kind:string;episodeID?:string;status?:string}[]};
+  expect(timeline.events.filter(e=>e.kind==='alert').map(e=>[e.episodeID,e.status])).toEqual(expect.arrayContaining([[event.episodeId,'sent'],[next.episodeId,'silenced']]));
+ });
+ it('repeats on schedule when the previous send died mid-dispatch with an expired lease',async()=>{
+  const {parent,listener,event}=await ready();await heartbeat(listener,event,'crying');
+  // A worker that crashed after claiming leaves the row 'sending' until the cron sweep.
+  await env.DB.prepare("UPDATE events SET status='sending',lease_until=? WHERE event_id=?").bind(Date.now()-1,event.eventId).run();
+  advance(5);mockPush();await runReminder(testEnv,parent.deviceId);
+  expect(pushRequests).toHaveLength(2);
+  expect(JSON.parse(String(pushRequests[1].init?.body)).episodeId).toBe(event.episodeId);
+  // A live lease still holds repeats back, so a send in progress is never doubled.
+  const latest=await env.DB.prepare('SELECT event_id FROM events WHERE reminder_of IS NOT NULL ORDER BY created_at DESC LIMIT 1').first<{event_id:string}>();
+  await env.DB.prepare("UPDATE events SET status='sending',lease_until=? WHERE event_id=?").bind(Date.now()+30000,latest!.event_id).run();
+  advance(5);await runReminder(testEnv,parent.deviceId);expect(pushRequests).toHaveLength(2);
+ });
  it('sends nothing before 5 seconds, then repeats even when the Listener is quiet',async()=>{
   const {parent,listener,event}=await ready();await heartbeat(listener,event,'quiet');
   advance(4);await runReminder(testEnv,parent.deviceId);expect(pushRequests).toHaveLength(1);
@@ -1412,7 +1432,7 @@ describe('configurable reminders and acknowledgement mute',()=>{
   expect(reminder.eventId).not.toBe(event.eventId);expect(reminder.episodeId).toBe(event.episodeId);
   expect(reminder.aps.alert.title).toBe('Repeat alert · Check on baby');expect(reminder.aps.alert.body).toContain('Settings');
   const headers=pushRequests[1].init?.headers as Record<string,string>;
-  expect(Number(headers['apns-expiration'])).toBe(Math.floor(Date.now()/1000)+15);
+  expect(Number(headers['apns-expiration'])).toBe(Math.floor(Date.now()/1000)+3600);
   expect(headers['apns-collapse-id']).toBe(reminder.eventId);
   advance(5);mockPush();await runReminder(testEnv,parent.deviceId);expect(pushRequests).toHaveLength(3);
   const later=JSON.parse(String(pushRequests[2].init?.body));
@@ -1647,7 +1667,9 @@ describe('12-hour event timeline',()=>{
   expect((await call('listener/event',listener,suppressed)).status).toBe(200);
   const page=await history(parent);
   expect(page.events.filter(e=>e.kind==='alert_acknowledged')).toHaveLength(1);
-  const sent=page.events.filter(e=>e.kind==='alert');expect(sent).toHaveLength(1);expect(sent[0].count).toBe(3);expect(sent[0].status).toBe('sent');
+  const sent=page.events.filter(e=>e.kind==='alert'&&e.status==='sent');expect(sent).toHaveLength(1);expect(sent[0].count).toBe(3);
+  // The cry the snooze kept silent is shown, not hidden.
+  expect(page.events.filter(e=>e.kind==='alert'&&e.status==='silenced').map(e=>e.episodeID)).toEqual([suppressed.episodeId]);
   expect(page.events.find(e=>e.kind==='alert_acknowledged')?.endAt).toBeDefined();
  });
  it('records outages with connection alerts disabled and detects gaps before cron',async()=>{

@@ -364,6 +364,7 @@ private extension TimelineEvent {
             switch status {
             case "sent": kind == "test_alert" ? "Test notification sent" : kind == "connection_alert" ? "Connection alert sent" : "Alert sent · \(destination)"
             case "failed": "Alert delivery failed"
+            case "silenced": "Alert silenced · Not sent"
             case "uncertain": "Alert delivery uncertain"
             case "blocked": "Alert blocked"
             case "sending": "Sending alert"
@@ -377,6 +378,7 @@ private extension TimelineEvent {
         case "monitoring_observed", "stopped_observed", "standby_observed", "detection_paused_observed": "Backend observation · Exact transition time unknown"
         case "cry_ended": endAt.map { "Episode lasted \(durationText(occurredAt.timeIntervalSince($0)))" } ?? "Quiet period confirmed"
         case "alert" where isServerRejection, "connection_alert" where isServerRejection: "No notification was sent · Recorded by backend"
+        case "alert" where status == "silenced", "connection_alert" where status == "silenced": "Snooze, Stop or a settled cry kept this alert silent"
         case "alert", "test_alert", "connection_alert": "\(count ?? 1) \((count ?? 1) == 1 ? "alert" : "alerts, including reminders") · \(destination)"
         case "alert_acknowledged": endAt.map { "Alerts snoozed until \($0.formatted(date: .omitted, time: .standard))" } ?? "Confirmed by parent"
         case "heartbeat_missing": "Expected heartbeats stopped arriving"

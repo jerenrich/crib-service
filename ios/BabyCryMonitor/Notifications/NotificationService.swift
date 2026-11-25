@@ -15,8 +15,13 @@ import Observation
     func failed()
     func simulate(_ alert: CryAlert) async throws
     func setParentConnectionDeadline(_ deadline: Date?) async throws
+    /// Settings that keep a crying alert from waking someone on this iPhone.
+    var wakeProblems: [String] { get }
+    func refreshWakeReadiness() async
 }
 extension NotificationProviding {
+    var wakeProblems: [String] { [] }
+    func refreshWakeReadiness() async {}
     func cleanUpAlerts(using relevance: NotificationRelevance, deliveredBefore: Date) async {}
     func dismissCryingAlerts(testEventID: UUID?) async {}
     var authorizationAllowed: Bool { false }
@@ -25,6 +30,7 @@ extension NotificationProviding {
 @MainActor @Observable final class NotificationService: NSObject, UNUserNotificationCenterDelegate, NotificationProviding {
     private(set) var status = "Notifications not enabled"
     private(set) var authorizationAllowed = false
+    private(set) var wakeProblems: [String] = []
     var onToken: ((String) -> Void)?
     var onAlert: (() -> Void)?
     var onAcknowledge: ((UUID) async -> Void)?
@@ -64,10 +70,26 @@ extension NotificationProviding {
             log?.record("notification_sound_permission", code: settings.soundSetting.rawValue)
             log?.record("notification_time_sensitive_permission", code: settings.timeSensitiveSetting.rawValue)
             authorizationAllowed = allowed && settings.alertSetting == .enabled
+            observeWakeReadiness(settings)
             status = allowed ? "Registering for push notifications…" : "Notifications disabled. Enable them in iPhone Settings."
             log?.record(allowed ? "notification_permission_allowed" : "notification_permission_denied")
             if allowed { UIApplication.shared.registerForRemoteNotifications() }
         } catch { status = "Could not request notification permission."; log?.record("notification_permission_failed", error: error) }
+    }
+    /// Re-read settings the parent may have changed in iPhone Settings while away.
+    func refreshWakeReadiness() async {
+        observeWakeReadiness(await UNUserNotificationCenter.current().notificationSettings())
+    }
+    private func observeWakeReadiness(_ settings: UNNotificationSettings) {
+        let authorization: WakeReadiness.Authorization = switch settings.authorizationStatus {
+        case .authorized: .authorized
+        case .provisional, .ephemeral: .quiet
+        default: .denied
+        }
+        let problems = WakeReadiness.problems(authorization: authorization, alerts: settings.alertSetting == .enabled,
+            sounds: settings.soundSetting == .enabled, timeSensitive: settings.timeSensitiveSetting == .enabled)
+        if problems != wakeProblems { log?.record("notification_wake_problems", code: problems.count) }
+        wakeProblems = problems
     }
     func registered(_ token: Data) {
         status = "Push token registered"

@@ -48,7 +48,7 @@ import Observation
         "settings_sync_failed", "parent_status_failed", "parent_status_recovered", "backend_unavailable",
         "network_available", "network_unavailable", "push_token_received", "push_token_uploaded", "push_received",
         "notification_permission_allowed", "notification_permission_denied", "notification_permission_failed",
-        "notification_sound_permission_before_request", "notification_alert_permission", "notification_sound_permission", "notification_time_sensitive_permission",
+        "notification_sound_permission_before_request", "notification_alert_permission", "notification_sound_permission", "notification_time_sensitive_permission", "notification_wake_problems",
         "parent_connection_warning_armed", "parent_connection_warning_cancelled", "parent_connection_warning_failed",
         "push_registration_failed", "local_notification_scheduled", "local_notification_failed", "watch_sync_failed", "watch_token_synced",
         "watch_notification_authorization", "watch_alert_permission", "watch_sound_permission", "watch_time_sensitive_permission",
@@ -96,7 +96,7 @@ import Observation
                                       "alert_held_for_monitoring_report"]
         // State re-read on every foreground: keep the first value and any change.
         let states: Set<String> = ["notification_sound_permission_before_request", "notification_alert_permission",
-                                   "notification_sound_permission", "notification_time_sensitive_permission",
+                                   "notification_sound_permission", "notification_time_sensitive_permission", "notification_wake_problems",
                                    "notification_permission_allowed", "notification_permission_denied", "push_token_uploaded"]
         let details = error.map { Self.errorDetails($0) } ?? ""
         let fingerprint = "event_\(event)_\(code ?? 0)_\(details)"

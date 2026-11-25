@@ -834,11 +834,12 @@ import UIKit
     /// covered. Send one persistent alert through the durable outbox; the server
     /// repeats it until this Listener reports monitoring again or a person stops it.
     private func reportUnexpectedStop(reason: String? = nil) {
-        guard role == .listener, paired, let credential, storageHealthy, store != nil, !monitoringFailureQueued else { return }
+        // Healthy storage is not required: a failed save is itself a reason the
+        // nursery is no longer covered, and the alert is delivered from memory.
+        guard role == .listener, paired, let credential, store != nil, !monitoringFailureQueued else { return }
         monitoringFailureQueued = true
         guard let alert = engine.queueMonitoringFailure(listenerId: credential.deviceId, at: currentTime(), reason: reason) else { return }
         persist()
-        guard storageHealthy else { return }
         log.alertPersisted(alert, at: currentTime(), elapsedMS: 0)
         log.record("monitoring_failure_alert_queued")
         requestImmediateAlertDelivery()
@@ -1214,10 +1215,14 @@ import UIKit
         if !events.isEmpty || previousState != state || date.timeIntervalSince(lastSavedAt) >= 5 {
             persist(); lastSavedAt = date
         }
-        if !events.isEmpty, storageHealthy, store != nil {
-            let duration = persistenceStarted.duration(to: .now).components
-            let elapsedMS = Int(duration.seconds * 1000 + duration.attoseconds / 1_000_000_000_000_000)
-            for event in events { log.alertPersisted(event, at: currentTime(), elapsedMS: elapsedMS) }
+        if !events.isEmpty, store != nil {
+            if storageHealthy {
+                let duration = persistenceStarted.duration(to: .now).components
+                let elapsedMS = Int(duration.seconds * 1000 + duration.attoseconds / 1_000_000_000_000_000)
+                for event in events { log.alertPersisted(event, at: currentTime(), elapsedMS: elapsedMS) }
+            }
+            // Deliver even when the save failed: the server deduplicates by event ID,
+            // so an in-memory alert is safe to send and never worse than holding it.
             requestImmediateAlertDelivery()
         }
         if previousState == .crying, state != .crying { queueHeartbeat() }
@@ -1225,6 +1230,7 @@ import UIKit
     func setAppActive(_ active: Bool) {
         audio.setClassificationAppActive(active)
         appActive = active
+        if active, role == .parent { Task { await notifications.refreshWakeReadiness() } }
         if !active { stopWatchTest() }
         synchronizeLiveSound()
         observeBackgroundBenchmark()
@@ -1412,9 +1418,13 @@ import UIKit
         if let credential { engine.scopeTimeline(to: "\(backendURL)|\(credential.deviceId)") }
         do { try store.save(engine.snapshot) }
         catch {
+            let wasMonitoring = monitoring
             storageHealthy = false; storageFailure = error; monitoring = false; audio.stop()
             self.error = "Monitoring stopped: metadata could not be saved. \(error.localizedDescription)"
             log.record("metadata_write_failed", error: error)
+            // Tell the Parent the nursery is no longer covered; alerts already in
+            // memory, including one queued by this save, are still delivered.
+            if wasMonitoring { reportUnexpectedStop() }
         }
     }
     func saveSettings(_ config: MonitoringConfiguration) {
@@ -1579,7 +1589,7 @@ import UIKit
                 refreshListenerPairing(using: client)
                 guard paired else { return }
                 scheduleHeartbeatIfDue()
-                guard revision == environmentRevision, role == .listener, storageHealthy else { return }
+                guard revision == environmentRevision, role == .listener else { return }
                 await deliverAlerts(using: client, revision: revision)
             }
         } catch { deliveryStatus = "Backend unavailable: \(error.localizedDescription)"; log.record("backend_unavailable", error: error) }
@@ -1596,7 +1606,7 @@ import UIKit
             guard let self else { return }
             defer { self.immediateAlertTask = nil }
             let revision = self.environmentRevision
-            guard !self.managingDevice, self.role == .listener, self.paired, self.storageHealthy,
+            guard !self.managingDevice, self.role == .listener, self.paired,
                   self.connectivity.available else { return }
             do {
                 let client = try await self.registeredClient()
@@ -1613,7 +1623,7 @@ import UIKit
             while self.alertDeliveryRequested {
                 self.alertDeliveryRequested = false
                 guard !Task.isCancelled, revision == self.environmentRevision, !self.managingDevice,
-                      self.role == .listener, self.paired, self.storageHealthy, self.connectivity.available else { return }
+                      self.role == .listener, self.paired, self.connectivity.available else { return }
                 // The server acknowledges (and the Listener then drops) an upload judged
                 // against an older applied Stop. Hold the outbox until this Start is
                 // recorded; the one-second tick retries the report and then the alerts.

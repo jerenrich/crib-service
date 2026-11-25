@@ -17,6 +17,20 @@ final class AlertCoordinatorTests: XCTestCase {
         }
         func requests() -> [UUID] { ids }
     }
+    @MainActor func testFreshAlertIsSentBeforeOlderRetries() async throws {
+        let listener = UUID(), now = Date(timeIntervalSince1970: 10_000)
+        func pending(_ createdAt: Date, attempts: Int) -> PendingAlert {
+            var item = PendingAlert(alert: CryAlert(episodeId: UUID(), listenerId: listener, cryStartedAt: createdAt,
+                                                    durationSeconds: 0, createdAt: createdAt, isRepeat: false))
+            item.attempts = attempts; item.nextAttemptAt = now
+            return item
+        }
+        let older = pending(now.addingTimeInterval(-600), attempts: 4), fresh = pending(now, attempts: 0)
+        let sender = Transport(); await sender.online()
+        await AlertCoordinator().deliverReady([older, fresh], listenerId: listener, now: now, sender: sender) { _, _ in }
+        let order = await sender.requests()
+        XCTAssertEqual(order, [fresh.alert.eventId, older.alert.eventId])
+    }
     @MainActor func testOfflineEventRestoresThenRetriesSameUUID() async throws {
         var simulation = CrySessionTests.Simulation(); simulation.run(306)
         var engine = simulation.engine

@@ -417,6 +417,7 @@ struct NightstandView: View {
     private var compactParentContents: some View {
         VStack(spacing: 8) {
             header
+            wakeWarning
             timedHero
             soundPanel.frame(height: hasTwoCaregivers ? 80 : 84)
             if hasTwoCaregivers { CaregiverDutyRow { caregiversPresented = true } }
@@ -428,6 +429,22 @@ struct NightstandView: View {
         .padding(.horizontal, 20)
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity, alignment: .top)
+    }
+
+    /// Shown when this iPhone's own settings would keep a crying alert silent.
+    @ViewBuilder private var wakeWarning: some View {
+        let problems = model.notifications.wakeProblems
+        if !problems.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                Label("Alerts may not wake you", systemImage: "bell.slash.fill").font(.headline)
+                ForEach(problems, id: \.self) { Text($0).font(.footnote) }
+            }
+            .foregroundStyle(.white)
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.red.opacity(0.85), in: RoundedRectangle(cornerRadius: 12))
+            .accessibilityElement(children: .combine)
+        }
     }
 
     private var timingSummary: some View {
