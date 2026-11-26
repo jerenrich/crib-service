@@ -2256,8 +2256,12 @@ final class AppModelTests: XCTestCase {
             connectionAlertPreferences.append(enabled)
             statusValue?.connectionAlertsEnabled = enabled
         }
+        var connectionAlertDelayGate: RequestGate?
+        func setConnectionAlertDelayGate(_ gate: RequestGate?) { connectionAlertDelayGate = gate }
         func connectionAlertDelay(_ seconds: Int) async throws {
             connectionAlertDelays.append(seconds)
+            let gate = connectionAlertDelayGate; connectionAlertDelayGate = nil
+            await gate?.wait()
             statusValue?.connectionAlertDelay = TimeInterval(seconds)
         }
         func heartbeat(_ value: Heartbeat) async throws -> MonitoringConfiguration {
@@ -3221,12 +3225,53 @@ final class AppModelTests: XCTestCase {
             monitoring: true, configuration: MonitoringConfiguration()))
         fixture.model.selectRole(.parent); await fixture.model.refreshParent()
         XCTAssertNil(fixture.model.parentStatus?.connectionAlertDelay)
+        // A server that does not report a delay cannot change it: no slider.
+        XCTAssertNil(fixture.model.adjustableConnectionAlertDelay)
         await fixture.model.setConnectionAlertDelay(420)
         XCTAssertEqual(fixture.model.parentStatus?.connectionAlertDelay, 420)
+        XCTAssertEqual(fixture.model.adjustableConnectionAlertDelay, 420)
         for invalid in [0.0, 30, 90, 1260] { await fixture.model.setConnectionAlertDelay(invalid) }
         let sent = await fixture.backend.connectionAlertDelays
         XCTAssertEqual(sent, [420])
         XCTAssertEqual(fixture.model.parentStatus?.connectionAlertsEnabled, true)
+        // Alerts off hides the slider, keeping the saved delay.
+        await fixture.model.setConnectionAlerts(false)
+        XCTAssertEqual(fixture.model.parentStatus?.connectionAlertsEnabled, false)
+        XCTAssertNil(fixture.model.adjustableConnectionAlertDelay)
+    }
+
+    @MainActor func testOverlappingConnectionAlertDelaySavesKeepTheLatestChoice() async throws {
+        let fixture = try Fixture()
+        await fixture.backend.setStatus(ParentStatus(paired: true, connectionAlertsEnabled: true,
+            connectionAlertDelay: 180, monitoring: true, configuration: MonitoringConfiguration()))
+        fixture.model.selectRole(.parent); await fixture.model.refreshParent()
+        let gate = RequestGate()
+        await fixture.backend.setConnectionAlertDelayGate(gate)
+        let first = Task { await fixture.model.setConnectionAlertDelay(300) }
+        let started = await eventually { await fixture.backend.connectionAlertDelays == [300] }
+        XCTAssertTrue(started)
+        // A second choice while the first save runs is queued, not dropped.
+        await fixture.model.setConnectionAlertDelay(600)
+        await fixture.model.setConnectionAlertDelay(900)
+        await gate.open(); await first.value
+        let sent = await fixture.backend.connectionAlertDelays
+        XCTAssertEqual(sent, [300, 900])
+        XCTAssertEqual(fixture.model.parentStatus?.connectionAlertDelay, 900)
+        XCTAssertFalse(fixture.model.changingConnectionAlerts)
+    }
+
+    func testSliderKeepsLatestStopUntilEverySaveEnds() {
+        var tracker = SliderSaveTracker()
+        tracker.begin(4); tracker.begin(6)
+        tracker.end()
+        XCTAssertEqual(tracker.index, 6, "A save finishing while another runs must not snap the thumb back")
+        tracker.end()
+        XCTAssertNil(tracker.index)
+        tracker.begin(2); tracker.end()
+        XCTAssertNil(tracker.index)
+        tracker.end()
+        tracker.begin(3)
+        XCTAssertEqual(tracker.index, 3, "An extra end must not leave a later save unshown")
     }
 
     @MainActor func testUpgradeClearsLegacyLocalWarningWithoutOptIn() async throws {

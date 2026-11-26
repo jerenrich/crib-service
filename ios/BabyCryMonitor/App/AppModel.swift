@@ -2400,20 +2400,38 @@ import UIKit
         }
         catch { self.error = error.localizedDescription; log.record("connection_preferences_failed", error: error) }
     }
+    /// The delay to offer in Settings: nil while alerts are off, or for a server
+    /// that predates the setting (it alerts after 3 minutes and cannot change that).
+    var adjustableConnectionAlertDelay: Double? {
+        parentStatus?.connectionAlertsEnabled == true ? parentStatus?.connectionAlertDelay : nil
+    }
     /// Whole minutes, 1 to 20; the Worker rejects anything else.
     static let connectionAlertDelays: [Double] = (1...20).map { Double($0 * 60) }
+    /// A delay chosen while another delay save runs; that save applies it next.
+    private var queuedConnectionAlertDelay: TimeInterval?
+    private var savingConnectionAlertDelay = false
     func setConnectionAlertDelay(_ seconds: TimeInterval) async {
-        guard role == .parent, !changingConnectionAlerts, Self.connectionAlertDelays.contains(seconds) else { return }
-        changingConnectionAlerts = true; defer { changingConnectionAlerts = false }
+        guard role == .parent, Self.connectionAlertDelays.contains(seconds) else { return }
+        // Never drop a newer choice: the running save sends it once it finishes.
+        if savingConnectionAlertDelay { queuedConnectionAlertDelay = seconds; return }
+        guard !changingConnectionAlerts else { return }
+        changingConnectionAlerts = true; savingConnectionAlertDelay = true
+        defer { changingConnectionAlerts = false; savingConnectionAlertDelay = false; queuedConnectionAlertDelay = nil }
         let revision = environmentRevision
-        do {
-            let client = try await registeredClient(); try await client.connectionAlertDelay(Int(seconds))
-            guard revision == environmentRevision, role == .parent else { return }
-            // Show the saved value at once; the refresh confirms it.
-            parentStatus?.connectionAlertDelay = seconds
-            await refreshParent()
+        var next: TimeInterval? = seconds
+        while let seconds = next {
+            next = nil
+            do {
+                let client = try await registeredClient(); try await client.connectionAlertDelay(Int(seconds))
+                guard revision == environmentRevision, role == .parent else { return }
+                // Show the saved value at once; the refresh confirms it.
+                parentStatus?.connectionAlertDelay = seconds
+            }
+            catch { self.error = error.localizedDescription; log.record("connection_preferences_failed", error: error); return }
+            // Confirm once nothing newer waits; a choice made during the refresh is sent next.
+            if queuedConnectionAlertDelay == nil { await refreshParent() }
+            next = queuedConnectionAlertDelay; queuedConnectionAlertDelay = nil
         }
-        catch { self.error = error.localizedDescription; log.record("connection_preferences_failed", error: error) }
     }
     func removePairing(deleteDevice: Bool) async {
         guard !managingDevice else { return }

@@ -312,6 +312,17 @@ describe('connection alerts, readiness and replacement',()=>{
   await call('listener/heartbeat',listener,beat(listener));
   expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM timeline_events WHERE kind='connection_restored'").first()).toEqual({n:1});
  });
+ it('looks for a restored-connection row only after a gap of at least a minute',async()=>{
+  const {listener}=await paired();
+  await call('listener/heartbeat',listener,beat(listener));
+  const last=new Date(Date.now()-30000).toISOString();
+  await env.DB.prepare('UPDATE heartbeats SET received_at=? WHERE listener_id=?').bind(last,listener.deviceId).run();
+  // Seed a missing row the cron could only record after a minute or more.
+  await env.DB.prepare(`INSERT INTO timeline_events(id,parent_id,listener_id,pair_created_at,kind,occurred_at,payload)
+   SELECT ?,parent_id,listener_id,created_at,'heartbeat_missing',?,'{}' FROM pairs WHERE listener_id=?`).bind(`missing:${last}`,Date.now(),listener.deviceId).run();
+  await call('listener/heartbeat',listener,beat(listener));
+  expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM timeline_events WHERE kind='connection_restored'").first()).toEqual({n:0});
+ });
  it('keeps a raised outage alerting when the delay is lengthened mid-outage',async()=>{
   const {parent,listener}=await paired();await call('device/push-token',parent,{token:'ab'.repeat(32)});
   expect((await call('connection-alerts',parent,{delaySeconds:60})).status).toBe(200);
@@ -4054,6 +4065,17 @@ describe('unexpected Listener monitoring stops',()=>{
   expect(await runReminder(testEnv,parent.deviceId)).toBe(false);expect(pushRequests).toHaveLength(3);
   const open=await env.DB.prepare("SELECT COUNT(*) AS count FROM events WHERE resolved_at IS NULL AND json_extract(payload,'$.type')='monitoring_failed'").first();
   expect(open).toEqual({count:0});
+ });
+ it('keeps the later observed state when two heartbeats share a millisecond',async()=>{
+  const {parent,listener}=await ready();
+  const stamp=new Date(Date.now()).toISOString();
+  vi.spyOn(Date,'now').mockReturnValue(Date.parse(stamp));
+  await call('listener/heartbeat',listener,beat(listener,true));
+  await call('listener/heartbeat',listener,{...beat(listener,false),microphoneActive:true,detectionPaused:'other_audio'});
+  vi.restoreAllMocks();
+  const timeline=await (await call('timeline',parent,undefined,'GET')).json() as {events:{kind:string;occurredAt:string}[]};
+  // A state that lasted no time is not history: the later heartbeat's state wins.
+  expect(timeline.events.filter(e=>e.occurredAt===stamp&&e.kind.endsWith('_observed')).map(e=>e.kind)).toEqual(['detection_paused_observed']);
  });
  it('explains a pause for other audio on the Listener in the push, its repeats and status',async()=>{
   const {parent,listener}=await ready();
