@@ -36,10 +36,10 @@ export function heartbeatTimeline(env:Env,pair:Pair,beat:Heartbeat,previous:{rec
  }
  // Never describe the first observation as an exact start/stop time.
  if(!old||old.monitoring!==beat.monitoring||old.microphoneActive!==beat.microphoneActive||old.detectionPaused!==beat.detectionPaused||previous&&now-Date.parse(previous.received_at)>180000){
-  // The kind is part of the id: two heartbeats in one millisecond must not
-  // collide and silently drop the second state.
+  // Two heartbeats in one millisecond share this id; the later state replaces
+  // the earlier one (see the conflict clause below), as in the heartbeats row.
   const kind=beat.monitoring?'monitoring_observed':beat.detectionPaused?'detection_paused_observed':beat.microphoneActive?'standby_observed':'stopped_observed';
-  events.push({id:`state:${stamp}:${kind}`,kind,occurredAt:stamp});
+  events.push({id:`state:${stamp}`,kind,occurredAt:stamp});
  }
  events.push({id:`coverage:${Math.floor(now/hour)}`,kind:beat.monitoring?'coverage_active':beat.microphoneActive?'coverage_standby':'coverage_stopped',occurredAt:stamp});
  if(old&&!(beat.timelineEvents?.length)) {
@@ -56,7 +56,8 @@ export function heartbeatTimeline(env:Env,pair:Pair,beat:Heartbeat,previous:{rec
  const accepted=events.filter(e=>Date.parse(e.occurredAt)>=pair.created_at&&Date.parse(e.occurredAt)<=now+5000&&
   (!e.episodeID||!e.endAt||Date.parse(e.endAt)>=pair.created_at));
  // A second detector can confirm an earlier onset after the first heartbeat.
- // Only move that episode's start earlier; retries and other events stay stable.
+ // Only move that episode's start earlier, and let a later heartbeat in the same
+ // millisecond replace an observed state; retries and other events stay stable.
  // A gap shorter than 3 minutes is history only if the cron recorded it for a
  // short alert delay (1 minute at least); then close it here too.
  const restored=previous&&now-Date.parse(previous.received_at)>connectionAlertDelays[0]*1000&&!events.some(e=>e.kind==='heartbeat_missing')?[timelineInsert(env,pair,
@@ -65,11 +66,11 @@ export function heartbeatTimeline(env:Env,pair:Pair,beat:Heartbeat,previous:{rec
   SELECT json_extract(value,'$.id'),?,?,?,json_extract(value,'$.kind'),
   CAST(ROUND((julianday(json_extract(value,'$.occurredAt'))-2440587.5)*86400000) AS INTEGER),value
   FROM json_each(?) WHERE EXISTS(SELECT 1 FROM pairs WHERE parent_id=? AND listener_id=? AND created_at=?)
-  ON CONFLICT DO UPDATE SET occurred_at=excluded.occurred_at,payload=excluded.payload
-  WHERE timeline_events.kind='cry_started' AND excluded.kind='cry_started'
+  ON CONFLICT DO UPDATE SET kind=excluded.kind,occurred_at=excluded.occurred_at,payload=excluded.payload
+  WHERE (timeline_events.kind='cry_started' AND excluded.kind='cry_started' AND excluded.occurred_at<timeline_events.occurred_at
+   OR timeline_events.id LIKE 'state:%')
   AND timeline_events.parent_id=excluded.parent_id AND timeline_events.listener_id=excluded.listener_id
-  AND timeline_events.pair_created_at=excluded.pair_created_at
-  AND excluded.occurred_at<timeline_events.occurred_at`).bind(pair.parent_id,pair.listener_id,pair.created_at,JSON.stringify(accepted),pair.parent_id,pair.listener_id,pair.created_at)];
+  AND timeline_events.pair_created_at=excluded.pair_created_at`).bind(pair.parent_id,pair.listener_id,pair.created_at,JSON.stringify(accepted),pair.parent_id,pair.listener_id,pair.created_at)];
 }
 
 export async function timeline(env:Env,device:Device) {

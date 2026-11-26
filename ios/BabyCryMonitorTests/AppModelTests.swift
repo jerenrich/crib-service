@@ -2256,8 +2256,12 @@ final class AppModelTests: XCTestCase {
             connectionAlertPreferences.append(enabled)
             statusValue?.connectionAlertsEnabled = enabled
         }
+        var connectionAlertDelayGate: RequestGate?
+        func setConnectionAlertDelayGate(_ gate: RequestGate?) { connectionAlertDelayGate = gate }
         func connectionAlertDelay(_ seconds: Int) async throws {
             connectionAlertDelays.append(seconds)
+            let gate = connectionAlertDelayGate; connectionAlertDelayGate = nil
+            await gate?.wait()
             statusValue?.connectionAlertDelay = TimeInterval(seconds)
         }
         func heartbeat(_ value: Heartbeat) async throws -> MonitoringConfiguration {
@@ -3236,16 +3240,38 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(fixture.model.adjustableConnectionAlertDelay)
     }
 
-    func testSliderKeepsChosenStopUntilLatestSaveEnds() {
+    @MainActor func testOverlappingConnectionAlertDelaySavesKeepTheLatestChoice() async throws {
+        let fixture = try Fixture()
+        await fixture.backend.setStatus(ParentStatus(paired: true, connectionAlertsEnabled: true,
+            connectionAlertDelay: 180, monitoring: true, configuration: MonitoringConfiguration()))
+        fixture.model.selectRole(.parent); await fixture.model.refreshParent()
+        let gate = RequestGate()
+        await fixture.backend.setConnectionAlertDelayGate(gate)
+        let first = Task { await fixture.model.setConnectionAlertDelay(300) }
+        let started = await eventually { await fixture.backend.connectionAlertDelays == [300] }
+        XCTAssertTrue(started)
+        // A second choice while the first save runs is queued, not dropped.
+        await fixture.model.setConnectionAlertDelay(600)
+        await fixture.model.setConnectionAlertDelay(900)
+        await gate.open(); await first.value
+        let sent = await fixture.backend.connectionAlertDelays
+        XCTAssertEqual(sent, [300, 900])
+        XCTAssertEqual(fixture.model.parentStatus?.connectionAlertDelay, 900)
+        XCTAssertFalse(fixture.model.changingConnectionAlerts)
+    }
+
+    func testSliderKeepsLatestStopUntilEverySaveEnds() {
         var tracker = SliderSaveTracker()
-        let first = tracker.begin(4)
-        let second = tracker.begin(4)
-        tracker.end(first)
-        XCTAssertEqual(tracker.index, 4, "An earlier save finishing must not snap the thumb back")
-        tracker.end(second)
+        tracker.begin(4); tracker.begin(6)
+        tracker.end()
+        XCTAssertEqual(tracker.index, 6, "A save finishing while another runs must not snap the thumb back")
+        tracker.end()
         XCTAssertNil(tracker.index)
-        let third = tracker.begin(2); tracker.end(third)
+        tracker.begin(2); tracker.end()
         XCTAssertNil(tracker.index)
+        tracker.end()
+        tracker.begin(3)
+        XCTAssertEqual(tracker.index, 3, "An extra end must not leave a later save unshown")
     }
 
     @MainActor func testUpgradeClearsLegacyLocalWarningWithoutOptIn() async throws {
